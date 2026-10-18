@@ -19,7 +19,6 @@ use std::io::Read;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use base64::{engine::general_purpose, Engine as _};
 use futures::Future;
 
 use rust_rcs_core::cpim::{CPIMInfo, CPIMMessage};
@@ -65,13 +64,13 @@ use rust_rcs_core::sip::INVITE;
 use rust_rcs_core::sip::sip_headers::AsFromTo;
 
 use rust_rcs_core::util::rand::create_raw_alpha_numeric_string;
-use rust_rcs_core::util::raw_string::StrFind;
 
 use rust_strict_sdp::AsSDP;
 
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::contact::ContactKnownIdentities;
@@ -83,7 +82,9 @@ use super::session_invitation::{
 };
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMContact, CPMServiceType};
-use super::{make_cpim_message_content_body, understands_cpim_requirements, CPMMessageParam};
+use super::{
+    decode_base64, make_cpim_message_content_body, understands_cpim_requirements, CPMMessageParam,
+};
 
 // to-do: use enum
 pub struct CPMSessionInfo {
@@ -116,6 +117,16 @@ impl CPMSessionInfo {
         }
         known_identities
     }
+}
+
+/// Whether `uri` is the store and forward server's, which delivers deferred
+/// messages on behalf of their sender (GSMA RCC.07 section 3.3.4.1.5)
+fn is_store_and_forward_server(uri: &[u8]) -> bool {
+    let user_part = match uri.iter().position(|c| *c == b':') {
+        Some(idx) => &uri[idx + 1..],
+        None => uri,
+    };
+    user_part.len() >= 13 && user_part[..13].eq_ignore_ascii_case(b"rcse-standfw@")
 }
 
 pub fn get_cpm_session_info_from_message(
@@ -177,7 +188,7 @@ pub fn get_cpm_session_info_from_message(
                                 .first()
                             {
                                 if let Some(uri_part) = &name_addr.uri_part {
-                                    if uri_part.uri.start_with(b"rcse-standfw@") {
+                                    if is_store_and_forward_server(uri_part.uri) {
                                         is_deferred_session = true;
                                         if let Some(referred_by_header) = referred_by_header {
                                             if let Some(referred_by) = referred_by_header
@@ -382,6 +393,9 @@ enum CPMSessionState {
         // Arc<MsrpChannel>,
         mpsc::Sender<CPMMessageParam>,
     ),
+    /// Ended by either side, its MSRP connection closing as the sender of
+    /// the messages, kept by Starting, is dropped
+    Ended,
     // Started(
     //     Arc<Body>,
     //     Arc<Body>,
@@ -401,6 +415,11 @@ pub struct CPMSession {
     /// The messages sent before the session started, taken under the state
     /// lock
     pending_messages: Mutex<Vec<CPMMessageParam>>,
+    /// Told when the session ends
+    ended: Arc<Notify>,
+    /// The writer of the MSRP connection, once up, taken under the state
+    /// lock
+    msrp_writer: Arc<Mutex<Option<mpsc::Sender<Option<Vec<u8>>>>>>,
 }
 
 impl CPMSession {
@@ -411,7 +430,14 @@ impl CPMSession {
                 CPMSessionNegotiationState::NoneSet,
             ))),
             pending_messages: Mutex::new(Vec::new()),
+            ended: Arc::new(Notify::new()),
+            msrp_writer: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Told once when the session ends, to whoever waits first
+    pub fn ended(&self) -> Arc<Notify> {
+        Arc::clone(&self.ended)
     }
 
     pub fn get_session_info(&self) -> &CPMSessionInfo {
@@ -630,8 +656,21 @@ impl CPMSession {
 
                     let future = connect_function(sock, &addr, port, tls);
 
+                    let session_state = Arc::clone(&self.session_state);
+                    let msrp_writer = Arc::clone(&self.msrp_writer);
+                    let session_end_function = Arc::new(session_end_function);
+                    let session_end_function_ = Arc::clone(&session_end_function);
+
                     rt.spawn(async move {
-                        if let Ok(cs) = future.await {
+                        let cs = match future.await {
+                            Ok(cs) => cs,
+                            Err(_) => {
+                                // no connection, no session
+                                session_end_function_();
+                                return;
+                            }
+                        };
+                        {
                             // let transport = MsrpTransportWrapper::new(
                             //     cs,
                             //     t_id,
@@ -648,6 +687,14 @@ impl CPMSession {
 
                             let (data_tx, data_rx) = mpsc::channel(8);
                             let data_tx_ = data_tx.clone();
+
+                            // the writer, which the session closes the
+                            // connection with when it ends, unless it has
+                            if let CPMSessionState::Ended = *session_state.lock().unwrap() {
+                                return;
+                            } else {
+                                *msrp_writer.lock().unwrap() = Some(data_tx.clone());
+                            }
 
                             msrp_transport_start(
                                 cs,
@@ -683,6 +730,20 @@ impl CPMSession {
                                     }
                                 }
                             });
+
+                            // the side that connects binds the connection to
+                            // the session at once, with a SEND that may be
+                            // empty (RFC 4975 section 5.4)
+                            demuxer_.start(
+                                from_path.clone(),
+                                to_path.clone(),
+                                None,
+                                0,
+                                std::io::empty(),
+                                |_, _| {},
+                                chunk_tx.clone(),
+                                &rt_,
+                            );
 
                             while let Some(message) = message_rx.recv().await {
                                 let content_type = b"message/cpim".to_vec();
@@ -761,7 +822,128 @@ impl CPMSession {
                     }
                 });
             }
+            CPMSessionState::Ended => {
+                drop(guard);
+                (message.message_result_callback)(480, String::from("Temporarily Unavailable"));
+            }
         }
+    }
+
+    /// Ends the session, closing its MSRP connection, and failing the
+    /// messages waiting for it to start; whether it had not ended already
+    pub fn end(&self, rt: &Arc<Runtime>) -> bool {
+        let (pending_messages, msrp_writer) = {
+            let mut guard = self.session_state.lock().unwrap();
+            if let CPMSessionState::Ended = *guard {
+                return false;
+            }
+            *guard = CPMSessionState::Ended;
+            (
+                std::mem::take(&mut *self.pending_messages.lock().unwrap()),
+                self.msrp_writer.lock().unwrap().take(),
+            )
+        };
+
+        // the connection is closed, which its transport, holding a sender of
+        // its own, would not be on its senders being dropped
+        if let Some(msrp_writer) = msrp_writer {
+            rt.spawn(async move {
+                let _ = msrp_writer.send(None).await;
+            });
+        }
+
+        self.ended.notify_one();
+
+        for message in pending_messages {
+            (message.message_result_callback)(480, String::from("Temporarily Unavailable"));
+        }
+
+        true
+    }
+}
+
+/// What ending a chat session takes
+#[derive(Clone)]
+pub(crate) struct SessionEnd {
+    pub(crate) sip_session: Arc<SipSession<CPMSession>>,
+    pub(crate) ongoing_sessions:
+        Arc<Mutex<Vec<(ContactKnownIdentities, Arc<SipSession<CPMSession>>)>>>,
+    pub(crate) dialog: Arc<SipDialog>,
+    pub(crate) tm: Arc<SipTransactionManager>,
+    pub(crate) registered_public_identity: Arc<Mutex<Option<(Arc<SipTransport>, String, String)>>>,
+    pub(crate) rt: Arc<Runtime>,
+}
+
+impl SessionEnd {
+    /// Ends the session, unless it ended already: a message sent from now on
+    /// starts another, its MSRP connection closes, and its dialog goes,
+    /// ended with a BYE if `send_bye`, as when its MSRP connection is lost
+    pub(crate) fn end(&self, send_bye: bool) {
+        {
+            let mut guard = self.ongoing_sessions.lock().unwrap();
+            if let Some(idx) = guard
+                .iter()
+                .position(|(_, sip_session)| Arc::ptr_eq(sip_session, &self.sip_session))
+            {
+                guard.swap_remove(idx);
+            }
+        }
+
+        if !self.sip_session.get_inner().end(&self.rt) {
+            return;
+        }
+
+        if send_bye {
+            if let Ok(message) = self.dialog.make_request(b"BYE", None) {
+                let transport = match &*self.registered_public_identity.lock().unwrap() {
+                    Some((transport, _, _)) => Some(Arc::clone(transport)),
+                    None => None,
+                };
+                if let Some(transport) = transport {
+                    self.tm.send_request(
+                        message,
+                        &transport,
+                        ClientTransactionNilCallbacks {},
+                        &self.rt,
+                    );
+                }
+            }
+        }
+
+        // not from within the dialog, which may be calling us
+        let sip_session = Arc::clone(&self.sip_session);
+        self.rt.spawn(async move {
+            sip_session.hang_up();
+        });
+    }
+}
+
+type OutgoingInvitation = Arc<(ContactKnownIdentities, mpsc::Sender<CPMMessageParam>)>;
+
+fn remove_invitation(
+    invitations: &Arc<Mutex<Vec<OutgoingInvitation>>>,
+    invitation: &OutgoingInvitation,
+) {
+    let mut guard = invitations.lock().unwrap();
+    if let Some(idx) = guard.iter().position(|i| Arc::ptr_eq(i, invitation)) {
+        guard.swap_remove(idx);
+    }
+}
+
+/// Ends an invitation that failed, so that a message sent from now on
+/// starts another, and fails those waiting for it as it failed
+fn fail_invitation(
+    invitations: &Arc<Mutex<Vec<OutgoingInvitation>>>,
+    invitation: OutgoingInvitation,
+    message_rx: &mut mpsc::Receiver<CPMMessageParam>,
+    status_code: u16,
+    reason_phrase: &str,
+) {
+    remove_invitation(invitations, &invitation);
+    drop(invitation);
+    message_rx.close();
+    while let Ok(message) = message_rx.try_recv() {
+        (message.message_result_callback)(status_code, String::from(reason_phrase));
     }
 }
 
@@ -805,9 +987,7 @@ impl MsrpDataWriter for CPMSessionCPIMMessageWriter {
                             };
 
                             if base64_encoded {
-                                if let Ok(decoded_content_body) =
-                                    general_purpose::STANDARD.decode(content_body)
-                                {
+                                if let Ok(decoded_content_body) = decode_base64(content_body) {
                                     (self.message_callback)(
                                         &cpim_message_info,
                                         content_type,
@@ -1005,6 +1185,22 @@ impl CPMSessionService {
         }
     }
 
+    /// Whether there is a session with `recipient`, or one being set up
+    pub fn has_session_with(&self, recipient: &str) -> bool {
+        for (known_identities, _) in &*self.ongoing_sessions.lock().unwrap() {
+            if known_identities == recipient {
+                return true;
+            }
+        }
+        for invitation in &*self.ongoing_outgoing_invitations.lock().unwrap() {
+            let (known_identities, _) = invitation.as_ref();
+            if known_identities == recipient {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn send_message<F>(
         &self,
         message_type: &str,
@@ -1114,7 +1310,7 @@ impl CPMSessionService {
                 accept_types: if let RecipientType::Chatbot = recipient_type {
                     b"message/cpim"
                 } else {
-                    b"message/cpim application/im-iscomposing+xm"
+                    b"message/cpim application/im-iscomposing+xml"
                 },
                 setup_method: if active_setup {
                     MsrpSetupMethod::Active
@@ -1168,9 +1364,10 @@ impl CPMSessionService {
                     },
                 ));
 
+                // the service of the session, which the Contact also gives
                 invite_message.add_header(Header::new(
                     b"Accept-Contact",
-                    "*;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg\"",
+                    "*;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
                 ));
 
                 if let RecipientType::Chatbot = recipient_type {
@@ -1263,6 +1460,7 @@ impl CPMSessionService {
                 let mut known_identities = ContactKnownIdentities::new();
                 known_identities.add_identity(String::from(recipient));
                 let outgoing_invitation = Arc::new((known_identities, message_tx));
+                let recipient_ = String::from(recipient);
                 let outgoing_invitation_ = Arc::clone(&outgoing_invitation);
 
                 let ongoing_outgoing_invitations = Arc::clone(&self.ongoing_outgoing_invitations);
@@ -1310,20 +1508,25 @@ impl CPMSessionService {
                                         _ => None,
                                     } {
                                         if let Some(r_msrp_info) = r_sdp.as_msrp_info() {
-                                            if let Ok(raddr) = std::str::from_utf8(r_msrp_info.address) {
+                                            // where the first URI of a=path points
+                                            // (RFC 4975 section 8.1)
+                                            let connection_address = r_msrp_info.connection_address(false);
+                                            if let Some(Ok(raddr)) = connection_address.map(|(a, _)| std::str::from_utf8(a)) {
                                                 let raddr = String::from(raddr);
-                                                let rport = r_msrp_info.port;
+                                                let rport = connection_address.map_or(r_msrp_info.port, |(_, p)| p);
                                                 let rpath = r_msrp_info.path.to_vec();
 
                                                 let asserted_contact_uri = session_info.asserted_contact_uri.clone();
                                                 let asserted_contact_uri_ = asserted_contact_uri.clone();
-                                                let known_identities = session_info.get_contact_known_identities();
+                                                // known also by the address the
+                                                // messages were sent to
+                                                let mut known_identities = session_info.get_contact_known_identities();
+                                                known_identities.add_identity(String::from(&recipient_));
                                                 let cpm_session = CPMSession::new(session_info);
 
                                                 if let Ok(_) = cpm_session.set_local_sdp(l_sdp_body, sock, tls, host, port, path) {
                                                     if let Ok(_) = cpm_session.set_remote_sdp(r_sdp_body, raddr, rport, rpath) {
                                                         let cpm_session = Arc::new(cpm_session);
-                                                        let cpm_session_ = Arc::clone(&cpm_session);
 
                                                         let (d_tx, mut d_rx) = mpsc::channel(1);
 
@@ -1357,10 +1560,19 @@ impl CPMSessionService {
 
                                                             let public_user_identity_ = public_user_identity.clone();
 
+                                                            let session_end = SessionEnd {
+                                                                sip_session: Arc::clone(&sip_session),
+                                                                ongoing_sessions: Arc::clone(&ongoing_sessions),
+                                                                dialog: Arc::clone(&dialog),
+                                                                tm: Arc::clone(&tm_),
+                                                                registered_public_identity: Arc::clone(&registered_public_identity),
+                                                                rt: Arc::clone(&rt_),
+                                                            };
+
                                                             sip_session.setup_confirmed_dialog(&dialog, CPMSessionDialogEventReceiver {
                                                                 public_user_identity: public_user_identity_,
                                                                 sip_session: Arc::clone(&sip_session),
-                                                                ongoing_sessions: Arc::clone(&ongoing_sessions),
+                                                                session_end: session_end.clone(),
                                                                 message_receive_listener: Arc::new(move |cpim_info, content_type, content_body| {
                                                                     message_receive_listener_(&sip_session_, asserted_contact_uri_.as_bytes(), cpim_info, content_type, content_body)
                                                                 }),
@@ -1388,8 +1600,16 @@ impl CPMSessionService {
                                                             let tm = Arc::clone(&tm_);
                                                             let rt = Arc::clone(&rt_);
 
+                                                            let session_end_ = session_end.clone();
+
                                                             rt_.spawn(async move {
-                                                                while let Some(ev) = sess_rx.recv().await {
+                                                                // until the session ends, its timers
+                                                                // with it
+                                                                let ended = session_end_.sip_session.get_inner().ended();
+                                                                while let Some(ev) = tokio::select! {
+                                                                    ev = sess_rx.recv() => ev,
+                                                                    _ = ended.notified() => None,
+                                                                } {
                                                                     match ev {
                                                                         SipSessionEvent::ShouldRefresh(dialog) => {
                                                                             if let Ok(mut message) =
@@ -1419,20 +1639,8 @@ impl CPMSessionService {
                                                                             }
                                                                         }
 
-                                                                        SipSessionEvent::Expired(dialog) => {
-                                                                            if let Ok(message) = dialog.make_request(b"BYE", None) {
-                                                                                let guard =
-                                                                                registered_public_identity_.lock().unwrap();
-
-                                                                                if let Some((transport, _, _)) = &*guard {
-                                                                                    tm.send_request(
-                                                                                        message,
-                                                                                        transport,
-                                                                                        ClientTransactionNilCallbacks {},
-                                                                                        &rt,
-                                                                                    );
-                                                                                }
-                                                                            }
+                                                                        SipSessionEvent::Expired(_) => {
+                                                                            session_end_.end(true);
                                                                         }
 
                                                                         _ => {}
@@ -1464,19 +1672,20 @@ impl CPMSessionService {
                                                                         &rt_,
                                                                     );
 
-                                                                    let ongoing_sessions_ = Arc::clone(&ongoing_sessions);
-
                                                                     if let Ok(message_tx) = cpm_session.start(&public_user_identity, move |cpim_info, content_type, mesage_buf| {
                                                                         message_receive_listener(&sip_session_2, asserted_contact_uri.as_bytes(), cpim_info, content_type, mesage_buf)
                                                                     }, &connect_function, move || {
-                                                                        let mut guard = ongoing_sessions_.lock().unwrap();
-                                                                        if let Some(idx) = guard.iter().position(|(_, sip_session)| {
-                                                                            let inner = sip_session.get_inner();
-                                                                            Arc::ptr_eq(&inner, &cpm_session_)
-                                                                        }) {
-                                                                            guard.swap_remove(idx);
-                                                                        }
+                                                                        // the MSRP connection lost, the
+                                                                        // session is ended
+                                                                        session_end.end(true)
                                                                     }, &rt) {
+
+                                                                        // the session takes the messages
+                                                                        // from now on, the invitation those
+                                                                        // sent to it until no one holds it
+                                                                        ongoing_sessions.lock().unwrap().push((known_identities, sip_session));
+                                                                        remove_invitation(&ongoing_outgoing_invitations, &outgoing_invitation_);
+                                                                        drop(outgoing_invitation_);
 
                                                                         match message_tx.send(message).await {
                                                                             Ok(()) => {},
@@ -1494,16 +1703,6 @@ impl CPMSessionService {
                                                                             }
                                                                         }
 
-                                                                        let mut guard = ongoing_sessions.lock().unwrap();
-
-                                                                        guard.push((known_identities, sip_session));
-
-                                                                        let mut guard = ongoing_outgoing_invitations.lock().unwrap();
-
-                                                                        if let Some(idx) = guard.iter().position(|outgoing_invitation| Arc::ptr_eq(outgoing_invitation, &outgoing_invitation_)) {
-                                                                            guard.swap_remove(idx);
-                                                                        }
-
                                                                         return;
                                                                     }
                                                                 }
@@ -1518,12 +1717,26 @@ impl CPMSessionService {
                             }
 
                             Err((error_code, error_reason)) => {
+                                fail_invitation(
+                                    &ongoing_outgoing_invitations,
+                                    outgoing_invitation_,
+                                    &mut message_rx,
+                                    error_code,
+                                    &error_reason,
+                                );
                                 (message.message_result_callback)(error_code, error_reason);
                                 return;
                             }
                         }
                     }
 
+                    fail_invitation(
+                        &ongoing_outgoing_invitations,
+                        outgoing_invitation_,
+                        &mut message_rx,
+                        500,
+                        "Internal Error",
+                    );
                     (message.message_result_callback)(500, String::from("Internal Error"));
                 });
 
@@ -1742,8 +1955,7 @@ impl<T> ClientTransactionCallbacks for UpdateMessageCallbacks<T> {
 
 pub(crate) struct CPMSessionDialogEventReceiver {
     pub(crate) sip_session: Arc<SipSession<CPMSession>>,
-    pub(crate) ongoing_sessions:
-        Arc<Mutex<Vec<(ContactKnownIdentities, Arc<SipSession<CPMSession>>)>>>,
+    pub(crate) session_end: SessionEnd,
     pub(crate) public_user_identity: String,
     pub(crate) message_receive_listener: Arc<dyn Fn(&CPIMInfo, &[u8], &[u8]) + Send + Sync>,
     pub(crate) msrp_socket_connect_function: Arc<
@@ -1762,8 +1974,7 @@ pub(crate) struct CPMSessionDialogEventReceiver {
 
 impl SipDialogEventCallbacks for CPMSessionDialogEventReceiver {
     fn on_ack(&self, _transaction: &Arc<ServerTransaction>) {
-        let ongoing_sessions = Arc::clone(&self.ongoing_sessions);
-        let sip_session_ = Arc::clone(&self.sip_session);
+        let session_end = self.session_end.clone();
         let session = self.sip_session.get_inner();
         let message_receive_listener = Arc::clone(&self.message_receive_listener);
         match session.start(
@@ -1772,15 +1983,8 @@ impl SipDialogEventCallbacks for CPMSessionDialogEventReceiver {
                 message_receive_listener(cpim_info, content_type, content_body)
             },
             &self.msrp_socket_connect_function,
-            move || {
-                let mut guard = ongoing_sessions.lock().unwrap();
-                if let Some(idx) = guard
-                    .iter()
-                    .position(|(_, sip_session)| Arc::ptr_eq(sip_session, &sip_session_))
-                {
-                    guard.swap_remove(idx);
-                }
-            },
+            // the MSRP connection lost, the session is ended
+            move || session_end.end(true),
             &self.rt,
         ) {
             Ok(_) => {}
@@ -1863,13 +2067,8 @@ impl SipDialogEventCallbacks for CPMSessionDialogEventReceiver {
     }
 
     fn on_terminating_request(&self, _message: &SipMessage) {
-        let mut guard = self.ongoing_sessions.lock().unwrap();
-        if let Some(idx) = guard
-            .iter()
-            .position(|(_, sip_session)| Arc::ptr_eq(&sip_session, &self.sip_session))
-        {
-            guard.swap_remove(idx);
-        }
+        // a BYE, answered by the dialog
+        self.session_end.end(false);
     }
 
     fn on_terminating_response(&self, message: &SipMessage) {}

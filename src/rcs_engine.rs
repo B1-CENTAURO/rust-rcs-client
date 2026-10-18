@@ -674,6 +674,8 @@ impl RcsEngine {
 
                 cpm_session_service: Arc::clone(&cpm_session_service),
 
+                standalone_messaging_service: Arc::clone(&standalone_messaging_service),
+
                 conference_service_v1: Arc::clone(&multi_conference_service_v1),
 
                 subscription_id,
@@ -924,8 +926,10 @@ impl RcsEngine {
 
         // bool contact_is_chatbot = (options & rcs_send_message_option_contact_is_chatbot) != 0;
 
-        // bool contact_supports_one_to_one = (options & rcs_send_message_option_contact_supports_one_to_one) != 0;
-        let recipient_supports_one_to_one = false;
+        // a chat with the recipient, which an answer goes in; without one,
+        // whether the recipient takes chats is not known, as capabilities
+        // are not exchanged
+        let has_session = self.cpm_session_service.has_session_with(recipient);
 
         // bool contact_supports_standalone = (options & rcs_send_message_option_contact_supports_standalone) != 0;
         let recipient_supports_standalone = true;
@@ -939,13 +943,12 @@ impl RcsEngine {
             let messaging_config = &*self.messaging_config.lock().unwrap();
 
             if let RecipientType::Chatbot = recipient_type {
-                if messaging_config.chatbot_msg_tech == 1
-                    && messaging_config.chat_auth == 1
-                    && recipient_supports_one_to_one
-                {
+                // chatbots by chat only, or by either (GSMA RCC.07 chatbot
+                // messaging technology)
+                if messaging_config.chatbot_msg_tech == 1 && messaging_config.chat_auth == 1 {
                     send_through_one_to_one_chat_service = true;
                 } else if messaging_config.chatbot_msg_tech == 2 {
-                    if messaging_config.chat_auth == 1 && recipient_supports_one_to_one {
+                    if messaging_config.chat_auth == 1 && has_session {
                         send_through_one_to_one_chat_service = true;
                     }
 
@@ -963,17 +966,22 @@ impl RcsEngine {
                     send_through_group_chat_service = true;
                 }
             } else if let RecipientType::ResourceList = recipient_type {
-                if messaging_config.standalone_msg_auth == 1 {
-                    // to-do: check max_one_to_many_recipients for limit
-                    if let Some(exploder_uri) = &messaging_config.exploder_uri {
-                        recipient_uri = String::from(exploder_uri);
-                    } else {
-                        recipient_uri = String::from("exploder@conf-factory");
-                    }
+                // to-do: check max_one_to_many_recipients for limit
+                // through the exploder the network gives, which has no
+                // address to fall back on
+                if let (1, Some(exploder_uri)) = (
+                    messaging_config.standalone_msg_auth,
+                    &messaging_config.exploder_uri,
+                ) {
+                    recipient_uri = String::from(exploder_uri);
                     send_through_standalone_message_service = true;
                 }
             } else {
-                if messaging_config.chat_auth == 1 && recipient_supports_one_to_one {
+                // in the chat there is, or in a new one when the message
+                // cannot go standalone
+                if messaging_config.chat_auth == 1
+                    && (has_session || messaging_config.standalone_msg_auth != 1)
+                {
                     send_through_one_to_one_chat_service = true;
                 }
 
@@ -1617,6 +1625,8 @@ struct Connector {
 
     cpm_session_service: Arc<CPMSessionService>,
 
+    standalone_messaging_service: Arc<StandaloneMessagingService>,
+
     conference_service_v1: Arc<MultiConferenceServiceV1>,
 
     subscription_id: i32,
@@ -1933,6 +1943,14 @@ impl Connector {
                     sip_instance_id.clone(),
                     Arc::clone(transport),
                 );
+
+                // the Contact of its answers to large-mode messages
+                self.standalone_messaging_service
+                    .set_registered_public_identity(
+                        unbarred_impu.clone(),
+                        sip_instance_id.clone(),
+                        Arc::clone(transport),
+                    );
 
                 self.retry.lock().unwrap().failures = 0;
 

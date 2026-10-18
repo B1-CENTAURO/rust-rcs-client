@@ -61,6 +61,17 @@ pub fn understands_cpim_requirements(message: &CPIMMessage) -> bool {
     unmet.is_empty()
 }
 
+/// `data` decoded from base64, as MIME writes it, in lines (RFC 2045
+/// section 6.8)
+pub fn decode_base64(data: &[u8]) -> Result<Vec<u8>, base64::DecodeError> {
+    let data: Vec<u8> = data
+        .iter()
+        .copied()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    general_purpose::STANDARD.decode(data)
+}
+
 pub struct MessagingSessionHandle {
     pub(crate) inner: Arc<SipSession<CPMSession>>,
 }

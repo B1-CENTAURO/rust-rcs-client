@@ -18,7 +18,6 @@ use std::io::Read;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use base64::{engine::general_purpose, Engine as _};
 use futures::Future;
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::internet::body::multipart_body::MultipartBody;
@@ -27,6 +26,7 @@ use rust_rcs_core::io::network::stream::{ClientSocket, ClientStream};
 use rust_rcs_core::msrp::info::msrp_info_reader::AsMsrpInfo;
 use rust_rcs_core::msrp::info::{MsrpDirection, MsrpInfo, MsrpInterfaceType, MsrpSetupMethod};
 use rust_rcs_core::msrp::msrp_channel::MsrpChannel;
+use rust_rcs_core::msrp::msrp_chunk::MsrpChunk;
 use rust_rcs_core::msrp::msrp_demuxer::MsrpDemuxer;
 use rust_rcs_core::msrp::msrp_muxer::{MsrpDataWriter, MsrpMessageReceiver, MsrpMuxer};
 use rust_rcs_core::msrp::msrp_transport::msrp_transport_start;
@@ -41,6 +41,7 @@ use rust_strict_sdp::{AsSDP, Sdp};
 
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 use uuid::Uuid;
 
@@ -74,13 +75,15 @@ use rust_rcs_core::util::rand::{self, create_raw_alpha_numeric_string};
 use rust_rcs_core::util::raw_string::{StrEq, StrFind};
 // use rust_rcs_core::util::timer::Timer;
 
-use crate::chat_bot::cpim::GetBotInfo;
 use crate::messaging::ffi::RecipientType;
 
 use super::session::{get_cpm_session_info_from_message, CPMSessionInfo, UpdateMessageCallbacks};
+use super::session_invitation::set_sdp;
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMServiceType};
-use super::{make_cpim_message_content_body, understands_cpim_requirements, CPMMessageParam};
+use super::{
+    decode_base64, make_cpim_message_content_body, understands_cpim_requirements, CPMMessageParam,
+};
 
 const LOG_TAG: &str = "messaging";
 
@@ -175,7 +178,14 @@ impl StandaloneLargeModeSendSession {
             let rt_ = Arc::clone(rt);
 
             rt.spawn(async move {
-                if let Ok(cs) = connect_function(sock, &addr, port, tls).await {
+                let cs = match connect_function(sock, &addr, port, tls).await {
+                    Ok(cs) => cs,
+                    Err((status_code, reason_phrase)) => {
+                        message_result_callback(status_code, String::from(reason_phrase));
+                        return;
+                    }
+                };
+                {
                     let t_id = format!("");
 
                     let from_path = lpath.clone();
@@ -278,6 +288,49 @@ impl StandaloneLargeModeSendSession {
             });
         }
         guard.2.take();
+    }
+}
+
+/// Ends a large-mode session the client sent its message in
+struct LargeModeSessionEnd {
+    done: Mutex<bool>,
+    dialog: Arc<SipDialog>,
+    session: Arc<StandaloneLargeModeSendSession>,
+    sip_session: Arc<SipSession<StandaloneLargeModeSendSession>>,
+    core: Arc<SipCore>,
+    ended: Arc<Notify>,
+    rt: Arc<Runtime>,
+}
+
+impl LargeModeSessionEnd {
+    /// Sends a BYE, closes the MSRP connection and lets the dialog go, once
+    fn end(&self) {
+        {
+            let mut done = self.done.lock().unwrap();
+            if *done {
+                return;
+            }
+            *done = true;
+        }
+
+        if let Ok(message) = self.dialog.make_request(b"BYE", None) {
+            if let Some((transport, _, _)) = self.core.get_default_public_identity() {
+                self.core.get_transaction_manager().send_request(
+                    message,
+                    &transport,
+                    ClientTransactionNilCallbacks {},
+                    &self.rt,
+                );
+            }
+        }
+
+        self.session.stop(&self.rt);
+        self.ended.notify_one();
+
+        let sip_session = Arc::clone(&self.sip_session);
+        self.rt.spawn(async move {
+            sip_session.hang_up();
+        });
     }
 }
 
@@ -419,7 +472,13 @@ impl StandaloneLargeModeReceiveSession {
                         sip_cpim_body,
                     });
 
+                    let demuxer_ = Arc::clone(&demuxer);
+                    let from_path = lpath.clone();
+                    let to_path = rpath.clone();
+
                     let mut session_channel = MsrpChannel::new(lpath, rpath, demuxer, muxer);
+
+                    let bind_tx = data_tx_.clone();
 
                     msrp_transport_start(
                         cs,
@@ -430,6 +489,30 @@ impl StandaloneLargeModeReceiveSession {
                         || {},
                         &rt_,
                     );
+
+                    // the side that connects binds the connection to the
+                    // session at once, with a SEND that may be empty (RFC
+                    // 4975 section 5.4)
+                    let (chunk_tx, mut chunk_rx) = mpsc::channel::<MsrpChunk>(1);
+                    demuxer_.start(
+                        from_path,
+                        to_path,
+                        None,
+                        0,
+                        std::io::empty(),
+                        |_, _| {},
+                        chunk_tx,
+                        &rt_,
+                    );
+                    if let Some(chunk) = chunk_rx.recv().await {
+                        let mut data = Vec::with_capacity(chunk.estimated_size());
+                        {
+                            let mut readers = Vec::new();
+                            chunk.get_readers(&mut readers);
+                            let _ = DynamicChain::new(readers).read_to_end(&mut data);
+                        }
+                        let _ = bind_tx.send(Some(data)).await;
+                    }
                 }
             });
 
@@ -486,7 +569,7 @@ impl MsrpDataWriter for StandaloneLargeModeMessageDataWriter {
                                             };
                                             if base64_encoded {
                                                 if let Ok(decoded_content_body) =
-                                                    general_purpose::STANDARD.decode(content_body)
+                                                    decode_base64(content_body)
                                                 {
                                                     message_receive_listener(
                                                         &self.contact_uri,
@@ -527,7 +610,7 @@ impl MsrpDataWriter for StandaloneLargeModeMessageDataWriter {
                                         };
 
                                         if e {
-                                            if let Ok(d) = general_purpose::STANDARD.decode(b) {
+                                            if let Ok(d) = decode_base64(b) {
                                                 message_receive_listener(
                                                     &self.contact_uri,
                                                     &cpim_info,
@@ -779,6 +862,18 @@ impl StandaloneMessagingService {
                         String::from(&public_user_identity),
                     ));
 
+                    // as every CPM request starting a conversation (OMA CPM)
+                    for name in [&b"Conversation-ID"[..], b"Contribution-ID"] {
+                        invite_message.add_header(Header::new(
+                            name,
+                            String::from(
+                                Uuid::new_v4()
+                                    .as_hyphenated()
+                                    .encode_lower(&mut Uuid::encode_buffer()),
+                            ),
+                        ));
+                    }
+
                     let message_imdn_id = Uuid::new_v4();
 
                     let cpim_body = make_cpim_message_content_body(
@@ -911,9 +1006,12 @@ impl StandaloneMessagingService {
                                         _ => None,
                                     } {
                                         if let Some(r_msrp_info) = r_sdp.as_msrp_info() {
-                                            if let Ok(raddr) = std::str::from_utf8(r_msrp_info.address) {
+                                            // where the first URI of a=path points
+                                            // (RFC 4975 section 8.1)
+                                            let connection_address = r_msrp_info.connection_address(false);
+                                            if let Some(Ok(raddr)) = connection_address.map(|(a, _)| std::str::from_utf8(a)) {
                                                 let raddr = String::from(raddr);
-                                                let rport = r_msrp_info.port;
+                                                let rport = connection_address.map_or(r_msrp_info.port, |(_, p)| p);
                                                 let rpath = r_msrp_info.path.to_vec();
 
                                                 let (d_tx, mut d_rx) = mpsc::channel(1);
@@ -961,10 +1059,16 @@ impl StandaloneMessagingService {
                                                     let core = Arc::clone(&core_);
                                                     let rt = Arc::clone(&rt_);
 
+                                                    let ended = Arc::new(Notify::new());
+                                                    let ended_ = Arc::clone(&ended);
+
                                                     rt_.spawn(async move {
                                                         let rt_ = Arc::clone(&rt);
                                                         let core_ = Arc::clone(&core);
-                                                        while let Some(ev) = sess_rx.recv().await {
+                                                        while let Some(ev) = tokio::select! {
+                                                            ev = sess_rx.recv() => ev,
+                                                            _ = ended_.notified() => None,
+                                                        } {
                                                             match ev {
                                                                 SipSessionEvent::ShouldRefresh(dialog) => {
                                                                     if let Ok(mut message) =
@@ -1026,7 +1130,25 @@ impl StandaloneMessagingService {
                                                                 &rt_,
                                                             );
 
-                                                            session.start(&message.message_result_callback, &connect_function, &rt_);
+                                                            // the one message sent, or not, the
+                                                            // session ends with a BYE
+                                                            let message_result_callback = Arc::clone(&message.message_result_callback);
+                                                            let ending = LargeModeSessionEnd {
+                                                                done: Mutex::new(false),
+                                                                dialog: Arc::clone(&dialog),
+                                                                session: Arc::clone(&session),
+                                                                sip_session: Arc::clone(&sip_session),
+                                                                core: Arc::clone(&core_),
+                                                                ended,
+                                                                rt: Arc::clone(&rt_),
+                                                            };
+                                                            let result_callback: Arc<dyn Fn(u16, String) + Send + Sync> = Arc::new(move |status_code, reason_phrase| {
+                                                                message_result_callback(status_code, reason_phrase);
+                                                                ending.end();
+                                                            });
+
+                                                            session.start(&result_callback, &connect_function, &rt_);
+                                                            return;
                                                         }
                                                     }
                                                 }
@@ -1368,9 +1490,16 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                     &msrp_info,
                                 )) {
                                     Ok((sock, host, port, tls, active_setup, ipv6)) => {
-                                        if let Ok(raddr) = std::str::from_utf8(msrp_info.address) {
+                                        // where the first URI of a=path points
+                                        // (RFC 4975 section 8.1)
+                                        let connection_address =
+                                            msrp_info.connection_address(false);
+                                        if let Some(Ok(raddr)) =
+                                            connection_address.map(|(a, _)| std::str::from_utf8(a))
+                                        {
                                             let raddr = String::from(raddr);
-                                            let rport = msrp_info.port;
+                                            let rport = connection_address
+                                                .map_or(msrp_info.port, |(_, p)| p);
                                             let rpath = msrp_info.path.to_vec();
 
                                             let path_random = create_raw_alpha_numeric_string(16);
@@ -1452,6 +1581,10 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                                     }
                                                 }
 
+                                                // the answer to the offer (RFC 3264
+                                                // section 6)
+                                                set_sdp(&mut resp_message, Arc::clone(&l_sdp));
+
                                                 let (d_tx, mut d_rx) = mpsc::channel(1);
 
                                                 let ongoing_dialogs_ = Arc::clone(ongoing_dialogs);
@@ -1462,15 +1595,37 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                                     }
                                                 });
 
-                                                if let Ok(dialog) = SipDialog::try_new_as_uas(
+                                                let dialog = SipDialog::try_new_as_uas(
                                                     message,
                                                     &resp_message,
                                                     move |d| match d_tx.blocking_send(d) {
                                                         Ok(()) => {}
-                                                        Err(e) => {}
+                                                        Err(_) => {}
                                                     },
-                                                ) {
+                                                );
+
+                                                // without a dialog the ACK, and the
+                                                // session, would have nowhere to go
+                                                let resp_message = match dialog {
+                                                    Ok(_) => resp_message,
+                                                    Err(_) => {
+                                                        match server_transaction::make_response(
+                                                            message,
+                                                            transaction.to_tag(),
+                                                            500,
+                                                            b"Server Internal Error",
+                                                        ) {
+                                                            Some(resp_message) => resp_message,
+                                                            None => return false,
+                                                        }
+                                                    }
+                                                };
+
+                                                if let Ok(dialog) = dialog {
                                                     let dialog = Arc::new(dialog);
+
+                                                    // so that the ACK and the BYE reach it
+                                                    ongoing_dialogs.add_dialog(&dialog);
 
                                                     let session =
                                                         StandaloneLargeModeReceiveSession::new(
@@ -1783,7 +1938,7 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                                             .sub_type
                                                             .equals_bytes(b"cpim", true)
                                                     {
-                                                        match CPIMMessage::try_from(req_body) {
+                                                        match CPIMMessage::try_from(&message.body) {
                                                             Ok(cpim) => {
                                                                 cpim_message = Some(cpim);
                                                                 break;
@@ -1828,32 +1983,10 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                     return true;
                                 }
 
-                                if let Ok(cpim_info) = cpim_message.get_info() {
-                                    if !is_imdn && is_chatbot_message {
-                                        if let None = cpim_info.get_bot_related_info() {
-                                            if let Some(resp_message) =
-                                                server_transaction::make_response(
-                                                    message,
-                                                    transaction.to_tag(),
-                                                    606,
-                                                    b"Not Acceptable",
-                                                )
-                                            {
-                                                if let Some((tx, _)) = channels.take() {
-                                                    server_transaction::send_response(
-                                                        Arc::clone(transaction),
-                                                        resp_message,
-                                                        tx,
-                                                        // &timer,
-                                                        rt,
-                                                    );
-                                                }
-                                            }
-
-                                            return true;
-                                        }
-                                    }
-                                }
+                                // a chatbot's message is taken whether or not it
+                                // has a maap.Traffic-Type, which is optional; it
+                                // was refused with 606 for want of bot information
+                                // that nothing read
 
                                 let mut contact_uri: Option<Vec<u8>> = None;
 
@@ -1916,6 +2049,7 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
 
                                 if let Some(contact_uri) = contact_uri {
                                     if let Ok(message_info) = cpim_message.get_info() {
+                                        let mut accepted = true;
                                         if let Some((content_type, body, encoded)) =
                                             cpim_message.get_message_body()
                                         {
@@ -1928,15 +2062,18 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                             };
 
                                             if encoded {
-                                                if let Ok(decoded_body) =
-                                                    general_purpose::STANDARD.decode(body)
-                                                {
-                                                    (self.service.message_receive_listener)(
-                                                        &contact_uri,
-                                                        &message_info,
-                                                        content_type,
-                                                        &decoded_body,
-                                                    )
+                                                match decode_base64(body) {
+                                                    Ok(decoded_body) => {
+                                                        (self.service.message_receive_listener)(
+                                                            &contact_uri,
+                                                            &message_info,
+                                                            content_type,
+                                                            &decoded_body,
+                                                        )
+                                                    }
+                                                    // not taken, and not to be
+                                                    // answered as if it were
+                                                    Err(_) => accepted = false,
                                                 }
                                             } else {
                                                 (self.service.message_receive_listener)(
@@ -1948,12 +2085,19 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                             }
                                         }
 
+                                        let (status_code, reason_phrase): (u16, &[u8]) = if accepted
+                                        {
+                                            (200, b"Ok")
+                                        } else {
+                                            (400, b"Bad Request")
+                                        };
+
                                         if let Some(resp_message) =
                                             server_transaction::make_response(
                                                 message,
                                                 transaction.to_tag(),
-                                                200,
-                                                b"Ok",
+                                                status_code,
+                                                reason_phrase,
                                             )
                                         {
                                             if let Some((tx, _)) = channels.take() {
@@ -2380,6 +2524,11 @@ impl SipDialogEventCallbacks for StandaloneLargeModeReceiveSessionDialogEventRec
 
     fn on_terminating_request(&self, message: &SipMessage) {
         self.sip_session.get_inner().stop(&self.rt);
+        // the dialog goes, not from within it
+        let sip_session = Arc::clone(&self.sip_session);
+        self.rt.spawn(async move {
+            sip_session.hang_up();
+        });
     }
 
     fn on_terminating_response(&self, message: &SipMessage) {
