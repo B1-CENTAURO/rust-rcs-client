@@ -22,6 +22,8 @@ use std::sync::Arc;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Local, SecondsFormat};
 use rust_rcs_core::{
+    cpim::CPIMMessage,
+    ffi::log::platform_log,
     internet::{body::message_body::MessageBody, Body, Header},
     sip::sip_session::SipSession,
 };
@@ -30,6 +32,34 @@ use uuid::Uuid;
 use self::session::CPMSession;
 
 use super::ffi::RecipientType;
+
+const LOG_TAG: &str = "messaging";
+
+/// The CPIM headers the client reads, through CPIMMessage::get_info()
+const UNDERSTOOD_CPIM_HEADERS: [&[u8]; 6] = [
+    b"From",
+    b"To",
+    b"DateTime",
+    b"<urn:ietf:params:imdn>.Message-ID",
+    b"<urn:ietf:params:imdn>.Disposition-Notification",
+    b"<http://www.openmobilealliance.org/cpm/>.Payload-Type",
+];
+
+/// Whether the client understands all that `message` requires with Require
+/// headers (RFC 3862 section 3.5), as it must to take the message
+pub fn understands_cpim_requirements(message: &CPIMMessage) -> bool {
+    let unmet = message.get_unmet_requirements(&UNDERSTOOD_CPIM_HEADERS);
+    for name in &unmet {
+        platform_log(
+            LOG_TAG,
+            format!(
+                "CPIM message requires {:?}, which is not understood",
+                String::from_utf8_lossy(name)
+            ),
+        );
+    }
+    unmet.is_empty()
+}
 
 pub struct MessagingSessionHandle {
     pub(crate) inner: Arc<SipSession<CPMSession>>,
@@ -151,4 +181,48 @@ pub fn make_cpim_message_content_body(
         headers: cpim_headers,
         body: Arc::new(cpim_content_body),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_rcs_core::cpim::CPIMMessage;
+    use rust_rcs_core::internet::Body;
+
+    use super::understands_cpim_requirements;
+
+    fn message(require: &str) -> CPIMMessage {
+        let data = format!(
+            "From: <sip:anonymous@anonymous.invalid>\r\n\
+To: <sip:anonymous@anonymous.invalid>\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+NS: x <urn:example:x>\r\n\
+{}\
+imdn.Message-ID: Kn31\r\n\
+DateTime: 2023-04-04T12:16:49.000+08:00\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hi",
+            require
+        );
+        CPIMMessage::try_from(&Body::construct_message(data.as_bytes()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_message_requiring_what_the_client_reads_is_taken() {
+        assert!(understands_cpim_requirements(&message("")));
+        assert!(understands_cpim_requirements(&message(
+            "Require: imdn.Disposition-Notification, DateTime\r\n"
+        )));
+    }
+
+    #[test]
+    fn a_message_requiring_more_is_not() {
+        assert!(!understands_cpim_requirements(&message(
+            "Require: x.Vital\r\n"
+        )));
+        assert!(!understands_cpim_requirements(&message(
+            "Require: DateTime, Subject\r\n"
+        )));
+    }
 }
