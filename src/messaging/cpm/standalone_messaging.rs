@@ -80,7 +80,7 @@ use crate::messaging::ffi::RecipientType;
 use super::session::{get_cpm_session_info_from_message, CPMSessionInfo, UpdateMessageCallbacks};
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMServiceType};
-use super::{make_cpim_message_content_body, CPMMessageParam};
+use super::{make_cpim_message_content_body, understands_cpim_requirements, CPMMessageParam};
 
 const LOG_TAG: &str = "messaging";
 
@@ -468,6 +468,10 @@ impl MsrpDataWriter for StandaloneLargeModeMessageDataWriter {
         if let Some(message_receive_listener) = self.message_receive_listener.take() {
             match Body::construct_message(&self.data) {
                 Ok(body) => match CPIMMessage::try_from(&body) {
+                    Ok(cpim_message) if !understands_cpim_requirements(&cpim_message) => {
+                        Err((400, "required CPIM header not understood"))
+                    }
+
                     Ok(cpim_message) => {
                         if let Some(sip_cpim_body) = &self.sip_cpim_body {
                             match CPIMMessage::try_from(sip_cpim_body) {
@@ -1803,6 +1807,27 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                             }
 
                             if let Some(cpim_message) = cpim_message {
+                                if !understands_cpim_requirements(&cpim_message) {
+                                    if let Some(resp_message) = server_transaction::make_response(
+                                        message,
+                                        transaction.to_tag(),
+                                        400,
+                                        b"Bad Request",
+                                    ) {
+                                        if let Some((tx, _)) = channels.take() {
+                                            server_transaction::send_response(
+                                                Arc::clone(transaction),
+                                                resp_message,
+                                                tx,
+                                                // &timer,
+                                                rt,
+                                            );
+                                        }
+                                    }
+
+                                    return true;
+                                }
+
                                 if let Ok(cpim_info) = cpim_message.get_info() {
                                     if !is_imdn && is_chatbot_message {
                                         if let None = cpim_info.get_bot_related_info() {

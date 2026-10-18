@@ -83,7 +83,7 @@ use super::session_invitation::{
 };
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMContact, CPMServiceType};
-use super::{make_cpim_message_content_body, CPMMessageParam};
+use super::{make_cpim_message_content_body, understands_cpim_requirements, CPMMessageParam};
 
 // to-do: use enum
 pub struct CPMSessionInfo {
@@ -757,6 +757,10 @@ impl MsrpDataWriter for CPMSessionCPIMMessageWriter {
     fn complete(&mut self) -> Result<(), (u16, &'static str)> {
         match Body::construct_message(&self.message_buf) {
             Ok(body) => match CPIMMessage::try_from(&body) {
+                Ok(cpim_message) if !understands_cpim_requirements(&cpim_message) => {
+                    Err((400, "required CPIM header not understood"))
+                }
+
                 Ok(cpim_message) => match cpim_message.get_info() {
                     Ok(cpim_message_info) => {
                         if let Some((content_type, content_body, base64_encoded)) =
