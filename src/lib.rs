@@ -102,6 +102,14 @@ impl RcsRuntime {
     }
 }
 
+/// `text` as a C string, without the NUL bytes it cannot hold, which text
+/// from the network may have
+fn c_string<T: Into<Vec<u8>>>(text: T) -> CString {
+    let mut bytes = text.into();
+    bytes.retain(|b| *b != 0);
+    CString::new(bytes).unwrap_or_default()
+}
+
 pub struct RcsClient {
     subscription_id: i32,
     mcc: u16,
@@ -136,16 +144,16 @@ impl RcsClient {
         multi_conference_v1_invite_handler_context: *mut MultiConferenceV1InviteHandlerContext,
         rt: Arc<Runtime>,
     ) -> RcsClient {
-        let state_cb_context = Arc::new(Mutex::new(StateChangeCallbackContextWrapper(
-            NonNull::new(state_cb_context).unwrap(),
-        )));
-        let message_cb_context = Arc::new(Mutex::new(MessageCallbackContextWrapper(
-            NonNull::new(message_cb_context).unwrap(),
-        )));
-        let multi_conference_v1_invite_handler_context =
-            Arc::new(Mutex::new(MultiConferenceV1InviteHandlerContextWrapper(
-                NonNull::new(multi_conference_v1_invite_handler_context).unwrap(),
-            )));
+        let state_cb_context = Arc::new(Mutex::new(
+            NonNull::new(state_cb_context).map(StateChangeCallbackContextWrapper),
+        ));
+        let message_cb_context = Arc::new(Mutex::new(
+            NonNull::new(message_cb_context).map(MessageCallbackContextWrapper),
+        ));
+        let multi_conference_v1_invite_handler_context = Arc::new(Mutex::new(
+            NonNull::new(multi_conference_v1_invite_handler_context)
+                .map(MultiConferenceV1InviteHandlerContextWrapper),
+        ));
         let context_ = Arc::clone(&context);
         let engine = RcsEngine::new(
             subscription_id,
@@ -154,7 +162,9 @@ impl RcsClient {
             move |state| {
                 if let Some(state_cb) = state_cb {
                     let state_cb_context = state_cb_context.lock().unwrap();
-                    let state_cb_context_ptr = state_cb_context.0.as_ptr();
+                    let state_cb_context_ptr = state_cb_context
+                        .as_ref()
+                        .map_or(ptr::null_mut(), |c| c.0.as_ptr());
                     match state {
                         rcs_engine::RcsEngineRegistrationState::NONE => {
                             state_cb(0, state_cb_context_ptr)
@@ -181,15 +191,17 @@ impl RcsClient {
                         Some(session_handle) => Some(Box::new(session_handle)),
                         None => None,
                     };
-                    let contact_uri = CString::new(contact_uri).unwrap();
-                    let content_type = CString::new(content_type).unwrap();
-                    let content_body = CString::new(content_body).unwrap();
-                    let imdn_message_id = CString::new(imdn_message_id).unwrap();
-                    let cpim_date = CString::new(cpim_date).unwrap();
+                    let contact_uri = c_string(contact_uri);
+                    let content_type = c_string(content_type);
+                    let content_body = c_string(content_body);
+                    let imdn_message_id = c_string(imdn_message_id);
+                    let cpim_date = c_string(cpim_date);
                     if let Some(cpim_from) = cpim_from {
-                        let cpim_from = CString::new(cpim_from).unwrap();
+                        let cpim_from = c_string(cpim_from);
                         let message_cb_context = message_cb_context.lock().unwrap();
-                        let message_cb_context_ptr = message_cb_context.0.as_ptr();
+                        let message_cb_context_ptr = message_cb_context
+                            .as_ref()
+                            .map_or(ptr::null_mut(), |c| c.0.as_ptr());
                         messag_cb(
                             service_type,
                             session_handle,
@@ -203,7 +215,9 @@ impl RcsClient {
                         );
                     } else {
                         let message_cb_context = message_cb_context.lock().unwrap();
-                        let message_cb_context_ptr = message_cb_context.0.as_ptr();
+                        let message_cb_context_ptr = message_cb_context
+                            .as_ref()
+                            .map_or(ptr::null_mut(), |c| c.0.as_ptr());
                         messag_cb(
                             service_type,
                             session_handle,
@@ -224,7 +238,9 @@ impl RcsClient {
                     let multi_conference_v1_invite_handler_context =
                         multi_conference_v1_invite_handler_context.lock().unwrap();
                     let multi_conference_v1_invite_handler_context_ptr =
-                        multi_conference_v1_invite_handler_context.0.as_ptr();
+                        multi_conference_v1_invite_handler_context
+                            .as_ref()
+                            .map_or(ptr::null_mut(), |c| c.0.as_ptr());
                     let offer_sdp_ptr = offer_sdp.as_ptr();
                     let offer_sdp_len = offer_sdp.len();
                     multi_conference_v1_invite_handler(
@@ -649,7 +665,7 @@ pub unsafe extern "C" fn rcs_client_send_message(
                     recipient_type,
                     move |status_code, reason_phrase| {
                         if let Some(cb) = cb {
-                            let reason_phrase = CString::new(reason_phrase).unwrap();
+                            let reason_phrase = c_string(reason_phrase);
                             if let Some(cb_context_) = cb_context_ {
                                 let cb_context = cb_context_.lock().unwrap();
                                 cb(status_code, reason_phrase.as_ptr(), cb_context.0.as_ptr());
@@ -667,7 +683,7 @@ pub unsafe extern "C" fn rcs_client_send_message(
     }
 
     if let Some(cb) = cb {
-        let reason_phrase = CString::new("Forbidden").unwrap();
+        let reason_phrase = c_string("Forbidden");
         cb(
             403,
             reason_phrase.as_ptr(),
@@ -721,7 +737,7 @@ pub unsafe extern "C" fn rcs_client_send_imdn_report(
                 rt,
                 move |status_code, reason_phrase| {
                     if let Some(cb) = cb {
-                        let reason_phrase = CString::new(reason_phrase).unwrap();
+                        let reason_phrase = c_string(reason_phrase);
                         if let Some(cb_context_) = cb_context_ {
                             let cb_context = cb_context_.lock().unwrap();
                             cb(status_code, reason_phrase.as_ptr(), cb_context.0.as_ptr());
@@ -737,7 +753,7 @@ pub unsafe extern "C" fn rcs_client_send_imdn_report(
     }
 
     if let Some(cb) = cb {
-        let reason_phrase = CString::new("Forbidden").unwrap();
+        let reason_phrase = c_string("Forbidden");
         cb(
             403,
             reason_phrase.as_ptr(),
@@ -881,9 +897,9 @@ pub unsafe extern "C" fn rcs_client_upload_file(
                             ),
                         );
                         if let Some(result_cb) = result_cb {
-                            let reason_phrase = CString::new(reason_phrase).unwrap();
+                            let reason_phrase = c_string(reason_phrase);
                             let result_xml = if let Some(result_xml) = result_xml {
-                                let result_xml = CString::new(result_xml).unwrap();
+                                let result_xml = c_string(result_xml);
                                 Some(result_xml)
                             } else {
                                 None
@@ -922,7 +938,7 @@ pub unsafe extern "C" fn rcs_client_upload_file(
     }
 
     if let Some(result_cb) = result_cb {
-        let reason_phrase = CString::new("Forbidden").unwrap();
+        let reason_phrase = c_string("Forbidden");
         let xml = ptr::null();
         let result_cb_context_ptr = if let Some(result_cb_context) = result_cb_context {
             result_cb_context.0.as_ptr()
@@ -1023,7 +1039,7 @@ pub unsafe extern "C" fn rcs_client_download_file(
                         },
                         move |status_code, reason_phrase| {
                             if let Some(result_cb) = result_cb {
-                                let reason_phrase = CString::new(reason_phrase).unwrap();
+                                let reason_phrase = c_string(reason_phrase);
                                 if let Some(result_cb_context_) = result_cb_context_ {
                                     let result_cb_context = result_cb_context_.lock().unwrap();
                                     result_cb(
@@ -1045,7 +1061,7 @@ pub unsafe extern "C" fn rcs_client_download_file(
     }
 
     if let Some(cb) = result_cb {
-        let reason_phrase = CString::new("Forbidden").unwrap();
+        let reason_phrase = c_string("Forbidden");
         let result_cb_context_ptr = if let Some(result_cb_context) = result_cb_context {
             result_cb_context.0.as_ptr()
         } else {
@@ -1202,16 +1218,14 @@ pub unsafe extern "C" fn rcs_client_retrieve_specific_chatbots(
                     rt,
                     move |status_code, reason_phrase, specific_chatbots, response_etag, expiry| {
                         if let Some(cb) = cb {
-                            let reason_phrase = CString::new(reason_phrase).unwrap();
+                            let reason_phrase = c_string(reason_phrase);
 
                             let specific_chatbots = match specific_chatbots {
-                                Some(specific_chatbots) => {
-                                    Some(CString::new(specific_chatbots).unwrap())
-                                }
+                                Some(specific_chatbots) => Some(c_string(specific_chatbots)),
                                 None => None,
                             };
                             let response_etag = match response_etag {
-                                Some(response_etag) => Some(CString::new(response_etag).unwrap()),
+                                Some(response_etag) => Some(c_string(response_etag)),
                                 None => None,
                             };
 
@@ -1243,7 +1257,7 @@ pub unsafe extern "C" fn rcs_client_retrieve_specific_chatbots(
     }
 
     if let Some(cb) = cb {
-        let reason_phrase = CString::new("Forbidden").unwrap();
+        let reason_phrase = c_string("Forbidden");
         let cb_context_ptr = cb_context.0.as_ptr();
         cb(
             403,
@@ -1296,9 +1310,9 @@ pub unsafe extern "C" fn rcs_client_search_chatbot(
                     rt,
                     move |status_code, reason_phrase, json| {
                         if let Some(cb) = cb {
-                            let reason_phrase = CString::new(reason_phrase).unwrap();
+                            let reason_phrase = c_string(reason_phrase);
                             let json = match json {
-                                Some(json) => Some(CString::new(json).unwrap()),
+                                Some(json) => Some(c_string(json)),
                                 None => None,
                             };
 
@@ -1324,7 +1338,7 @@ pub unsafe extern "C" fn rcs_client_search_chatbot(
     }
 
     if let Some(cb) = cb {
-        let reason_phrase = CString::new("Forbidden").unwrap();
+        let reason_phrase = c_string("Forbidden");
         let json = ptr::null();
         let cb_context_ptr = cb_context.0.as_ptr();
         cb(403, reason_phrase.as_ptr(), json, cb_context_ptr);
@@ -1377,14 +1391,14 @@ pub unsafe extern "C" fn rcs_client_retrieve_chatbot_info(
                     rt,
                     move |status_code, reason_phrase, chatbot_info, response_etag, expiry| {
                         if let Some(cb) = cb {
-                            let reason_phrase = CString::new(reason_phrase).unwrap();
+                            let reason_phrase = c_string(reason_phrase);
 
                             let chatbot_info = match chatbot_info {
-                                Some(chatbot_info) => Some(CString::new(chatbot_info).unwrap()),
+                                Some(chatbot_info) => Some(c_string(chatbot_info)),
                                 None => None,
                             };
                             let response_etag = match response_etag {
-                                Some(response_etag) => Some(CString::new(response_etag).unwrap()),
+                                Some(response_etag) => Some(c_string(response_etag)),
                                 None => None,
                             };
 
@@ -1416,7 +1430,7 @@ pub unsafe extern "C" fn rcs_client_retrieve_chatbot_info(
     }
 
     if let Some(cb) = cb {
-        let reason_phrase = CString::new("Forbidden").unwrap();
+        let reason_phrase = c_string("Forbidden");
         let cb_context_ptr = cb_context.0.as_ptr();
         cb(
             403,
@@ -1432,4 +1446,16 @@ pub unsafe extern "C" fn rcs_client_retrieve_chatbot_info(
 #[no_mangle]
 pub unsafe extern "C" fn destroy_rcs_client(client: *mut RcsClient) {
     let _ = Box::from_raw(client);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::c_string;
+
+    #[test]
+    fn text_with_nul_bytes_becomes_a_c_string_without_them() {
+        assert_eq!(c_string("plain").as_bytes(), b"plain");
+        assert_eq!(c_string("a\0b\0").as_bytes(), b"ab");
+        assert_eq!(c_string(vec![0u8, 0]).as_bytes(), b"");
+    }
 }

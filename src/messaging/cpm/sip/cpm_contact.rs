@@ -64,7 +64,12 @@ impl AsCPMContact for HeaderField<'_> {
                         }
                     }
 
-                    for p in uri_part.get_parameter_iterator() {
+                    // isfocus (RFC 4579 section 3.4) and the feature tags are
+                    // parameters of the header, which some write in the URI
+                    for p in uri_part
+                        .get_parameter_iterator()
+                        .chain(self.get_parameter_iterator())
+                    {
                         if p.name.eq_ignore_ascii_case(b"isfocus") {
                             service_type = CPMServiceType::Group;
                         } else if p.name.eq_ignore_ascii_case(b"+g.gsma.rcs.msgrevoke") {

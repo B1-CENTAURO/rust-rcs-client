@@ -15,7 +15,6 @@
 extern crate rust_rcs_core;
 extern crate rust_strict_sdp;
 
-use core::panic;
 use std::{
     pin::Pin,
     sync::{Arc, Mutex},
@@ -27,7 +26,10 @@ use tokio::{runtime::Runtime, sync::mpsc};
 use rust_rcs_core::{
     cpim::CPIMInfo,
     internet::{Body, Header},
-    io::network::stream::{ClientSocket, ClientStream},
+    io::{
+        network::stream::{ClientSocket, ClientStream},
+        Serializable,
+    },
     msrp::info::{
         msrp_info_reader::AsMsrpInfo, MsrpDirection, MsrpInfo, MsrpInterfaceType, MsrpSetupMethod,
     },
@@ -37,7 +39,7 @@ use rust_rcs_core::{
             choose_timeout_for_server_transaction_response, Refresher, SipSession, SipSessionEvent,
             SipSessionEventReceiver,
         },
-        sip_transaction::{client_transaction::ClientTransactionNilCallbacks, server_transaction},
+        sip_transaction::server_transaction,
         ServerTransaction, ServerTransactionEvent, SipDialog, SipMessage, SipTransactionManager,
         SipTransport,
     },
@@ -49,7 +51,10 @@ use rust_strict_sdp::AsSDP;
 use crate::contact::ContactKnownIdentities;
 
 use super::{
-    session::{CPMSession, CPMSessionDialogEventReceiver, CPMSessionInfo, UpdateMessageCallbacks},
+    session::{
+        CPMSession, CPMSessionDialogEventReceiver, CPMSessionInfo, SessionEnd,
+        UpdateMessageCallbacks,
+    },
     sip::cpm_contact::CPMServiceType,
 };
 
@@ -216,9 +221,11 @@ pub fn try_accept_invitation<'a, 'b>(
 ) {
     match (msrp_socket_allocator_function)(Some(&msrp_info)) {
         Ok((cs, host, port, tls, active_setup, ipv6)) => {
-            if let Ok(raddr) = std::str::from_utf8(msrp_info.address) {
+            // where the first URI of a=path points (RFC 4975 section 8.1)
+            let connection_address = msrp_info.connection_address(false);
+            if let Some(Ok(raddr)) = connection_address.map(|(a, _)| std::str::from_utf8(a)) {
                 let raddr = String::from(raddr);
-                let rport = msrp_info.port;
+                let rport = connection_address.map_or(msrp_info.port, |(_, p)| p);
                 let rpath = msrp_info.path.to_vec();
 
                 let path_random = create_raw_alpha_numeric_string(16);
@@ -239,9 +246,9 @@ pub fn try_accept_invitation<'a, 'b>(
                     MsrpInterfaceType::IPv6
                 } else {
                     MsrpInterfaceType::IPv4
-                }, port, path: &path, inactive: false, direction: MsrpDirection::SendReceive, accept_types: match session_info.cpm_contact.service_type {
+                }, port, path: &path, inactive: false, direction: answer_direction(&msrp_info.direction), accept_types: match session_info.cpm_contact.service_type {
                     CPMServiceType::OneToOne => {
-                        b"message/cpim application/im-iscomposing+xm"
+                        b"message/cpim application/im-iscomposing+xml"
                     },
                     CPMServiceType::Group => {
                         b"message/cpim application/conference-info+xml"
@@ -275,6 +282,7 @@ pub fn try_accept_invitation<'a, 'b>(
                 let l_sdp = l_sdp.into_bytes();
                 let l_sdp = Body::Raw(l_sdp);
                 let l_sdp = Arc::new(l_sdp);
+                let sdp_answer = Arc::clone(&l_sdp);
 
                 let known_identities = session_info.get_contact_known_identities();
 
@@ -291,6 +299,9 @@ pub fn try_accept_invitation<'a, 'b>(
                             200,
                             b"OK",
                         ) {
+                            // the answer to the offer (RFC 3264 section 6)
+                            set_sdp(&mut resp_message, sdp_answer);
+
                             let public_user_identity = {
                                 let guard = registered_public_identity.lock().unwrap();
 
@@ -309,12 +320,29 @@ pub fn try_accept_invitation<'a, 'b>(
                                             },
                                         ));
 
-                                        String::from(contact_identity)
+                                        Some(String::from(contact_identity))
                                     } else {
-                                        panic!("")
+                                        None
                                     }
                                 } else {
-                                    panic!("")
+                                    None
+                                }
+                            };
+
+                            // not registered, or not on the connection the
+                            // invitation came over
+                            let public_user_identity = match public_user_identity {
+                                Some(public_user_identity) => public_user_identity,
+                                None => {
+                                    reject(
+                                        transaction,
+                                        message,
+                                        tx,
+                                        480,
+                                        b"Temporarily Unavailable",
+                                        rt,
+                                    );
+                                    return;
                                 }
                             };
 
@@ -345,7 +373,15 @@ pub fn try_accept_invitation<'a, 'b>(
 
                                     dialog
                                 } else {
-                                    panic!("")
+                                    reject(
+                                        transaction,
+                                        message,
+                                        tx,
+                                        500,
+                                        b"Server Internal Error",
+                                        rt,
+                                    );
+                                    return;
                                 }
                             };
 
@@ -364,12 +400,21 @@ pub fn try_accept_invitation<'a, 'b>(
 
                             let message_receive_listener = Arc::clone(message_receive_listener);
 
+                            let session_end = SessionEnd {
+                                sip_session: Arc::clone(&sip_session),
+                                ongoing_sessions: Arc::clone(ongoing_sessions),
+                                dialog: Arc::clone(&dialog),
+                                tm: Arc::clone(tm),
+                                registered_public_identity: Arc::clone(registered_public_identity),
+                                rt: Arc::clone(rt),
+                            };
+
                             sip_session.setup_confirmed_dialog(
                                 &dialog,
                                 CPMSessionDialogEventReceiver {
                                     public_user_identity,
                                     sip_session: Arc::clone(&sip_session),
-                                    ongoing_sessions: Arc::clone(ongoing_sessions),
+                                    session_end: session_end.clone(),
                                     message_receive_listener: Arc::new(
                                         move |cpim_info, content_type, content_body| {
                                             message_receive_listener(
@@ -429,7 +474,12 @@ pub fn try_accept_invitation<'a, 'b>(
                             let rt_ = Arc::clone(rt);
 
                             rt.spawn(async move {
-                                while let Some(ev) = sess_rx.recv().await {
+                                // until the session ends, its timers with it
+                                let ended = session_end.sip_session.get_inner().ended();
+                                while let Some(ev) = tokio::select! {
+                                    ev = sess_rx.recv() => ev,
+                                    _ = ended.notified() => None,
+                                } {
                                     match ev {
                                         SipSessionEvent::ShouldRefresh(dialog) => {
                                             if let Ok(mut message) =
@@ -459,20 +509,8 @@ pub fn try_accept_invitation<'a, 'b>(
                                             }
                                         }
 
-                                        SipSessionEvent::Expired(dialog) => {
-                                            if let Ok(message) = dialog.make_request(b"BYE", None) {
-                                                let guard =
-                                                    registered_public_identity.lock().unwrap();
-
-                                                if let Some((transport, _, _)) = &*guard {
-                                                    tm.send_request(
-                                                        message,
-                                                        transport,
-                                                        ClientTransactionNilCallbacks {},
-                                                        &rt_,
-                                                    );
-                                                }
-                                            }
+                                        SipSessionEvent::Expired(_) => {
+                                            session_end.end(true);
                                         }
 
                                         _ => {}
@@ -546,4 +584,41 @@ pub fn try_accept_invitation<'a, 'b>(
             }
         }
     }
+}
+
+/// Answers `message` with `status_code`, which ends its transaction
+fn reject(
+    transaction: &Arc<ServerTransaction>,
+    message: &SipMessage,
+    tx: mpsc::Sender<ServerTransactionEvent>,
+    status_code: u16,
+    reason_phrase: &[u8],
+    rt: &Arc<Runtime>,
+) {
+    if let Some(resp_message) =
+        server_transaction::make_response(message, transaction.to_tag(), status_code, reason_phrase)
+    {
+        server_transaction::send_response(Arc::clone(transaction), resp_message, tx, rt);
+    }
+}
+
+/// The direction answering an offer of `offered` (RFC 3264 section 6.1): a
+/// session the other end only sends in, as a deferred one, we only receive
+/// in
+pub fn answer_direction(offered: &MsrpDirection) -> MsrpDirection {
+    match offered {
+        MsrpDirection::SendOnly => MsrpDirection::ReceiveOnly,
+        MsrpDirection::ReceiveOnly => MsrpDirection::SendOnly,
+        _ => MsrpDirection::SendReceive,
+    }
+}
+
+/// Puts `sdp` in `message` as its body
+pub fn set_sdp(message: &mut SipMessage, sdp: Arc<Body>) {
+    message.add_header(Header::new(b"Content-Type", b"application/sdp"));
+    message.add_header(Header::new(
+        b"Content-Length",
+        format!("{}", sdp.estimated_size()),
+    ));
+    message.set_body(sdp);
 }
