@@ -1089,6 +1089,7 @@ impl CPMSessionService {
                 } else {
                     Some(b"multipart/mixed text/plain application/vnd.gsma.rcs-ft-http+xml application/vnd.gsma.rcspushlocation+xml message/imdn+xml")
                 },
+                cema: false,
                 file_info: None,
             };
 

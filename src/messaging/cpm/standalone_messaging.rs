@@ -703,6 +703,7 @@ impl StandaloneMessagingService {
                         MsrpSetupMethod::Passive
                     },
                     accept_wrapped_types: Some(message_type.as_bytes()),
+                    cema: false,
                     file_info: None,
                 };
 
@@ -1409,6 +1410,7 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                                 },
                                                 accept_wrapped_types: msrp_info
                                                     .accept_wrapped_types,
+                                                cema: false,
                                                 file_info: None,
                                             };
 

@@ -269,7 +269,7 @@ pub fn try_accept_invitation<'a, 'b>(
                     CPMServiceType::System => {
                         Some(b"multipart/mixed text/plain application/vnd.gsma.rcs-ft-http+xml application/vnd.gsma.rcspushlocation+xml message/imdn+xml")
                     },
-                }, file_info: None };
+                }, cema: false, file_info: None };
 
                 let l_sdp = String::from(l_msrp_info);
                 let l_sdp = l_sdp.into_bytes();
