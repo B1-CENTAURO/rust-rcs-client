@@ -24,7 +24,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::runtime::Runtime;
 
-use rust_rcs_core::internet::header;
+use rust_rcs_core::cpim::CPIMMessage;
+use rust_rcs_core::imdn::notification::{Dispositions, Imdn, Notification, Status};
+use rust_rcs_core::internet::{header, Body};
 use rust_rcs_core::io::network::stream::ClientSocket;
 use rust_rcs_core::sip::sip_parser::SipParser;
 use rust_rcs_core::sip::sip_subscription::SubscriptionManager;
@@ -37,8 +39,12 @@ use rust_rcs_core::sip::{
 
 use crate::messaging::ffi::RecipientType;
 
+use super::imdn::{acknowledge_delivery, ImdnService, ReceivedMessages};
+use super::new_message_id;
 use super::session::{CPMSessionService, CPMSessionServiceWrapper};
-use super::standalone_messaging::{StandaloneMessagingService, StandaloneMessagingServiceWrapper};
+use super::standalone_messaging::{
+    self, StandaloneMessagingService, StandaloneMessagingServiceWrapper,
+};
 
 pub const IMPU: &str = "sip:+15551234@example.com";
 pub const INSTANCE: &str = "<urn:uuid:11111111-2222-3333-4444-555555555555>";
@@ -56,6 +62,8 @@ pub struct Client {
     pub received: Receiver<(String, String, String)>,
     /// (subject, referred-by name) of each group chat the app is invited to
     pub group_invites: Receiver<(String, String)>,
+    /// The messages taken, noted as the engine notes them
+    pub received_messages: Arc<ReceivedMessages>,
 }
 
 impl Client {
@@ -67,6 +75,17 @@ impl Client {
         recipient_type: RecipientType,
         content: &str,
     ) -> Receiver<(u16, String)> {
+        self.send_with_id(recipient, recipient_type, content, &new_message_id())
+    }
+
+    /// As send(), with the imdn.Message-ID `message_id`
+    pub fn send_with_id(
+        &self,
+        recipient: &str,
+        recipient_type: RecipientType,
+        content: &str,
+        message_id: &str,
+    ) -> Receiver<(u16, String)> {
         let (result_tx, result_rx) = mpsc::channel();
         let (returned_tx, returned_rx) = mpsc::channel();
 
@@ -75,10 +94,12 @@ impl Client {
         let rt = Arc::clone(&self.rt);
         let recipient = String::from(recipient);
         let content = String::from(content);
+        let message_id = String::from(message_id);
         std::thread::spawn(move || {
             sessions.send_message(
                 "text/plain",
                 &content,
+                &message_id,
                 &recipient,
                 &recipient_type,
                 &recipient,
@@ -187,13 +208,58 @@ pub fn start(registered: bool) -> (Client, Peer) {
     let (group_invites_tx, group_invites) = mpsc::channel();
     let group_invites_tx = std::sync::Mutex::new(group_invites_tx);
 
+    // the messages taken are acknowledged as the engine does, once the
+    // transport is registered
+    let received_messages = Arc::new(ReceivedMessages::new());
+    let registered_transport: Arc<std::sync::Mutex<Option<Arc<SipTransport>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let registered_identity = {
+        let registered_transport = Arc::clone(&registered_transport);
+        move || {
+            registered_transport
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|transport| (transport, String::from(IMPU)))
+        }
+    };
+    let registered_identity_ = registered_identity.clone();
+    let (received_messages_1, tm_1, rt_1) = (
+        Arc::clone(&received_messages),
+        Arc::clone(&tm),
+        Arc::clone(&rt),
+    );
+    let (received_messages_2, tm_2, rt_2) = (
+        Arc::clone(&received_messages),
+        Arc::clone(&tm),
+        Arc::clone(&rt),
+    );
+
     let sessions = Arc::new(CPMSessionService::new(
-        move |_session, contact, _cpim_info, content_type, content| {
+        move |session, contact, cpim_info, content_type, content| {
             let _ = received_tx.lock().unwrap().send((
                 String::from_utf8_lossy(contact).into_owned(),
                 String::from_utf8_lossy(content_type).into_owned(),
                 String::from_utf8_lossy(content).into_owned(),
             ));
+            if let Some(service) = ImdnService::of_chat(
+                &session
+                    .get_inner()
+                    .get_session_info()
+                    .cpm_contact
+                    .service_type,
+            ) {
+                acknowledge_delivery(
+                    &received_messages_1,
+                    service,
+                    &String::from_utf8_lossy(contact),
+                    cpim_info,
+                    content_type,
+                    registered_identity.clone(),
+                    &tm_1,
+                    &rt_1,
+                );
+            }
         },
         |_msrp_info| allocate_msrp_socket(),
         |sock, raddr, rport, _tls| connect_msrp_socket(sock, raddr, rport),
@@ -209,12 +275,22 @@ pub fn start(registered: bool) -> (Client, Peer) {
     ));
 
     let standalone = Arc::new(StandaloneMessagingService::new(
-        move |contact, _cpim_info, content_type, content| {
+        move |contact, cpim_info, content_type, content| {
             let _ = received_tx_.lock().unwrap().send((
                 String::from_utf8_lossy(contact).into_owned(),
                 String::from_utf8_lossy(content_type).into_owned(),
                 String::from_utf8_lossy(content).into_owned(),
             ));
+            acknowledge_delivery(
+                &received_messages_2,
+                ImdnService::Standalone,
+                &String::from_utf8_lossy(contact),
+                cpim_info,
+                content_type,
+                registered_identity_.clone(),
+                &tm_2,
+                &rt_2,
+            );
         },
         |_msrp_info| allocate_msrp_socket(),
         |sock, raddr, rport, _tls| connect_msrp_socket(sock, raddr, rport),
@@ -263,6 +339,10 @@ pub fn start(registered: bool) -> (Client, Peer) {
             String::from(INSTANCE),
             Arc::clone(&transport),
         );
+        registered_transport
+            .lock()
+            .unwrap()
+            .replace(Arc::clone(&transport));
     }
 
     (
@@ -274,6 +354,7 @@ pub fn start(registered: bool) -> (Client, Peer) {
             standalone,
             received,
             group_invites,
+            received_messages,
         },
         Peer {
             rt,
@@ -539,18 +620,12 @@ impl MsrpConnection {
 
     /// Sends `content` in a CPIM message, as message `message_id`
     pub fn send_text(&mut self, rt: &Runtime, from_path: &str, to_path: &str, content: &str) {
-        let cpim = format!(
-            "From: <{}>\r\n\
-To: <{}>\r\n\
-DateTime: 2026-10-18T12:00:00.000Z\r\n\
-NS: imdn <urn:ietf:params:imdn>\r\n\
-imdn.Message-ID: peer-message-1\r\n\
-\r\n\
-Content-Type: text/plain;charset=UTF-8\r\n\
-\r\n\
-{}",
-            PEER, IMPU, content
-        );
+        let cpim = cpim("Content-Type: text/plain;charset=UTF-8\r\n", content);
+        self.send_cpim(rt, from_path, to_path, &cpim);
+    }
+
+    /// Sends the CPIM message `cpim`
+    pub fn send_cpim(&mut self, rt: &Runtime, from_path: &str, to_path: &str, cpim: &str) {
         let data = format!(
             "MSRP peer-t1 SEND\r\n\
 To-Path: {}\r\n\
@@ -999,16 +1074,22 @@ fn a_group_invitation_reaches_the_group_handler() {
 
 /// A CPIM message from the peer to the client, its content as given
 fn cpim(content_headers: &str, content: &str) -> String {
+    cpim_with("", content_headers, content)
+}
+
+/// As cpim(), with the CPIM headers `cpim_headers` too
+fn cpim_with(cpim_headers: &str, content_headers: &str, content: &str) -> String {
     format!(
         "From: <{}>\r\n\
 To: <{}>\r\n\
 DateTime: 2026-10-18T12:00:00.000Z\r\n\
 NS: imdn <urn:ietf:params:imdn>\r\n\
 imdn.Message-ID: peer-message-1\r\n\
+{}\
 \r\n\
 {}\r\n\
 {}",
-        PEER, IMPU, content_headers, content
+        PEER, IMPU, cpim_headers, content_headers, content
     )
 }
 
@@ -1079,6 +1160,7 @@ fn a_large_message_sent_is_reported_once_and_its_session_ended() {
     client.standalone.send_large_mode_message(
         "text/plain",
         "a large message",
+        "large-1",
         PEER,
         &RecipientType::Contact,
         PEER,
@@ -1099,6 +1181,17 @@ fn a_large_message_sent_is_reported_once_and_its_session_ended() {
     let mut connection = msrp.accept(&rt);
     let send = connection.next_message(&rt);
     assert_eq!(cpim_text(&send.body), "a large message");
+    // the message has the ID given, as the INVITE told
+    let cpim = CPIMMessage::try_from(&Body::construct_message(&send.body).unwrap()).unwrap();
+    assert_eq!(
+        id_and_dispositions(&cpim),
+        (String::from("large-1"), DELIVERY_AND_DISPLAY)
+    );
+    assert!(
+        String::from_utf8_lossy(&body_data(&invite)).contains("imdn.Message-ID: large-1\r\n"),
+        "{}",
+        String::from_utf8_lossy(&body_data(&invite))
+    );
     connection.respond(&rt, &send, "200 OK");
 
     assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
@@ -1108,6 +1201,12 @@ fn a_large_message_sent_is_reported_once_and_its_session_ended() {
 
 /// A pager-mode MESSAGE from the peer carrying `body`
 fn pager_message(call_id: &str, content_type: &str, body: &str) -> String {
+    pager_message_of(call_id, "cpm.msg", content_type, body)
+}
+
+/// A MESSAGE from the peer of the CPM service `service`, as cpm.msg,
+/// carrying `body`
+fn pager_message_of(call_id: &str, service: &str, content_type: &str, body: &str) -> String {
     format!(
         "MESSAGE sip:+15551234@{};transport=tcp SIP/2.0\r\n\
 Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bK{}\r\n\
@@ -1116,7 +1215,7 @@ To: <{}>\r\n\
 Call-ID: {}\r\n\
 CSeq: 1 MESSAGE\r\n\
 P-Asserted-Identity: <{}>\r\n\
-Accept-Contact: *;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg\"\r\n\
+Accept-Contact: *;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.{}\"\r\n\
 Max-Forwards: 70\r\n\
 Content-Type: {}\r\n\
 Content-Length: {}\r\n\
@@ -1128,6 +1227,7 @@ Content-Length: {}\r\n\
         IMPU,
         call_id,
         PEER,
+        service,
         content_type,
         body.len(),
         body
@@ -1241,4 +1341,257 @@ fn an_outgoing_chat_ended_by_a_bye_is_started_again() {
         header_value(&invite_again, "Call-ID"),
         header_value(&invite, "Call-ID")
     );
+}
+
+/// The body of `message`, as sent
+fn body_data(message: &SipMessage) -> Vec<u8> {
+    use std::io::Read;
+
+    let mut data = Vec::new();
+    if let Some(body) = message.get_body() {
+        body.reader().unwrap().read_to_end(&mut data).unwrap();
+    }
+    data
+}
+
+/// The CPIM message `message` carries
+fn cpim_of(message: &SipMessage) -> CPIMMessage {
+    CPIMMessage::try_from(&Body::construct_message(&body_data(message)).unwrap()).unwrap()
+}
+
+fn request_uri(message: &SipMessage) -> String {
+    match message {
+        SipMessage::Request(line, _, _) => String::from_utf8_lossy(&line.uri).into_owned(),
+        _ => panic!("not a request"),
+    }
+}
+
+/// The ID and dispositions asked for of the CPIM message `cpim`
+fn id_and_dispositions(cpim: &CPIMMessage) -> (String, Dispositions) {
+    let info = cpim.get_info().unwrap();
+    (
+        String::from_utf8_lossy(info.imdn_message_id).into_owned(),
+        info.disposition_notification
+            .map_or(Dispositions::default(), Dispositions::parse),
+    )
+}
+
+const DELIVERY_AND_DISPLAY: Dispositions = Dispositions {
+    positive_delivery: true,
+    negative_delivery: false,
+    display: true,
+    processing: false,
+};
+
+#[test]
+fn a_message_sent_has_the_id_given_and_asks_to_be_told_of_its_delivery_and_display() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+
+    // in a chat
+    let msrp = MsrpPeer::listen(&rt);
+    let _result = client.send_with_id(PEER, RecipientType::Contact, "chat", "chat-message-1");
+    let invite = peer.next_request("INVITE");
+    peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
+    peer.next_request("ACK");
+    let mut connection = msrp.accept(&rt);
+    let send = connection.next_message(&rt);
+    let cpim = CPIMMessage::try_from(&Body::construct_message(&send.body).unwrap()).unwrap();
+    assert_eq!(
+        id_and_dispositions(&cpim),
+        (String::from("chat-message-1"), DELIVERY_AND_DISPLAY)
+    );
+    connection.respond(&rt, &send, "200 OK");
+
+    // in pager mode, and an is-composing indication asking for nothing
+    for (message_type, message_id, dispositions) in [
+        ("text/plain", "pager-message-1", DELIVERY_AND_DISPLAY),
+        (
+            "application/im-iscomposing+xml",
+            "composing-1",
+            Dispositions::default(),
+        ),
+    ] {
+        standalone_messaging::send_message(
+            message_type,
+            "<isComposing/>",
+            message_id,
+            PEER,
+            &RecipientType::Contact,
+            PEER,
+            |_, _| {},
+            Arc::clone(&client.core),
+            &client.transport,
+            IMPU,
+            &rt,
+        );
+        let message = peer.next_request("MESSAGE");
+        assert_eq!(
+            id_and_dispositions(&cpim_of(&message)),
+            (String::from(message_id), dispositions)
+        );
+        peer.send(&answer(&message, "200 OK", None));
+    }
+}
+
+/// The notification the MESSAGE `receipt` from the client carries, it
+/// having been sent to the peer by `service`
+fn notification(receipt: &SipMessage, service: &str) -> Imdn {
+    assert_eq!(request_uri(receipt), PEER);
+    assert_eq!(header_value(receipt, "To"), format!("<{}>", PEER));
+    assert_eq!(
+        header_value(receipt, "Accept-Contact"),
+        format!(
+            "*;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.{}\"",
+            service
+        )
+    );
+    assert_eq!(
+        header_value(receipt, "P-Preferred-Service"),
+        format!("urn:urn-7:3gpp-service.ims.icsi.oma.{}", service)
+    );
+    assert_eq!(header_value(receipt, "Content-Type"), "message/cpim");
+
+    let cpim = cpim_of(receipt);
+    assert!(cpim.contains_imdn());
+    let info = cpim.get_info().unwrap();
+    assert_eq!(
+        (info.from, info.to),
+        (
+            format!("<{}>", IMPU).as_bytes(),
+            format!("<{}>", PEER).as_bytes()
+        )
+    );
+    let (message_id, dispositions) = id_and_dispositions(&cpim);
+    assert!(!message_id.is_empty() && message_id != "peer-message-1");
+    assert_eq!(dispositions, Dispositions::default(), "it asks for nothing");
+
+    let data = body_data(receipt);
+    let data = String::from_utf8_lossy(&data);
+    let xml = data.rsplit("\r\n\r\n").next().unwrap();
+    Imdn::from_xml(xml.as_bytes()).expect("an IMDN document as it is")
+}
+
+const ASKING: &str = "imdn.Disposition-Notification: positive-delivery, display\r\n";
+
+#[test]
+fn a_standalone_message_asking_to_be_told_of_its_delivery_is() {
+    let (client, mut peer) = start(true);
+
+    peer.send(&pager_message(
+        "asking",
+        "message/cpim",
+        &cpim_with(ASKING, "Content-Type: text/plain\r\n", "tell me"),
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    let receipt = peer.next_request("MESSAGE");
+    assert_eq!(
+        notification(&receipt, "cpm.msg"),
+        Imdn {
+            message_id: String::from("peer-message-1"),
+            datetime: String::from("2026-10-18T12:00:00.000Z"),
+            recipient_uri: None,
+            original_recipient_uri: None,
+            notification: Notification::Delivery,
+            status: Status::Delivered,
+        }
+    );
+    peer.send(&answer(&receipt, "200 OK", None));
+
+    // and of its display, by what was noted of it
+    let (xml, sender_uri, service) = client
+        .received_messages
+        .displayed("peer-message-1")
+        .unwrap();
+    super::imdn::send_imdn(
+        &xml,
+        &sender_uri,
+        service,
+        &client.core.get_transaction_manager(),
+        &client.transport,
+        IMPU,
+        |_, _| {},
+        &client.rt,
+    );
+    let receipt = peer.next_request("MESSAGE");
+    let imdn = notification(&receipt, "cpm.msg");
+    assert_eq!(
+        (imdn.message_id.as_str(), imdn.notification, imdn.status),
+        ("peer-message-1", Notification::Display, Status::Displayed)
+    );
+
+    // one not asking is not told of
+    peer.send(&pager_message(
+        "not-asking",
+        "message/cpim",
+        &cpim("Content-Type: text/plain\r\n", "say nothing"),
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    peer.silence();
+}
+
+#[test]
+fn a_chat_message_asking_to_be_told_of_its_delivery_is_by_the_chat_service() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (msrp, mut connection, _ok, our_path) = incoming_chat(&client, &mut peer, "asking");
+
+    connection.send_cpim(
+        &rt,
+        &msrp.path,
+        &our_path,
+        &cpim_with(ASKING, "Content-Type: text/plain\r\n", "tell me"),
+    );
+    let response = connection.next(&rt);
+    assert!(
+        response.first_line.contains(" 200"),
+        "{}",
+        response.first_line
+    );
+
+    let receipt = peer.next_request("MESSAGE");
+    let imdn = notification(&receipt, "cpm.session");
+    assert_eq!(
+        (imdn.message_id.as_str(), imdn.notification, imdn.status),
+        ("peer-message-1", Notification::Delivery, Status::Delivered)
+    );
+}
+
+#[test]
+fn a_notification_sent_is_taken_as_one_and_not_told_of() {
+    let (client, mut peer) = start(true);
+
+    peer.send(&pager_message(
+        "asking",
+        "message/cpim",
+        &cpim_with(ASKING, "Content-Type: text/plain\r\n", "tell me"),
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    let _ = client.received.recv_timeout(Duration::from_secs(5));
+    let receipt = peer.next_request("MESSAGE");
+    peer.send(&answer(&receipt, "200 OK", None));
+
+    // the client's receipt, sent back to it by the chat service, as a
+    // notification of a chat message would come
+    let receipt_cpim = String::from_utf8(body_data(&receipt)).unwrap();
+    for service in ["cpm.msg", "cpm.session"] {
+        peer.send(&pager_message_of(
+            service,
+            service,
+            "message/cpim",
+            &receipt_cpim,
+        ));
+        assert_eq!(status_code(&peer.next_response()), 200, "{}", service);
+        let (_, content_type, content) = client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the notification given to the app");
+        assert!(
+            content_type.starts_with("message/imdn+xml"),
+            "{}",
+            content_type
+        );
+        assert!(Imdn::from_xml(content.as_bytes()).is_some(), "{}", content);
+    }
+    peer.silence();
 }

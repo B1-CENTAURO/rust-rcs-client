@@ -636,6 +636,60 @@ pub unsafe extern "C" fn rcs_client_send_message(
 ) {
     platform_log(LOG_TAG, "calling rcs_client_send_message()");
 
+    send_message(
+        rcs_runtime,
+        client,
+        message_type,
+        message_content,
+        recipient,
+        recipient_type,
+        ptr::null(),
+        cb,
+        cb_context,
+    );
+}
+
+/// As rcs_client_send_message(), the message sent with the imdn.Message-ID
+/// `imdn_message_id`, which notifications of it give, or with a new one if
+/// NULL
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_send_message_with_imdn_id(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    message_type: *const c_char,
+    message_content: *const c_char,
+    recipient: *const c_char,
+    recipient_type: i8,
+    imdn_message_id: *const c_char,
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_send_message_with_imdn_id()");
+
+    send_message(
+        rcs_runtime,
+        client,
+        message_type,
+        message_content,
+        recipient,
+        recipient_type,
+        imdn_message_id,
+        cb,
+        cb_context,
+    );
+}
+
+unsafe fn send_message(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    message_type: *const c_char,
+    message_content: *const c_char,
+    recipient: *const c_char,
+    recipient_type: i8,
+    imdn_message_id: *const c_char,
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
     let cb_context = if cb_context.is_null() {
         None
     } else {
@@ -650,6 +704,11 @@ pub unsafe extern "C" fn rcs_client_send_message(
             let message_content = CStr::from_ptr(message_content).to_string_lossy();
             let recipient = CStr::from_ptr(recipient).to_string_lossy();
             let recipient_type = get_recipient_type(recipient_type);
+            let imdn_message_id = if imdn_message_id.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(imdn_message_id).to_string_lossy())
+            };
 
             if let Some(recipient_type) = recipient_type {
                 let cb_context_ = if let Some(cb_context) = cb_context {
@@ -661,6 +720,7 @@ pub unsafe extern "C" fn rcs_client_send_message(
                 client.engine.send_message(
                     &message_type,
                     &message_content,
+                    imdn_message_id.as_deref(),
                     &recipient,
                     recipient_type,
                     move |status_code, reason_phrase| {
@@ -734,6 +794,68 @@ pub unsafe extern "C" fn rcs_client_send_imdn_report(
                 &sender_uri,
                 sender_service_type,
                 sender_session_handle,
+                rt,
+                move |status_code, reason_phrase| {
+                    if let Some(cb) = cb {
+                        let reason_phrase = c_string(reason_phrase);
+                        if let Some(cb_context_) = cb_context_ {
+                            let cb_context = cb_context_.lock().unwrap();
+                            cb(status_code, reason_phrase.as_ptr(), cb_context.0.as_ptr());
+                        } else {
+                            cb(status_code, reason_phrase.as_ptr(), ptr::null_mut());
+                        }
+                    }
+                },
+            );
+
+            return;
+        }
+    }
+
+    if let Some(cb) = cb {
+        let reason_phrase = c_string("Forbidden");
+        cb(
+            403,
+            reason_phrase.as_ptr(),
+            if let Some(cb_context) = cb_context {
+                cb_context.0.as_ptr()
+            } else {
+                ptr::null_mut()
+            },
+        );
+    }
+}
+
+/// Tells the sender of the message `imdn_message_id`, taken lately, that it
+/// was displayed, if it asked to be told: 404 if the message is not known,
+/// 403 if it did not ask
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_send_display_notification(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    imdn_message_id: *const c_char,
+    cb: Option<SendImdnReportResultCallback>,
+    cb_context: *mut SendImdnReportResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_send_display_notification()");
+
+    let cb_context = if cb_context.is_null() {
+        None
+    } else {
+        Some(SendImdnReportResultCallbackContextWrapper(
+            NonNull::new(cb_context).unwrap(),
+        ))
+    };
+
+    if let Some(rcs_runtime) = rcs_runtime.as_ref() {
+        let rt = Arc::clone(&rcs_runtime.rt);
+        if let Some(client) = client.as_ref() {
+            let cb_context_ = cb_context.map(|cb_context| Arc::new(Mutex::new(cb_context)));
+
+            let imdn_message_id = CStr::from_ptr(imdn_message_id).to_string_lossy();
+
+            client.engine.send_display_notification(
+                &imdn_message_id,
                 rt,
                 move |status_code, reason_phrase| {
                     if let Some(cb) = cb {
