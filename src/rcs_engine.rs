@@ -899,70 +899,52 @@ impl RcsEngine {
     {
         let core = Arc::clone(&self.core);
 
-        // let tm_control_itf = engine_itf.tm_control_itf;
-
-        let guard = self.state.lock().unwrap();
-
-        match &*guard {
+        // what to send with, decided under the engine's locks, which are not
+        // held while sending or calling back, so that the application may
+        // call into the engine from the callback
+        let registered = match &*self.state.lock().unwrap() {
             (
                 RcsEngineConnectionState::CONNECTED(transport, _),
                 RcsEngineRegistrationState::MAINTAINED(public_user_identity),
-            ) => {
-                let mut send_through_one_to_one_chat_service = false;
-                let mut send_through_group_chat_service = false;
-                let mut send_through_standalone_message_service = false;
+            ) => Some((Arc::clone(transport), public_user_identity.clone())),
+            _ => None,
+        };
 
-                // bool contact_is_chatbot = (options & rcs_send_message_option_contact_is_chatbot) != 0;
+        let (transport, public_user_identity) = match registered {
+            Some(registered) => registered,
+            None => {
+                message_result_callback(403, String::from("Forbidden"));
+                return;
+            }
+        };
 
-                // bool contact_supports_one_to_one = (options & rcs_send_message_option_contact_supports_one_to_one) != 0;
-                let recipient_supports_one_to_one = false;
+        let mut send_through_one_to_one_chat_service = false;
+        let mut send_through_group_chat_service = false;
+        let mut send_through_standalone_message_service = false;
 
-                // bool contact_supports_standalone = (options & rcs_send_message_option_contact_supports_standalone) != 0;
-                let recipient_supports_standalone = true;
+        // bool contact_is_chatbot = (options & rcs_send_message_option_contact_is_chatbot) != 0;
 
-                // bool contact_is_group = (options & rcs_send_message_option_send_to_group) != 0;
-                // let recipient_is_group = false;
+        // bool contact_supports_one_to_one = (options & rcs_send_message_option_contact_supports_one_to_one) != 0;
+        let recipient_supports_one_to_one = false;
 
-                let messaging_config = &*self.messaging_config.lock().unwrap();
-                let mut recipient_uri = String::from(recipient);
+        // bool contact_supports_standalone = (options & rcs_send_message_option_contact_supports_standalone) != 0;
+        let recipient_supports_standalone = true;
 
-                if let RecipientType::Chatbot = recipient_type {
-                    if messaging_config.chatbot_msg_tech == 1
-                        && messaging_config.chat_auth == 1
-                        && recipient_supports_one_to_one
-                    {
-                        send_through_one_to_one_chat_service = true;
-                    } else if messaging_config.chatbot_msg_tech == 2 {
-                        if messaging_config.chat_auth == 1 && recipient_supports_one_to_one {
-                            send_through_one_to_one_chat_service = true;
-                        }
+        // bool contact_is_group = (options & rcs_send_message_option_send_to_group) != 0;
+        // let recipient_is_group = false;
 
-                        if messaging_config.standalone_msg_auth == 1
-                            && recipient_supports_standalone
-                        {
-                            send_through_standalone_message_service = true;
-                        }
-                    } else if messaging_config.chatbot_msg_tech == 3
-                        && messaging_config.standalone_msg_auth == 1
-                        && recipient_supports_standalone
-                    {
-                        send_through_standalone_message_service = true;
-                    }
-                } else if let RecipientType::Group = recipient_type {
-                    if messaging_config.group_chat_auth == 1 {
-                        send_through_group_chat_service = true;
-                    }
-                } else if let RecipientType::ResourceList = recipient_type {
-                    if messaging_config.standalone_msg_auth == 1 {
-                        // to-do: check max_one_to_many_recipients for limit
-                        if let Some(exploder_uri) = &messaging_config.exploder_uri {
-                            recipient_uri = String::from(exploder_uri);
-                        } else {
-                            recipient_uri = String::from("exploder@conf-factory");
-                        }
-                        send_through_standalone_message_service = true;
-                    }
-                } else {
+        let mut recipient_uri = String::from(recipient);
+
+        let (standalone_msg_max_size, standalone_msg_switch_over_size) = {
+            let messaging_config = &*self.messaging_config.lock().unwrap();
+
+            if let RecipientType::Chatbot = recipient_type {
+                if messaging_config.chatbot_msg_tech == 1
+                    && messaging_config.chat_auth == 1
+                    && recipient_supports_one_to_one
+                {
+                    send_through_one_to_one_chat_service = true;
+                } else if messaging_config.chatbot_msg_tech == 2 {
                     if messaging_config.chat_auth == 1 && recipient_supports_one_to_one {
                         send_through_one_to_one_chat_service = true;
                     }
@@ -970,61 +952,84 @@ impl RcsEngine {
                     if messaging_config.standalone_msg_auth == 1 && recipient_supports_standalone {
                         send_through_standalone_message_service = true;
                     }
+                } else if messaging_config.chatbot_msg_tech == 3
+                    && messaging_config.standalone_msg_auth == 1
+                    && recipient_supports_standalone
+                {
+                    send_through_standalone_message_service = true;
+                }
+            } else if let RecipientType::Group = recipient_type {
+                if messaging_config.group_chat_auth == 1 {
+                    send_through_group_chat_service = true;
+                }
+            } else if let RecipientType::ResourceList = recipient_type {
+                if messaging_config.standalone_msg_auth == 1 {
+                    // to-do: check max_one_to_many_recipients for limit
+                    if let Some(exploder_uri) = &messaging_config.exploder_uri {
+                        recipient_uri = String::from(exploder_uri);
+                    } else {
+                        recipient_uri = String::from("exploder@conf-factory");
+                    }
+                    send_through_standalone_message_service = true;
+                }
+            } else {
+                if messaging_config.chat_auth == 1 && recipient_supports_one_to_one {
+                    send_through_one_to_one_chat_service = true;
                 }
 
-                if send_through_one_to_one_chat_service || send_through_group_chat_service {
-                    let core = &self.core;
-                    self.cpm_session_service.send_message(
-                        message_type,
-                        message_content,
-                        recipient,
-                        &recipient_type,
-                        &recipient_uri,
-                        message_result_callback,
-                        core,
-                        rt,
-                    );
-
-                    return;
-                } else if send_through_standalone_message_service {
-                    if messaging_config.standalone_msg_max_size >= message_content.len() {
-                        if messaging_config.standalone_msg_switch_over_size < message_content.len()
-                        {
-                            let core = &self.core;
-                            self.standalone_messaging_service.send_large_mode_message(
-                                message_type,
-                                message_content,
-                                recipient,
-                                &recipient_type,
-                                &recipient_uri,
-                                message_result_callback,
-                                core,
-                                rt,
-                            );
-                        } else {
-                            standalone_messaging::send_message(
-                                message_type,
-                                message_content,
-                                recipient,
-                                &recipient_type,
-                                &recipient_uri,
-                                message_result_callback,
-                                core,
-                                transport,
-                                public_user_identity,
-                                &rt,
-                            );
-                        }
-
-                        return;
-                    }
+                if messaging_config.standalone_msg_auth == 1 && recipient_supports_standalone {
+                    send_through_standalone_message_service = true;
                 }
             }
 
-            _ => {}
-        }
+            (
+                messaging_config.standalone_msg_max_size,
+                messaging_config.standalone_msg_switch_over_size,
+            )
+        };
 
-        message_result_callback(403, String::from("Forbidden"))
+        if send_through_one_to_one_chat_service || send_through_group_chat_service {
+            self.cpm_session_service.send_message(
+                message_type,
+                message_content,
+                recipient,
+                &recipient_type,
+                &recipient_uri,
+                message_result_callback,
+                &core,
+                rt,
+            );
+        } else if send_through_standalone_message_service
+            && standalone_msg_max_size >= message_content.len()
+        {
+            if standalone_msg_switch_over_size < message_content.len() {
+                self.standalone_messaging_service.send_large_mode_message(
+                    message_type,
+                    message_content,
+                    recipient,
+                    &recipient_type,
+                    &recipient_uri,
+                    message_result_callback,
+                    &core,
+                    rt,
+                );
+            } else {
+                standalone_messaging::send_message(
+                    message_type,
+                    message_content,
+                    recipient,
+                    &recipient_type,
+                    &recipient_uri,
+                    message_result_callback,
+                    core,
+                    &transport,
+                    &public_user_identity,
+                    &rt,
+                );
+            }
+        } else {
+            message_result_callback(403, String::from("Forbidden"))
+        }
     }
 
     pub fn send_imdn_report<F>(
@@ -1038,41 +1043,39 @@ impl RcsEngine {
     ) where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
-        let guard = self.state.lock().unwrap();
-
-        match &*guard {
+        // as send_message(), no engine lock held while sending or calling back
+        let registered = match &*self.state.lock().unwrap() {
             (
                 RcsEngineConnectionState::CONNECTED(transport, _),
                 RcsEngineRegistrationState::MAINTAINED(public_user_identity),
-            ) => {
-                if sender_service_type == 1 {
-                    let core = Arc::clone(&self.core);
+            ) => Some((Arc::clone(transport), public_user_identity.clone())),
+            _ => None,
+        };
 
-                    let recipient_type = RecipientType::Contact;
+        match registered {
+            Some((transport, public_user_identity)) if sender_service_type == 1 => {
+                let core = Arc::clone(&self.core);
 
-                    standalone_messaging::send_message(
-                        "message/imdn",
-                        imdn_content,
-                        sender_uri,
-                        &recipient_type, // to-do: support IMDN in group chat
-                        sender_uri,
-                        move |status_code, reason_phrase| {
-                            send_imdn_report_result_callback(status_code, reason_phrase);
-                        },
-                        core,
-                        transport,
-                        public_user_identity,
-                        &rt,
-                    );
+                let recipient_type = RecipientType::Contact;
 
-                    return;
-                }
+                standalone_messaging::send_message(
+                    "message/imdn",
+                    imdn_content,
+                    sender_uri,
+                    &recipient_type, // to-do: support IMDN in group chat
+                    sender_uri,
+                    move |status_code, reason_phrase| {
+                        send_imdn_report_result_callback(status_code, reason_phrase);
+                    },
+                    core,
+                    &transport,
+                    &public_user_identity,
+                    &rt,
+                );
             }
 
-            _ => {}
+            _ => send_imdn_report_result_callback(403, String::from("Forbidden")),
         }
-
-        send_imdn_report_result_callback(403, String::from("Forbidden"));
     }
 
     pub fn upload_file<PF, RF>(
