@@ -750,6 +750,7 @@ impl StandaloneMessagingService {
         &self,
         message_type: &str,
         message_content: &str,
+        message_id: &str,
         recipient: &str,
         recipient_type: &RecipientType,
         recipient_uri: &str,
@@ -874,14 +875,12 @@ impl StandaloneMessagingService {
                         ));
                     }
 
-                    let message_imdn_id = Uuid::new_v4();
-
                     let cpim_body = make_cpim_message_content_body(
                         message_type,
                         "",
                         &recipient_type,
                         recipient_uri,
-                        message_imdn_id,
+                        message_id,
                         &public_user_identity,
                     );
 
@@ -977,6 +976,7 @@ impl StandaloneMessagingService {
                     let message = CPMMessageParam::new(
                         String::from(message_type),
                         String::from(message_content),
+                        String::from(message_id),
                         recipient,
                         recipient_type,
                         recipient_uri,
@@ -1037,7 +1037,7 @@ impl StandaloneMessagingService {
                                                         &message.message_content,
                                                         &message.recipient_type,
                                                         &message.recipient_uri,
-                                                        message_imdn_id,
+                                                        &message.message_id,
                                                         &public_user_identity,
                                                     );
                                                     let message_body = Arc::new(message_body);
@@ -2155,6 +2155,7 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
 pub fn send_message<F>(
     message_type: &str,
     message_content: &str,
+    message_id: &str,
     recipient: &str,
     recipient_type: &RecipientType,
     recipient_uri: &str,
@@ -2244,7 +2245,7 @@ pub fn send_message<F>(
         message_content,
         &recipient_type,
         recipient_uri,
-        Uuid::new_v4(),
+        message_id,
         public_user_identity,
     );
 
@@ -2536,9 +2537,9 @@ impl SipDialogEventCallbacks for StandaloneLargeModeReceiveSessionDialogEventRec
     }
 }
 
-struct OutgoingPagerModeContext {
-    client_transaction_tx: mpsc::Sender<(u16, String)>,
-    rt: Arc<Runtime>,
+pub(crate) struct OutgoingPagerModeContext {
+    pub(crate) client_transaction_tx: mpsc::Sender<(u16, String)>,
+    pub(crate) rt: Arc<Runtime>,
 }
 
 impl ClientTransactionCallbacks for OutgoingPagerModeContext {

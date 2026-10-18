@@ -754,7 +754,7 @@ impl CPMSession {
                                     &message.message_content,
                                     &message.recipient_type,
                                     &message.recipient_uri,
-                                    Uuid::new_v4(), // to-do: should be provided by user
+                                    &message.message_id,
                                     &public_user_identity,
                                 );
 
@@ -1205,6 +1205,7 @@ impl CPMSessionService {
         &self,
         message_type: &str,
         message_content: &str,
+        message_id: &str,
         recipient: &str,
         recipient_type: &RecipientType,
         recipient_uri: &str,
@@ -1234,6 +1235,7 @@ impl CPMSessionService {
                 let message = CPMMessageParam::new(
                     String::from(message_type),
                     String::from(message_content),
+                    String::from(message_id),
                     recipient,
                     recipient_type,
                     recipient_uri,
@@ -1262,6 +1264,7 @@ impl CPMSessionService {
                 let message = CPMMessageParam::new(
                     String::from(message_type),
                     String::from(message_content),
+                    String::from(message_id),
                     recipient,
                     recipient_type,
                     recipient_uri,
@@ -1449,6 +1452,7 @@ impl CPMSessionService {
                 let message = CPMMessageParam::new(
                     String::from(message_type),
                     String::from(message_content),
+                    String::from(message_id),
                     recipient,
                     recipient_type,
                     recipient_uri,
@@ -2584,6 +2588,7 @@ Content-Length: 0\r\n\
             CPMMessageParam::new(
                 String::from("text/plain"),
                 String::from("never sent"),
+                String::from("never-sent-1"),
                 "sip:+15559876@example.com",
                 &RecipientType::Contact,
                 "sip:+15559876@example.com",

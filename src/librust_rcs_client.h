@@ -98,12 +98,22 @@ extern void rcs_client_send_message(struct rcs_runtime *runtime, struct rcs_clie
                                 int8_t recipient_type,
                                 message_result_callback cb, void *context);
 
+// as rcs_client_send_message, with the imdn.Message-ID that delivery and display notifications of the message give, or a new one if NULL
+extern void rcs_client_send_message_with_imdn_id(struct rcs_runtime *runtime, struct rcs_client *client, const char *message_type, const char *message_content, const char *recipient,
+                                int8_t recipient_type, const char *imdn_message_id,
+                                message_result_callback cb, void *context);
+
 typedef void (*send_imdn_report_result_callback) (uint16_t status_code, const char *reason_phrase, void *context);
 
 void send_imdn_report_result_callback_context_release(void *context);
 
+// sends an IMDN document (RFC 5438) to the sender of a message, by the service it came by: a chat (0) or standalone messaging (1)
 extern void rcs_client_send_imdn_report(struct rcs_runtime *runtime, struct rcs_client *client,
                                 const char *imdn_content, const char *sender_uri, int sender_service_type, struct rcs_messaging_session *session,
+                                send_imdn_report_result_callback callback, void *context);
+
+// tells the sender of a message lately taken that it was displayed, if it asked to be told: 404 if the message is not known, 403 if it did not ask
+extern void rcs_client_send_display_notification(struct rcs_runtime *runtime, struct rcs_client *client, const char *imdn_message_id,
                                 send_imdn_report_result_callback callback, void *context);
 
 typedef void (*upload_file_progress_callback) (uint32_t current, int32_t total, void *context);

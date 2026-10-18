@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod imdn;
 pub mod session;
 pub mod session_invitation;
 pub mod sip;
@@ -79,6 +80,8 @@ pub struct MessagingSessionHandle {
 pub struct CPMMessageParam {
     message_type: String,
     message_content: String,
+    /// The imdn.Message-ID it is sent with, which notifications of it give
+    message_id: String,
     recipient: String,
     recipient_type: RecipientType,
     recipient_uri: String,
@@ -89,6 +92,7 @@ impl CPMMessageParam {
     pub fn new<F>(
         message_type: String,
         message_content: String,
+        message_id: String,
         recipient: &str,
         recipient_type: &RecipientType,
         recipient_uri: &str,
@@ -100,6 +104,7 @@ impl CPMMessageParam {
         CPMMessageParam {
             message_type,
             message_content,
+            message_id,
             recipient: String::from(recipient),
             recipient_type: RecipientType::from(recipient_type),
             recipient_uri: String::from(recipient_uri),
@@ -108,12 +113,27 @@ impl CPMMessageParam {
     }
 }
 
+/// A new imdn.Message-ID
+pub fn new_message_id() -> String {
+    String::from(
+        Uuid::new_v4()
+            .as_hyphenated()
+            .encode_lower(&mut Uuid::encode_buffer()),
+    )
+}
+
+/// Whether a message of `message_type` asks to be told of its delivery and
+/// display, as all but an is-composing indication do (RFC 3994 section 4)
+fn asks_for_notifications(message_type: &str) -> bool {
+    !message_type.eq_ignore_ascii_case("application/im-iscomposing+xml")
+}
+
 pub fn make_cpim_message_content_body(
     message_type: &str,
     message_content: &str,
     recipient_type: &RecipientType,
     recipient_uri: &str,
-    message_imdn_id: Uuid,
+    message_imdn_id: &str,
     public_user_identity: &str,
 ) -> Body {
     let encoded = general_purpose::STANDARD.encode(message_content);
@@ -139,13 +159,8 @@ pub fn make_cpim_message_content_body(
 
     let mut cpim_headers = Vec::new();
 
-    if message_type.eq("message/imdn") {
-        cpim_headers.push(Header::new("From", "<sip:anonymous@anonymous.invalid>"));
-        cpim_headers.push(Header::new("To", "<sip:anonymous@anonymous.invalid>"));
-    } else {
-        cpim_headers.push(Header::new("From", format!("<{}>", public_user_identity)));
-        cpim_headers.push(Header::new("To", format!("<{}>", recipient_uri)));
-    }
+    cpim_headers.push(Header::new("From", format!("<{}>", public_user_identity)));
+    cpim_headers.push(Header::new("To", format!("<{}>", recipient_uri)));
 
     let utc: DateTime<Local> = Local::now();
 
@@ -158,19 +173,15 @@ pub fn make_cpim_message_content_body(
 
     cpim_headers.push(Header::new(
         "imdn.Message-ID",
-        String::from(
-            message_imdn_id
-                .as_hyphenated()
-                .encode_lower(&mut Uuid::encode_buffer()),
-        ),
+        String::from(message_imdn_id),
     ));
 
-    // if !message_type.eq("message/imdn") {
-    //     cpim_headers.push(Header::new(
-    //         "imdn.Disposition-Notification",
-    //         "positive-delivery",
-    //     ));
-    // }
+    if asks_for_notifications(message_type) {
+        cpim_headers.push(Header::new(
+            "imdn.Disposition-Notification",
+            "positive-delivery, display",
+        ));
+    }
 
     cpim_headers.push(Header::new(
         "NS",
@@ -187,6 +198,46 @@ pub fn make_cpim_message_content_body(
     if let RecipientType::Chatbot = recipient_type {
         cpim_headers.push(Header::new("NS", "maap <http://www.gsma.com/rcs/maap/>"));
     }
+
+    Body::Message(MessageBody {
+        headers: cpim_headers,
+        body: Arc::new(cpim_content_body),
+    })
+}
+
+/// The CPIM message of the IMDN document `imdn_xml`, to `recipient_uri`: the
+/// document as it is, as a notification (RFC 5438 section 7.1), and asking
+/// for no notification of itself
+pub fn make_cpim_imdn_body(
+    imdn_xml: &str,
+    recipient_uri: &str,
+    public_user_identity: &str,
+) -> Body {
+    let content_body = Vec::from(imdn_xml);
+
+    let content_headers = vec![
+        Header::new("Content-Type", "message/imdn+xml"),
+        Header::new("Content-Disposition", "notification"),
+        Header::new("Content-Length", format!("{}", content_body.len())),
+    ];
+
+    let cpim_content_body = Body::Message(MessageBody {
+        headers: content_headers,
+        body: Arc::new(Body::Raw(content_body)),
+    });
+
+    let utc: DateTime<Local> = Local::now();
+
+    let cpim_headers = vec![
+        Header::new("From", format!("<{}>", public_user_identity)),
+        Header::new("To", format!("<{}>", recipient_uri)),
+        Header::new(
+            "DateTime",
+            utc.to_rfc3339_opts(SecondsFormat::Millis, false),
+        ),
+        Header::new("NS", "imdn <urn:ietf:params:imdn>"),
+        Header::new("imdn.Message-ID", new_message_id()),
+    ];
 
     Body::Message(MessageBody {
         headers: cpim_headers,

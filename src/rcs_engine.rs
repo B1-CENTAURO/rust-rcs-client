@@ -96,6 +96,10 @@ use crate::connectivity::retry::Reconnect;
 use crate::connectivity::{flow::FlowManager, registration::Registration};
 use crate::context::Context;
 use crate::messaging::config::MessagingConfigs;
+use crate::messaging::cpm::imdn::{
+    acknowledge_delivery, send_imdn, ImdnService, ReceivedMessages, Refusal,
+};
+use crate::messaging::cpm::new_message_id;
 use crate::messaging::cpm::session::CPMSessionService;
 use crate::messaging::cpm::session::CPMSessionServiceWrapper;
 use crate::messaging::cpm::standalone_messaging::StandaloneMessagingServiceWrapper;
@@ -147,6 +151,9 @@ pub struct RcsEngine {
 
     conference_service_v1: Arc<MultiConferenceServiceV1>,
 
+    /// The messages last taken, and the notifications each asks for
+    received_messages: Arc<ReceivedMessages>,
+
     // msrp_channels: Arc<MsrpChannelManager>,
     core: Arc<SipCore>,
 }
@@ -182,6 +189,9 @@ impl RcsEngine {
         let sm = SubscriptionManager::new(500);
         // let (tm, tm_control_itf, tm_event_itf) = SipTransactionManager::new(rt);
         let (tm, tm_event_itf) = SipTransactionManager::new(&rt);
+        let tm = Arc::new(tm);
+
+        let received_messages = Arc::new(ReceivedMessages::new());
 
         #[cfg(not(all(feature = "android", target_os = "android")))]
         let tls_client_config = context.get_tls_client_config();
@@ -496,6 +506,12 @@ impl RcsEngine {
         let msrp_socket_connect_function_impl_1 = Arc::new(msrp_socket_connect_function_impl);
         let msrp_socket_connect_function_impl_2 = Arc::clone(&msrp_socket_connect_function_impl_1);
 
+        let (state_1, tm_1, received_messages_1, rt_1) = (
+            Arc::clone(&state),
+            Arc::clone(&tm),
+            Arc::clone(&received_messages),
+            Arc::clone(&rt),
+        );
         let standalone_messaging_service = StandaloneMessagingService::new(
             move |contact_uri, cpim_info, content_type, message_body| {
                 if let (Ok(contact_uri), Ok(content_type), Ok(message_body)) = (
@@ -527,6 +543,16 @@ impl RcsEngine {
                             cpim_date,
                             cpim_from.as_deref(),
                         );
+                        acknowledge_delivery(
+                            &received_messages_1,
+                            ImdnService::Standalone,
+                            contact_uri,
+                            cpim_info,
+                            content_type.as_bytes(),
+                            || registered_identity(&state_1),
+                            &tm_1,
+                            &rt_1,
+                        );
                     } else {
                         platform_log(LOG_TAG, "failed to decode cpim info as utf-8 string");
                     }
@@ -541,6 +567,12 @@ impl RcsEngine {
             },
         );
         let standalone_messaging_service = Arc::new(standalone_messaging_service);
+        let (state_2, tm_2, received_messages_2, rt_2) = (
+            Arc::clone(&state),
+            Arc::clone(&tm),
+            Arc::clone(&received_messages),
+            Arc::clone(&rt),
+        );
         let cpm_session_service = CPMSessionService::new(
             move |session, contact_uri, cpim_info, content_type, message_body| {
                 if let (Ok(contact_uri), Ok(content_type), Ok(message_body)) = (
@@ -575,6 +607,24 @@ impl RcsEngine {
                             cpim_date,
                             cpim_from.as_deref(),
                         );
+                        if let Some(service) = ImdnService::of_chat(
+                            &session
+                                .get_inner()
+                                .get_session_info()
+                                .cpm_contact
+                                .service_type,
+                        ) {
+                            acknowledge_delivery(
+                                &received_messages_2,
+                                service,
+                                contact_uri,
+                                cpim_info,
+                                content_type.as_bytes(),
+                                || registered_identity(&state_2),
+                                &tm_2,
+                                &rt_2,
+                            );
+                        }
                     } else {
                         platform_log(LOG_TAG, "failed to decode cpim info as utf-8 string");
                     }
@@ -621,7 +671,6 @@ impl RcsEngine {
             MultiConferenceServiceV1::new(multi_conference_v1_invite_handler_function);
         let multi_conference_service_v1 = Arc::new(multi_conference_service_v1);
         let sm = Arc::new(sm);
-        let tm = Arc::new(tm);
         let allowed_methods: Vec<&'static [u8]> =
             [ACK, BYE, CANCEL, INVITE, MESSAGE, NOTIFY, OPTIONS, UPDATE].to_vec();
 
@@ -720,6 +769,8 @@ impl RcsEngine {
             ft_http_configs: FileTransferOverHTTPConfigs::new(),
 
             conference_service_v1: multi_conference_service_v1,
+
+            received_messages,
 
             // msrp_channels,
             core,
@@ -888,10 +939,13 @@ impl RcsEngine {
                 .release(&transport, registration.as_ref(), &rt);
         }
     }
+    /// Sends a message, with the imdn.Message-ID `message_id`, or a new one,
+    /// which notifications of it give
     pub fn send_message<F>(
         &self,
         message_type: &str,
         message_content: &str,
+        message_id: Option<&str>,
         recipient: &str,
         recipient_type: RecipientType,
         message_result_callback: F,
@@ -901,18 +955,15 @@ impl RcsEngine {
     {
         let core = Arc::clone(&self.core);
 
+        let message_id = match message_id {
+            Some(message_id) => String::from(message_id),
+            None => new_message_id(),
+        };
+
         // what to send with, decided under the engine's locks, which are not
         // held while sending or calling back, so that the application may
         // call into the engine from the callback
-        let registered = match &*self.state.lock().unwrap() {
-            (
-                RcsEngineConnectionState::CONNECTED(transport, _),
-                RcsEngineRegistrationState::MAINTAINED(public_user_identity),
-            ) => Some((Arc::clone(transport), public_user_identity.clone())),
-            _ => None,
-        };
-
-        let (transport, public_user_identity) = match registered {
+        let (transport, public_user_identity) = match registered_identity(&self.state) {
             Some(registered) => registered,
             None => {
                 message_result_callback(403, String::from("Forbidden"));
@@ -1000,6 +1051,7 @@ impl RcsEngine {
             self.cpm_session_service.send_message(
                 message_type,
                 message_content,
+                &message_id,
                 recipient,
                 &recipient_type,
                 &recipient_uri,
@@ -1014,6 +1066,7 @@ impl RcsEngine {
                 self.standalone_messaging_service.send_large_mode_message(
                     message_type,
                     message_content,
+                    &message_id,
                     recipient,
                     &recipient_type,
                     &recipient_uri,
@@ -1025,6 +1078,7 @@ impl RcsEngine {
                 standalone_messaging::send_message(
                     message_type,
                     message_content,
+                    &message_id,
                     recipient,
                     &recipient_type,
                     &recipient_uri,
@@ -1040,49 +1094,81 @@ impl RcsEngine {
         }
     }
 
+    /// Sends the IMDN document `imdn_content` to `sender_uri`, by the service
+    /// the message told of came by: a chat (0) or standalone messaging (1)
     pub fn send_imdn_report<F>(
         &self,
         imdn_content: &str,
         sender_uri: &str,
         sender_service_type: i32,
-        sender_session_handle: *mut MessagingSessionHandle,
+        _sender_session_handle: *mut MessagingSessionHandle,
         rt: Arc<Runtime>,
         send_imdn_report_result_callback: F,
     ) where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
-        // as send_message(), no engine lock held while sending or calling back
-        let registered = match &*self.state.lock().unwrap() {
-            (
-                RcsEngineConnectionState::CONNECTED(transport, _),
-                RcsEngineRegistrationState::MAINTAINED(public_user_identity),
-            ) => Some((Arc::clone(transport), public_user_identity.clone())),
-            _ => None,
+        let service = match sender_service_type {
+            0 => ImdnService::Chat,
+            1 => ImdnService::Standalone,
+            _ => {
+                send_imdn_report_result_callback(403, String::from("Forbidden"));
+                return;
+            }
         };
 
-        match registered {
-            Some((transport, public_user_identity)) if sender_service_type == 1 => {
-                let core = Arc::clone(&self.core);
+        // as send_message(), no engine lock held while sending or calling back
+        match registered_identity(&self.state) {
+            Some((transport, public_user_identity)) => send_imdn(
+                imdn_content,
+                sender_uri,
+                service,
+                &self.core.get_transaction_manager(),
+                &transport,
+                &public_user_identity,
+                send_imdn_report_result_callback,
+                &rt,
+            ),
 
-                let recipient_type = RecipientType::Contact;
+            None => send_imdn_report_result_callback(403, String::from("Forbidden")),
+        }
+    }
 
-                standalone_messaging::send_message(
-                    "message/imdn",
-                    imdn_content,
-                    sender_uri,
-                    &recipient_type, // to-do: support IMDN in group chat
-                    sender_uri,
-                    move |status_code, reason_phrase| {
-                        send_imdn_report_result_callback(status_code, reason_phrase);
-                    },
-                    core,
-                    &transport,
-                    &public_user_identity,
-                    &rt,
-                );
+    /// Tells the sender of the message `message_id` that it was displayed, if
+    /// it asked to be told. A message not among those last taken is answered
+    /// with 404, one that did not ask with 403.
+    pub fn send_display_notification<F>(
+        &self,
+        message_id: &str,
+        rt: Arc<Runtime>,
+        result_callback: F,
+    ) where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        let (imdn_xml, sender_uri, service) = match self.received_messages.displayed(message_id) {
+            Ok(notification) => notification,
+            Err(Refusal::Unknown) => {
+                result_callback(404, String::from("Not Found"));
+                return;
             }
+            Err(Refusal::NotAskedFor) => {
+                result_callback(403, String::from("Forbidden"));
+                return;
+            }
+        };
 
-            _ => send_imdn_report_result_callback(403, String::from("Forbidden")),
+        match registered_identity(&self.state) {
+            Some((transport, public_user_identity)) => send_imdn(
+                &imdn_xml,
+                &sender_uri,
+                service,
+                &self.core.get_transaction_manager(),
+                &transport,
+                &public_user_identity,
+                result_callback,
+                &rt,
+            ),
+
+            None => result_callback(403, String::from("Forbidden")),
         }
     }
 
@@ -2034,6 +2120,19 @@ impl Connector {
         if !deregistering {
             self.tm.unregister_sip_transport(transport, rt);
         }
+    }
+}
+
+/// The transport and public identity the engine is registered with, if it is
+fn registered_identity(
+    state: &Mutex<(RcsEngineConnectionState, RcsEngineRegistrationState)>,
+) -> Option<(Arc<SipTransport>, String)> {
+    match &*state.lock().unwrap() {
+        (
+            RcsEngineConnectionState::CONNECTED(transport, _),
+            RcsEngineRegistrationState::MAINTAINED(public_user_identity),
+        ) => Some((Arc::clone(transport), public_user_identity.clone())),
+        _ => None,
     }
 }
 
