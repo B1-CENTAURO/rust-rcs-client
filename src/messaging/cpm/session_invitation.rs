@@ -15,7 +15,6 @@
 extern crate rust_rcs_core;
 extern crate rust_strict_sdp;
 
-use core::panic;
 use std::{
     pin::Pin,
     sync::{Arc, Mutex},
@@ -309,12 +308,29 @@ pub fn try_accept_invitation<'a, 'b>(
                                             },
                                         ));
 
-                                        String::from(contact_identity)
+                                        Some(String::from(contact_identity))
                                     } else {
-                                        panic!("")
+                                        None
                                     }
                                 } else {
-                                    panic!("")
+                                    None
+                                }
+                            };
+
+                            // not registered, or not on the connection the
+                            // invitation came over
+                            let public_user_identity = match public_user_identity {
+                                Some(public_user_identity) => public_user_identity,
+                                None => {
+                                    reject(
+                                        transaction,
+                                        message,
+                                        tx,
+                                        480,
+                                        b"Temporarily Unavailable",
+                                        rt,
+                                    );
+                                    return;
                                 }
                             };
 
@@ -345,7 +361,15 @@ pub fn try_accept_invitation<'a, 'b>(
 
                                     dialog
                                 } else {
-                                    panic!("")
+                                    reject(
+                                        transaction,
+                                        message,
+                                        tx,
+                                        500,
+                                        b"Server Internal Error",
+                                        rt,
+                                    );
+                                    return;
                                 }
                             };
 
@@ -545,5 +569,21 @@ pub fn try_accept_invitation<'a, 'b>(
                 );
             }
         }
+    }
+}
+
+/// Answers `message` with `status_code`, which ends its transaction
+fn reject(
+    transaction: &Arc<ServerTransaction>,
+    message: &SipMessage,
+    tx: mpsc::Sender<ServerTransactionEvent>,
+    status_code: u16,
+    reason_phrase: &[u8],
+    rt: &Arc<Runtime>,
+) {
+    if let Some(resp_message) =
+        server_transaction::make_response(message, transaction.to_tag(), status_code, reason_phrase)
+    {
+        server_transaction::send_response(Arc::clone(transaction), resp_message, tx, rt);
     }
 }

@@ -1571,9 +1571,9 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                                     rt.spawn(async move{
                                                         while let Some(ev) = rx.recv().await {
                                                             match ev {
-                                                                ServerTransactionEvent::Cancelled => {
-                                                                    todo!()
-                                                                },
+                                                                // the 200 went first: the session
+                                                                // ends with a BYE, if at all
+                                                                ServerTransactionEvent::Cancelled => {},
                                                                 _ => {},
                                                             }
                                                         }

@@ -184,6 +184,9 @@ pub fn make_cpim_message_content_body(
 }
 
 #[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
 mod tests {
     use rust_rcs_core::cpim::CPIMMessage;
     use rust_rcs_core::internet::Body;

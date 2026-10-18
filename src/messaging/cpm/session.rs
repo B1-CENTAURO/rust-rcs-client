@@ -398,6 +398,9 @@ enum CPMSessionState {
 pub struct CPMSession {
     session_info: CPMSessionInfo,
     session_state: Arc<Mutex<CPMSessionState>>,
+    /// The messages sent before the session started, taken under the state
+    /// lock
+    pending_messages: Mutex<Vec<CPMMessageParam>>,
 }
 
 impl CPMSession {
@@ -407,6 +410,7 @@ impl CPMSession {
             session_state: Arc::new(Mutex::new(CPMSessionState::Negotiating(
                 CPMSessionNegotiationState::NoneSet,
             ))),
+            pending_messages: Mutex::new(Vec::new()),
         }
     }
 
@@ -594,6 +598,23 @@ impl CPMSession {
                     let (message_tx, mut message_rx) = mpsc::channel::<CPMMessageParam>(8);
                     let message_tx_ = message_tx.clone();
 
+                    // the messages sent while the session was set up go first
+                    let pending_messages =
+                        std::mem::take(&mut *self.pending_messages.lock().unwrap());
+                    if !pending_messages.is_empty() {
+                        let message_tx = message_tx.clone();
+                        rt.spawn(async move {
+                            for message in pending_messages {
+                                if let Err(e) = message_tx.send(message).await {
+                                    (e.0.message_result_callback)(
+                                        500,
+                                        String::from("Internal Error"),
+                                    );
+                                }
+                            }
+                        });
+                    }
+
                     *guard = CPMSessionState::Starting(
                         l_sdp, r_sdp, laddr, lport, raddr, rport,
                         // session_channel,
@@ -725,8 +746,10 @@ impl CPMSession {
     pub fn send_message(&self, message: CPMMessageParam, rt: &Arc<Runtime>) {
         let guard = self.session_state.lock().unwrap();
         match &*guard {
-            CPMSessionState::Negotiating(_) => todo!(),
-            CPMSessionState::Negotiated(_, _, _, _, _, _, _, _, _, _) => todo!(),
+            // until the session starts, as an incoming one does on the ACK
+            CPMSessionState::Negotiating(_) | CPMSessionState::Negotiated(..) => {
+                self.pending_messages.lock().unwrap().push(message);
+            }
             CPMSessionState::Starting(_, _, _, _, _, _, message_tx) => {
                 let message_tx = message_tx.clone();
                 rt.spawn(async move {
@@ -738,6 +761,16 @@ impl CPMSession {
                     }
                 });
             }
+        }
+    }
+}
+
+impl Drop for CPMSession {
+    /// The messages that waited for a session that never started fail
+    fn drop(&mut self) {
+        let pending_messages = std::mem::take(&mut *self.pending_messages.lock().unwrap());
+        for message in pending_messages {
+            (message.message_result_callback)(480, String::from("Temporarily Unavailable"));
         }
     }
 }
@@ -986,9 +1019,9 @@ impl CPMSessionService {
     ) where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
-        let guard = self.ongoing_sessions.lock().unwrap();
+        let sessions = self.ongoing_sessions.lock().unwrap();
 
-        for (known_identities, sip_session) in &*guard {
+        for (known_identities, sip_session) in &*sessions {
             if known_identities == recipient {
                 sip_session.mark_session_active();
 
@@ -1017,9 +1050,9 @@ impl CPMSessionService {
             }
         }
 
-        let guard = self.ongoing_outgoing_invitations.lock().unwrap();
+        let mut invitations = self.ongoing_outgoing_invitations.lock().unwrap();
 
-        for invitation in &*guard {
+        for invitation in &*invitations {
             let (known_identities, message_tx) = invitation.as_ref();
             if known_identities == recipient {
                 let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
@@ -1508,13 +1541,14 @@ impl CPMSessionService {
                     rt,
                 );
 
-                self.ongoing_outgoing_invitations
-                    .lock()
-                    .unwrap()
-                    .push(outgoing_invitation);
+                // through the guard held, the lock not being reentrant
+                invitations.push(outgoing_invitation);
                 return;
             }
         }
+
+        drop(invitations);
+        drop(sessions);
 
         (message_result_callback)(500, String::from("Internal Error"));
     }
@@ -1654,7 +1688,12 @@ impl ClientTransactionCallbacks for CPMSessionInviteCallbacks {
     }
 
     fn on_transport_error(&self) {
-        todo!()
+        let client_transaction_tx = self.client_transaction_tx.clone();
+        self.rt.spawn(async move {
+            let _ = client_transaction_tx
+                .send(Err((408, String::from("Request Timeout"))))
+                .await;
+        });
     }
 }
 
@@ -2279,5 +2318,85 @@ impl TransactionHandler for CPMSessionServiceWrapper {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rust_rcs_core::sip::sip_parser::SipParser;
+    use rust_rcs_core::sip::ClientTransactionCallbacks;
+    use tokio::runtime::Runtime;
+
+    use super::super::CPMMessageParam;
+    use super::{get_cpm_session_info_from_message, CPMSession, CPMSessionInviteCallbacks};
+    use crate::messaging::ffi::RecipientType;
+
+    #[test]
+    fn an_invite_that_times_out_fails_its_messages() {
+        let rt = Arc::new(Runtime::new().unwrap());
+        let (client_transaction_tx, mut client_transaction_rx) = tokio::sync::mpsc::channel(1);
+        let callbacks = CPMSessionInviteCallbacks {
+            recipient_type: RecipientType::Group,
+            client_transaction_tx,
+            rt: Arc::clone(&rt),
+        };
+
+        callbacks.on_transport_error();
+
+        let result = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), client_transaction_rx.recv()).await
+        });
+        match result {
+            Ok(Some(Err((status_code, _)))) => assert_eq!(status_code, 408),
+            _ => panic!("no failure reported"),
+        }
+    }
+
+    #[test]
+    fn messages_waiting_for_a_session_that_never_starts_fail() {
+        let mut parser = SipParser::new();
+        parser.feed(
+            b"INVITE sip:+15551234@192.0.2.10:5060;transport=tcp SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bKnever\r\n\
+From: <sip:+15559876@example.com>;tag=peer1\r\n\
+To: <sip:+15551234@example.com>\r\n\
+Call-ID: never\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:+15559876@192.0.2.1:5060;transport=tcp>\r\n\
+P-Asserted-Identity: <sip:+15559876@example.com>\r\n\
+Conversation-ID: conversation-1\r\n\
+Contribution-ID: contribution-1\r\n\
+Content-Length: 0\r\n\
+\r\n",
+        );
+        let invite = parser.produce().unwrap().unwrap();
+        let session_info = get_cpm_session_info_from_message(&invite, false).unwrap();
+
+        let rt = Arc::new(Runtime::new().unwrap());
+        let (result_tx, result_rx) = mpsc::channel();
+        let result_tx = std::sync::Mutex::new(result_tx);
+
+        let session = CPMSession::new(session_info);
+        session.send_message(
+            CPMMessageParam::new(
+                String::from("text/plain"),
+                String::from("never sent"),
+                "sip:+15559876@example.com",
+                &RecipientType::Contact,
+                "sip:+15559876@example.com",
+                move |status_code, _| {
+                    let _ = result_tx.lock().unwrap().send(status_code);
+                },
+            ),
+            &rt,
+        );
+        assert!(result_rx.try_recv().is_err(), "it waits for the session");
+
+        drop(session);
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(480));
     }
 }
