@@ -14,6 +14,7 @@
 
 extern crate libc;
 
+use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 #[cfg(not(any(
@@ -23,11 +24,14 @@ use std::net::Ipv6Addr;
 use std::net::{SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
+use std::time::Duration;
 
 use futures::StreamExt;
 
 #[cfg(all(feature = "ohos", all(target_os = "linux", target_env = "ohos")))]
 use libc::{AF_INET, AF_INET6};
+use rust_rcs_core::dns::DnsConfig;
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::http::HttpClient;
 #[cfg(all(feature = "android", target_os = "android"))]
@@ -65,9 +69,6 @@ use rust_rcs_core::sip::UPDATE;
 use tokio::net::TcpSocket;
 use tokio::runtime::Runtime;
 
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-
 use url::Url;
 use uuid::Uuid;
 
@@ -86,9 +87,12 @@ use crate::connection::msrp_connection_config::MsrpConnectionConfig;
 use crate::connection::p_cscf_connection_config::PCscfConnectionConfig;
 use crate::connection::p_cscf_connection_config::ServiceType;
 use crate::connectivity::authentication_type::AuthenticationType;
+use crate::connectivity::flow::FlowEvent;
 use crate::connectivity::registration::deregister;
 use crate::connectivity::registration::start_register;
 use crate::connectivity::registration::RegistrationEvent;
+use crate::connectivity::retry::backoff;
+use crate::connectivity::retry::Reconnect;
 use crate::connectivity::{flow::FlowManager, registration::Registration};
 use crate::context::Context;
 use crate::messaging::config::MessagingConfigs;
@@ -125,26 +129,7 @@ pub enum RcsEngineRegistrationState {
 pub struct RcsEngine {
     state: Arc<Mutex<(RcsEngineConnectionState, RcsEngineRegistrationState)>>,
 
-    state_callback: Arc<Box<dyn Fn(RcsEngineRegistrationState) + Send + Sync + 'static>>,
-
-    tm: Arc<SipTransactionManager>,
-
-    subscription_id: i32,
-
-    impi: Option<String>,
-    impu: Option<String>,
-
-    home_domain: Option<String>,
-
-    authentication_type: Option<AuthenticationType>,
-
-    sip_instance_id: Uuid,
-
-    p_cscf_connection_config: PCscfConnectionConfig,
-
-    registration_id_counter: u32,
-
-    flow_manager: Arc<FlowManager>,
+    connector: Arc<Connector>,
 
     standalone_messaging_service: Arc<StandaloneMessagingService>,
 
@@ -164,7 +149,6 @@ pub struct RcsEngine {
 
     // msrp_channels: Arc<MsrpChannelManager>,
     core: Arc<SipCore>,
-    context: Arc<Context>,
 }
 
 impl RcsEngine {
@@ -194,7 +178,6 @@ impl RcsEngine {
 
         let state_callback: Arc<Box<dyn Fn(RcsEngineRegistrationState) + Send + Sync + 'static>> =
             Arc::new(Box::new(state_callback));
-        let state_callback_ = Arc::clone(&state_callback);
 
         let sm = SubscriptionManager::new(500);
         // let (tm, tm_control_itf, tm_event_itf) = SipTransactionManager::new(rt);
@@ -665,78 +648,60 @@ impl RcsEngine {
             &rt,
         ));
 
-        let core_ = Arc::clone(&core);
-        let rt_ = Arc::clone(&rt);
+        let connector = Arc::new_cyclic(|connector: &Weak<Connector>| {
+            let connector = Weak::clone(connector);
+
+            Connector {
+                state: Arc::clone(&state),
+
+                state_callback,
+
+                tm: Arc::clone(&tm),
+
+                core: Arc::clone(&core),
+
+                context,
+
+                flow_manager: Arc::new(FlowManager::new(
+                    &sm,
+                    &tm,
+                    move |event, transport, registration| {
+                        if let Some(connector) = connector.upgrade() {
+                            connector.on_flow_event(event, &transport, &registration);
+                        }
+                    },
+                )),
+
+                cpm_session_service: Arc::clone(&cpm_session_service),
+
+                conference_service_v1: Arc::clone(&multi_conference_service_v1),
+
+                subscription_id,
+
+                settings: Mutex::new(ConnectSettings {
+                    impi: None,
+                    impu: None,
+                    home_domain: None,
+                    authentication_type: None,
+                    sip_instance_id: Uuid::new_v4(),
+                    p_cscf_connection_config: PCscfConnectionConfig::new(),
+                    registration_id_counter: 0,
+                }),
+
+                retry: Mutex::new(Retry {
+                    wanted: false,
+                    failures: 0,
+                    generation: 0,
+                }),
+
+                rt: Arc::clone(&rt),
+            }
+        });
 
         RcsEngine {
-            state: Arc::clone(&state),
+            state,
 
-            state_callback,
-
-            tm: Arc::clone(&tm),
-
-            subscription_id,
-
-            impi: None,
-            impu: None,
-
-            home_domain: None,
-
-            authentication_type: None,
-
-            sip_instance_id: Uuid::new_v4(),
-
-            p_cscf_connection_config: PCscfConnectionConfig::new(),
-
-            registration_id_counter: 0,
-
-            flow_manager: Arc::new(FlowManager::new(
-                &sm,
-                &tm,
-                move |is_registered, transport, public_user_id, registration| {
-                    platform_log(
-                        LOG_TAG,
-                        format!(
-                            "flow_manager state_callback: is_registered={:?}, public_user_id={:?}",
-                            is_registered, &public_user_id
-                        ),
-                    );
-
-                    let mut guard = state.lock().unwrap();
-                    match &guard.0 {
-                        RcsEngineConnectionState::CONNECTED(transport_, _) => {
-                            if Arc::ptr_eq(&transport, transport_) {
-                                match (is_registered, public_user_id) {
-                                    (true, Some(public_user_id)) => {
-                                        let public_user_id_ = public_user_id.clone();
-                                        guard.1 =
-                                            RcsEngineRegistrationState::MAINTAINED(public_user_id_);
-                                        state_callback_(RcsEngineRegistrationState::MAINTAINED(
-                                            public_user_id,
-                                        ));
-                                    }
-                                    _ => {
-                                        guard.0 = RcsEngineConnectionState::IDLE;
-                                        guard.1 = RcsEngineRegistrationState::NONE;
-                                        state_callback_(RcsEngineRegistrationState::NONE);
-                                    }
-                                }
-
-                                return;
-                            }
-
-                            platform_log(LOG_TAG, "already registered on another socket");
-                        }
-                        _ => {
-                            platform_log(LOG_TAG, "already abandonned");
-                        }
-                    }
-
-                    if is_registered {
-                        deregister(&registration, &core_, &rt_);
-                    }
-                },
-            )),
+            connector,
 
             standalone_messaging_service,
 
@@ -756,7 +721,6 @@ impl RcsEngine {
 
             // msrp_channels,
             core,
-            context,
             // gba_context: None,
         }
     }
@@ -769,91 +733,100 @@ impl RcsEngine {
             let ims_app = ImsApplication::new(&ims_app);
             let rcs_app = RcsApplication::new(&rcs_app);
 
-            self.impi.take();
+            {
+                let mut guard = self.connector.settings.lock().unwrap();
+                let settings = &mut *guard;
 
-            if let Some(pvui) = ims_app.get_private_user_identity() {
-                self.impi.replace(String::from(pvui));
-            }
+                settings.impi.take();
 
-            self.impu.take();
+                if let Some(pvui) = ims_app.get_private_user_identity() {
+                    settings.impi.replace(String::from(pvui));
+                }
 
-            let mut pbui_priority = 0;
+                settings.impu.take();
 
-            for pbui in ims_app.get_public_user_identity_list() {
-                if pbui.starts_with("sip:") {
-                    if pbui.starts_with("sip:+") {
-                        if pbui_priority < 3 {
-                            pbui_priority = 3;
-                            self.impu = Some(String::from(pbui));
+                let mut pbui_priority = 0;
+
+                for pbui in ims_app.get_public_user_identity_list() {
+                    if pbui.starts_with("sip:") {
+                        if pbui.starts_with("sip:+") {
+                            if pbui_priority < 3 {
+                                pbui_priority = 3;
+                                settings.impu = Some(String::from(pbui));
+                            }
+                        } else {
+                            if pbui_priority < 2 {
+                                pbui_priority = 2;
+                                settings.impu = Some(String::from(pbui));
+                            }
+                        }
+                    } else if pbui.starts_with("tel:") {
+                        if pbui_priority < 1 {
+                            pbui_priority = 1;
+                            settings.impu = Some(String::from(pbui));
                         }
                     } else {
-                        if pbui_priority < 2 {
-                            pbui_priority = 2;
-                            self.impu = Some(String::from(pbui));
-                        }
-                    }
-                } else if pbui.starts_with("tel:") {
-                    if pbui_priority < 1 {
-                        pbui_priority = 1;
-                        self.impu = Some(String::from(pbui));
-                    }
-                } else {
-                    if self.impu.is_none() {
-                        self.impu.replace(String::from(pbui));
-                    }
-                }
-            }
-
-            platform_log(
-                LOG_TAG,
-                format!(
-                    "rcs engine configured with IMPI: {:?}, IMPU: {:?}",
-                    &self.impi, &self.impu
-                ),
-            );
-
-            self.home_domain = None;
-
-            if let Some(home_domain) = ims_app.get_home_domain() {
-                self.home_domain = Some(String::from(home_domain));
-            }
-
-            self.authentication_type = None;
-
-            if let Some(gsma_ext) = ims_app.get_ims_gsma_extension() {
-                let ext_info = gsma_ext.get_info();
-
-                if let Some(auth_type) = ext_info.auth_type {
-                    if auth_type.eq_ignore_ascii_case("AKA") {
-                        if let (Some(realm), Some(username)) = (&self.home_domain, &self.impi) {
-                            self.authentication_type = Some(AuthenticationType::Aka(
-                                String::from("AKAv1-MD5"),
-                                realm.clone(),
-                                username.clone(),
-                            ));
-                        }
-                    } else if auth_type.eq_ignore_ascii_case("Digest") {
-                        if let (Some(realm), Some(username), Some(password)) =
-                            (ext_info.realm, ext_info.user_name, ext_info.user_password)
-                        {
-                            self.authentication_type = Some(AuthenticationType::Digest(
-                                String::from("SHA-256"),
-                                String::from(realm),
-                                String::from(username),
-                                String::from(password),
-                            ))
+                        if settings.impu.is_none() {
+                            settings.impu.replace(String::from(pbui));
                         }
                     }
                 }
 
-                if let Some(uuid_value) = ext_info.uuid_value {
-                    if let Ok(uuid) = Uuid::parse_str(uuid_value) {
-                        self.sip_instance_id = uuid;
+                platform_log(
+                    LOG_TAG,
+                    format!(
+                        "rcs engine configured with IMPI: {:?}, IMPU: {:?}",
+                        &settings.impi, &settings.impu
+                    ),
+                );
+
+                settings.home_domain = None;
+
+                if let Some(home_domain) = ims_app.get_home_domain() {
+                    settings.home_domain = Some(String::from(home_domain));
+                }
+
+                settings.authentication_type = None;
+
+                if let Some(gsma_ext) = ims_app.get_ims_gsma_extension() {
+                    let ext_info = gsma_ext.get_info();
+
+                    if let Some(auth_type) = ext_info.auth_type {
+                        if auth_type.eq_ignore_ascii_case("AKA") {
+                            if let (Some(realm), Some(username)) =
+                                (&settings.home_domain, &settings.impi)
+                            {
+                                settings.authentication_type = Some(AuthenticationType::Aka(
+                                    String::from("AKAv1-MD5"),
+                                    realm.clone(),
+                                    username.clone(),
+                                ));
+                            }
+                        } else if auth_type.eq_ignore_ascii_case("Digest") {
+                            if let (Some(realm), Some(username), Some(password)) =
+                                (ext_info.realm, ext_info.user_name, ext_info.user_password)
+                            {
+                                settings.authentication_type = Some(AuthenticationType::Digest(
+                                    String::from("SHA-256"),
+                                    String::from(realm),
+                                    String::from(username),
+                                    String::from(password),
+                                ))
+                            }
+                        }
+                    }
+
+                    if let Some(uuid_value) = ext_info.uuid_value {
+                        if let Ok(uuid) = Uuid::parse_str(uuid_value) {
+                            settings.sip_instance_id = uuid;
+                        }
                     }
                 }
-            }
 
-            self.p_cscf_connection_config.update_configuration(&ims_app);
+                settings
+                    .p_cscf_connection_config
+                    .update_configuration(&ims_app);
+            }
 
             self.chatbot_config.update_configuration(&rcs_app);
 
@@ -871,409 +844,48 @@ impl RcsEngine {
         }
     }
 
-    pub fn connect(&mut self, rt: Arc<Runtime>) {
+    /// Connects and registers, on the runtime the engine was made with, and
+    /// connects again whenever the connection is lost, until disconnect()
+    pub fn connect(&mut self, _rt: Arc<Runtime>) {
         platform_log(LOG_TAG, "calling engine->connect()");
 
-        if let (Some(impi), Some(impu), Some(home_domain), Some(authentication_type)) = (
-            &self.impi,
-            &self.impu,
-            &self.home_domain,
-            &self.authentication_type,
-        ) {
-            if let Some((dns_config, service_type, address, known_host, known_ip, known_port)) =
-                self.p_cscf_connection_config.get_next()
-            {
-                platform_log(
-                    LOG_TAG,
-                    format!(
-                        "connect(): configured with: {}, known as {:?}, {:?}:{:?}",
-                        &address, &known_host, &known_ip, &known_port
-                    ),
-                );
+        let attempt = {
+            let mut retry = self.connector.retry.lock().unwrap();
+            retry.wanted = true;
+            retry.failures = 0;
+            retry.generation += 1;
+            retry.generation
+        };
 
-                let state = Arc::clone(&self.state);
-
-                let mut guard = state.lock().unwrap();
-
-                match &guard.0 {
-                    RcsEngineConnectionState::IDLE => {
-                        guard.0 = RcsEngineConnectionState::CONNECTING;
-                    }
-
-                    _ => {
-                        return;
-                    }
-                }
-
-                let impi = impi.clone();
-                let impu = impu.clone();
-                let home_domain = home_domain.clone();
-                let authentication_type = authentication_type.clone();
-
-                let state_ = Arc::clone(&state);
-                let state_callback_ = Arc::clone(&self.state_callback);
-
-                let tm = Arc::clone(&self.tm);
-                // let tm_control_itf = engine_itf.tm_control_itf.clone();
-                let tm_control_itf = tm.get_ctrl_itf();
-                let context = Arc::clone(&self.context);
-                let rt_ = Arc::clone(&rt);
-
-                let subscription_id = self.subscription_id;
-                let sip_instance_id = self.sip_instance_id;
-
-                self.registration_id_counter += 1;
-                let registration_id = self.registration_id_counter;
-
-                let flow_manager = Arc::clone(&self.flow_manager);
-
-                let cpm_session_service = Arc::clone(&self.cpm_session_service);
-
-                let conference_service_v1 = Arc::clone(&self.conference_service_v1);
-
-                let core = Arc::clone(&self.core);
-
-                rt.spawn(async move {
-                    let dns_client = context.get_dns_client();
-                    let dns_config_ = dns_config.clone();
-
-                    let service_name = service_type.get_string_repr();
-
-                    #[cfg(not(all(feature = "android", target_os = "android")))]
-                    let tls_client_config = context.get_tls_client_config();
-
-                    if let Ok(mut stream) = if let Some(port) = known_port {
-                        let (tx, rx) = mpsc::channel(1);
-                        rt_.spawn(async move {
-                            match tx.send((address.clone(), port)).await {
-                                Ok(()) => {}
-                                Err(_) => {}
-                            }
-                        });
-                        Ok(ReceiverStream::from(rx))
-                    } else {
-                        dns_client
-                            .resolve_service(dns_config_, address.clone(), service_name)
-                            .await
-                    } {
-                        while let Some((target, port)) = stream.next().await {
-                            platform_log(
-                                LOG_TAG,
-                                format!(
-                                    "connect(): sip service resolved with {}:{}",
-                                    &target, port
-                                ),
-                            );
-
-                            let dns_config_ = dns_config.clone();
-
-                            if let Ok(mut stream) = if let Some(addr) = known_ip {
-                                let (tx, rx) = mpsc::channel(1);
-                                rt_.spawn(async move {
-                                    match tx.send(addr).await {
-                                        Ok(()) => {}
-                                        Err(_) => {}
-                                    }
-                                });
-                                Ok(ReceiverStream::from(rx))
-                            } else {
-                                dns_client
-                                    .resolve(
-                                        dns_config_,
-                                        if let Some(host) = &known_host {
-                                            String::from(host)
-                                        } else {
-                                            target.clone()
-                                        },
-                                    )
-                                    .await
-                            } {
-                                while let Some(addr) = stream.next().await {
-                                    if let std::net::IpAddr::V6(_) = addr {
-                                        platform_log(LOG_TAG, "IPv6 not supported for sip connection under most Carrier network now");
-                                        continue;
-                                    }
-                                    if let Some(cs) = match service_type {
-                                        ServiceType::SipD2T => {
-                                            #[cfg(all(feature = "android", target_os = "android"))]
-                                            let r = ClientStream::new_android(addr, port).await;
-
-                                            #[cfg(all(feature = "ohos", all(target_os = "linux", target_env = "ohos")))]
-                                            let r = ClientStream::new_ohos(addr, port).await;
-
-                                            #[cfg(not(any(
-                                                all(feature = "android", target_os = "android"),
-                                                all(feature = "ohos", all(target_os = "linux", target_env = "ohos"))
-                                            )))]
-                                            let r = ClientStream::new_tokio(addr, port).await;
-
-                                            match r {
-                                                Ok(cs) => Some(cs),
-                                                Err(e) => {
-                                                    platform_log(LOG_TAG, format!("error creating client stream: {:?}", e));
-                                                    None
-                                                },
-                                            }
-                                        }
-                                        ServiceType::SipsD2T => {
-                                            #[cfg(all(feature = "android", target_os = "android"))]
-                                            let r = ClientStream::new_android_ssl(
-                                                addr,
-                                                port,
-                                                if let Some(host) = &known_host {
-                                                    host
-                                                } else {
-                                                    &target
-                                                },
-                                            )
-                                            .await;
-
-                                            #[cfg(all(feature = "ohos", all(target_os = "linux", target_env = "ohos")))]
-                                            let r = ClientStream::new_ohos_ssl(
-                                                Arc::clone(&tls_client_config),
-                                                addr,
-                                                port,
-                                                if let Some(host) = &known_host {
-                                                    host
-                                                } else {
-                                                    &target
-                                                },
-                                            )
-                                            .await;
-
-                                            #[cfg(not(any(
-                                                all(feature = "android", target_os = "android"),
-                                                all(feature = "ohos", all(target_os = "linux", target_env = "ohos"))
-                                            )))]
-                                            let r = ClientStream::new_tokio_ssl(
-                                                Arc::clone(&tls_client_config),
-                                                addr,
-                                                port,
-                                                if let Some(host) = &known_host {
-                                                    host
-                                                } else {
-                                                    &target
-                                                },
-                                            )
-                                            .await;
-
-                                            match r
-                                            {
-                                                Ok(cs) => match cs.do_handshake().await {
-                                                    Ok((cs, _)) => {
-                                                        platform_log(LOG_TAG, format!("ssl do_handshake success"));
-                                                        Some(cs)
-                                                    },
-                                                    Err(e) => {
-                                                        platform_log(
-                                                            LOG_TAG,
-                                                            format!("ssl do_handshake failed with error {:?}", e),
-                                                        );
-                                                        None
-                                                    },
-                                                }
-,
-                                                Err(e) => {
-                                                    platform_log(LOG_TAG, format!("error creating ssl client stream: {:?}", e));
-                                                    None
-                                                },
-                                            }
-                                        }
-                                        ServiceType::SipD2U => None,
-                                    } {
-                                        let transport_address = cs.get_local_transport_address();
-
-                                        let t = SipTransport::new::<ClientStream>(
-                                            transport_address.clone(),
-                                            cs.get_sip_transport_type(),
-                                        );
-
-                                        let state_ec = Arc::clone(&state_);
-                                        let flow_manager_ec = Arc::clone(&flow_manager);
-                                        let tm_ec = Arc::clone(&tm);
-                                        let rt_ec = Arc::clone(&rt_);
-                                        let state_callback_ec = Arc::clone(&state_callback_);
-
-                                        let transport = Arc::new(t);
-                                        let transport_ec = Arc::clone(&transport);
-                                        let transport_tx = setup_sip_transport(&transport, cs, tm_control_itf.clone(), Arc::clone(&rt_), move || {
-
-                                            platform_log(
-                                                LOG_TAG,
-                                                "on sip transport exit",
-                                            );
-
-                                            let mut guard = state_ec.lock().unwrap();
-                                            guard.0 = RcsEngineConnectionState::IDLE;
-                                            guard.1 = RcsEngineRegistrationState::NONE;
-                                            state_callback_ec(RcsEngineRegistrationState::NONE);
-                                            let _ = flow_manager_ec.stop_observation(&transport_ec);
-                                            tm_ec.unregister_sip_transport(&transport_ec, &rt_ec);
-                                        });
-
-                                        {
-                                            let mut guard = state_.lock().unwrap();
-
-                                            match guard.0 {
-                                                RcsEngineConnectionState::CONNECTING => {
-                                                    guard.0 = RcsEngineConnectionState::CONNECTED(
-                                                        Arc::clone(&transport),
-                                                        transport_address.clone(),
-                                                    );
-
-                                                    tm.register_sip_transport(Arc::clone(&transport), transport_tx);
-                                                },
-
-                                                _ => return,
-                                            }
-                                        }
-
-                                        let state = Arc::clone(&state_);
-
-                                        let flow_manager_ = Arc::clone(&flow_manager);
-
-                                        let cpm_session_service_ = Arc::clone(&cpm_session_service);
-
-                                        let conference_service_v1_ =
-                                            Arc::clone(&conference_service_v1);
-
-                                        let transport_ = Arc::clone(&transport);
-                                        // let transport_address_ = transport_address.clone();
-
-                                        let core_ = Arc::clone(&core);
-
-                                        let rt = Arc::clone(&rt_);
-
-                                        let registration = Registration::new(
-                                            subscription_id,
-                                            impi,
-                                            impu,
-                                            home_domain,
-                                            authentication_type,
-                                            Arc::clone(&transport),
-                                            transport_address.clone(),
-                                            registration_id,
-                                            sip_instance_id,
-                                        );
-
-                                        let registration = Arc::new(registration);
-
-                                        flow_manager.observe_registration(
-                                            &transport,
-                                            transport_address,
-                                            &registration,
-                                            &core_,
-                                            &rt_,
-                                        );
-
-                                        start_register(&registration, &flow_manager, &core, &rt_, move |ev| {
-                                            let transport = Arc::clone(&transport_);
-                                            // let transport_address = transport_address_.clone();
-                                            match ev {
-                                                RegistrationEvent::Registered(
-                                                    unbarred_impu,
-                                                ) => {
-                                                    platform_log(
-                                                        LOG_TAG,
-                                                        "on RegistrationEvent::Registered",
-                                                    );
-
-                                                    let sip_instance_id = format!(
-                                                        "<urn:uuid:{}>",
-                                                        sip_instance_id
-                                                            .as_hyphenated()
-                                                            .encode_lower(
-                                                                &mut Uuid::encode_buffer()
-                                                            )
-                                                    );
-
-                                                    core_.set_default_public_identity(
-                                                        unbarred_impu.clone(),
-                                                        sip_instance_id.clone(),
-                                                        Arc::clone(&transport),
-                                                    ); // fix-me: contact identities should not be visible for sip core, best we can do is to provide a map between transport and registered impu to each message consumer
-
-                                                    cpm_session_service_
-                                                        .set_registered_public_identity(
-                                                            unbarred_impu.clone(),
-                                                            sip_instance_id.clone(),
-                                                            Arc::clone(&transport),
-                                                        );
-
-                                                    conference_service_v1_
-                                                        .set_registered_public_identity(
-                                                            unbarred_impu.clone(),
-                                                            sip_instance_id.clone(),
-                                                            Arc::clone(&transport),
-                                                        );
-
-                                                    let mut guard = state.lock().unwrap();
-                                                    let default_public_identity =
-                                                        unbarred_impu.clone();
-                                                    guard.1 = RcsEngineRegistrationState::AUTHENTICATED(default_public_identity); // to-do: we need to append transport address anyway, why not here?
-                                                    state_callback_(RcsEngineRegistrationState::AUTHENTICATED(unbarred_impu));
-                                                },
-                                                RegistrationEvent::Refreshed => {
-                                                    platform_log(
-                                                        LOG_TAG,
-                                                        "on RegistrationEvent::Refreshed",
-                                                    );
-                                                },
-                                                RegistrationEvent::Released => {
-                                                    platform_log(
-                                                        LOG_TAG,
-                                                        "on RegistrationEvent::Released",
-                                                    );
-
-                                                    let mut guard = state.lock().unwrap();
-                                                    guard.0 = RcsEngineConnectionState::IDLE;
-                                                    guard.1 = RcsEngineRegistrationState::NONE;
-                                                    state_callback_(RcsEngineRegistrationState::NONE);
-                                                    let _ = flow_manager_.stop_observation(&transport);
-                                                    tm.unregister_sip_transport(&transport, &rt);
-                                                },
-                                            }
-                                        });
-
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let mut guard = state_.lock().unwrap();
-
-                    guard.0 = RcsEngineConnectionState::IDLE;
-                });
-            }
-        }
+        self.connector.connect(attempt);
     }
 
     pub fn disconnect(&self, rt: Arc<Runtime>) {
-        let mut guard = self.state.lock().unwrap();
-        match &mut guard.0 {
-            RcsEngineConnectionState::IDLE => {}
-            RcsEngineConnectionState::CONNECTING => {}
-            RcsEngineConnectionState::CONNECTED(transport, _) => {
-                let transport = Arc::clone(transport);
-                match &mut guard.1 {
-                    RcsEngineRegistrationState::NONE => {}
-                    RcsEngineRegistrationState::AUTHENTICATED(_)
-                    | RcsEngineRegistrationState::MAINTAINED(_) => {
-                        if let Some(registration) = self.flow_manager.stop_observation(&transport) {
-                            deregister(&registration, &self.core, &rt);
-                        }
-                    }
-                }
-            }
+        {
+            let mut retry = self.connector.retry.lock().unwrap();
+            retry.wanted = false;
+            retry.generation += 1;
         }
 
-        guard.0 = RcsEngineConnectionState::IDLE;
-        guard.1 = RcsEngineRegistrationState::NONE;
-        (self.state_callback)(RcsEngineRegistrationState::NONE);
-    }
+        let transport = {
+            let mut guard = self.state.lock().unwrap();
+            let transport = match &guard.0 {
+                RcsEngineConnectionState::CONNECTED(transport, _) => Some(Arc::clone(transport)),
+                _ => None,
+            };
+            guard.0 = RcsEngineConnectionState::IDLE;
+            guard.1 = RcsEngineRegistrationState::NONE;
+            transport
+        };
 
+        (self.connector.state_callback)(RcsEngineRegistrationState::NONE);
+
+        if let Some(transport) = transport {
+            let registration = self.connector.flow_manager.stop_observation(&transport);
+            self.connector
+                .release(&transport, registration.as_ref(), &rt);
+        }
+    }
     pub fn send_message<F>(
         &self,
         message_type: &str,
@@ -1955,5 +1567,650 @@ impl RcsEngine {
                 }
             }
         });
+    }
+}
+
+/// What connecting takes from the configuration
+struct ConnectSettings {
+    impi: Option<String>,
+    impu: Option<String>,
+
+    home_domain: Option<String>,
+
+    authentication_type: Option<AuthenticationType>,
+
+    sip_instance_id: Uuid,
+
+    p_cscf_connection_config: PCscfConnectionConfig,
+
+    registration_id_counter: u32,
+}
+
+/// Whether to stay connected, and how to try again
+struct Retry {
+    /// Whether connect() was called last, rather than disconnect()
+    wanted: bool,
+    /// The attempts in a row that have failed to register
+    failures: u32,
+    /// Counts the attempts to connect, so that only the latest goes on
+    generation: u64,
+}
+
+/// Connects to a P-CSCF and registers, and does so again whenever the
+/// connection or the registration is lost. The retry lock is never taken with
+/// the state lock held
+struct Connector {
+    state: Arc<Mutex<(RcsEngineConnectionState, RcsEngineRegistrationState)>>,
+
+    state_callback: Arc<Box<dyn Fn(RcsEngineRegistrationState) + Send + Sync + 'static>>,
+
+    tm: Arc<SipTransactionManager>,
+
+    core: Arc<SipCore>,
+
+    context: Arc<Context>,
+
+    flow_manager: Arc<FlowManager>,
+
+    cpm_session_service: Arc<CPMSessionService>,
+
+    conference_service_v1: Arc<MultiConferenceServiceV1>,
+
+    subscription_id: i32,
+
+    settings: Mutex<ConnectSettings>,
+
+    retry: Mutex<Retry>,
+
+    rt: Arc<Runtime>,
+}
+
+impl Connector {
+    /// Connects and registers, unless `attempt` is not the latest attempt or
+    /// there is a connection already
+    fn connect(self: &Arc<Self>, attempt: u64) {
+        {
+            let retry = self.retry.lock().unwrap();
+            if !retry.wanted || retry.generation != attempt {
+                return;
+            }
+
+            let mut guard = self.state.lock().unwrap();
+            match &guard.0 {
+                RcsEngineConnectionState::IDLE => {
+                    guard.0 = RcsEngineConnectionState::CONNECTING;
+                }
+
+                _ => return,
+            }
+        }
+
+        let configured = {
+            let mut guard = self.settings.lock().unwrap();
+            let settings = &mut *guard;
+            match (
+                settings.impi.clone(),
+                settings.impu.clone(),
+                settings.home_domain.clone(),
+                settings.authentication_type.clone(),
+            ) {
+                (Some(impi), Some(impu), Some(home_domain), Some(authentication_type)) => {
+                    settings.registration_id_counter += 1;
+                    Some((
+                        impi,
+                        impu,
+                        home_domain,
+                        authentication_type,
+                        settings.sip_instance_id,
+                        settings.registration_id_counter,
+                        settings.p_cscf_connection_config.get_next(),
+                    ))
+                }
+
+                _ => None,
+            }
+        };
+
+        let (
+            impi,
+            impu,
+            home_domain,
+            authentication_type,
+            sip_instance_id,
+            registration_id,
+            p_cscf,
+        ) = match configured {
+            Some(configured) => configured,
+            None => {
+                platform_log(LOG_TAG, "connect(): not configured");
+                self.end_attempt(attempt, Reconnect::Never);
+                return;
+            }
+        };
+
+        let (dns_config, service_type, address, known_host, known_ip, known_port) = match p_cscf {
+            Some(p_cscf) => p_cscf,
+            None => {
+                platform_log(LOG_TAG, "connect(): no P-CSCF to connect to");
+                self.end_attempt(attempt, Reconnect::Backoff);
+                return;
+            }
+        };
+
+        platform_log(
+            LOG_TAG,
+            format!(
+                "connect(): configured with: {}, known as {:?}, {:?}:{:?}",
+                &address, &known_host, &known_ip, &known_port
+            ),
+        );
+
+        let connector = Arc::clone(self);
+
+        self.rt.spawn(async move {
+            let cs = match connect_to_p_cscf(
+                &connector.context,
+                dns_config,
+                &service_type,
+                known_host,
+                known_ip,
+                known_port,
+            )
+            .await
+            {
+                Some(cs) => cs,
+                None => {
+                    connector.end_attempt(attempt, Reconnect::Backoff);
+                    return;
+                }
+            };
+
+            let transport_address = cs.get_local_transport_address();
+
+            let transport = Arc::new(SipTransport::new::<ClientStream>(
+                transport_address.clone(),
+                cs.get_sip_transport_type(),
+            ));
+
+            let connector_ec = Arc::downgrade(&connector);
+            let transport_ec = Arc::clone(&transport);
+            let transport_tx = setup_sip_transport(
+                &transport,
+                cs,
+                connector.tm.get_ctrl_itf(),
+                Arc::clone(&connector.rt),
+                move || {
+                    platform_log(LOG_TAG, "on sip transport exit");
+
+                    if let Some(connector) = connector_ec.upgrade() {
+                        connector.on_lost(&transport_ec, Reconnect::Backoff);
+                    }
+                },
+            );
+
+            {
+                let retry = connector.retry.lock().unwrap();
+                let mut guard = connector.state.lock().unwrap();
+
+                match guard.0 {
+                    RcsEngineConnectionState::CONNECTING if retry.generation == attempt => {
+                        guard.0 = RcsEngineConnectionState::CONNECTED(
+                            Arc::clone(&transport),
+                            transport_address.clone(),
+                        );
+
+                        connector
+                            .tm
+                            .register_sip_transport(Arc::clone(&transport), transport_tx);
+                    }
+
+                    _ => return, // dropping transport_tx closes the connection
+                }
+            }
+
+            let registration = Arc::new(Registration::new(
+                connector.subscription_id,
+                impi,
+                impu,
+                home_domain,
+                authentication_type,
+                Arc::clone(&transport),
+                transport_address.clone(),
+                registration_id,
+                sip_instance_id,
+            ));
+
+            connector.flow_manager.observe_registration(
+                &transport,
+                transport_address,
+                &registration,
+                &connector.core,
+                &connector.rt,
+            );
+
+            let connector_ = Arc::downgrade(&connector);
+            let transport_ = Arc::clone(&transport);
+            start_register(
+                &registration,
+                &connector.flow_manager,
+                &connector.core,
+                &connector.rt,
+                move |ev| {
+                    if let Some(connector) = connector_.upgrade() {
+                        connector.on_registration_event(ev, &transport_, sip_instance_id);
+                    }
+                },
+            );
+        });
+    }
+
+    /// Ends `attempt` to connect, unless another attempt overtook it, and
+    /// connects again as `reconnect` says
+    fn end_attempt(self: &Arc<Self>, attempt: u64, reconnect: Reconnect) {
+        {
+            let retry = self.retry.lock().unwrap();
+            if retry.generation != attempt {
+                return;
+            }
+
+            let mut guard = self.state.lock().unwrap();
+            match &guard.0 {
+                RcsEngineConnectionState::CONNECTING => {
+                    guard.0 = RcsEngineConnectionState::IDLE;
+                }
+
+                _ => return,
+            }
+        }
+
+        self.schedule_reconnect(reconnect);
+    }
+
+    /// Ends the connection over `transport`, unless it ended already, and
+    /// connects again as `reconnect` says
+    fn on_lost(self: &Arc<Self>, transport: &Arc<SipTransport>, reconnect: Reconnect) {
+        {
+            let mut guard = self.state.lock().unwrap();
+            match &guard.0 {
+                RcsEngineConnectionState::CONNECTED(current, _)
+                    if Arc::ptr_eq(current, transport) => {}
+
+                _ => return,
+            }
+
+            guard.0 = RcsEngineConnectionState::IDLE;
+            guard.1 = RcsEngineRegistrationState::NONE;
+        }
+
+        (self.state_callback)(RcsEngineRegistrationState::NONE);
+
+        let _ = self.flow_manager.stop_observation(transport);
+        self.tm.unregister_sip_transport(transport, &self.rt);
+
+        self.schedule_reconnect(reconnect);
+    }
+
+    /// Connects again after the time `reconnect` says, if still wanted, the
+    /// backoff growing with each attempt in a row that fails
+    fn schedule_reconnect(self: &Arc<Self>, reconnect: Reconnect) {
+        let (delay, attempt) = {
+            let mut retry = self.retry.lock().unwrap();
+            if !retry.wanted {
+                return;
+            }
+
+            let delay = match reconnect_delay(reconnect, retry.failures) {
+                Some(delay) => delay,
+                None => return,
+            };
+
+            retry.failures += 1;
+            retry.generation += 1;
+
+            (delay, retry.generation)
+        };
+
+        platform_log(LOG_TAG, format!("connecting again in {:?}", delay));
+
+        let connector = Arc::downgrade(self);
+
+        self.rt.spawn(async move {
+            tokio::time::sleep(delay).await;
+
+            if let Some(connector) = connector.upgrade() {
+                connector.connect(attempt);
+            }
+        });
+    }
+
+    fn on_registration_event(
+        self: &Arc<Self>,
+        event: RegistrationEvent,
+        transport: &Arc<SipTransport>,
+        sip_instance_id: Uuid,
+    ) {
+        match event {
+            RegistrationEvent::Registered(unbarred_impu) => {
+                platform_log(LOG_TAG, "on RegistrationEvent::Registered");
+
+                {
+                    let mut guard = self.state.lock().unwrap();
+                    match &guard.0 {
+                        RcsEngineConnectionState::CONNECTED(current, _)
+                            if Arc::ptr_eq(current, transport) => {}
+
+                        _ => return,
+                    }
+
+                    guard.1 = RcsEngineRegistrationState::AUTHENTICATED(unbarred_impu.clone());
+                    // to-do: we need to append transport address anyway, why not here?
+                }
+
+                let sip_instance_id = format!(
+                    "<urn:uuid:{}>",
+                    sip_instance_id
+                        .as_hyphenated()
+                        .encode_lower(&mut Uuid::encode_buffer())
+                );
+
+                self.core.set_default_public_identity(
+                    unbarred_impu.clone(),
+                    sip_instance_id.clone(),
+                    Arc::clone(transport),
+                ); // fix-me: contact identities should not be visible for sip core, best we can do is to provide a map between transport and registered impu to each message consumer
+
+                self.cpm_session_service.set_registered_public_identity(
+                    unbarred_impu.clone(),
+                    sip_instance_id.clone(),
+                    Arc::clone(transport),
+                );
+
+                self.conference_service_v1.set_registered_public_identity(
+                    unbarred_impu.clone(),
+                    sip_instance_id.clone(),
+                    Arc::clone(transport),
+                );
+
+                self.retry.lock().unwrap().failures = 0;
+
+                (self.state_callback)(RcsEngineRegistrationState::AUTHENTICATED(unbarred_impu));
+            }
+
+            RegistrationEvent::Refreshed => {
+                platform_log(LOG_TAG, "on RegistrationEvent::Refreshed");
+            }
+
+            RegistrationEvent::Released(reconnect) => {
+                platform_log(
+                    LOG_TAG,
+                    format!("on RegistrationEvent::Released, {:?}", reconnect),
+                );
+
+                self.on_lost(transport, reconnect);
+            }
+        }
+    }
+
+    fn on_flow_event(
+        self: &Arc<Self>,
+        event: FlowEvent,
+        transport: &Arc<SipTransport>,
+        registration: &Arc<Registration>,
+    ) {
+        match event {
+            FlowEvent::Registered(public_user_id) => {
+                platform_log(
+                    LOG_TAG,
+                    format!("flow_manager: registered as {}", &public_user_id),
+                );
+
+                let current = {
+                    let mut guard = self.state.lock().unwrap();
+                    match &guard.0 {
+                        RcsEngineConnectionState::CONNECTED(current, _)
+                            if Arc::ptr_eq(current, transport) =>
+                        {
+                            guard.1 =
+                                RcsEngineRegistrationState::MAINTAINED(public_user_id.clone());
+                            true
+                        }
+
+                        _ => false,
+                    }
+                };
+
+                if !current {
+                    platform_log(LOG_TAG, "registered on a connection given up");
+                    self.release(transport, Some(registration), &self.rt);
+                    return;
+                }
+
+                (self.state_callback)(RcsEngineRegistrationState::MAINTAINED(public_user_id));
+            }
+
+            FlowEvent::Lost(reconnect) => {
+                platform_log(LOG_TAG, format!("flow_manager: lost, {:?}", reconnect));
+
+                self.on_lost(transport, reconnect);
+            }
+        }
+    }
+
+    /// Leaves the connection over `transport`, de-registering `registration`
+    /// first if registered
+    fn release(
+        &self,
+        transport: &Arc<SipTransport>,
+        registration: Option<&Arc<Registration>>,
+        rt: &Arc<Runtime>,
+    ) {
+        let deregistering = match registration {
+            Some(registration) => deregister(registration, &self.core, rt),
+            None => false,
+        };
+
+        // the connection is left once the de-registration is answered
+        if !deregistering {
+            self.tm.unregister_sip_transport(transport, rt);
+        }
+    }
+}
+
+/// How long to wait before connecting again as `reconnect` says, after
+/// `failures` attempts in a row have failed, if at all
+fn reconnect_delay(reconnect: Reconnect, failures: u32) -> Option<Duration> {
+    match reconnect {
+        Reconnect::Now if failures == 0 => Some(Duration::ZERO),
+        Reconnect::Now | Reconnect::Backoff => Some(backoff(failures)),
+        Reconnect::After(after) => Some(after.max(backoff(failures))),
+        Reconnect::Never => None,
+    }
+}
+
+/// A connection to the P-CSCF known by `host` or `ip`, at `port` or the
+/// ports DNS gives (RFC 3263), the addresses of each tried in turn, IPv4
+/// first
+async fn connect_to_p_cscf(
+    context: &Arc<Context>,
+    dns_config: DnsConfig,
+    service_type: &ServiceType,
+    host: Option<String>,
+    ip: Option<IpAddr>,
+    port: Option<u16>,
+) -> Option<ClientStream> {
+    let dns_client = context.get_dns_client();
+
+    let name = match (&host, ip) {
+        (Some(host), _) => host.clone(),
+        (None, Some(ip)) => ip.to_string(),
+        (None, None) => return None,
+    };
+
+    let mut targets = Vec::new();
+    match port {
+        Some(port) => targets.push((name.clone(), port)),
+        None => {
+            if let Ok(mut stream) = dns_client
+                .resolve_service(
+                    dns_config.clone(),
+                    name.clone(),
+                    service_type.get_string_repr(),
+                )
+                .await
+            {
+                while let Some(target) = stream.next().await {
+                    targets.push(target);
+                }
+            }
+        }
+    }
+
+    for (target, port) in targets {
+        platform_log(
+            LOG_TAG,
+            format!("connect(): sip service resolved with {}:{}", &target, port),
+        );
+
+        let mut addrs = Vec::new();
+        match ip {
+            Some(ip) => addrs.push(ip),
+            None => {
+                if let Ok(mut stream) = dns_client.resolve(dns_config.clone(), target.clone()).await
+                {
+                    while let Some(addr) = stream.next().await {
+                        addrs.push(addr);
+                    }
+                }
+            }
+        }
+
+        // IPv6 only where IPv4 fails, as many carrier networks do not take
+        // SIP over IPv6 yet
+        addrs.sort_by_key(|addr| addr.is_ipv6());
+
+        // the server is known by the domain asked for, not the one DNS gave
+        // (RFC 5922 section 4)
+        let server_name = host.as_deref().unwrap_or(&name);
+
+        for addr in addrs {
+            if let Some(cs) = open_stream(context, service_type, addr, port, server_name).await {
+                return Some(cs);
+            }
+        }
+    }
+
+    None
+}
+
+async fn open_stream(
+    context: &Arc<Context>,
+    service_type: &ServiceType,
+    addr: IpAddr,
+    port: u16,
+    server_name: &str,
+) -> Option<ClientStream> {
+    match service_type {
+        ServiceType::SipD2T => {
+            #[cfg(all(feature = "android", target_os = "android"))]
+            let r = ClientStream::new_android(addr, port).await;
+
+            #[cfg(all(feature = "ohos", all(target_os = "linux", target_env = "ohos")))]
+            let r = ClientStream::new_ohos(addr, port).await;
+
+            #[cfg(not(any(
+                all(feature = "android", target_os = "android"),
+                all(feature = "ohos", all(target_os = "linux", target_env = "ohos"))
+            )))]
+            let r = ClientStream::new_tokio(addr, port).await;
+
+            match r {
+                Ok(cs) => Some(cs),
+                Err(e) => {
+                    platform_log(LOG_TAG, format!("error creating client stream: {:?}", e));
+                    None
+                }
+            }
+        }
+
+        ServiceType::SipsD2T => {
+            #[cfg(all(feature = "android", target_os = "android"))]
+            let r = ClientStream::new_android_ssl(addr, port, server_name).await;
+
+            #[cfg(all(feature = "ohos", all(target_os = "linux", target_env = "ohos")))]
+            let r = ClientStream::new_ohos_ssl(
+                context.get_tls_client_config(),
+                addr,
+                port,
+                server_name,
+            )
+            .await;
+
+            #[cfg(not(any(
+                all(feature = "android", target_os = "android"),
+                all(feature = "ohos", all(target_os = "linux", target_env = "ohos"))
+            )))]
+            let r = ClientStream::new_tokio_ssl(
+                context.get_tls_client_config(),
+                addr,
+                port,
+                server_name,
+            )
+            .await;
+
+            match r {
+                Ok(cs) => match cs.do_handshake().await {
+                    Ok((cs, _)) => {
+                        platform_log(LOG_TAG, format!("ssl do_handshake success"));
+                        Some(cs)
+                    }
+                    Err(e) => {
+                        platform_log(
+                            LOG_TAG,
+                            format!("ssl do_handshake failed with error {:?}", e),
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    platform_log(
+                        LOG_TAG,
+                        format!("error creating ssl client stream: {:?}", e),
+                    );
+                    None
+                }
+            }
+        }
+
+        ServiceType::SipD2U => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::reconnect_delay;
+    use crate::connectivity::retry::Reconnect;
+
+    #[test]
+    fn a_lost_registration_is_made_again_at_once_only_after_a_success() {
+        assert_eq!(reconnect_delay(Reconnect::Now, 0), Some(Duration::ZERO));
+
+        // lost again before registering: the backoff
+        let delay = reconnect_delay(Reconnect::Now, 1).unwrap();
+        assert!(delay >= Duration::from_secs(30) && delay <= Duration::from_secs(60));
+
+        let delay = reconnect_delay(Reconnect::Backoff, 0).unwrap();
+        assert!(delay >= Duration::from_secs(15) && delay <= Duration::from_secs(30));
+
+        // the time the network asks for, or the backoff if longer
+        assert_eq!(
+            reconnect_delay(Reconnect::After(Duration::from_secs(600)), 0),
+            Some(Duration::from_secs(600))
+        );
+        let delay = reconnect_delay(Reconnect::After(Duration::from_secs(1)), 2).unwrap();
+        assert!(delay >= Duration::from_secs(60) && delay <= Duration::from_secs(120));
+
+        assert_eq!(reconnect_delay(Reconnect::Never, 0), None);
     }
 }
