@@ -16,3 +16,7 @@ pub mod authentication_type;
 pub mod flow;
 pub mod reg_info_xml;
 pub mod registration;
+pub mod retry;
+
+#[cfg(test)]
+mod tests;

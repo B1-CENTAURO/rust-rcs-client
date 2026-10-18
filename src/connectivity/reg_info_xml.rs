@@ -37,6 +37,7 @@ pub struct ContactNode {
     pub event: String,
     pub duration_registered: Option<String>,
     pub expires: Option<String>,
+    pub retry_after: Option<String>,
     pub id: String,
     pub uri: String,
 }
@@ -254,6 +255,7 @@ where
     let mut event: Option<String> = None;
     let mut duration_registered: Option<String> = None;
     let mut expires: Option<String> = None;
+    let mut retry_after: Option<String> = None;
     let mut id: Option<String> = None;
 
     for attribute in e.attributes() {
@@ -273,6 +275,10 @@ where
             } else if attribute.key.as_ref() == b"expires" {
                 if let Ok(attribute_value) = attribute.unescape_value() {
                     expires.replace(attribute_value.into_owned());
+                }
+            } else if attribute.key.as_ref() == b"retry-after" {
+                if let Ok(attribute_value) = attribute.unescape_value() {
+                    retry_after.replace(attribute_value.into_owned());
                 }
             } else if attribute.key.as_ref() == b"id" {
                 if let Ok(attribute_value) = attribute.unescape_value() {
@@ -323,6 +329,7 @@ where
             event,
             duration_registered,
             expires,
+            retry_after,
             id,
             uri,
         });

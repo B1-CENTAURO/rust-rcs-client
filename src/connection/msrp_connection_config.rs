@@ -54,10 +54,11 @@ impl MsrpConnectionConfig {
                     server_addrs: dns_servers,
                 };
 
-                let proto = if network_type == 1 {
-                    &self.transport_proto.ps_media
-                } else {
-                    &self.transport_proto.wifi_media
+                // 1 is Wi-Fi, 2 cellular and 3 cellular roaming
+                let proto = match network_type {
+                    2 => &self.transport_proto.ps_media,
+                    3 => &self.transport_proto.ps_media_roaming,
+                    _ => &self.transport_proto.wifi_media,
                 };
 
                 return Some((
