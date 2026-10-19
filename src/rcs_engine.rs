@@ -1210,6 +1210,23 @@ impl RcsEngine {
         }
     }
 
+    /// Leaves the group chat at `conference_uri` for good, its session
+    /// restarted first if there is none (RCC.07 section 3.2.4.11). `callback`
+    /// is told how the focus answered; a restart refused with 404 or 403
+    /// means the user already takes no part in the group (section 3.2.4.10).
+    pub fn leave_group_chat<F>(&self, conference_uri: &str, callback: F, rt: &Arc<Runtime>)
+    where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        match registered_identity(&self.state) {
+            Some(_) => {
+                self.cpm_session_service
+                    .leave_group_chat(conference_uri, callback, &self.core, rt)
+            }
+            None => callback(403, String::from("Forbidden")),
+        }
+    }
+
     /// Tells `recipient`, in the chat session there is with it, that the user
     /// is composing a message, or no longer is. No session is started for it:
     /// 404 if there is none.

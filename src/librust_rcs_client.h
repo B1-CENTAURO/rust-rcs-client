@@ -124,6 +124,11 @@ extern void rcs_client_add_group_chat_participants(struct rcs_client *client, co
                                 const char *const *participants, size_t participant_count,
                                 message_result_callback cb, void *context);
 
+// leaves the group chat for good, where ending its session leaves it only until the next; its session is restarted first if there is none;
+// a restart refused with 404 or 403 means the user already takes no part in the group
+extern void rcs_client_leave_group_chat(struct rcs_runtime *runtime, struct rcs_client *client, const char *conference_uri,
+                                message_result_callback cb, void *context);
+
 // tells the recipient, in the chat session there is with it, that the user is composing (active != 0) or no longer is;
 // no session is started for it: 404 if there is none
 extern void rcs_client_send_is_composing(struct rcs_runtime *runtime, struct rcs_client *client, const char *recipient,

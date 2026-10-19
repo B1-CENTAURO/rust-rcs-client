@@ -16,6 +16,7 @@
 //! package (RFC 4575) while the session with the group lasts, and adding
 //! participants to one (RFC 5368)
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use quick_xml::events::Event;
@@ -279,6 +280,10 @@ impl Roster {
 /// last
 pub struct GroupChats {
     core: Mutex<Option<Weak<SipCore>>>,
+    /// The Conversation-ID and Contribution-ID of each group by its URI, as
+    /// its last session had them, for it to be restarted with (RCC.07
+    /// section 3.2.4.10)
+    ids: Mutex<HashMap<String, (String, String)>>,
     registered_public_identity: Arc<Mutex<Option<(Arc<SipTransport>, String, String)>>>,
     pub(crate) listener: Arc<dyn Fn(CPMGroupEvent) + Send + Sync>,
 }
@@ -290,6 +295,7 @@ impl GroupChats {
     ) -> GroupChats {
         GroupChats {
             core: Mutex::new(None),
+            ids: Mutex::new(HashMap::new()),
             registered_public_identity,
             listener,
         }
@@ -298,6 +304,12 @@ impl GroupChats {
     /// The core subscriptions to the groups' conference events are made with
     pub(crate) fn attach_core(&self, core: &Arc<SipCore>) {
         self.core.lock().unwrap().replace(Arc::downgrade(core));
+    }
+
+    /// The Conversation-ID and Contribution-ID the group at `conference_uri`
+    /// had in its last session, if there was one
+    pub(crate) fn ids_of(&self, conference_uri: &str) -> Option<(String, String)> {
+        self.ids.lock().unwrap().get(conference_uri).cloned()
     }
 
     /// Takes note of `sip_session` starting, which if with a group is
@@ -312,6 +324,15 @@ impl GroupChats {
         }
         let conference_uri =
             String::from_utf8_lossy(&session_info.cpm_contact.service_uri).into_owned();
+
+        if let (Some(conversation_id), Some(contribution_id)) =
+            (&session_info.conversation_id, &session_info.contribution_id)
+        {
+            self.ids.lock().unwrap().insert(
+                conference_uri.clone(),
+                (conversation_id.clone(), contribution_id.clone()),
+            );
+        }
 
         (self.listener)(CPMGroupEvent::Joined(conference_uri.clone()));
 

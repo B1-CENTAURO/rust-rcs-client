@@ -87,6 +87,7 @@ use super::session_invitation::{
 };
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMContact, CPMServiceType};
+use super::standalone_messaging::OutgoingPagerModeContext;
 use super::{
     decode_base64, is_composing_document, is_media_type, make_cpim_message_content_body,
     new_message_id, understands_cpim_requirements, CPMMessageParam, IS_COMPOSING,
@@ -905,6 +906,10 @@ impl CPMSession {
     }
 }
 
+/// The Reason of the BYE leaving a group chat for good, as RCC.07 gives it;
+/// one of another cause leaves it only until the session is restarted
+const LEAVING_REASON: &[u8] = b"SIP;cause=200;text=\"Call completed\"";
+
 /// What ending a chat session takes
 #[derive(Clone)]
 pub(crate) struct SessionEnd {
@@ -922,6 +927,57 @@ impl SessionEnd {
     /// starts another, its MSRP connection closes, and its dialog goes,
     /// ended with a BYE if `send_bye`, as when its MSRP connection is lost
     pub(crate) fn end(&self, send_bye: bool) {
+        if !self.close() {
+            return;
+        }
+
+        if send_bye {
+            if let Ok(message) = self.dialog.make_request(b"BYE", None) {
+                self.send(message, ClientTransactionNilCallbacks {});
+            }
+        }
+
+        self.hang_up();
+    }
+
+    /// Leaves the group the session is with for good, where end() leaves it
+    /// only until the next session: with a BYE whose Reason is SIP cause 200
+    /// (RCC.07 section 3.2.4.11, by RCC.11), `callback` told how it was
+    /// answered, or else why it was not sent
+    pub(crate) fn leave<F>(&self, callback: F)
+    where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        if !self.close() {
+            callback(481, String::from("Call/Transaction Does Not Exist"));
+            return;
+        }
+
+        let (client_transaction_tx, mut client_transaction_rx) = mpsc::channel(1);
+        self.rt.spawn(async move {
+            match client_transaction_rx.recv().await {
+                Some((status_code, reason_phrase)) => callback(status_code, reason_phrase),
+                None => callback(500, String::from("Internal Error")),
+            }
+        });
+
+        if let Ok(mut message) = self.dialog.make_request(b"BYE", None) {
+            message.add_header(Header::new(b"Reason", LEAVING_REASON));
+            self.send(
+                message,
+                OutgoingPagerModeContext {
+                    client_transaction_tx,
+                    rt: Arc::clone(&self.rt),
+                },
+            );
+        }
+
+        self.hang_up();
+    }
+
+    /// Takes the session out of those ongoing and ends it; false if it ended
+    /// already
+    fn close(&self) -> bool {
         // which the session holds, and holds it
         self.sip_session
             .get_inner()
@@ -940,28 +996,27 @@ impl SessionEnd {
             }
         }
 
-        if !self.sip_session.get_inner().end(&self.rt) {
-            return;
-        }
+        self.sip_session.get_inner().end(&self.rt)
+    }
 
-        if send_bye {
-            if let Ok(message) = self.dialog.make_request(b"BYE", None) {
-                let transport = match &*self.registered_public_identity.lock().unwrap() {
-                    Some((transport, _, _)) => Some(Arc::clone(transport)),
-                    None => None,
-                };
-                if let Some(transport) = transport {
-                    self.tm.send_request(
-                        message,
-                        &transport,
-                        ClientTransactionNilCallbacks {},
-                        &self.rt,
-                    );
-                }
-            }
+    /// Sends `message` over the registered transport, if there is one
+    fn send<C>(&self, message: SipMessage, callbacks: C)
+    where
+        C: ClientTransactionCallbacks + Send + Sync + 'static,
+    {
+        let transport = match &*self.registered_public_identity.lock().unwrap() {
+            Some((transport, _, _)) => Some(Arc::clone(transport)),
+            None => None,
+        };
+        if let Some(transport) = transport {
+            self.tm
+                .send_request(message, &transport, callbacks, &self.rt);
         }
+    }
 
-        // not from within the dialog, which may be calling us
+    /// Lets go of the session's dialog, not from within the dialog, which
+    /// may be calling us
+    fn hang_up(&self) {
         let sip_session = Arc::clone(&self.sip_session);
         self.rt.spawn(async move {
             sip_session.hang_up();
@@ -1273,25 +1328,7 @@ impl CPMSessionService {
     where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
-        let session_end = {
-            let sessions = self.ongoing_sessions.lock().unwrap();
-            sessions
-                .iter()
-                .find(|(known_identities, sip_session)| {
-                    known_identities == conference_uri
-                        && matches!(
-                            sip_session
-                                .get_inner()
-                                .get_session_info()
-                                .cpm_contact
-                                .service_type,
-                            CPMServiceType::Group
-                        )
-                })
-                .and_then(|(_, sip_session)| {
-                    sip_session.get_inner().session_end.lock().unwrap().clone()
-                })
-        };
+        let session_end = group_session_end(&self.ongoing_sessions.lock().unwrap(), conference_uri);
         match session_end {
             Some(session_end) => refer_participants(&session_end, participants, callback),
             None => false,
@@ -1392,23 +1429,8 @@ impl CPMSessionService {
             Some((_, public_user_identity, _)) => public_user_identity.clone(),
             None => return false,
         };
-        let session = {
-            let sessions = self.ongoing_sessions.lock().unwrap();
-            sessions
-                .iter()
-                .find(|(known_identities, sip_session)| {
-                    known_identities == conference_uri
-                        && matches!(
-                            sip_session
-                                .get_inner()
-                                .get_session_info()
-                                .cpm_contact
-                                .service_type,
-                            CPMServiceType::Group
-                        )
-                })
-                .map(|(_, sip_session)| sip_session.get_inner())
-        };
+        let session = group_session(&self.ongoing_sessions.lock().unwrap(), conference_uri)
+            .map(|sip_session| sip_session.get_inner());
         match session {
             Some(session) => {
                 send_group_imdn(
@@ -1444,6 +1466,68 @@ impl CPMSessionService {
             }
             None => false,
         }
+    }
+
+    /// Leaves the group chat at `conference_uri` for good, where ending its
+    /// session leaves it only until the next: in its session, which is
+    /// started first if there is none. `callback` is told how the focus
+    /// answered, or why the group could not be left.
+    pub fn leave_group_chat<F>(
+        &self,
+        conference_uri: &str,
+        callback: F,
+        core: &Arc<SipCore>,
+        rt: &Arc<Runtime>,
+    ) where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        let sessions = self.ongoing_sessions.lock().unwrap();
+        if let Some(session_end) = group_session_end(&sessions, conference_uri) {
+            drop(sessions);
+            session_end.leave(callback);
+            return;
+        }
+
+        let invitations = self.ongoing_outgoing_invitations.lock().unwrap();
+        if invitations.iter().any(|invitation| {
+            let (known_identities, _) = invitation.as_ref();
+            known_identities == conference_uri
+        }) {
+            // a session with the group on its way, for a request made once
+            // it starts to leave in
+            drop(invitations);
+            drop(sessions);
+            callback(491, String::from("Request Pending"));
+            return;
+        }
+
+        let ongoing_sessions = Arc::clone(&self.ongoing_sessions);
+        let group = String::from(conference_uri);
+        self.invite(
+            sessions,
+            invitations,
+            Invitee {
+                uri: conference_uri,
+                to_uri: conference_uri,
+                recipient_type: &RecipientType::Group,
+                known_as: Some(conference_uri),
+                new_group: None,
+            },
+            None,
+            Some(Box::new(move |status_code, reason_phrase, _| {
+                if status_code != 200 {
+                    callback(status_code, reason_phrase);
+                    return;
+                }
+                let session_end = group_session_end(&ongoing_sessions.lock().unwrap(), &group);
+                match session_end {
+                    Some(session_end) => session_end.leave(callback),
+                    None => callback(481, String::from("Call/Transaction Does Not Exist")),
+                }
+            })),
+            core,
+            rt,
+        );
     }
 
     pub fn has_session_with(&self, recipient: &str) -> bool {
@@ -1727,19 +1811,24 @@ impl CPMSessionService {
                     invite_message.add_header(Header::new(b"Accept-Contact", "*;+g.3gpp.iari-ref=\"urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.chatbot\";+g.gsma.rcs.botversion=\"#=1,#=2\";require;explicit"));
                 }
 
-                let conversation_id = String::from(
-                    Uuid::new_v4()
-                        .as_hyphenated()
-                        .encode_lower(&mut Uuid::encode_buffer()),
-                );
-                invite_message.add_header(Header::new(b"Conversation-ID", conversation_id));
-
-                let contribution_id = String::from(
-                    Uuid::new_v4()
-                        .as_hyphenated()
-                        .encode_lower(&mut Uuid::encode_buffer()),
-                );
-                invite_message.add_header(Header::new(b"Contribution-ID", contribution_id));
+                // a group restarted with those it was started or joined with
+                // (RCC.07 section 3.2.4.10)
+                let stored_ids = match (recipient_type, &invitee.new_group) {
+                    (RecipientType::Group, None) => self.group_chats.ids_of(recipient),
+                    _ => None,
+                };
+                let (conversation_id, contribution_id) = stored_ids.unwrap_or_else(|| {
+                    let new_id = || {
+                        String::from(
+                            Uuid::new_v4()
+                                .as_hyphenated()
+                                .encode_lower(&mut Uuid::encode_buffer()),
+                        )
+                    };
+                    (new_id(), new_id())
+                });
+                invite_message.add_header(Header::new(b"Conversation-ID", conversation_id.clone()));
+                invite_message.add_header(Header::new(b"Contribution-ID", contribution_id.clone()));
 
                 invite_message.add_header(Header::new(
                     b"Allow",
@@ -1858,7 +1947,11 @@ impl CPMSessionService {
 
                     if let Some(res) = client_transaction_rx.recv().await {
                         match res {
-                            Ok((resp_message, session_info, r_sdp_body)) => {
+                            Ok((resp_message, mut session_info, r_sdp_body)) => {
+                                // those sent, unless the answer tells others
+                                session_info.conversation_id.get_or_insert(conversation_id);
+                                session_info.contribution_id.get_or_insert(contribution_id);
+
                                 if let Some(l_sdp) = match l_sdp_body.as_ref() {
                                     Body::Raw(raw) => {
                                         raw.as_sdp()
@@ -2158,6 +2251,37 @@ impl CPMSessionService {
             started(500, String::from("Internal Error"), None);
         }
     }
+}
+
+/// The session with the group at `conference_uri` among `sessions`
+fn group_session<'s>(
+    sessions: &'s [(ContactKnownIdentities, Arc<SipSession<CPMSession>>)],
+    conference_uri: &str,
+) -> Option<&'s Arc<SipSession<CPMSession>>> {
+    sessions
+        .iter()
+        .find(|(known_identities, sip_session)| {
+            known_identities == conference_uri
+                && matches!(
+                    sip_session
+                        .get_inner()
+                        .get_session_info()
+                        .cpm_contact
+                        .service_type,
+                    CPMServiceType::Group
+                )
+        })
+        .map(|(_, sip_session)| sip_session)
+}
+
+/// What ending the session with the group at `conference_uri` takes, if
+/// there is such a session and it has not ended
+fn group_session_end(
+    sessions: &[(ContactKnownIdentities, Arc<SipSession<CPMSession>>)],
+    conference_uri: &str,
+) -> Option<SessionEnd> {
+    group_session(sessions, conference_uri)
+        .and_then(|sip_session| sip_session.get_inner().session_end.lock().unwrap().clone())
 }
 
 /// Whom an outgoing session is with

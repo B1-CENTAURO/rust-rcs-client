@@ -1106,6 +1106,33 @@ pub unsafe extern "C" fn rcs_client_send_is_composing(
     callback(403, String::from("Forbidden"));
 }
 
+/// Leaves the group chat at `conference_uri` for good, where ending its
+/// session leaves it only until the next; its session is restarted first if
+/// there is none. A restart refused with 404 or 403 means the user already
+/// takes no part in the group.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_leave_group_chat(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    conference_uri: *const c_char,
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_leave_group_chat()");
+
+    let callback = message_result_closure(cb, cb_context);
+
+    if let (Some(rcs_runtime), Some(client)) = (rcs_runtime.as_ref(), client.as_ref()) {
+        let conference_uri = CStr::from_ptr(conference_uri).to_string_lossy();
+        client
+            .engine
+            .leave_group_chat(&conference_uri, callback, &rcs_runtime.rt);
+        return;
+    }
+
+    callback(403, String::from("Forbidden"));
+}
+
 /// Ends the chat session with `recipient`, a contact or a group: 404 if there
 /// is none. A message sent to it from now on starts another.
 #[no_mangle]

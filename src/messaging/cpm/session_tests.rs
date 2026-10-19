@@ -2316,3 +2316,157 @@ fn a_group_message_asking_to_be_told_of_is_answered_in_the_session_of_the_group(
         .sessions
         .send_group_imdn(PEER, &notice.xml, ALICE, |_, _| {}, &rt));
 }
+
+/// The Reason of a BYE leaving a group for good
+const LEAVING: &str = "SIP;cause=200;text=\"Call completed\"";
+
+/// The Contact of the focus of the group
+fn focus_contact() -> String {
+    format!(
+        "<{}>;isfocus;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+        GROUP
+    )
+}
+
+/// Leaves the group at `conference_uri`, returning a receiver of how it went
+fn leave(client: &Client, conference_uri: &str) -> Receiver<u16> {
+    let (result_tx, result) = mpsc::channel();
+    client.sessions.leave_group_chat(
+        conference_uri,
+        move |status_code, _| {
+            let _ = result_tx.send(status_code);
+        },
+        &client.core,
+        &client.rt,
+    );
+    result
+}
+
+#[test]
+fn a_group_is_left_for_good_with_a_bye_saying_so() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (mut connection, invite, _subscribe, _) = new_group(&client, &mut peer);
+
+    let result = leave(&client, GROUP);
+    let bye = peer.next_request("BYE");
+    assert_eq!(
+        header_value(&bye, "Call-ID"),
+        header_value(&invite, "Call-ID"),
+        "in the session's dialog"
+    );
+    assert_eq!(header_value(&bye, "Reason"), LEAVING);
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
+
+    assert!(!client.sessions.has_session_with(GROUP));
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+    assert_eq!(next_group_event(&client), format!("left {}", GROUP));
+}
+
+#[test]
+fn a_group_without_a_session_is_restarted_to_be_left() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (mut connection, invite, _subscribe, _) = new_group(&client, &mut peer);
+
+    // its session ended for the time being, as the focus does once it idles
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    assert_eq!(header_value(&bye, "Reason"), "", "not leaving the group");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+
+    let msrp = MsrpPeer::listen(&rt);
+    let result = leave(&client, GROUP);
+    let restart = peer.next_request("INVITE");
+    assert_eq!(request_uri(&restart), GROUP);
+    assert_eq!(header_value(&restart, "To"), format!("<{}>", GROUP));
+    assert_eq!(header_value(&restart, "Require"), "", "no one to invite");
+    for id in ["Conversation-ID", "Contribution-ID"] {
+        assert_eq!(
+            header_value(&restart, id),
+            header_value(&invite, id),
+            "the group's {}",
+            id
+        );
+    }
+
+    // meanwhile, another request to leave waits for it
+    assert_eq!(
+        leave(&client, GROUP).recv_timeout(Duration::from_secs(5)),
+        Ok(491)
+    );
+
+    // and once restarted, it is left
+    peer.send(&answer_from(
+        &restart,
+        "200 OK",
+        &focus_contact(),
+        Some(&msrp.sdp("sendrecv")),
+    ));
+    let requests = next_requests(&mut peer, &["ACK", "SUBSCRIBE", "BYE"]);
+    let bye = &requests[2];
+    assert_eq!(
+        header_value(bye, "Call-ID"),
+        header_value(&restart, "Call-ID")
+    );
+    assert_eq!(header_value(bye, "Reason"), LEAVING);
+    peer.send(&answer(bye, "200 OK", None));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
+    assert!(!client.sessions.has_session_with(GROUP));
+
+    for event in ["joined", "left", "joined", "left"] {
+        assert_eq!(next_group_event(&client), format!("{} {}", event, GROUP));
+    }
+
+    // a group the focus no longer has is told as it refuses the restart,
+    // made with identifiers of its own
+    let other = "sip:conf9@conf.example.com";
+    let result = leave(&client, other);
+    let restart = peer.next_request("INVITE");
+    assert_eq!(request_uri(&restart), other);
+    assert_ne!(
+        header_value(&restart, "Conversation-ID"),
+        header_value(&invite, "Conversation-ID")
+    );
+    peer.send(&answer(&restart, "404 Not Found", None));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(404));
+    peer.next_request("ACK");
+    peer.silence();
+}
+
+#[test]
+fn a_group_joined_is_restarted_with_the_ids_it_was_joined_with() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let msrp = MsrpPeer::listen(&rt);
+
+    peer.send(&invite(
+        "group-joined",
+        &focus_contact(),
+        GROUP,
+        "cpm.session",
+        "Referred-By: <sip:+15550001@example.com>\r\n",
+        "application/sdp",
+        &msrp.sdp("sendrecv"),
+    ));
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "group-joined"));
+    peer.next_request("SUBSCRIBE");
+    let mut connection = msrp.accept(&rt);
+
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+
+    // a message to the group restarts it as it was joined
+    let _result = client.send(GROUP, RecipientType::Group, "back");
+    let restart = peer.next_request("INVITE");
+    assert_eq!(request_uri(&restart), GROUP);
+    assert_eq!(header_value(&restart, "Conversation-ID"), "conversation-1");
+    assert_eq!(header_value(&restart, "Contribution-ID"), "contribution-1");
+}
