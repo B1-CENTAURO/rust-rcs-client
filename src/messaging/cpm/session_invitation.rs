@@ -290,7 +290,7 @@ pub fn try_accept_invitation<'a, 'b>(
 
                 let known_identities = session_info.get_contact_known_identities();
 
-                let contact_uri = session_info.asserted_contact_uri.as_bytes().to_vec();
+                let contact_uri = session_info.contact_uri().into_bytes();
                 let session = CPMSession::new(session_info);
                 let session = Arc::new(session);
 

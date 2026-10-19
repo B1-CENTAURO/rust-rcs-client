@@ -16,6 +16,7 @@
 //! to their sender in SIP MESSAGEs of the service the message came by
 
 use std::collections::VecDeque;
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use rust_rcs_core::cpim::CPIMInfo;
@@ -23,14 +24,19 @@ use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::imdn::notification::{Dispositions, Imdn, Notification, Status};
 use rust_rcs_core::internet::Header;
 use rust_rcs_core::io::Serializable;
+use rust_rcs_core::sip::sip_session::SipSession;
 use rust_rcs_core::sip::{SipMessage, SipTransactionManager, SipTransport, MESSAGE};
 use rust_rcs_core::util::rand;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+use super::session::CPMSession;
 use super::sip::cpm_contact::CPMServiceType;
 use super::standalone_messaging::OutgoingPagerModeContext;
-use super::{is_media_type, make_cpim_imdn_body, new_message_id, IS_COMPOSING, LOG_TAG};
+use super::{
+    is_media_type, make_cpim_imdn_body, new_message_id, CPMMessageParam, IS_COMPOSING, LOG_TAG,
+};
+use crate::messaging::ffi::RecipientType;
 
 /// The service a message came by, which notifications of it go by
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +185,87 @@ pub fn acknowledge_delivery<R>(
     }
 }
 
+/// Notes a message taken in `sip_session`, with the group at
+/// `conference_uri`, from the participant its CPIM From gives, and tells the
+/// participant it was delivered, in the session, as `public_user_identity`
+/// gives us, if it asked to be told
+pub fn acknowledge_group_delivery<P>(
+    received_messages: &ReceivedMessages,
+    sip_session: &Arc<SipSession<CPMSession>>,
+    conference_uri: &str,
+    cpim_info: &CPIMInfo,
+    content_type: &[u8],
+    public_user_identity: P,
+    rt: &Arc<Runtime>,
+) where
+    P: FnOnce() -> Option<String>,
+{
+    // the participant, whom the focus sends the notification on to
+    let sender_uri = match &cpim_info.from_uri {
+        Some(uri) => {
+            String::from_utf8_lossy(&uri.string_representation_without_query_and_fragment())
+                .into_owned()
+        }
+        None => return,
+    };
+
+    if let Some(imdn_xml) =
+        received_messages.on_received_in_group(conference_uri, &sender_uri, cpim_info, content_type)
+    {
+        if let Some(public_user_identity) = public_user_identity() {
+            send_group_imdn(
+                &sip_session.get_inner(),
+                &imdn_xml,
+                &sender_uri,
+                &public_user_identity,
+                |status_code, reason_phrase| {
+                    platform_log(
+                        LOG_TAG,
+                        format!(
+                            "group delivery notification answered with {} {}",
+                            status_code, reason_phrase
+                        ),
+                    );
+                },
+                rt,
+            );
+        }
+    }
+}
+
+/// Sends the IMDN document `imdn_xml` in the session `session` with a group,
+/// for its focus to send on to the participant `recipient_uri`, the CPIM To
+/// (RFC 5438 section 9)
+pub fn send_group_imdn<F>(
+    session: &CPMSession,
+    imdn_xml: &str,
+    recipient_uri: &str,
+    public_user_identity: &str,
+    callback: F,
+    rt: &Arc<Runtime>,
+) where
+    F: Fn(u16, String) + Send + Sync + 'static,
+{
+    let body = make_cpim_imdn_body(imdn_xml, recipient_uri, public_user_identity);
+    let mut data = Vec::with_capacity(body.estimated_size());
+    if let Ok(mut reader) = body.reader() {
+        let _ = reader.read_to_end(&mut data);
+    }
+
+    let message = CPMMessageParam::new(
+        String::from("message/cpim"),
+        String::from_utf8_lossy(&data).into_owned(),
+        new_message_id(),
+        recipient_uri,
+        &RecipientType::Group,
+        recipient_uri,
+        callback,
+    )
+    .raw();
+
+    session.send_message(message, rt);
+}
+
 /// How many messages taken are kept note of, the oldest forgotten first
 const NOTED: usize = 1024;
 
@@ -189,6 +276,18 @@ struct Received {
     service: ImdnService,
     datetime: String,
     dispositions: Dispositions,
+    /// The URI of the group it was taken in, if in one
+    group: Option<String>,
+}
+
+/// A notification to send to `sender_uri`: in the session with `group` if
+/// the message was taken in one, else by `service`
+#[derive(Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub xml: String,
+    pub sender_uri: String,
+    pub service: ImdnService,
+    pub group: Option<String>,
 }
 
 /// What became of a notification asked for
@@ -223,6 +322,35 @@ impl ReceivedMessages {
         cpim_info: &CPIMInfo,
         content_type: &[u8],
     ) -> Option<String> {
+        self.note(service, sender_uri, None, cpim_info, content_type)
+    }
+
+    /// As on_received(), for a message taken in the session with the group
+    /// at `conference_uri`, from its participant `sender_uri`
+    pub fn on_received_in_group(
+        &self,
+        conference_uri: &str,
+        sender_uri: &str,
+        cpim_info: &CPIMInfo,
+        content_type: &[u8],
+    ) -> Option<String> {
+        self.note(
+            ImdnService::Chat,
+            sender_uri,
+            Some(conference_uri),
+            cpim_info,
+            content_type,
+        )
+    }
+
+    fn note(
+        &self,
+        service: ImdnService,
+        sender_uri: &str,
+        group: Option<&str>,
+        cpim_info: &CPIMInfo,
+        content_type: &[u8],
+    ) -> Option<String> {
         // nor an is-composing indication, which asks for nothing
         if is_media_type(content_type, "message/imdn+xml")
             || is_media_type(content_type, IS_COMPOSING)
@@ -249,6 +377,7 @@ impl ReceivedMessages {
                 service,
                 datetime: datetime.clone(),
                 dispositions,
+                group: group.map(String::from),
             });
         }
 
@@ -267,9 +396,9 @@ impl ReceivedMessages {
         None
     }
 
-    /// The notification that the message `message_id` was displayed, with
-    /// the sender to send it to and the service to send it by
-    pub fn displayed(&self, message_id: &str) -> Result<(String, String, ImdnService), Refusal> {
+    /// The notification that the message `message_id` was displayed, and
+    /// where to send it
+    pub fn displayed(&self, message_id: &str) -> Result<Notice, Refusal> {
         let received = self.received.lock().unwrap();
         let message = received
             .iter()
@@ -294,7 +423,12 @@ impl ReceivedMessages {
         .to_xml()
         .ok_or(Refusal::NotAskedFor)?;
 
-        Ok((xml, message.sender_uri.clone(), message.service))
+        Ok(Notice {
+            xml,
+            sender_uri: message.sender_uri.clone(),
+            service: message.service,
+            group: message.group.clone(),
+        })
     }
 }
 
@@ -406,10 +540,11 @@ hi",
         );
         receive(&received, "Kn32", Some("positive-delivery"), b"text/plain");
 
-        let (xml, sender_uri, service) = received.displayed("Kn31").unwrap();
-        assert_eq!(sender_uri, SENDER);
-        assert_eq!(service, ImdnService::Standalone);
-        let imdn = Imdn::from_xml(xml.as_bytes()).unwrap();
+        let notice = received.displayed("Kn31").unwrap();
+        assert_eq!(notice.sender_uri, SENDER);
+        assert_eq!(notice.service, ImdnService::Standalone);
+        assert_eq!(notice.group, None);
+        let imdn = Imdn::from_xml(notice.xml.as_bytes()).unwrap();
         assert_eq!(imdn.message_id, "Kn31");
         assert_eq!(imdn.datetime, "2023-04-04T12:16:49.000+08:00");
         assert_eq!(imdn.notification, Notification::Display);

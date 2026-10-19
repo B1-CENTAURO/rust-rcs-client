@@ -39,7 +39,9 @@ use rust_rcs_core::sip::{
 
 use crate::messaging::ffi::RecipientType;
 
-use super::imdn::{acknowledge_delivery, ImdnService, ReceivedMessages};
+use super::imdn::{
+    acknowledge_delivery, acknowledge_group_delivery, ImdnService, ReceivedMessages,
+};
 use super::new_message_id;
 use super::session::{CPMGroupEvent, CPMSessionService, CPMSessionServiceWrapper};
 use super::standalone_messaging::{
@@ -261,6 +263,17 @@ pub fn start(registered: bool) -> (Client, Peer) {
                     content_type,
                     registered_identity.clone(),
                     &tm_1,
+                    &rt_1,
+                );
+            } else {
+                // in a group's session, the contact its focus
+                acknowledge_group_delivery(
+                    &received_messages_1,
+                    session,
+                    &String::from_utf8_lossy(contact),
+                    cpim_info,
+                    content_type,
+                    || registered_identity().map(|(_, impu)| impu),
                     &rt_1,
                 );
             }
@@ -907,6 +920,46 @@ fn answer_from(request: &SipMessage, status: &str, contact: &str, sdp: Option<&s
 }
 
 impl MsrpConnection {
+    /// The next MSRP response, the empty SENDs that bind the connection
+    /// answered 200 on the way
+    pub fn next_response(&mut self, rt: &Runtime) -> MsrpFrame {
+        loop {
+            let frame = self.next(rt);
+            if frame.first_line.ends_with(" SEND") && frame.body.is_empty() {
+                self.respond(rt, &frame, "200 OK");
+                continue;
+            }
+            assert!(!frame.first_line.ends_with(" SEND"), "{}", frame.first_line);
+            return frame;
+        }
+    }
+
+    /// Checks that the client sends nothing for a while but the empty SENDs
+    /// that bind the connection
+    pub fn quiet(&mut self, rt: &Runtime) {
+        let sent = rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    if let Some(frame) = self.take_frame() {
+                        if !(frame.first_line.ends_with(" SEND") && frame.body.is_empty()) {
+                            return frame;
+                        }
+                        continue;
+                    }
+                    let mut data = [0; 4096];
+                    let size = self.stream.read(&mut data).await.unwrap();
+                    assert!(size > 0, "the MSRP connection closed");
+                    self.buffer.extend_from_slice(&data[..size]);
+                }
+            })
+            .await
+            .ok()
+        });
+        if let Some(frame) = sent {
+            panic!("unexpected: {}", frame.first_line);
+        }
+    }
+
     /// Waits for the client to close the connection
     pub fn closed(&mut self, rt: &Runtime) {
         rt.block_on(async {
@@ -1542,14 +1595,15 @@ fn a_standalone_message_asking_to_be_told_of_its_delivery_is() {
     peer.send(&answer(&receipt, "200 OK", None));
 
     // and of its display, by what was noted of it
-    let (xml, sender_uri, service) = client
+    let notice = client
         .received_messages
         .displayed("peer-message-1")
         .unwrap();
+    assert_eq!(notice.group, None, "standalone, not in a group");
     super::imdn::send_imdn(
-        &xml,
-        &sender_uri,
-        service,
+        &notice.xml,
+        &notice.sender_uri,
+        notice.service,
         &client.core.get_transaction_manager(),
         &client.transport,
         IMPU,
@@ -1741,7 +1795,7 @@ const GROUP: &str = "sip:conf1@conf.example.com";
 /// A group chat the client started with two participants, its MSRP
 /// connection up, with the INVITE and the SUBSCRIBE to its conference
 /// events, answered
-fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage, SipMessage) {
+fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage, SipMessage, String) {
     let rt = Arc::clone(&client.rt);
     let msrp = MsrpPeer::listen(&rt);
 
@@ -1796,7 +1850,7 @@ fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage, S
         ),
     );
 
-    (connection, invite, subscribe)
+    (connection, invite, subscribe, msrp.path)
 }
 
 /// The requests `methods` from the client, in whatever order
@@ -1853,7 +1907,7 @@ fn next_group_event(client: &Client) -> String {
 fn a_group_chat_is_started_through_the_factory_with_its_participants() {
     let (client, mut peer) = start(true);
     let rt = Arc::clone(&client.rt);
-    let (mut connection, invite, _subscribe) = new_group(&client, &mut peer);
+    let (mut connection, invite, _subscribe, _) = new_group(&client, &mut peer);
 
     assert_eq!(request_uri(&invite), FACTORY);
     assert_eq!(header_value(&invite, "To"), format!("<{}>", FACTORY));
@@ -1954,7 +2008,7 @@ const BOB: &str = "tel:+15550002";
 fn the_participants_of_a_group_are_followed_while_its_session_lasts() {
     let (client, mut peer) = start(true);
     let rt = Arc::clone(&client.rt);
-    let (mut connection, _invite, subscribe) = new_group(&client, &mut peer);
+    let (mut connection, _invite, subscribe, _) = new_group(&client, &mut peer);
 
     assert_eq!(request_uri(&subscribe), GROUP);
     assert_eq!(header_value(&subscribe, "To"), format!("<{}>", GROUP));
@@ -2038,7 +2092,7 @@ state=\"{}\" version=\"{}\"><users>{}</users></conference-info>",
 #[test]
 fn participants_are_added_by_a_refer_in_the_session_of_the_group() {
     let (client, mut peer) = start(true);
-    let (_connection, invite, _subscribe) = new_group(&client, &mut peer);
+    let (_connection, invite, _subscribe, _) = new_group(&client, &mut peer);
 
     let (result_tx, result) = mpsc::channel();
     assert!(client.sessions.add_participants(
@@ -2125,4 +2179,140 @@ fn a_group_invitation_without_subject_or_inviter_name_is_taken() {
     let subscribe = peer.next_request("SUBSCRIBE");
     assert_eq!(request_uri(&subscribe), GROUP);
     assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+}
+
+/// A CPIM message from the participant `from`, through the focus, asking for
+/// notifications as `cpim_headers` do
+fn group_cpim(from: &str, cpim_headers: &str, content: &str) -> String {
+    format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-18T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: peer-message-1\r\n\
+{}\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+{}",
+        from, GROUP, cpim_headers, content
+    )
+}
+
+/// The CPIM headers and IMDN document of a notification the client sent in
+/// an MSRP SEND
+fn group_notification(send: &MsrpFrame) -> (CPIMMessage, Imdn) {
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    let cpim = CPIMMessage::try_from(&Body::construct_message(&send.body).unwrap()).unwrap();
+    assert!(
+        cpim.contains_imdn(),
+        "{}",
+        String::from_utf8_lossy(&send.body)
+    );
+    let text = String::from_utf8_lossy(&send.body).into_owned();
+    let xml = text.rsplit("\r\n\r\n").next().unwrap();
+    let imdn = Imdn::from_xml(xml.as_bytes()).expect("an IMDN document as it is");
+    (cpim, imdn)
+}
+
+#[test]
+fn a_group_message_asking_to_be_told_of_is_answered_in_the_session_of_the_group() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (mut connection, invite, _subscribe, focus_path) = new_group(&client, &mut peer);
+    let our_path = sdp_attribute(&String::from_utf8_lossy(&body_data(&invite)), "path")
+        .expect("an a=path in the offer");
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &group_cpim(ALICE, ASKING, "hi all"),
+    );
+    let response = connection.next_response(&rt);
+    assert!(
+        response.first_line.contains(" 200"),
+        "{}",
+        response.first_line
+    );
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| (r.0, r.2)),
+        Ok((String::from(GROUP), String::from("hi all")))
+    );
+
+    // delivered, told the participant through the focus
+    let send = connection.next_message(&rt);
+    let (cpim, imdn) = group_notification(&send);
+    let info = cpim.get_info().unwrap();
+    assert_eq!(
+        (info.from, info.to),
+        (
+            format!("<{}>", IMPU).as_bytes(),
+            format!("<{}>", ALICE).as_bytes()
+        )
+    );
+    assert!(
+        info.disposition_notification.is_none(),
+        "it asks for nothing"
+    );
+    assert_eq!(
+        (imdn.message_id.as_str(), imdn.notification, imdn.status),
+        ("peer-message-1", Notification::Delivery, Status::Delivered)
+    );
+    connection.respond(&rt, &send, "200 OK");
+
+    // and displayed, the same way, by what was noted of it
+    let notice = client
+        .received_messages
+        .displayed("peer-message-1")
+        .unwrap();
+    assert_eq!(
+        (notice.group.as_deref(), notice.sender_uri.as_str()),
+        (Some(GROUP), ALICE)
+    );
+    let (result_tx, result) = mpsc::channel();
+    let result_tx = std::sync::Mutex::new(result_tx);
+    assert!(client.sessions.send_group_imdn(
+        GROUP,
+        &notice.xml,
+        &notice.sender_uri,
+        move |status_code, _| {
+            let _ = result_tx.lock().unwrap().send(status_code);
+        },
+        &rt,
+    ));
+    let send = connection.next_message(&rt);
+    let (_, imdn) = group_notification(&send);
+    assert_eq!(
+        (imdn.notification, imdn.status),
+        (Notification::Display, Status::Displayed)
+    );
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
+
+    // a message not asking is not answered
+    connection.send_cpim(&rt, &focus_path, &our_path, &group_cpim(BOB, "", "quiet"));
+    let response = connection.next_response(&rt);
+    assert!(
+        response.first_line.contains(" 200"),
+        "{}",
+        response.first_line
+    );
+    connection.quiet(&rt);
+
+    // nor is a group there is no session with, nor a one-to-one chat
+    assert!(!client.sessions.send_group_imdn(
+        "sip:conf9@conf.example.com",
+        &notice.xml,
+        ALICE,
+        |_, _| {},
+        &rt
+    ));
+    let _one_to_one = incoming_chat(&client, &mut peer, "one-to-one");
+    assert!(!client
+        .sessions
+        .send_group_imdn(PEER, &notice.xml, ALICE, |_, _| {}, &rt));
 }

@@ -97,11 +97,13 @@ use crate::connectivity::{flow::FlowManager, registration::Registration};
 use crate::context::Context;
 use crate::messaging::config::MessagingConfigs;
 use crate::messaging::cpm::imdn::{
-    acknowledge_delivery, send_imdn, ImdnService, ReceivedMessages, Refusal,
+    acknowledge_delivery, acknowledge_group_delivery, send_imdn, ImdnService, ReceivedMessages,
+    Refusal,
 };
 use crate::messaging::cpm::new_message_id;
 use crate::messaging::cpm::session::CPMSessionServiceWrapper;
 use crate::messaging::cpm::session::{CPMGroupEvent, CPMSessionService};
+use crate::messaging::cpm::sip::cpm_contact::CPMServiceType;
 use crate::messaging::cpm::standalone_messaging::StandaloneMessagingServiceWrapper;
 use crate::messaging::cpm::standalone_messaging::{self, StandaloneMessagingService};
 use crate::messaging::cpm::MessagingSessionHandle;
@@ -616,13 +618,9 @@ impl RcsEngine {
                             cpim_date,
                             cpim_from.as_deref(),
                         );
-                        if let Some(service) = ImdnService::of_chat(
-                            &session
-                                .get_inner()
-                                .get_session_info()
-                                .cpm_contact
-                                .service_type,
-                        ) {
+                        let cpm_session = session.get_inner();
+                        let service_type = &cpm_session.get_session_info().cpm_contact.service_type;
+                        if let Some(service) = ImdnService::of_chat(service_type) {
                             acknowledge_delivery(
                                 &received_messages_2,
                                 service,
@@ -631,6 +629,17 @@ impl RcsEngine {
                                 content_type.as_bytes(),
                                 || registered_identity(&state_2),
                                 &tm_2,
+                                &rt_2,
+                            );
+                        } else if let CPMServiceType::Group = *service_type {
+                            // the contact is the group's focus
+                            acknowledge_group_delivery(
+                                &received_messages_2,
+                                session,
+                                contact_uri,
+                                cpim_info,
+                                content_type.as_bytes(),
+                                || registered_identity(&state_2).map(|(_, impu)| impu),
                                 &rt_2,
                             );
                         }
@@ -1288,8 +1297,10 @@ impl RcsEngine {
     }
 
     /// Tells the sender of the message `message_id` that it was displayed, if
-    /// it asked to be told. A message not among those last taken is answered
-    /// with 404, one that did not ask with 403.
+    /// it asked to be told: in the session with the group if the message was
+    /// taken in one, else by the service it came by. A message not among
+    /// those last taken is answered with 404, one that did not ask with 403,
+    /// and one of a group there is no session with any longer with 480.
     pub fn send_display_notification<F>(
         &self,
         message_id: &str,
@@ -1298,7 +1309,7 @@ impl RcsEngine {
     ) where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
-        let (imdn_xml, sender_uri, service) = match self.received_messages.displayed(message_id) {
+        let notice = match self.received_messages.displayed(message_id) {
             Ok(notification) => notification,
             Err(Refusal::Unknown) => {
                 result_callback(404, String::from("Not Found"));
@@ -1310,11 +1321,35 @@ impl RcsEngine {
             }
         };
 
+        if let Some(group) = &notice.group {
+            let result_callback = Arc::new(Mutex::new(Some(result_callback)));
+            let result_callback_ = Arc::clone(&result_callback);
+            let sent = self.cpm_session_service.send_group_imdn(
+                group,
+                &notice.xml,
+                &notice.sender_uri,
+                move |status_code, reason_phrase| {
+                    let result_callback = result_callback_.lock().unwrap().take();
+                    if let Some(result_callback) = result_callback {
+                        result_callback(status_code, reason_phrase);
+                    }
+                },
+                &rt,
+            );
+            if !sent {
+                let result_callback = result_callback.lock().unwrap().take();
+                if let Some(result_callback) = result_callback {
+                    result_callback(480, String::from("Temporarily Unavailable"));
+                }
+            }
+            return;
+        }
+
         match registered_identity(&self.state) {
             Some((transport, public_user_identity)) => send_imdn(
-                &imdn_xml,
-                &sender_uri,
-                service,
+                &notice.xml,
+                &notice.sender_uri,
+                notice.service,
                 &self.core.get_transaction_manager(),
                 &transport,
                 &public_user_identity,
