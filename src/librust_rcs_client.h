@@ -103,6 +103,24 @@ extern void rcs_client_send_message_with_imdn_id(struct rcs_runtime *runtime, st
                                 int8_t recipient_type, const char *imdn_message_id,
                                 message_result_callback cb, void *context);
 
+typedef void (*group_chat_result_callback) (uint16_t status_code, const char *reason_phrase, const char *conference_uri, void *context);
+
+// starts a new group chat through the provisioned conference factory, about subject unless NULL;
+// the callback is told the URI of the group once it starts (NULL if it did not), messages to it being sent with recipient_type_group
+extern void rcs_client_create_group_chat(struct rcs_runtime *runtime, struct rcs_client *client,
+                                const char *const *participants, size_t participant_count, const char *subject,
+                                group_chat_result_callback cb, void *context);
+
+// tells the recipient, in the chat session there is with it, that the user is composing (active != 0) or no longer is;
+// no session is started for it: 404 if there is none
+extern void rcs_client_send_is_composing(struct rcs_runtime *runtime, struct rcs_client *client, const char *recipient,
+                                int8_t recipient_type, int active,
+                                message_result_callback cb, void *context);
+
+// ends the chat session with a contact or a group: 404 if there is none; a message sent to it from now on starts another
+extern void rcs_client_end_chat_session(struct rcs_client *client, const char *recipient,
+                                message_result_callback cb, void *context);
+
 typedef void (*send_imdn_report_result_callback) (uint16_t status_code, const char *reason_phrase, void *context);
 
 void send_imdn_report_result_callback_context_release(void *context);

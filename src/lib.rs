@@ -62,12 +62,12 @@ use messaging::ffi::{
     get_recipient_type, DownloadFileProgressCallback, DownloadFileProgressCallbackContext,
     DownloadFileResultCallback, DownloadFileResultCallbackContext,
     DownloadFileResultCallbackContextWrapper, DownloadileProgressCallbackContextWrapper,
-    MessageResultCallback, MessageResultCallbackContext, MessageResultCallbackContextWrapper,
-    SendImdnReportResultCallback, SendImdnReportResultCallbackContext,
-    SendImdnReportResultCallbackContextWrapper, UploadFileProgressCallback,
-    UploadFileProgressCallbackContext, UploadFileProgressCallbackContextWrapper,
-    UploadFileResultCallback, UploadFileResultCallbackContext,
-    UploadFileResultCallbackContextWrapper,
+    GroupChatResultCallback, MessageResultCallback, MessageResultCallbackContext,
+    MessageResultCallbackContextWrapper, SendImdnReportResultCallback,
+    SendImdnReportResultCallbackContext, SendImdnReportResultCallbackContextWrapper,
+    UploadFileProgressCallback, UploadFileProgressCallbackContext,
+    UploadFileProgressCallbackContextWrapper, UploadFileResultCallback,
+    UploadFileResultCallbackContext, UploadFileResultCallbackContextWrapper,
 };
 use provisioning::device_configuration::{
     start_auto_config, DeviceConfigurationStatus, RetryReason,
@@ -886,6 +886,160 @@ pub unsafe extern "C" fn rcs_client_send_display_notification(
             },
         );
     }
+}
+
+/// `cb` with `cb_context`, which is let go of when the closure is
+fn message_result_closure(
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) -> impl FnOnce(u16, String) + Send + Sync + 'static {
+    let cb_context = NonNull::new(cb_context)
+        .map(|cb_context| Arc::new(Mutex::new(MessageResultCallbackContextWrapper(cb_context))));
+    move |status_code, reason_phrase| {
+        if let Some(cb) = cb {
+            let reason_phrase = c_string(reason_phrase);
+            match &cb_context {
+                Some(cb_context) => {
+                    let cb_context = cb_context.lock().unwrap();
+                    cb(status_code, reason_phrase.as_ptr(), cb_context.0.as_ptr());
+                }
+                None => cb(status_code, reason_phrase.as_ptr(), ptr::null_mut()),
+            }
+        }
+    }
+}
+
+/// Starts a new group chat with the `participant_count` URIs at
+/// `participants`, about `subject` unless NULL. `cb` is told the URI of the
+/// group once its session starts, which messages to it are sent to as to a
+/// recipient of the group type, or NULL if it did not start.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_create_group_chat(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    participants: *const *const c_char,
+    participant_count: usize,
+    subject: *const c_char,
+    cb: Option<GroupChatResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_create_group_chat()");
+
+    let cb_context = NonNull::new(cb_context)
+        .map(|cb_context| Arc::new(Mutex::new(MessageResultCallbackContextWrapper(cb_context))));
+    let callback =
+        move |status_code: u16, reason_phrase: String, conference_uri: Option<String>| {
+            if let Some(cb) = cb {
+                let reason_phrase = c_string(reason_phrase);
+                let conference_uri = conference_uri.map(c_string);
+                let conference_uri = match &conference_uri {
+                    Some(conference_uri) => conference_uri.as_ptr(),
+                    None => ptr::null(),
+                };
+                match &cb_context {
+                    Some(cb_context) => {
+                        let cb_context = cb_context.lock().unwrap();
+                        cb(
+                            status_code,
+                            reason_phrase.as_ptr(),
+                            conference_uri,
+                            cb_context.0.as_ptr(),
+                        );
+                    }
+                    None => cb(
+                        status_code,
+                        reason_phrase.as_ptr(),
+                        conference_uri,
+                        ptr::null_mut(),
+                    ),
+                }
+            }
+        };
+
+    if let (Some(rcs_runtime), Some(client)) = (rcs_runtime.as_ref(), client.as_ref()) {
+        let participants = if participants.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(participants, participant_count)
+                .iter()
+                .filter(|participant| !participant.is_null())
+                .map(|participant| CStr::from_ptr(*participant).to_string_lossy().into_owned())
+                .collect()
+        };
+        let subject = if subject.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr(subject).to_string_lossy())
+        };
+
+        client.engine.create_group_chat(
+            participants,
+            subject.as_deref(),
+            callback,
+            &rcs_runtime.rt,
+        );
+        return;
+    }
+
+    callback(403, String::from("Forbidden"), None);
+}
+
+/// Tells `recipient`, in the chat session there is with it, that the user is
+/// composing a message if `active` is not 0, or no longer is. No session is
+/// started for it: 404 if there is none.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_send_is_composing(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    recipient: *const c_char,
+    recipient_type: i8,
+    active: i32,
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_send_is_composing()");
+
+    let callback = message_result_closure(cb, cb_context);
+
+    if let (Some(rcs_runtime), Some(client), Some(recipient_type)) = (
+        rcs_runtime.as_ref(),
+        client.as_ref(),
+        get_recipient_type(recipient_type),
+    ) {
+        let recipient = CStr::from_ptr(recipient).to_string_lossy();
+        client.engine.send_is_composing(
+            &recipient,
+            recipient_type,
+            active != 0,
+            callback,
+            &rcs_runtime.rt,
+        );
+        return;
+    }
+
+    callback(403, String::from("Forbidden"));
+}
+
+/// Ends the chat session with `recipient`, a contact or a group: 404 if there
+/// is none. A message sent to it from now on starts another.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_end_chat_session(
+    client: *mut RcsClient,
+    recipient: *const c_char,
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_end_chat_session()");
+
+    let callback = message_result_closure(cb, cb_context);
+
+    if let Some(client) = client.as_ref() {
+        let recipient = CStr::from_ptr(recipient).to_string_lossy();
+        client.engine.end_chat_session(&recipient, callback);
+        return;
+    }
+
+    callback(403, String::from("Forbidden"));
 }
 
 #[no_mangle]

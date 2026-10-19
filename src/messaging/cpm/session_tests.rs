@@ -626,21 +626,34 @@ impl MsrpConnection {
 
     /// Sends the CPIM message `cpim`
     pub fn send_cpim(&mut self, rt: &Runtime, from_path: &str, to_path: &str, cpim: &str) {
+        self.send_content(rt, from_path, to_path, "message/cpim", cpim);
+    }
+
+    /// Sends `content` of `content_type`
+    pub fn send_content(
+        &mut self,
+        rt: &Runtime,
+        from_path: &str,
+        to_path: &str,
+        content_type: &str,
+        content: &str,
+    ) {
         let data = format!(
             "MSRP peer-t1 SEND\r\n\
 To-Path: {}\r\n\
 From-Path: {}\r\n\
 Message-ID: peer-m1\r\n\
 Byte-Range: 1-{}/{}\r\n\
-Content-Type: message/cpim\r\n\
+Content-Type: {}\r\n\
 \r\n\
 {}\r\n\
 -------peer-t1$\r\n",
             to_path,
             from_path,
-            cpim.len(),
-            cpim.len(),
-            cpim
+            content.len(),
+            content.len(),
+            content_type,
+            content
         );
         rt.block_on(self.stream.write_all(data.as_bytes())).unwrap();
     }
@@ -844,12 +857,22 @@ fn header_value_uri(message: &SipMessage, name: &str) -> String {
 
 /// The peer's answer to the client's `request`
 fn answer(request: &SipMessage, status: &str, sdp: Option<&str>) -> String {
+    answer_from(
+        request,
+        status,
+        "<sip:+15559876@192.0.2.1:5060;transport=tcp>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+        sdp,
+    )
+}
+
+/// As answer(), from the Contact `contact`
+fn answer_from(request: &SipMessage, status: &str, contact: &str, sdp: Option<&str>) -> String {
     let mut data = format!("SIP/2.0 {}\r\n", status);
     for name in ["Via", "From", "Call-ID", "CSeq"] {
         data += &format!("{}: {}\r\n", name, header_value(request, name));
     }
     data += &format!("To: {};tag=peer2\r\n", header_value(request, "To"));
-    data += "Contact: <sip:+15559876@192.0.2.1:5060;transport=tcp>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"\r\n";
+    data += &format!("Contact: {}\r\n", contact);
     match sdp {
         Some(sdp) => {
             data += &format!(
@@ -1594,4 +1617,239 @@ fn a_notification_sent_is_taken_as_one_and_not_told_of() {
         assert!(Imdn::from_xml(content.as_bytes()).is_some(), "{}", content);
     }
     peer.silence();
+}
+
+#[test]
+fn an_is_composing_indication_goes_as_it_is_in_a_one_to_one_chat() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (_msrp, mut connection, _ok, _) = incoming_chat(&client, &mut peer, "composing");
+
+    for (active, state) in [
+        (true, "<state>active</state>"),
+        (false, "<state>idle</state>"),
+    ] {
+        let (result_tx, result) = mpsc::channel();
+        let result_tx = std::sync::Mutex::new(result_tx);
+        assert!(client.sessions.send_is_composing(
+            PEER,
+            &RecipientType::Contact,
+            active,
+            move |status_code, _| {
+                let _ = result_tx.lock().unwrap().send(status_code);
+            },
+            &rt,
+        ));
+        let send = connection.next_message(&rt);
+        assert_eq!(
+            send.header("Content-Type"),
+            Some("application/im-iscomposing+xml")
+        );
+        let body = String::from_utf8_lossy(&send.body);
+        assert!(body.contains(state), "{}", body);
+        assert!(
+            body.contains("xmlns=\"urn:ietf:params:xml:ns:im-iscomposing\""),
+            "{}",
+            body
+        );
+        connection.respond(&rt, &send, "200 OK");
+        assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
+    }
+}
+
+#[test]
+fn no_session_is_started_for_an_is_composing_indication() {
+    let (client, mut peer) = start(true);
+    assert!(!client.sessions.send_is_composing(
+        PEER,
+        &RecipientType::Contact,
+        true,
+        |_, _| {},
+        &client.rt
+    ));
+    peer.silence();
+}
+
+#[test]
+fn an_is_composing_indication_received_is_given_to_the_app_and_not_acknowledged() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (msrp, mut connection, _ok, our_path) = incoming_chat(&client, &mut peer, "composed");
+
+    let document = super::is_composing_document(true);
+    connection.send_content(
+        &rt,
+        &msrp.path,
+        &our_path,
+        "application/im-iscomposing+xml",
+        &document,
+    );
+    let response = connection.next(&rt);
+    assert!(
+        response.first_line.contains(" 200"),
+        "{}",
+        response.first_line
+    );
+    assert_eq!(
+        client.received.recv_timeout(Duration::from_secs(5)),
+        Ok((
+            String::from(PEER),
+            String::from("application/im-iscomposing+xml"),
+            document
+        ))
+    );
+    peer.silence();
+}
+
+#[test]
+fn a_chat_session_ended_on_request_is_ended_with_a_bye() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (_msrp, mut connection, _ok, _) = incoming_chat(&client, &mut peer, "ended");
+
+    assert!(client.sessions.end_session(PEER));
+    let bye = peer.next_request("BYE");
+    assert_eq!(header_value(&bye, "Call-ID"), "ended");
+    connection.closed(&rt);
+
+    assert!(!client.sessions.end_session(PEER), "it ended already");
+}
+
+const FACTORY: &str = "sip:conference-factory@conf.example.com";
+const GROUP: &str = "sip:conf1@conf.example.com";
+
+/// A group chat the client started with two participants, its MSRP
+/// connection up, with the INVITE
+fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage) {
+    let rt = Arc::clone(&client.rt);
+    let msrp = MsrpPeer::listen(&rt);
+
+    let (started_tx, started) = mpsc::channel();
+    client.sessions.create_group_chat(
+        FACTORY,
+        &[
+            String::from("sip:+15550001@example.com"),
+            String::from("tel:+15550002"),
+        ],
+        Some("Friends"),
+        move |status_code, _, conference_uri| {
+            let _ = started_tx.send((status_code, conference_uri));
+        },
+        &client.core,
+        &rt,
+    );
+
+    let invite = peer.next_request("INVITE");
+    // the focus asserting an identity other than its URI
+    let ok = answer_from(
+        &invite,
+        "200 OK",
+        &format!(
+            "<{}>;isfocus;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+            GROUP
+        ),
+        Some(&msrp.sdp("sendrecv")),
+    )
+    .replacen(
+        "Contact:",
+        "P-Asserted-Identity: <sip:focus@conf.example.com>\r\nContact:",
+        1,
+    );
+    peer.send(&ok);
+    peer.next_request("ACK");
+    let connection = msrp.accept(&rt);
+
+    assert_eq!(
+        started.recv_timeout(Duration::from_secs(5)),
+        Ok((200, Some(String::from(GROUP)))),
+        "the group known by its focus"
+    );
+
+    (connection, invite)
+}
+
+#[test]
+fn a_group_chat_is_started_through_the_factory_with_its_participants() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (mut connection, invite) = new_group(&client, &mut peer);
+
+    assert_eq!(request_uri(&invite), FACTORY);
+    assert_eq!(header_value(&invite, "To"), format!("<{}>", FACTORY));
+    assert_eq!(header_value(&invite, "Require"), "recipient-list-invite");
+    assert_eq!(header_value(&invite, "Subject"), "Friends");
+    assert!(header_value(&invite, "Content-Type").starts_with("multipart/mixed; boundary="));
+    let body = String::from_utf8_lossy(&body_data(&invite)).into_owned();
+    for part in [
+        "Content-Type: application/sdp",
+        "m=message ",
+        "Content-Type: application/resource-lists+xml",
+        "Content-Disposition: recipient-list",
+        "<entry uri=\"sip:+15550001@example.com\" cp:copyControl=\"to\"/>",
+        "<entry uri=\"tel:+15550002\" cp:copyControl=\"to\"/>",
+    ] {
+        assert!(body.contains(part), "{} in {}", part, body);
+    }
+
+    // a message to the group goes in its session
+    let result = client.send(GROUP, RecipientType::Group, "hello all");
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_text(&send.body), "hello all");
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+
+    // and an is-composing indication, in a CPIM message for the focus to
+    // know whose it is
+    assert!(client
+        .sessions
+        .send_is_composing(GROUP, &RecipientType::Group, true, |_, _| {}, &rt));
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    let cpim = String::from_utf8_lossy(&send.body).into_owned();
+    assert!(
+        cpim.contains("Content-Type: application/im-iscomposing+xml"),
+        "{}",
+        cpim
+    );
+    assert!(!cpim.contains("Disposition-Notification"), "{}", cpim);
+    connection.respond(&rt, &send, "200 OK");
+
+    // the factory is not the group
+    assert!(!client.sessions.has_session_with(FACTORY));
+
+    // the session ended on request
+    assert!(client.sessions.end_session(GROUP));
+    peer.next_request("BYE");
+    connection.closed(&rt);
+}
+
+#[test]
+fn a_group_chat_the_factory_refuses_is_reported_and_not_known() {
+    let (client, mut peer) = start(true);
+
+    let (started_tx, started) = mpsc::channel();
+    client.sessions.create_group_chat(
+        FACTORY,
+        &[String::from("sip:+15550001@example.com")],
+        None,
+        move |status_code, _, conference_uri| {
+            let _ = started_tx.send((status_code, conference_uri));
+        },
+        &client.core,
+        &client.rt,
+    );
+    let invite = peer.next_request("INVITE");
+    assert_eq!(header_value(&invite, "Subject"), "", "no subject");
+    peer.send(&answer(&invite, "403 Forbidden", None));
+    assert_eq!(
+        started.recv_timeout(Duration::from_secs(5)),
+        Ok((403, None))
+    );
+    peer.next_request("ACK");
+
+    // the factory is no one to send to in its session
+    assert!(!client.sessions.has_session_with(FACTORY));
 }

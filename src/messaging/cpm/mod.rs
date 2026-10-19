@@ -25,7 +25,7 @@ use chrono::{DateTime, Local, SecondsFormat};
 use rust_rcs_core::{
     cpim::CPIMMessage,
     ffi::log::platform_log,
-    internet::{body::message_body::MessageBody, Body, Header},
+    internet::{body::message_body::MessageBody, syntax, Body, Header},
     sip::sip_session::SipSession,
 };
 use uuid::Uuid;
@@ -82,6 +82,8 @@ pub struct CPMMessageParam {
     message_content: String,
     /// The imdn.Message-ID it is sent with, which notifications of it give
     message_id: String,
+    /// Sent as it is, of the type `message_type`, not in a CPIM message
+    raw: bool,
     recipient: String,
     recipient_type: RecipientType,
     recipient_uri: String,
@@ -105,11 +107,18 @@ impl CPMMessageParam {
             message_type,
             message_content,
             message_id,
+            raw: false,
             recipient: String::from(recipient),
             recipient_type: RecipientType::from(recipient_type),
             recipient_uri: String::from(recipient_uri),
             message_result_callback: Arc::new(message_result_callback),
         }
+    }
+
+    /// The message sent as it is, not in a CPIM message
+    pub fn raw(mut self) -> CPMMessageParam {
+        self.raw = true;
+        self
     }
 }
 
@@ -122,10 +131,37 @@ pub fn new_message_id() -> String {
     )
 }
 
+/// The media type of is-composing indications (RFC 3994)
+pub const IS_COMPOSING: &str = "application/im-iscomposing+xml";
+
+/// Whether `content_type`, parameters aside, is `media_type`
+pub fn is_media_type(content_type: &[u8], media_type: &str) -> bool {
+    let without_parameters = content_type
+        .split(|c| *c == b';')
+        .next()
+        .unwrap_or_default();
+    syntax::trim(without_parameters).eq_ignore_ascii_case(media_type.as_bytes())
+}
+
+/// An is-composing indication (RFC 3994 section 4): the user is composing a
+/// text message if `active`, refreshed within 60 s, or no longer is
+pub fn is_composing_document(active: bool) -> String {
+    let state = if active {
+        "<state>active</state><contenttype>text/plain</contenttype><refresh>60</refresh>"
+    } else {
+        "<state>idle</state>"
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<isComposing xmlns=\"urn:ietf:params:xml:ns:im-iscomposing\">{}</isComposing>",
+        state
+    )
+}
+
 /// Whether a message of `message_type` asks to be told of its delivery and
 /// display, as all but an is-composing indication do (RFC 3994 section 4)
 fn asks_for_notifications(message_type: &str) -> bool {
-    !message_type.eq_ignore_ascii_case("application/im-iscomposing+xml")
+    !is_media_type(message_type.as_bytes(), IS_COMPOSING)
 }
 
 pub fn make_cpim_message_content_body(
