@@ -17,10 +17,12 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 pub mod config;
+pub mod content_server;
 pub mod download;
 pub mod resume_info_xml;
 pub mod upload;
 
+pub use content_server::{ContentServer, Credentials};
 pub use download::download_file;
 
 pub use upload::upload_file;
@@ -37,3 +39,6 @@ impl FileTransferOverHTTPService {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
