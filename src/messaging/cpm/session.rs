@@ -1315,6 +1315,14 @@ impl CPMSessionService {
         }
     }
 
+    /// The Conversation-ID of the group at `conference_uri`, as its last
+    /// session had it, if there was one
+    pub fn group_conversation_id(&self, conference_uri: &str) -> Option<String> {
+        self.group_chats
+            .ids_of(conference_uri)
+            .map(|(conversation_id, _)| conversation_id)
+    }
+
     /// The core the conference events of groups are subscribed to with
     pub fn attach_core(&self, core: &Arc<SipCore>) {
         self.group_chats.attach_core(core);

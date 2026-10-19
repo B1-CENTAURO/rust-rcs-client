@@ -193,6 +193,16 @@ extern void rcs_client_download_file(struct rcs_runtime *runtime, struct rcs_cli
                                 download_file_progress_callback progress_cb, void *progress_cb_context,
                                 download_file_result_callback result_cb, void *result_cb_context);
 
+// as rcs_client_download_file, with what the message that brought the file's URL tells, for the download proxy to be told
+// if one is provisioned (ftHTTPDLURI): its imdn.Message-ID, its other party (a contact, or a group by its URI) and the
+// Conversation-ID of the group chat it came in, each NULL if not known; that of a group the client has had a session with
+// is told without being given
+extern void rcs_client_download_message_file(struct rcs_runtime *runtime, struct rcs_client *client,
+                                const char *file_uri, const char *download_path, uint32_t start, int32_t total,
+                                const char *imdn_message_id, const char *other_party, const char *conversation_id,
+                                download_file_progress_callback progress_cb, void *progress_cb_context,
+                                download_file_result_callback result_cb, void *result_cb_context);
+
 extern void destroy_rcs_messaging_session(struct rcs_messaging_session *session);
 
 // conference

@@ -75,7 +75,7 @@ use provisioning::device_configuration::{
     start_auto_config, DeviceConfigurationStatus, RetryReason,
 };
 
-use rcs_engine::RcsEngine;
+use rcs_engine::{DownloadOrigin, RcsEngine};
 
 const LOG_TAG: &str = "librust_rcs_client";
 
@@ -1428,6 +1428,94 @@ pub unsafe extern "C" fn rcs_client_download_file(
 ) {
     platform_log(LOG_TAG, "calling rcs_client_download_file()");
 
+    download_file(
+        rcs_runtime,
+        client,
+        file_uri,
+        download_path,
+        start,
+        total,
+        DownloadOrigin::default(),
+        progress_cb,
+        progress_cb_context,
+        result_cb,
+        result_cb_context,
+    );
+}
+
+/// As rcs_client_download_file(), with what the message that brought the
+/// file's URL tells, for the download proxy to be told if one is provisioned
+/// (RCC.07 section 4.2.3): its imdn.Message-ID, its other party, a contact or
+/// a group by its URI, and the Conversation-ID of the group chat it came in,
+/// each NULL if not known. That of a group the client has had a session with
+/// is told without being given.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_download_message_file(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    file_uri: *const c_char,
+    download_path: *const c_char,
+    start: u32,
+    total: i32,
+    imdn_message_id: *const c_char,
+    other_party: *const c_char,
+    conversation_id: *const c_char,
+    progress_cb: Option<DownloadFileProgressCallback>,
+    progress_cb_context: *mut DownloadFileProgressCallbackContext,
+    result_cb: Option<DownloadFileResultCallback>,
+    result_cb_context: *mut DownloadFileResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_download_message_file()");
+
+    let imdn_message_id = optional_string(imdn_message_id);
+    let other_party = optional_string(other_party);
+    let conversation_id = optional_string(conversation_id);
+
+    download_file(
+        rcs_runtime,
+        client,
+        file_uri,
+        download_path,
+        start,
+        total,
+        DownloadOrigin {
+            message_id: imdn_message_id.as_deref(),
+            other_party: other_party.as_deref(),
+            conversation_id: conversation_id.as_deref(),
+        },
+        progress_cb,
+        progress_cb_context,
+        result_cb,
+        result_cb_context,
+    );
+}
+
+/// The text at `s`, None if NULL or empty
+unsafe fn optional_string(s: *const c_char) -> Option<String> {
+    if s.is_null() {
+        return None;
+    }
+    let s = CStr::from_ptr(s).to_string_lossy();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.into_owned())
+    }
+}
+
+unsafe fn download_file(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    file_uri: *const c_char,
+    download_path: *const c_char,
+    start: u32,
+    total: i32,
+    origin: DownloadOrigin<'_>,
+    progress_cb: Option<DownloadFileProgressCallback>,
+    progress_cb_context: *mut DownloadFileProgressCallbackContext,
+    result_cb: Option<DownloadFileResultCallback>,
+    result_cb_context: *mut DownloadFileResultCallbackContext,
+) {
     let progress_cb_context = if progress_cb_context.is_null() {
         None
     } else {
@@ -1486,6 +1574,7 @@ pub unsafe extern "C" fn rcs_client_download_file(
                         &download_path,
                         start,
                         total,
+                        origin,
                         msisdn,
                         http_client,
                         gba_context,
