@@ -14,5 +14,7 @@
 
 pub mod config;
 pub mod cpm;
+#[cfg(feature = "e2ee")]
+pub mod e2ee;
 pub mod ffi;
 pub mod ft_http;
