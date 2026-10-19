@@ -111,7 +111,8 @@ extern void rcs_client_create_group_chat(struct rcs_runtime *runtime, struct rcs
                                 const char *const *participants, size_t participant_count, const char *subject,
                                 group_chat_result_callback cb, void *context);
 
-// told of a group chat taken part in: joined (event 0), a participant's status (1), left (2);
+// told of a group chat taken part in: joined (event 0), a participant's status (1), left (2),
+// or that an invitation to it waiting for the user's answer was withdrawn by whoever sent it (3);
 // for 1, the participant's URI, display name (or NULL) and status: connected, pending, ..., departed, booted, disconnected
 typedef void (*group_chat_event_callback) (int32_t event, const char *conference_uri, const char *participant_uri,
                                 const char *display_name, const char *status, void *context);

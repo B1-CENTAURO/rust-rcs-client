@@ -82,8 +82,8 @@ use crate::messaging::ffi::RecipientType;
 use super::group_chat::{refer_participants, GroupChats, GroupInvitation, Participant};
 use super::imdn::send_group_imdn;
 use super::session_invitation::{
-    decline_hanging_invitation, try_accept_hanging_invitation, try_accept_invitation,
-    CPMSessionInvitation, CPMSessionInvitationResponse,
+    decline_hanging_invitation, end_cancelled_invitation, try_accept_hanging_invitation,
+    try_accept_invitation, CPMSessionInvitation, CPMSessionInvitationResponse,
 };
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMContact, CPMServiceType};
@@ -1189,6 +1189,9 @@ impl MsrpDataWriter for IsComposingWriter {
 pub enum CPMGroupEvent {
     /// Invited to a group not known before
     Invited(GroupInvitation),
+    /// The invitation to the group at the URI, which waited for the user's
+    /// answer, cancelled by whoever sent it
+    InvitationWithdrawn(String),
     /// The session with the group at the URI started
     Joined(String),
     /// What the focus of the group at the URI tells of a participant
@@ -3063,7 +3066,24 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                 let rt_ = Arc::clone(rt);
 
                                                 rt.spawn(async move {
-                                                    match iv_rx.recv().await {
+                                                    let response = iv_rx.recv().await;
+
+                                                    // no longer one to answer,
+                                                    // before the app is told
+                                                    {
+                                                        let mut guard =
+                                                            ongoing_incoming_invitations_
+                                                                .lock()
+                                                                .unwrap();
+                                                        if let Some(idx) = guard
+                                                            .iter()
+                                                            .position(|iv| Arc::ptr_eq(iv, &iv_))
+                                                        {
+                                                            guard.swap_remove(idx);
+                                                        }
+                                                    }
+
+                                                    match response {
                                                         Some(
                                                             CPMSessionInvitationResponse::Accept,
                                                         ) => {
@@ -3089,21 +3109,22 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                         ),
                                                         Some(
                                                             CPMSessionInvitationResponse::Dispose,
-                                                        ) => match cancel_tx.send(()) {
-                                                            Ok(()) => {}
-                                                            Err(()) => {}
-                                                        },
+                                                        ) => {
+                                                            let _ = cancel_tx.send(());
+                                                            if let Some(conference_uri) =
+                                                                end_cancelled_invitation(
+                                                                    invitation,
+                                                                    &ongoing_dialogs,
+                                                                )
+                                                            {
+                                                                (group_chats.listener)(
+                                                                    CPMGroupEvent::InvitationWithdrawn(
+                                                                        conference_uri,
+                                                                    ),
+                                                                );
+                                                            }
+                                                        }
                                                         None => {}
-                                                    }
-
-                                                    let mut guard = ongoing_incoming_invitations_
-                                                        .lock()
-                                                        .unwrap();
-                                                    if let Some(idx) = guard
-                                                        .iter()
-                                                        .position(|iv| Arc::ptr_eq(iv, &iv_))
-                                                    {
-                                                        guard.swap_remove(idx);
                                                     }
                                                 });
 
