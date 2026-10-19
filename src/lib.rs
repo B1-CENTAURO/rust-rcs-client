@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 // use backtrace::Backtrace;
 
 use libc::c_char;
+use messaging::cpm::session::CPMGroupEvent;
 use messaging::cpm::MessagingSessionHandle;
 use rust_rcs_core::security::gba::GbaContext;
 use rust_rcs_core::third_gen_pp::ThreeDigit;
@@ -62,12 +63,13 @@ use messaging::ffi::{
     get_recipient_type, DownloadFileProgressCallback, DownloadFileProgressCallbackContext,
     DownloadFileResultCallback, DownloadFileResultCallbackContext,
     DownloadFileResultCallbackContextWrapper, DownloadileProgressCallbackContextWrapper,
-    GroupChatResultCallback, MessageResultCallback, MessageResultCallbackContext,
-    MessageResultCallbackContextWrapper, SendImdnReportResultCallback,
-    SendImdnReportResultCallbackContext, SendImdnReportResultCallbackContextWrapper,
-    UploadFileProgressCallback, UploadFileProgressCallbackContext,
-    UploadFileProgressCallbackContextWrapper, UploadFileResultCallback,
-    UploadFileResultCallbackContext, UploadFileResultCallbackContextWrapper,
+    GroupChatEventCallback, GroupChatResultCallback, MessageResultCallback,
+    MessageResultCallbackContext, MessageResultCallbackContextWrapper,
+    SendImdnReportResultCallback, SendImdnReportResultCallbackContext,
+    SendImdnReportResultCallbackContextWrapper, UploadFileProgressCallback,
+    UploadFileProgressCallbackContext, UploadFileProgressCallbackContextWrapper,
+    UploadFileResultCallback, UploadFileResultCallbackContext,
+    UploadFileResultCallbackContextWrapper,
 };
 use provisioning::device_configuration::{
     start_auto_config, DeviceConfigurationStatus, RetryReason,
@@ -957,15 +959,7 @@ pub unsafe extern "C" fn rcs_client_create_group_chat(
         };
 
     if let (Some(rcs_runtime), Some(client)) = (rcs_runtime.as_ref(), client.as_ref()) {
-        let participants = if participants.is_null() {
-            Vec::new()
-        } else {
-            std::slice::from_raw_parts(participants, participant_count)
-                .iter()
-                .filter(|participant| !participant.is_null())
-                .map(|participant| CStr::from_ptr(*participant).to_string_lossy().into_owned())
-                .collect()
-        };
+        let participants = participant_list(participants, participant_count);
         let subject = if subject.is_null() {
             None
         } else {
@@ -982,6 +976,98 @@ pub unsafe extern "C" fn rcs_client_create_group_chat(
     }
 
     callback(403, String::from("Forbidden"), None);
+}
+
+/// The participant URIs at `participants`, `participant_count` of them
+unsafe fn participant_list(
+    participants: *const *const c_char,
+    participant_count: usize,
+) -> Vec<String> {
+    if participants.is_null() {
+        return Vec::new();
+    }
+    std::slice::from_raw_parts(participants, participant_count)
+        .iter()
+        .filter(|participant| !participant.is_null())
+        .map(|participant| CStr::from_ptr(*participant).to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Sets what is told of the group chats taken part in: joined (0), a
+/// participant's status (1), left (2). The context of one set before is let
+/// go of.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_group_chat_listener(
+    client: *mut RcsClient,
+    cb: Option<GroupChatEventCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_set_group_chat_listener()");
+
+    let cb_context = NonNull::new(cb_context)
+        .map(|cb_context| Arc::new(Mutex::new(MessageResultCallbackContextWrapper(cb_context))));
+
+    if let (Some(client), Some(cb)) = (client.as_ref(), cb) {
+        client.engine.set_group_chat_listener(move |event| {
+            let (event, conference_uri, participant) = match event {
+                CPMGroupEvent::Joined(conference_uri) => (0, conference_uri, None),
+                CPMGroupEvent::Participant(conference_uri, participant) => {
+                    (1, conference_uri, Some(participant))
+                }
+                CPMGroupEvent::Left(conference_uri) => (2, conference_uri, None),
+                CPMGroupEvent::OnInvite => return,
+            };
+            let conference_uri = c_string(conference_uri);
+            let (uri, display_name, status) = match participant {
+                Some(participant) => (
+                    Some(c_string(participant.uri)),
+                    participant.display_name.map(c_string),
+                    Some(c_string(participant.status)),
+                ),
+                None => (None, None, None),
+            };
+            let as_ptr = |s: &Option<CString>| s.as_ref().map_or(ptr::null(), |s| s.as_ptr());
+            let cb_context = cb_context
+                .as_ref()
+                .map(|cb_context| cb_context.lock().unwrap());
+            cb(
+                event,
+                conference_uri.as_ptr(),
+                as_ptr(&uri),
+                as_ptr(&display_name),
+                as_ptr(&status),
+                cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr()),
+            );
+        });
+    }
+}
+
+/// Asks the focus of the group at `conference_uri`, in the session there is
+/// with it, to invite the `participant_count` URIs at `participants`: 404 if
+/// there is no session
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_add_group_chat_participants(
+    client: *mut RcsClient,
+    conference_uri: *const c_char,
+    participants: *const *const c_char,
+    participant_count: usize,
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_add_group_chat_participants()");
+
+    let callback = message_result_closure(cb, cb_context);
+
+    if let Some(client) = client.as_ref() {
+        let conference_uri = CStr::from_ptr(conference_uri).to_string_lossy();
+        let participants = participant_list(participants, participant_count);
+        client
+            .engine
+            .add_group_chat_participants(&conference_uri, &participants, callback);
+        return;
+    }
+
+    callback(403, String::from("Forbidden"));
 }
 
 /// Tells `recipient`, in the chat session there is with it, that the user is

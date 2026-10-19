@@ -41,7 +41,7 @@ use crate::messaging::ffi::RecipientType;
 
 use super::imdn::{acknowledge_delivery, ImdnService, ReceivedMessages};
 use super::new_message_id;
-use super::session::{CPMSessionService, CPMSessionServiceWrapper};
+use super::session::{CPMGroupEvent, CPMSessionService, CPMSessionServiceWrapper};
 use super::standalone_messaging::{
     self, StandaloneMessagingService, StandaloneMessagingServiceWrapper,
 };
@@ -64,6 +64,8 @@ pub struct Client {
     pub group_invites: Receiver<(String, String)>,
     /// The messages taken, noted as the engine notes them
     pub received_messages: Arc<ReceivedMessages>,
+    /// What the app is told of the group chats taken part in
+    pub group_events: Receiver<String>,
 }
 
 impl Client {
@@ -207,6 +209,8 @@ pub fn start(registered: bool) -> (Client, Peer) {
     let received_tx_ = Arc::clone(&received_tx);
     let (group_invites_tx, group_invites) = mpsc::channel();
     let group_invites_tx = std::sync::Mutex::new(group_invites_tx);
+    let (group_events_tx, group_events) = mpsc::channel();
+    let group_events_tx = std::sync::Mutex::new(group_events_tx);
 
     // the messages taken are acknowledged as the engine does, once the
     // transport is registered
@@ -271,7 +275,21 @@ pub fn start(registered: bool) -> (Client, Peer) {
                 .send((String::from(subject), String::from(referred_by_name)));
             200
         },
-        |_| {},
+        move |event| {
+            let event = match event {
+                CPMGroupEvent::OnInvite => String::from("invited"),
+                CPMGroupEvent::Joined(group) => format!("joined {}", group),
+                CPMGroupEvent::Participant(group, participant) => format!(
+                    "participant {} {} {} {}",
+                    group,
+                    participant.uri,
+                    participant.display_name.as_deref().unwrap_or("-"),
+                    participant.status
+                ),
+                CPMGroupEvent::Left(group) => format!("left {}", group),
+            };
+            let _ = group_events_tx.lock().unwrap().send(event);
+        },
     ));
 
     let standalone = Arc::new(StandaloneMessagingService::new(
@@ -314,6 +332,7 @@ pub fn start(registered: bool) -> (Client, Peer) {
         handlers,
         &rt,
     ));
+    sessions.attach_core(&core);
 
     let transport = Arc::new(SipTransport::new::<DuplexStream>(
         String::from(TRANSPORT_ADDRESS),
@@ -355,6 +374,7 @@ pub fn start(registered: bool) -> (Client, Peer) {
             received,
             group_invites,
             received_messages,
+            group_events,
         },
         Peer {
             rt,
@@ -1719,8 +1739,9 @@ const FACTORY: &str = "sip:conference-factory@conf.example.com";
 const GROUP: &str = "sip:conf1@conf.example.com";
 
 /// A group chat the client started with two participants, its MSRP
-/// connection up, with the INVITE
-fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage) {
+/// connection up, with the INVITE and the SUBSCRIBE to its conference
+/// events, answered
+fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage, SipMessage) {
     let rt = Arc::clone(&client.rt);
     let msrp = MsrpPeer::listen(&rt);
 
@@ -1756,7 +1777,9 @@ fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage) {
         1,
     );
     peer.send(&ok);
-    peer.next_request("ACK");
+    // the ACK, and the SUBSCRIBE once the session starts, in whatever order
+    // the transport takes them
+    let subscribe = next_requests(peer, &["ACK", "SUBSCRIBE"]).pop().unwrap();
     let connection = msrp.accept(&rt);
 
     assert_eq!(
@@ -1765,14 +1788,72 @@ fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage) {
         "the group known by its focus"
     );
 
-    (connection, invite)
+    peer.send(
+        &answer_from(&subscribe, "200 OK", &format!("<{}>", GROUP), None).replacen(
+            "Contact:",
+            "Expires: 3600\r\nContact:",
+            1,
+        ),
+    );
+
+    (connection, invite, subscribe)
+}
+
+/// The requests `methods` from the client, in whatever order
+fn next_requests(peer: &mut Peer, methods: &[&str]) -> Vec<SipMessage> {
+    let mut requests: Vec<SipMessage> = (0..methods.len()).map(|_| peer.next()).collect();
+    let mut sent: Vec<String> = requests.iter().map(first_line).collect();
+    sent.sort();
+    let mut expected: Vec<String> = methods.iter().map(|m| String::from(*m)).collect();
+    expected.sort();
+    assert_eq!(sent, expected);
+    requests.sort_by_key(|r| methods.iter().position(|m| *m == first_line(r)));
+    requests
+}
+
+/// A NOTIFY from the focus, in the subscription `subscribe` made, of the
+/// conference-info `document`
+fn conference_notify(subscribe: &SipMessage, seq: u32, document: &str) -> String {
+    format!(
+        "NOTIFY {} SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bKnotify{}\r\n\
+From: <{}>;tag=peer2\r\n\
+To: {}\r\n\
+Call-ID: {}\r\n\
+CSeq: {} NOTIFY\r\n\
+Max-Forwards: 70\r\n\
+Contact: <{}>\r\n\
+Event: conference\r\n\
+Subscription-State: active;expires=3600\r\n\
+Content-Type: application/conference-info+xml\r\n\
+Content-Length: {}\r\n\
+\r\n\
+{}",
+        contact_uri(subscribe),
+        seq,
+        GROUP,
+        header_value(subscribe, "From"),
+        header_value(subscribe, "Call-ID"),
+        seq,
+        GROUP,
+        document.len(),
+        document
+    )
+}
+
+/// The next event the app is told of a group chat
+fn next_group_event(client: &Client) -> String {
+    client
+        .group_events
+        .recv_timeout(Duration::from_secs(5))
+        .expect("an event of the group chat")
 }
 
 #[test]
 fn a_group_chat_is_started_through_the_factory_with_its_participants() {
     let (client, mut peer) = start(true);
     let rt = Arc::clone(&client.rt);
-    let (mut connection, invite) = new_group(&client, &mut peer);
+    let (mut connection, invite, _subscribe) = new_group(&client, &mut peer);
 
     assert_eq!(request_uri(&invite), FACTORY);
     assert_eq!(header_value(&invite, "To"), format!("<{}>", FACTORY));
@@ -1820,10 +1901,22 @@ fn a_group_chat_is_started_through_the_factory_with_its_participants() {
     // the factory is not the group
     assert!(!client.sessions.has_session_with(FACTORY));
 
-    // the session ended on request
+    // the session ended on request; the subscription, which no NOTIFY
+    // started, has nothing to end
+    let dialogs = || client.core.get_ongoing_dialogs().lock().unwrap().len();
+    let before = dialogs();
     assert!(client.sessions.end_session(GROUP));
     peer.next_request("BYE");
     connection.closed(&rt);
+
+    // and the dialog of the session goes once nothing holds it
+    let gone = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        dialogs() == before - 1
+    });
+    assert!(gone, "the dialog of the session went");
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+    assert_eq!(next_group_event(&client), format!("left {}", GROUP));
 }
 
 #[test]
@@ -1852,4 +1945,184 @@ fn a_group_chat_the_factory_refuses_is_reported_and_not_known() {
 
     // the factory is no one to send to in its session
     assert!(!client.sessions.has_session_with(FACTORY));
+}
+
+const ALICE: &str = "sip:+15550001@example.com";
+const BOB: &str = "tel:+15550002";
+
+#[test]
+fn the_participants_of_a_group_are_followed_while_its_session_lasts() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (mut connection, _invite, subscribe) = new_group(&client, &mut peer);
+
+    assert_eq!(request_uri(&subscribe), GROUP);
+    assert_eq!(header_value(&subscribe, "To"), format!("<{}>", GROUP));
+    assert_eq!(header_value(&subscribe, "Event"), "conference");
+    assert_eq!(
+        header_value(&subscribe, "Accept"),
+        "application/conference-info+xml"
+    );
+    assert_eq!(header_value(&subscribe, "Expires"), "3600");
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+
+    let user = |entity: &str, name: &str, status: &str, method: &str| {
+        format!(
+            "<user entity=\"{}\">{}<endpoint entity=\"{}\"><status>{}</status>{}</endpoint></user>",
+            entity,
+            if name.is_empty() {
+                String::new()
+            } else {
+                format!("<display-text>{}</display-text>", name)
+            },
+            entity,
+            status,
+            if method.is_empty() {
+                String::new()
+            } else {
+                format!("<disconnection-method>{}</disconnection-method>", method)
+            }
+        )
+    };
+    let document = |state: &str, version: u32, users: String| {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<conference-info xmlns=\"urn:ietf:params:xml:ns:conference-info\" entity=\"{}\" \
+state=\"{}\" version=\"{}\"><users>{}</users></conference-info>",
+            GROUP, state, version, users
+        )
+    };
+
+    peer.send(&conference_notify(
+        &subscribe,
+        1,
+        &document(
+            "full",
+            1,
+            user(ALICE, "Alice", "connected", "") + &user(BOB, "", "pending", ""),
+        ),
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(
+        next_group_event(&client),
+        format!("participant {} {} Alice connected", GROUP, ALICE)
+    );
+    assert_eq!(
+        next_group_event(&client),
+        format!("participant {} {} - pending", GROUP, BOB)
+    );
+
+    peer.send(&conference_notify(
+        &subscribe,
+        2,
+        &document("partial", 2, user(BOB, "", "disconnected", "departed")),
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(
+        next_group_event(&client),
+        format!("participant {} {} - departed", GROUP, BOB)
+    );
+
+    // the session ended, the subscription ends with it
+    assert!(client.sessions.end_session(GROUP));
+    let requests = next_requests(&mut peer, &["BYE", "SUBSCRIBE"]);
+    assert_eq!(header_value(&requests[1], "Expires"), "0");
+    assert_eq!(
+        header_value(&requests[1], "Call-ID"),
+        header_value(&subscribe, "Call-ID")
+    );
+    assert_eq!(next_group_event(&client), format!("left {}", GROUP));
+    connection.closed(&rt);
+}
+
+#[test]
+fn participants_are_added_by_a_refer_in_the_session_of_the_group() {
+    let (client, mut peer) = start(true);
+    let (_connection, invite, _subscribe) = new_group(&client, &mut peer);
+
+    let (result_tx, result) = mpsc::channel();
+    assert!(client.sessions.add_participants(
+        GROUP,
+        &[
+            String::from("sip:+15550003@example.com"),
+            String::from("tel:+15550004")
+        ],
+        move |status_code, _| {
+            let _ = result_tx.send(status_code);
+        },
+    ));
+
+    let refer = peer.next_request("REFER");
+    assert_eq!(request_uri(&refer), GROUP, "to the focus");
+    assert_eq!(
+        header_value(&refer, "Call-ID"),
+        header_value(&invite, "Call-ID"),
+        "in the session's dialog"
+    );
+    assert_eq!(header_value(&refer, "Require"), "multiple-refer");
+    assert_eq!(header_value(&refer, "Refer-Sub"), "false");
+    assert_eq!(
+        header_value(&refer, "Content-Type"),
+        "application/resource-lists+xml"
+    );
+    assert_eq!(
+        header_value(&refer, "Content-Disposition"),
+        "recipient-list"
+    );
+    let refer_to = header_value(&refer, "Refer-To");
+    let content_id = header_value(&refer, "Content-ID");
+    assert_eq!(
+        refer_to.trim_start_matches("<cid:").trim_end_matches('>'),
+        content_id.trim_start_matches('<').trim_end_matches('>'),
+        "the list by its Content-ID"
+    );
+    let body = String::from_utf8_lossy(&body_data(&refer)).into_owned();
+    for entry in [
+        "<entry uri=\"sip:+15550003@example.com\" cp:copyControl=\"to\"/>",
+        "<entry uri=\"tel:+15550004\" cp:copyControl=\"to\"/>",
+    ] {
+        assert!(body.contains(entry), "{} in {}", entry, body);
+    }
+
+    peer.send(&answer(&refer, "202 Accepted", None));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(202));
+
+    // no group is not asked, nor a one-to-one chat
+    assert!(!client.sessions.add_participants(
+        "sip:conf9@conf.example.com",
+        &[String::from(ALICE)],
+        |_, _| {}
+    ));
+    let _one_to_one = incoming_chat(&client, &mut peer, "one-to-one");
+    assert!(!client
+        .sessions
+        .add_participants(PEER, &[String::from(ALICE)], |_, _| {}));
+}
+
+#[test]
+fn a_group_invitation_without_subject_or_inviter_name_is_taken() {
+    let (client, mut peer) = start(true);
+    let msrp = MsrpPeer::listen(&client.rt);
+
+    peer.send(&invite(
+        "group-plain",
+        "<sip:conf1@conf.example.com;transport=tcp>;isfocus;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+        "sip:conf1@conf.example.com",
+        "cpm.session",
+        "Referred-By: <sip:+15550001@example.com>\r\n",
+        "application/sdp",
+        &msrp.sdp("sendrecv"),
+    ));
+    assert_eq!(
+        client.group_invites.recv_timeout(Duration::from_secs(5)),
+        Ok((String::new(), String::new()))
+    );
+
+    // taken, and once started its participants followed
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "group-plain"));
+    let subscribe = peer.next_request("SUBSCRIBE");
+    assert_eq!(request_uri(&subscribe), GROUP);
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
 }

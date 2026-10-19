@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod group_chat;
 pub mod imdn;
 pub mod session;
 pub mod session_invitation;

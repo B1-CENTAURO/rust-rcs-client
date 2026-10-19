@@ -72,12 +72,14 @@ use rust_strict_sdp::AsSDP;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
+use super::group_chat::{refer_participants, GroupChats, Participant};
 use super::session_invitation::{
     try_accept_hanging_invitation, try_accept_invitation, CPMSessionInvitation,
     CPMSessionInvitationResponse,
@@ -427,6 +429,8 @@ pub struct CPMSession {
     /// What ending the session takes, once its dialog is confirmed, taken
     /// when it ends
     session_end: Mutex<Option<SessionEnd>>,
+    /// Set when the session ends, for any number to watch
+    ended_watch: watch::Sender<bool>,
 }
 
 impl CPMSession {
@@ -440,7 +444,13 @@ impl CPMSession {
             ended: Arc::new(Notify::new()),
             msrp_writer: Arc::new(Mutex::new(None)),
             session_end: Mutex::new(None),
+            ended_watch: watch::channel(false).0,
         }
+    }
+
+    /// Whether the session ended, as it changes: true once it has
+    pub fn when_ended(&self) -> watch::Receiver<bool> {
+        self.ended_watch.subscribe()
     }
 
     /// Keeps what ending the session takes, for it to be ended on request
@@ -872,6 +882,7 @@ impl CPMSession {
         }
 
         self.ended.notify_one();
+        self.ended_watch.send_replace(true);
 
         for message in pending_messages {
             (message.message_result_callback)(480, String::from("Temporarily Unavailable"));
@@ -1109,7 +1120,12 @@ impl MsrpDataWriter for IsComposingWriter {
 
 pub enum CPMGroupEvent {
     OnInvite,
-    OnJoined,
+    /// The session with the group at the URI started
+    Joined(String),
+    /// What the focus of the group at the URI tells of a participant
+    Participant(String, Participant),
+    /// The session with the group at the URI ended
+    Left(String),
 }
 
 pub struct CPMSessionService {
@@ -1164,7 +1180,9 @@ pub struct CPMSessionService {
             + Sync
             + 'static,
     >,
-    group_invite_event_listener_function: Box<dyn Fn(CPMGroupEvent) + Send + Sync + 'static>,
+    /// The group chats taken part in, told of through the group event
+    /// listener
+    group_chats: Arc<GroupChats>,
 }
 
 impl CPMSessionService {
@@ -1205,17 +1223,65 @@ impl CPMSessionService {
             + 'static,
         GL: Fn(CPMGroupEvent) + Send + Sync + 'static,
     {
+        let registered_public_identity = Arc::new(Mutex::new(None));
+        let group_chats = Arc::new(GroupChats::new(
+            Arc::clone(&registered_public_identity),
+            Arc::new(group_invite_event_listener_function),
+        ));
+
         CPMSessionService {
             ongoing_sessions: Arc::new(Mutex::new(Vec::new())),
             ongoing_incoming_invitations: Arc::new(Mutex::new(Vec::new())),
             ongoing_outgoing_invitations: Arc::new(Mutex::new(Vec::new())),
-            registered_public_identity: Arc::new(Mutex::new(None)),
+            registered_public_identity,
             message_receive_listener: Arc::new(message_receive_listener),
             msrp_socket_allocator_function: Arc::new(msrp_socket_allocator_function),
             msrp_socket_connect_function: Arc::new(msrp_socket_connect_function),
             conversation_invite_handler_function: Box::new(conversation_invite_handler_function),
             group_invite_handler_function: Box::new(group_invite_handler_function),
-            group_invite_event_listener_function: Box::new(group_invite_event_listener_function),
+            group_chats,
+        }
+    }
+
+    /// The core the conference events of groups are subscribed to with
+    pub fn attach_core(&self, core: &Arc<SipCore>) {
+        self.group_chats.attach_core(core);
+    }
+
+    /// Asks the focus of the group at `conference_uri`, in the session there
+    /// is with it, to invite `participants` (RFC 5368), `callback` told how
+    /// it answered; false, and nothing asked, if there is no such session
+    pub fn add_participants<F>(
+        &self,
+        conference_uri: &str,
+        participants: &[String],
+        callback: F,
+    ) -> bool
+    where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        let session_end = {
+            let sessions = self.ongoing_sessions.lock().unwrap();
+            sessions
+                .iter()
+                .find(|(known_identities, sip_session)| {
+                    known_identities == conference_uri
+                        && matches!(
+                            sip_session
+                                .get_inner()
+                                .get_session_info()
+                                .cpm_contact
+                                .service_type,
+                            CPMServiceType::Group
+                        )
+                })
+                .and_then(|(_, sip_session)| {
+                    sip_session.get_inner().session_end.lock().unwrap().clone()
+                })
+        };
+        match session_end {
+            Some(session_end) => refer_participants(&session_end, participants, callback),
+            None => false,
         }
     }
 
@@ -1698,6 +1764,7 @@ impl CPMSessionService {
 
                 let ongoing_outgoing_invitations = Arc::clone(&self.ongoing_outgoing_invitations);
                 let ongoing_sessions = Arc::clone(&self.ongoing_sessions);
+                let group_chats = Arc::clone(&self.group_chats);
 
                 let registered_public_identity = Arc::clone(&self.registered_public_identity);
 
@@ -1775,7 +1842,7 @@ impl CPMSessionService {
                                                         });
 
                                                         if let Ok(dialog) = SipDialog::try_new_as_uac(&req_headers, &resp_message, move |d| {
-                                                            match d_tx.blocking_send(d) {
+                                                            match d_tx.try_send(d) {
                                                                 Ok(()) => {},
                                                                 Err(e) => {},
                                                             }
@@ -1816,6 +1883,8 @@ impl CPMSessionService {
                                                                 msrp_socket_connect_function: Arc::clone(
                                                                     &connect_function,
                                                                 ),
+                                                                // started once it is answered
+                                                                group_chats: None,
                                                                 rt: Arc::clone(&rt_),
                                                             });
 
@@ -1920,7 +1989,9 @@ impl CPMSessionService {
                                                                         // the session takes the messages
                                                                         // from now on, the invitation those
                                                                         // sent to it until no one holds it
+                                                                        let joined = Arc::clone(&sip_session);
                                                                         ongoing_sessions.lock().unwrap().push((known_identities, sip_session));
+                                                                        group_chats.started(&joined, &rt_);
                                                                         remove_invitation(&ongoing_outgoing_invitations, &outgoing_invitation_);
                                                                         drop(outgoing_invitation_);
 
@@ -2288,11 +2359,17 @@ pub(crate) struct CPMSessionDialogEventReceiver {
             + Send
             + Sync,
     >,
+    /// Told the session started, on the ACK, if one the client accepted
+    pub(crate) group_chats: Option<Arc<GroupChats>>,
     pub(crate) rt: Arc<Runtime>,
 }
 
 impl SipDialogEventCallbacks for CPMSessionDialogEventReceiver {
     fn on_ack(&self, _transaction: &Arc<ServerTransaction>) {
+        if let Some(group_chats) = &self.group_chats {
+            group_chats.started(&self.sip_session, &self.rt);
+        }
+
         let session_end = self.session_end.clone();
         let session = self.sip_session.get_inner();
         let message_receive_listener = Arc::clone(&self.message_receive_listener);
@@ -2458,52 +2535,72 @@ impl TransactionHandler for CPMSessionServiceWrapper {
 
                                 match session_info.cpm_contact.service_type {
                                     CPMServiceType::Group => loop {
-                                        if let (
-                                            Some(conversation_id),
-                                            Some(contribution_id),
-                                            Some(subject),
-                                            Some(referred_by),
-                                        ) = (
+                                        // the subject, and who invited, as
+                                        // far as the invitation tells: a
+                                        // focus inviting again may tell
+                                        // neither
+                                        if let (Some(conversation_id), Some(contribution_id)) = (
                                             &session_info.conversation_id,
                                             &session_info.contribution_id,
-                                            &session_info.subject,
-                                            &session_info.referred_by,
                                         ) {
-                                            if let Ok(subject) = urlencoding::decode(subject) {
-                                                if let Some(referred_by) = referred_by
+                                            let subject = session_info
+                                                .subject
+                                                .as_deref()
+                                                .and_then(|subject| {
+                                                    urlencoding::decode(subject).ok()
+                                                })
+                                                .map(|subject| subject.into_owned())
+                                                .unwrap_or_default();
+                                            let referred_by = session_info.referred_by.as_deref();
+                                            let referred_by = referred_by.and_then(|referred_by| {
+                                                referred_by
                                                     .as_bytes()
                                                     .as_name_addresses()
                                                     .first()
-                                                {
-                                                    if let Some(referred_by_name) =
-                                                        referred_by.display_name
-                                                    {
-                                                        if let Ok(referred_by_name) =
-                                                            std::str::from_utf8(referred_by_name)
-                                                        {
-                                                            if let Some(uri_part) =
-                                                                &referred_by.uri_part
-                                                            {
-                                                                if let Ok(referred_by_uri) =
-                                                                    std::str::from_utf8(
-                                                                        uri_part.uri,
-                                                                    )
-                                                                {
-                                                                    match msrp_info.direction {
-                                                                            MsrpDirection::SendReceive => {
-                                                                                auto_accept_response_code = (self.service.group_invite_handler_function)(&session_info.asserted_contact_uri, conversation_id, contribution_id, &subject, referred_by_name, referred_by_uri, cancel_rx);
-                                                                                break;
-                                                                            }
+                                                    .map(|name_addr| {
+                                                        (
+                                                            name_addr
+                                                                .display_name
+                                                                .map(|n| {
+                                                                    String::from_utf8_lossy(n)
+                                                                        .into_owned()
+                                                                })
+                                                                .unwrap_or_default(),
+                                                            name_addr
+                                                                .uri_part
+                                                                .as_ref()
+                                                                .map(|u| {
+                                                                    String::from_utf8_lossy(u.uri)
+                                                                        .into_owned()
+                                                                })
+                                                                .unwrap_or_default(),
+                                                        )
+                                                    })
+                                            });
+                                            let (referred_by_name, referred_by_uri) =
+                                                referred_by.unwrap_or_default();
 
-                                                                            _ => {
-                                                                                (self.service.group_invite_event_listener_function)(CPMGroupEvent::OnInvite);
-                                                                                return false;
-                                                                            }
-                                                                        }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
+                                            match msrp_info.direction {
+                                                MsrpDirection::SendReceive => {
+                                                    auto_accept_response_code = (self
+                                                        .service
+                                                        .group_invite_handler_function)(
+                                                        &session_info.asserted_contact_uri,
+                                                        conversation_id,
+                                                        contribution_id,
+                                                        &subject,
+                                                        &referred_by_name,
+                                                        &referred_by_uri,
+                                                        cancel_rx,
+                                                    );
+                                                    break;
+                                                }
+
+                                                _ => {
+                                                    (self.service.group_chats.listener)(
+                                                        CPMGroupEvent::OnInvite,
+                                                    );
+                                                    return false;
                                                 }
                                             }
                                         }
@@ -2610,6 +2707,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                             &self.service.registered_public_identity,
                                             ongoing_dialogs,
                                             &self.service.ongoing_sessions,
+                                            &self.service.group_chats,
                                             &self.tm,
                                             rt,
                                         )
@@ -2671,7 +2769,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                             if let Ok(dialog) = SipDialog::try_new_as_uas(
                                                 message,
                                                 &resp_message,
-                                                move |d| match d_tx.blocking_send(d) {
+                                                move |d| match d_tx.try_send(d) {
                                                     Ok(()) => {}
                                                     Err(e) => {}
                                                 },
@@ -2720,6 +2818,8 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                 let ongoing_dialogs = Arc::clone(ongoing_dialogs);
                                                 let ongoing_sessions =
                                                     Arc::clone(&self.service.ongoing_sessions);
+                                                let group_chats =
+                                                    Arc::clone(&self.service.group_chats);
 
                                                 let ongoing_incoming_invitations_ = Arc::clone(
                                                     &self.service.ongoing_incoming_invitations,
@@ -2741,6 +2841,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                                 &registered_public_identity,
                                                                 &ongoing_dialogs,
                                                                 &ongoing_sessions,
+                                                                &group_chats,
                                                                 &tm_,
                                                                 &rt_,
                                                             );
