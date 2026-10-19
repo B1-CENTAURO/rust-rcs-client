@@ -100,8 +100,8 @@ use crate::messaging::cpm::imdn::{
     acknowledge_delivery, send_imdn, ImdnService, ReceivedMessages, Refusal,
 };
 use crate::messaging::cpm::new_message_id;
-use crate::messaging::cpm::session::CPMSessionService;
 use crate::messaging::cpm::session::CPMSessionServiceWrapper;
+use crate::messaging::cpm::session::{CPMGroupEvent, CPMSessionService};
 use crate::messaging::cpm::standalone_messaging::StandaloneMessagingServiceWrapper;
 use crate::messaging::cpm::standalone_messaging::{self, StandaloneMessagingService};
 use crate::messaging::cpm::MessagingSessionHandle;
@@ -118,6 +118,8 @@ use super::provisioning::ims_application::ImsApplication;
 use super::provisioning::rcs_application::RcsApplication;
 
 const LOG_TAG: &str = "librust_rcs_client";
+
+type GroupChatListener = Arc<dyn Fn(CPMGroupEvent) + Send + Sync>;
 
 pub enum RcsEngineConnectionState {
     IDLE,
@@ -154,6 +156,9 @@ pub struct RcsEngine {
 
     /// The messages last taken, and the notifications each asks for
     received_messages: Arc<ReceivedMessages>,
+
+    /// Told of the group chats taken part in, if the app set one
+    group_chat_listener: Arc<Mutex<Option<GroupChatListener>>>,
 
     // msrp_channels: Arc<MsrpChannelManager>,
     core: Arc<SipCore>,
@@ -193,6 +198,9 @@ impl RcsEngine {
         let tm = Arc::new(tm);
 
         let received_messages = Arc::new(ReceivedMessages::new());
+
+        let group_chat_listener: Arc<Mutex<Option<GroupChatListener>>> = Arc::new(Mutex::new(None));
+        let group_chat_listener_ = Arc::clone(&group_chat_listener);
 
         #[cfg(not(all(feature = "android", target_os = "android")))]
         let tls_client_config = context.get_tls_client_config();
@@ -665,7 +673,13 @@ impl RcsEngine {
                 }
                 180
             },
-            move |ev| {},
+            move |event| {
+                // not called under the lock, for the app may set another
+                let listener = group_chat_listener_.lock().unwrap().clone();
+                if let Some(listener) = listener {
+                    listener(event);
+                }
+            },
         );
         let cpm_session_service = Arc::new(cpm_session_service);
         let multi_conference_service_v1 =
@@ -697,6 +711,8 @@ impl RcsEngine {
             transaction_handlers,
             &rt,
         ));
+
+        cpm_session_service.attach_core(&core);
 
         let connector = Arc::new_cyclic(|connector: &Weak<Connector>| {
             let connector = Weak::clone(connector);
@@ -772,6 +788,8 @@ impl RcsEngine {
             conference_service_v1: multi_conference_service_v1,
 
             received_messages,
+
+            group_chat_listener,
 
             // msrp_channels,
             core,
@@ -1133,6 +1151,53 @@ impl RcsEngine {
                 rt,
             ),
             _ => callback(403, String::from("Forbidden"), None),
+        }
+    }
+
+    /// Sets what is told of the group chats taken part in: joined, a
+    /// participant's status, left
+    pub fn set_group_chat_listener<L>(&self, listener: L)
+    where
+        L: Fn(CPMGroupEvent) + Send + Sync + 'static,
+    {
+        self.group_chat_listener
+            .lock()
+            .unwrap()
+            .replace(Arc::new(listener));
+    }
+
+    /// Asks the focus of the group at `conference_uri` to invite
+    /// `participants`, in the session there is with it: 404 if there is
+    /// none
+    pub fn add_group_chat_participants<F>(
+        &self,
+        conference_uri: &str,
+        participants: &[String],
+        result_callback: F,
+    ) where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        if participants.is_empty() {
+            result_callback(400, String::from("Bad Request"));
+            return;
+        }
+        let result_callback = Arc::new(Mutex::new(Some(result_callback)));
+        let result_callback_ = Arc::clone(&result_callback);
+        let asked = self.cpm_session_service.add_participants(
+            conference_uri,
+            participants,
+            move |status_code, reason_phrase| {
+                let result_callback = result_callback_.lock().unwrap().take();
+                if let Some(result_callback) = result_callback {
+                    result_callback(status_code, reason_phrase);
+                }
+            },
+        );
+        if !asked {
+            let result_callback = result_callback.lock().unwrap().take();
+            if let Some(result_callback) = result_callback {
+                result_callback(404, String::from("Not Found"));
+            }
         }
     }
 

@@ -51,6 +51,7 @@ use rust_strict_sdp::AsSDP;
 use crate::contact::ContactKnownIdentities;
 
 use super::{
+    group_chat::GroupChats,
     session::{
         CPMSession, CPMSessionDialogEventReceiver, CPMSessionInfo, SessionEnd,
         UpdateMessageCallbacks,
@@ -124,6 +125,7 @@ pub fn try_accept_hanging_invitation(
     registered_public_identity: &Arc<Mutex<Option<(Arc<SipTransport>, String, String)>>>,
     ongoing_dialogs: &Arc<Mutex<Vec<Arc<SipDialog>>>>,
     ongoing_sessions: &Arc<Mutex<Vec<(ContactKnownIdentities, Arc<SipSession<CPMSession>>)>>>,
+    group_chats: &Arc<GroupChats>,
     tm: &Arc<SipTransactionManager>,
     rt: &Arc<Runtime>,
 ) {
@@ -157,6 +159,7 @@ pub fn try_accept_hanging_invitation(
                     registered_public_identity,
                     ongoing_dialogs,
                     ongoing_sessions,
+                    group_chats,
                     tm,
                     rt,
                 );
@@ -216,6 +219,7 @@ pub fn try_accept_invitation<'a, 'b>(
     registered_public_identity: &Arc<Mutex<Option<(Arc<SipTransport>, String, String)>>>,
     ongoing_dialogs: &Arc<Mutex<Vec<Arc<SipDialog>>>>,
     ongoing_sessions: &Arc<Mutex<Vec<(ContactKnownIdentities, Arc<SipSession<CPMSession>>)>>>,
+    group_chats: &Arc<GroupChats>,
     tm: &Arc<SipTransactionManager>,
     rt: &Arc<Runtime>,
 ) {
@@ -361,7 +365,7 @@ pub fn try_accept_invitation<'a, 'b>(
 
                                 if let Ok(dialog) =
                                     SipDialog::try_new_as_uas(message, &resp_message, move |d| {
-                                        match d_tx.blocking_send(d) {
+                                        match d_tx.try_send(d) {
                                             Ok(()) => {}
                                             Err(e) => {}
                                         }
@@ -432,6 +436,8 @@ pub fn try_accept_invitation<'a, 'b>(
                                     msrp_socket_connect_function: Arc::clone(
                                         msrp_socket_connect_function,
                                     ),
+                                    // started on the ACK
+                                    group_chats: Some(Arc::clone(group_chats)),
                                     rt: Arc::clone(rt),
                                 },
                             );

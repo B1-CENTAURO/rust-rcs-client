@@ -1025,7 +1025,7 @@ impl StandaloneMessagingService {
                                                 });
 
                                                 if let Ok(dialog) = SipDialog::try_new_as_uac(&req_headers, &resp_message, move |d| {
-                                                    match d_tx.blocking_send(d) {
+                                                    match d_tx.try_send(d) {
                                                         Ok(()) => {},
                                                         Err(e) => {},
                                                     }
@@ -1598,7 +1598,7 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                                 let dialog = SipDialog::try_new_as_uas(
                                                     message,
                                                     &resp_message,
-                                                    move |d| match d_tx.blocking_send(d) {
+                                                    move |d| match d_tx.try_send(d) {
                                                         Ok(()) => {}
                                                         Err(_) => {}
                                                     },

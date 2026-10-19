@@ -63,6 +63,17 @@ pub type GroupChatResultCallback = extern "C" fn(
     context: *mut MessageResultCallbackContext,
 );
 
+/// Told of a group chat taken part in: joined (0), a participant's status
+/// (1), with its URI, display name or NULL, and status, or left (2)
+pub type GroupChatEventCallback = extern "C" fn(
+    event: i32,
+    conference_uri: *const c_char,
+    participant_uri: *const c_char,
+    display_name: *const c_char,
+    status: *const c_char,
+    context: *mut MessageResultCallbackContext,
+);
+
 #[repr(C)]
 pub struct MessageResultCallbackContext {
     _data: [u8; 0],
