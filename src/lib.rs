@@ -63,8 +63,8 @@ use messaging::ffi::{
     get_recipient_type, DownloadFileProgressCallback, DownloadFileProgressCallbackContext,
     DownloadFileResultCallback, DownloadFileResultCallbackContext,
     DownloadFileResultCallbackContextWrapper, DownloadileProgressCallbackContextWrapper,
-    GroupChatEventCallback, GroupChatResultCallback, MessageResultCallback,
-    MessageResultCallbackContext, MessageResultCallbackContextWrapper,
+    GroupChatEventCallback, GroupChatInvitationCallback, GroupChatResultCallback,
+    MessageResultCallback, MessageResultCallbackContext, MessageResultCallbackContextWrapper,
     SendImdnReportResultCallback, SendImdnReportResultCallbackContext,
     SendImdnReportResultCallbackContextWrapper, UploadFileProgressCallback,
     UploadFileProgressCallbackContext, UploadFileProgressCallbackContextWrapper,
@@ -1015,7 +1015,8 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_listener(
                     (1, conference_uri, Some(participant))
                 }
                 CPMGroupEvent::Left(conference_uri) => (2, conference_uri, None),
-                CPMGroupEvent::OnInvite => return,
+                // told through the invitation listener
+                CPMGroupEvent::Invited(_) => return,
             };
             let conference_uri = c_string(conference_uri);
             let (uri, display_name, status) = match participant {
@@ -1040,6 +1041,78 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_listener(
             );
         });
     }
+}
+
+/// Sets what is told of the invitations to group chats not known before. The
+/// context of one set before is let go of.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_group_chat_invitation_listener(
+    client: *mut RcsClient,
+    cb: Option<GroupChatInvitationCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(
+        LOG_TAG,
+        "calling rcs_client_set_group_chat_invitation_listener()",
+    );
+
+    let cb_context = NonNull::new(cb_context)
+        .map(|cb_context| Arc::new(Mutex::new(MessageResultCallbackContextWrapper(cb_context))));
+
+    if let (Some(client), Some(cb)) = (client.as_ref(), cb) {
+        client
+            .engine
+            .set_group_chat_invitation_listener(move |invitation| {
+                let conference_uri = c_string(invitation.conference_uri);
+                let conversation_id = c_string(invitation.conversation_id);
+                let subject = invitation.subject.map(c_string);
+                let inviter_uri = invitation.inviter_uri.map(c_string);
+                let inviter_name = invitation.inviter_name.map(c_string);
+                let as_ptr = |s: &Option<CString>| s.as_ref().map_or(ptr::null(), |s| s.as_ptr());
+                let cb_context = cb_context
+                    .as_ref()
+                    .map(|cb_context| cb_context.lock().unwrap());
+                cb(
+                    conference_uri.as_ptr(),
+                    conversation_id.as_ptr(),
+                    as_ptr(&subject),
+                    as_ptr(&inviter_uri),
+                    as_ptr(&inviter_name),
+                    i32::from(invitation.pending),
+                    cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr()),
+                );
+            });
+    }
+}
+
+/// Accepts the invitation to the group chat at `conference_uri` that waits
+/// for the user's answer if `accept` is not 0, or declines it: 404 if there
+/// is none
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_answer_group_chat_invitation(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    conference_uri: *const c_char,
+    accept: i32,
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_answer_group_chat_invitation()");
+
+    let callback = message_result_closure(cb, cb_context);
+
+    if let (Some(rcs_runtime), Some(client)) = (rcs_runtime.as_ref(), client.as_ref()) {
+        let conference_uri = CStr::from_ptr(conference_uri).to_string_lossy();
+        client.engine.answer_group_chat_invitation(
+            &conference_uri,
+            accept != 0,
+            callback,
+            &rcs_runtime.rt,
+        );
+        return;
+    }
+
+    callback(403, String::from("Forbidden"));
 }
 
 /// Asks the focus of the group at `conference_uri`, in the session there is

@@ -119,6 +119,19 @@ typedef void (*group_chat_event_callback) (int32_t event, const char *conference
 // sets the group chat listener; the context of one set before is released
 extern void rcs_client_set_group_chat_listener(struct rcs_client *client, group_chat_event_callback cb, void *context);
 
+// told of an invitation to a group chat not known before: the group's URI and Conversation-ID, then its subject and the URI
+// and display name of whoever invited, each NULL if not told; pending != 0 if it waits for the user's answer, as group chats
+// are not accepted automatically (AutAcceptGroupChat 0), else it is being accepted, and joined (event 0) once it is
+typedef void (*group_chat_invitation_callback) (const char *conference_uri, const char *conversation_id, const char *subject,
+                                const char *inviter_uri, const char *inviter_name, int32_t pending, void *context);
+
+// sets the group chat invitation listener; the context of one set before is released
+extern void rcs_client_set_group_chat_invitation_listener(struct rcs_client *client, group_chat_invitation_callback cb, void *context);
+
+// accepts (accept != 0) or declines the invitation to the group chat that waits for the user's answer: 404 if there is none
+extern void rcs_client_answer_group_chat_invitation(struct rcs_runtime *runtime, struct rcs_client *client, const char *conference_uri,
+                                int accept, message_result_callback cb, void *context);
+
 // asks the focus of the group, in the session there is with it, to invite participants: 404 if there is no session
 extern void rcs_client_add_group_chat_participants(struct rcs_client *client, const char *conference_uri,
                                 const char *const *participants, size_t participant_count,

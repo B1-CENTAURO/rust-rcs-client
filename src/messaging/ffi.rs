@@ -74,6 +74,20 @@ pub type GroupChatEventCallback = extern "C" fn(
     context: *mut MessageResultCallbackContext,
 );
 
+/// Told of an invitation to a group chat not known before: the group's URI
+/// and Conversation-ID, then its subject and the URI and display name of
+/// whoever invited, each NULL if not told; `pending` is not 0 if it waits
+/// for the user's answer, else it is being accepted
+pub type GroupChatInvitationCallback = extern "C" fn(
+    conference_uri: *const c_char,
+    conversation_id: *const c_char,
+    subject: *const c_char,
+    inviter_uri: *const c_char,
+    inviter_name: *const c_char,
+    pending: i32,
+    context: *mut MessageResultCallbackContext,
+);
+
 #[repr(C)]
 pub struct MessageResultCallbackContext {
     _data: [u8; 0],

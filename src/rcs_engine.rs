@@ -96,6 +96,7 @@ use crate::connectivity::retry::Reconnect;
 use crate::connectivity::{flow::FlowManager, registration::Registration};
 use crate::context::Context;
 use crate::messaging::config::MessagingConfigs;
+use crate::messaging::cpm::group_chat::GroupInvitation;
 use crate::messaging::cpm::imdn::{
     acknowledge_delivery, acknowledge_group_delivery, send_imdn, ImdnService, ReceivedMessages,
     Refusal,
@@ -122,6 +123,7 @@ use super::provisioning::rcs_application::RcsApplication;
 const LOG_TAG: &str = "librust_rcs_client";
 
 type GroupChatListener = Arc<dyn Fn(CPMGroupEvent) + Send + Sync>;
+type GroupChatInvitationListener = Arc<dyn Fn(GroupInvitation) + Send + Sync>;
 
 pub enum RcsEngineConnectionState {
     IDLE,
@@ -161,6 +163,9 @@ pub struct RcsEngine {
 
     /// Told of the group chats taken part in, if the app set one
     group_chat_listener: Arc<Mutex<Option<GroupChatListener>>>,
+
+    /// Told of the invitations to group chats, if the app set one
+    group_chat_invitation_listener: Arc<Mutex<Option<GroupChatInvitationListener>>>,
 
     // msrp_channels: Arc<MsrpChannelManager>,
     core: Arc<SipCore>,
@@ -203,6 +208,9 @@ impl RcsEngine {
 
         let group_chat_listener: Arc<Mutex<Option<GroupChatListener>>> = Arc::new(Mutex::new(None));
         let group_chat_listener_ = Arc::clone(&group_chat_listener);
+        let group_chat_invitation_listener: Arc<Mutex<Option<GroupChatInvitationListener>>> =
+            Arc::new(Mutex::new(None));
+        let group_chat_invitation_listener_ = Arc::clone(&group_chat_invitation_listener);
 
         #[cfg(not(all(feature = "android", target_os = "android")))]
         let tls_client_config = context.get_tls_client_config();
@@ -684,9 +692,19 @@ impl RcsEngine {
             },
             move |event| {
                 // not called under the lock, for the app may set another
-                let listener = group_chat_listener_.lock().unwrap().clone();
-                if let Some(listener) = listener {
-                    listener(event);
+                match event {
+                    CPMGroupEvent::Invited(invitation) => {
+                        let listener = group_chat_invitation_listener_.lock().unwrap().clone();
+                        if let Some(listener) = listener {
+                            listener(invitation);
+                        }
+                    }
+                    event => {
+                        let listener = group_chat_listener_.lock().unwrap().clone();
+                        if let Some(listener) = listener {
+                            listener(event);
+                        }
+                    }
                 }
             },
         );
@@ -799,6 +817,8 @@ impl RcsEngine {
             received_messages,
 
             group_chat_listener,
+
+            group_chat_invitation_listener,
 
             // msrp_channels,
             core,
@@ -1173,6 +1193,39 @@ impl RcsEngine {
             .lock()
             .unwrap()
             .replace(Arc::new(listener));
+    }
+
+    /// Sets what is told of the invitations to group chats not known before,
+    /// as they are being accepted or wait for the user's answer
+    pub fn set_group_chat_invitation_listener<L>(&self, listener: L)
+    where
+        L: Fn(GroupInvitation) + Send + Sync + 'static,
+    {
+        self.group_chat_invitation_listener
+            .lock()
+            .unwrap()
+            .replace(Arc::new(listener));
+    }
+
+    /// Accepts the invitation to the group chat at `conference_uri` that
+    /// waits for the user's answer, or declines it: 404 if there is none
+    pub fn answer_group_chat_invitation<F>(
+        &self,
+        conference_uri: &str,
+        accept: bool,
+        callback: F,
+        rt: &Arc<Runtime>,
+    ) where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        if self
+            .cpm_session_service
+            .answer_invitation(conference_uri, accept, rt)
+        {
+            callback(200, String::from("Ok"));
+        } else {
+            callback(404, String::from("Not Found"));
+        }
     }
 
     /// Asks the focus of the group at `conference_uri` to invite
