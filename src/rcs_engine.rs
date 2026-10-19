@@ -1095,6 +1095,94 @@ impl RcsEngine {
         }
     }
 
+    /// Starts a new group chat with `participants`, about `subject`, through
+    /// the provisioned conference factory. `callback` is told the URI of the
+    /// group once its session starts, which messages to it are sent to, as to
+    /// a recipient of the group type, or else why it did not start.
+    pub fn create_group_chat<F>(
+        &self,
+        participants: Vec<String>,
+        subject: Option<&str>,
+        callback: F,
+        rt: &Arc<Runtime>,
+    ) where
+        F: FnOnce(u16, String, Option<String>) + Send + Sync + 'static,
+    {
+        let factory_uri = {
+            let messaging_config = &*self.messaging_config.lock().unwrap();
+            let too_many = messaging_config.max_ad_hoc_group_size > 0
+                && participants.len() + 1 > messaging_config.max_ad_hoc_group_size;
+            match (
+                messaging_config.group_chat_auth,
+                &messaging_config.conf_fcty_uri,
+            ) {
+                (1, Some(factory_uri)) if !participants.is_empty() && !too_many => {
+                    Some(factory_uri.clone())
+                }
+                _ => None,
+            }
+        };
+
+        match (factory_uri, registered_identity(&self.state)) {
+            (Some(factory_uri), Some(_)) => self.cpm_session_service.create_group_chat(
+                &factory_uri,
+                &participants,
+                subject,
+                callback,
+                &self.core,
+                rt,
+            ),
+            _ => callback(403, String::from("Forbidden"), None),
+        }
+    }
+
+    /// Tells `recipient`, in the chat session there is with it, that the user
+    /// is composing a message, or no longer is. No session is started for it:
+    /// 404 if there is none.
+    pub fn send_is_composing<F>(
+        &self,
+        recipient: &str,
+        recipient_type: RecipientType,
+        active: bool,
+        result_callback: F,
+        rt: &Arc<Runtime>,
+    ) where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        let result_callback = Arc::new(Mutex::new(Some(result_callback)));
+        let result_callback_ = Arc::clone(&result_callback);
+        let sent = self.cpm_session_service.send_is_composing(
+            recipient,
+            &recipient_type,
+            active,
+            move |status_code, reason_phrase| {
+                if let Some(result_callback) = result_callback_.lock().unwrap().take() {
+                    result_callback(status_code, reason_phrase);
+                }
+            },
+            rt,
+        );
+        if !sent {
+            let result_callback = result_callback.lock().unwrap().take();
+            if let Some(result_callback) = result_callback {
+                result_callback(404, String::from("Not Found"));
+            }
+        }
+    }
+
+    /// Ends the chat session with `recipient`, a contact or a group: 404 if
+    /// there is none. A message sent to it from now on starts another.
+    pub fn end_chat_session<F>(&self, recipient: &str, result_callback: F)
+    where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        if self.cpm_session_service.end_session(recipient) {
+            result_callback(200, String::from("Ok"));
+        } else {
+            result_callback(404, String::from("Not Found"));
+        }
+    }
+
     /// Sends the IMDN document `imdn_content` to `sender_uri`, by the service
     /// the message told of came by: a chat (0) or standalone messaging (1)
     pub fn send_imdn_report<F>(

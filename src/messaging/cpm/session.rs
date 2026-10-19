@@ -17,11 +17,13 @@ extern crate rust_strict_sdp;
 
 use std::io::Read;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::Future;
 
 use rust_rcs_core::cpim::{CPIMInfo, CPIMMessage};
+use rust_rcs_core::internet::body::message_body::MessageBody;
+use rust_rcs_core::internet::body::multipart_body::MultipartBody;
 use rust_rcs_core::internet::body::VectorReader;
 use rust_rcs_core::internet::header::search;
 use rust_rcs_core::internet::header_field::AsHeaderField;
@@ -83,7 +85,8 @@ use super::session_invitation::{
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMContact, CPMServiceType};
 use super::{
-    decode_base64, make_cpim_message_content_body, understands_cpim_requirements, CPMMessageParam,
+    decode_base64, is_composing_document, is_media_type, make_cpim_message_content_body,
+    new_message_id, understands_cpim_requirements, CPMMessageParam, IS_COMPOSING,
 };
 
 // to-do: use enum
@@ -104,8 +107,9 @@ impl CPMSessionInfo {
     pub fn get_contact_known_identities(&self) -> ContactKnownIdentities {
         let mut known_identities = ContactKnownIdentities::new();
         known_identities.add_identity(self.asserted_contact_uri.clone());
+        // a group by its focus, which messages to it are sent to (RFC 4579)
         match self.cpm_contact.service_type {
-            CPMServiceType::OneToOne | CPMServiceType::Chatbot => {
+            CPMServiceType::OneToOne | CPMServiceType::Chatbot | CPMServiceType::Group => {
                 if let Ok(service_uri) = std::str::from_utf8(&self.cpm_contact.service_uri) {
                     known_identities.add_identity(String::from(service_uri));
                 }
@@ -420,6 +424,9 @@ pub struct CPMSession {
     /// The writer of the MSRP connection, once up, taken under the state
     /// lock
     msrp_writer: Arc<Mutex<Option<mpsc::Sender<Option<Vec<u8>>>>>>,
+    /// What ending the session takes, once its dialog is confirmed, taken
+    /// when it ends
+    session_end: Mutex<Option<SessionEnd>>,
 }
 
 impl CPMSession {
@@ -432,7 +439,13 @@ impl CPMSession {
             pending_messages: Mutex::new(Vec::new()),
             ended: Arc::new(Notify::new()),
             msrp_writer: Arc::new(Mutex::new(None)),
+            session_end: Mutex::new(None),
         }
+    }
+
+    /// Keeps what ending the session takes, for it to be ended on request
+    pub(crate) fn keep_session_end(&self, session_end: SessionEnd) {
+        self.session_end.lock().unwrap().replace(session_end);
     }
 
     /// Told once when the session ends, to whoever waits first
@@ -746,30 +759,36 @@ impl CPMSession {
                             );
 
                             while let Some(message) = message_rx.recv().await {
-                                let content_type = b"message/cpim".to_vec();
-                                let content_type = Some(content_type);
+                                let (content_type, data) = if message.raw {
+                                    (
+                                        message.message_type.as_bytes().to_vec(),
+                                        message.message_content.as_bytes().to_vec(),
+                                    )
+                                } else {
+                                    let body = make_cpim_message_content_body(
+                                        &message.message_type,
+                                        &message.message_content,
+                                        &message.recipient_type,
+                                        &message.recipient_uri,
+                                        &message.message_id,
+                                        &public_user_identity,
+                                    );
 
-                                let body = make_cpim_message_content_body(
-                                    &message.message_type,
-                                    &message.message_content,
-                                    &message.recipient_type,
-                                    &message.recipient_uri,
-                                    &message.message_id,
-                                    &public_user_identity,
-                                );
-
-                                let size = body.estimated_size();
-
-                                let mut data = Vec::with_capacity(size);
-                                match body.reader() {
-                                    Ok(mut reader) => {
-                                        match reader.read_to_end(&mut data) {
-                                            Ok(_) => {}
-                                            Err(_) => {} // to-do: early failure
+                                    let mut data = Vec::with_capacity(body.estimated_size());
+                                    match body.reader() {
+                                        Ok(mut reader) => {
+                                            match reader.read_to_end(&mut data) {
+                                                Ok(_) => {}
+                                                Err(_) => {} // to-do: early failure
+                                            }
                                         }
+                                        Err(_) => {} // to-do: early failure
                                     }
-                                    Err(_) => {} // to-do: early failure
-                                }
+
+                                    (b"message/cpim".to_vec(), data)
+                                };
+                                let content_type = Some(content_type);
+                                let size = data.len();
 
                                 let from_path_ = from_path.clone();
                                 let to_path_ = to_path.clone();
@@ -879,6 +898,14 @@ impl SessionEnd {
     /// starts another, its MSRP connection closes, and its dialog goes,
     /// ended with a BYE if `send_bye`, as when its MSRP connection is lost
     pub(crate) fn end(&self, send_bye: bool) {
+        // which the session holds, and holds it
+        self.sip_session
+            .get_inner()
+            .session_end
+            .lock()
+            .unwrap()
+            .take();
+
         {
             let mut guard = self.ongoing_sessions.lock().unwrap();
             if let Some(idx) = guard
@@ -1037,9 +1064,46 @@ impl MsrpMessageReceiver for CPMSessionMessageReceiver {
                 message_buf: Vec::with_capacity(1024),
                 message_callback: cb,
             }))
+        } else if is_media_type(content_type, IS_COMPOSING) {
+            // as it is, from the other end of the session (RFC 3994)
+            Ok(Box::new(IsComposingWriter {
+                content_type: content_type.to_vec(),
+                data: Vec::new(),
+                callback: Arc::clone(&self.callback),
+            }))
         } else {
             Err((415, "Unsupported Media Type"))
         }
+    }
+}
+
+/// An is-composing indication sent as it is, given to the app as a message of
+/// no CPIM headers
+struct IsComposingWriter {
+    content_type: Vec<u8>,
+    data: Vec<u8>,
+    callback: Arc<dyn Fn(&CPIMInfo, &[u8], &[u8]) + Send + Sync>,
+}
+
+impl MsrpDataWriter for IsComposingWriter {
+    fn write(&mut self, data: &[u8]) -> Result<usize, (u16, &'static str)> {
+        self.data.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn complete(&mut self) -> Result<(), (u16, &'static str)> {
+        let info = CPIMInfo {
+            imdn_message_id: b"",
+            from: b"",
+            to: b"",
+            date: b"",
+            from_uri: None,
+            to_uri: None,
+            payload_type: None,
+            disposition_notification: None,
+        };
+        (self.callback)(&info, &self.content_type, &self.data);
+        Ok(())
     }
 }
 
@@ -1186,6 +1250,72 @@ impl CPMSessionService {
     }
 
     /// Whether there is a session with `recipient`, or one being set up
+    /// Tells `recipient`, in the chat session there is with it, that the user
+    /// is composing a message, or no longer is (RFC 3994). As an indication
+    /// starts no session, false, and nothing sent, if there is none. It goes
+    /// as it is in a one-to-one chat, and in a CPIM message in a group's, for
+    /// the sender to be known.
+    pub fn send_is_composing<F>(
+        &self,
+        recipient: &str,
+        recipient_type: &RecipientType,
+        active: bool,
+        result_callback: F,
+        rt: &Arc<Runtime>,
+    ) -> bool
+    where
+        F: Fn(u16, String) + Send + Sync + 'static,
+    {
+        let cpm_session = {
+            let sessions = self.ongoing_sessions.lock().unwrap();
+            match sessions
+                .iter()
+                .find(|(known_identities, _)| known_identities == recipient)
+            {
+                Some((_, sip_session)) => sip_session.get_inner(),
+                None => return false,
+            }
+        };
+
+        let message = CPMMessageParam::new(
+            String::from(IS_COMPOSING),
+            is_composing_document(active),
+            new_message_id(),
+            recipient,
+            recipient_type,
+            recipient,
+            result_callback,
+        );
+        let message = match recipient_type {
+            RecipientType::Group => message,
+            _ => message.raw(),
+        };
+
+        cpm_session.send_message(message, rt);
+        true
+    }
+
+    /// Ends the chat session with `recipient`, with a BYE; whether there was
+    /// one. A message sent to `recipient` from now on starts another.
+    pub fn end_session(&self, recipient: &str) -> bool {
+        let session_end = {
+            let sessions = self.ongoing_sessions.lock().unwrap();
+            sessions
+                .iter()
+                .find(|(known_identities, _)| known_identities == recipient)
+                .and_then(|(_, sip_session)| {
+                    sip_session.get_inner().session_end.lock().unwrap().clone()
+                })
+        };
+        match session_end {
+            Some(session_end) => {
+                session_end.end(true);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn has_session_with(&self, recipient: &str) -> bool {
         for (known_identities, _) in &*self.ongoing_sessions.lock().unwrap() {
             if known_identities == recipient {
@@ -1248,7 +1378,7 @@ impl CPMSessionService {
             }
         }
 
-        let mut invitations = self.ongoing_outgoing_invitations.lock().unwrap();
+        let invitations = self.ongoing_outgoing_invitations.lock().unwrap();
 
         for invitation in &*invitations {
             let (known_identities, message_tx) = invitation.as_ref();
@@ -1282,6 +1412,96 @@ impl CPMSessionService {
                 return;
             }
         }
+
+        let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
+        let message_result_callback = move |status_code, reason_phrase| {
+            let mut guard = message_result_callback.lock().unwrap();
+            if let Some(message_result_callback) = guard.take() {
+                message_result_callback(status_code, reason_phrase);
+            }
+        };
+
+        let message = CPMMessageParam::new(
+            String::from(message_type),
+            String::from(message_content),
+            String::from(message_id),
+            recipient,
+            recipient_type,
+            recipient_uri,
+            message_result_callback,
+        );
+
+        self.invite(
+            sessions,
+            invitations,
+            Invitee {
+                uri: recipient,
+                to_uri: recipient_uri,
+                recipient_type,
+                known_as: Some(recipient),
+                new_group: None,
+            },
+            Some(message),
+            None,
+            core,
+            rt,
+        );
+    }
+
+    /// Starts a new group chat with `participants`, about `subject`, through
+    /// the conference factory at `factory_uri` (RFC 5366). `callback` is told
+    /// the URI of the group once its session starts, a message to which goes
+    /// in the session, or else why it did not start.
+    pub fn create_group_chat<F>(
+        &self,
+        factory_uri: &str,
+        participants: &[String],
+        subject: Option<&str>,
+        callback: F,
+        core: &Arc<SipCore>,
+        rt: &Arc<Runtime>,
+    ) where
+        F: FnOnce(u16, String, Option<String>) + Send + Sync + 'static,
+    {
+        let sessions = self.ongoing_sessions.lock().unwrap();
+        let invitations = self.ongoing_outgoing_invitations.lock().unwrap();
+
+        self.invite(
+            sessions,
+            invitations,
+            Invitee {
+                uri: factory_uri,
+                to_uri: factory_uri,
+                recipient_type: &RecipientType::Group,
+                // the group is known by its own URI once it starts, not by
+                // the factory's
+                known_as: None,
+                new_group: Some((participants, subject)),
+            },
+            None,
+            Some(Box::new(callback)),
+            core,
+            rt,
+        );
+    }
+
+    /// Starts a session with `invitee`, `message` sent in it once it starts,
+    /// as the messages sent to the invitation meanwhile are, and `started`
+    /// told how it went. The invitation is made known through `invitations`;
+    /// the guards are let go of before anyone is called back.
+    fn invite(
+        &self,
+        sessions: MutexGuard<'_, Vec<(ContactKnownIdentities, Arc<SipSession<CPMSession>>)>>,
+        mut invitations: MutexGuard<'_, Vec<OutgoingInvitation>>,
+        invitee: Invitee<'_>,
+        message: Option<CPMMessageParam>,
+        started: Option<Started>,
+        core: &Arc<SipCore>,
+        rt: &Arc<Runtime>,
+    ) {
+        let recipient = invitee.uri;
+        let recipient_uri = invitee.to_uri;
+        let recipient_type = invitee.recipient_type;
 
         if let Ok((sock, host, port, tls, active_setup, ipv6)) =
             (self.msrp_socket_allocator_function)(None)
@@ -1416,16 +1636,41 @@ impl CPMSessionService {
                     String::from(contact_identity),
                 ));
 
-                invite_message.add_header(Header::new(b"Content-Type", "application/sdp"));
-
-                let content_length = sdp.estimated_size();
-                invite_message.add_header(Header::new(
-                    b"Content-Length",
-                    format!("{}", content_length),
-                ));
-
                 let l_sdp_body = Arc::clone(&sdp);
-                invite_message.set_body(sdp);
+
+                match invitee.new_group {
+                    // the participants for the focus to invite (RFC 5366)
+                    Some((participants, subject)) => {
+                        invite_message
+                            .add_header(Header::new(b"Require", b"recipient-list-invite"));
+
+                        if let Some(subject) = subject {
+                            let subject: String =
+                                subject.chars().filter(|c| !c.is_control()).collect();
+                            invite_message.add_header(Header::new(b"Subject", subject));
+                        }
+
+                        let (boundary, body) = group_invitation_body(&sdp, participants);
+                        invite_message.add_header(Header::new(
+                            b"Content-Type",
+                            format!("multipart/mixed; boundary={}", boundary),
+                        ));
+                        invite_message.add_header(Header::new(
+                            b"Content-Length",
+                            format!("{}", body.estimated_size()),
+                        ));
+                        invite_message.set_body(Arc::new(body));
+                    }
+
+                    None => {
+                        invite_message.add_header(Header::new(b"Content-Type", "application/sdp"));
+                        invite_message.add_header(Header::new(
+                            b"Content-Length",
+                            format!("{}", sdp.estimated_size()),
+                        ));
+                        invite_message.set_body(sdp);
+                    }
+                }
 
                 let req_headers = invite_message.copy_headers();
 
@@ -1441,30 +1686,14 @@ impl CPMSessionService {
 
                 let connect_function = Arc::clone(&self.msrp_socket_connect_function);
 
-                let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
-                let message_result_callback = move |status_code, reason_phrase| {
-                    let mut guard = message_result_callback.lock().unwrap();
-                    if let Some(message_result_callback) = guard.take() {
-                        message_result_callback(status_code, reason_phrase);
-                    }
-                };
-
-                let message = CPMMessageParam::new(
-                    String::from(message_type),
-                    String::from(message_content),
-                    String::from(message_id),
-                    recipient,
-                    recipient_type,
-                    recipient_uri,
-                    message_result_callback,
-                );
-
                 let ongoing_dialogs = core.get_ongoing_dialogs();
 
                 let mut known_identities = ContactKnownIdentities::new();
-                known_identities.add_identity(String::from(recipient));
+                if let Some(known_as) = invitee.known_as {
+                    known_identities.add_identity(String::from(known_as));
+                }
                 let outgoing_invitation = Arc::new((known_identities, message_tx));
-                let recipient_ = String::from(recipient);
+                let known_as = invitee.known_as.map(String::from);
                 let outgoing_invitation_ = Arc::clone(&outgoing_invitation);
 
                 let ongoing_outgoing_invitations = Arc::clone(&self.ongoing_outgoing_invitations);
@@ -1521,11 +1750,14 @@ impl CPMSessionService {
                                                 let rpath = r_msrp_info.path.to_vec();
 
                                                 let asserted_contact_uri = session_info.asserted_contact_uri.clone();
+                                                let service_uri = String::from_utf8_lossy(&session_info.cpm_contact.service_uri).into_owned();
                                                 let asserted_contact_uri_ = asserted_contact_uri.clone();
                                                 // known also by the address the
                                                 // messages were sent to
                                                 let mut known_identities = session_info.get_contact_known_identities();
-                                                known_identities.add_identity(String::from(&recipient_));
+                                                if let Some(known_as) = &known_as {
+                                                    known_identities.add_identity(known_as.clone());
+                                                }
                                                 let cpm_session = CPMSession::new(session_info);
 
                                                 if let Ok(_) = cpm_session.set_local_sdp(l_sdp_body, sock, tls, host, port, path) {
@@ -1572,6 +1804,7 @@ impl CPMSessionService {
                                                                 registered_public_identity: Arc::clone(&registered_public_identity),
                                                                 rt: Arc::clone(&rt_),
                                                             };
+                                                            cpm_session.keep_session_end(session_end.clone());
 
                                                             sip_session.setup_confirmed_dialog(&dialog, CPMSessionDialogEventReceiver {
                                                                 public_user_identity: public_user_identity_,
@@ -1691,11 +1924,17 @@ impl CPMSessionService {
                                                                         remove_invitation(&ongoing_outgoing_invitations, &outgoing_invitation_);
                                                                         drop(outgoing_invitation_);
 
-                                                                        match message_tx.send(message).await {
-                                                                            Ok(()) => {},
-                                                                            Err(e) => {
-                                                                                (e.0.message_result_callback)(403, String::from("Forbidden"));
-                                                                            },
+                                                                        if let Some(started) = started {
+                                                                            started(200, String::from("Ok"), Some(service_uri));
+                                                                        }
+
+                                                                        if let Some(message) = message {
+                                                                            match message_tx.send(message).await {
+                                                                                Ok(()) => {},
+                                                                                Err(e) => {
+                                                                                    (e.0.message_result_callback)(403, String::from("Forbidden"));
+                                                                                },
+                                                                            }
                                                                         }
 
                                                                         while let Some(message) = message_rx.recv().await {
@@ -1728,7 +1967,12 @@ impl CPMSessionService {
                                     error_code,
                                     &error_reason,
                                 );
-                                (message.message_result_callback)(error_code, error_reason);
+                                if let Some(message) = message {
+                                    (message.message_result_callback)(error_code, error_reason.clone());
+                                }
+                                if let Some(started) = started {
+                                    started(error_code, error_reason, None);
+                                }
                                 return;
                             }
                         }
@@ -1741,7 +1985,12 @@ impl CPMSessionService {
                         500,
                         "Internal Error",
                     );
-                    (message.message_result_callback)(500, String::from("Internal Error"));
+                    if let Some(message) = message {
+                        (message.message_result_callback)(500, String::from("Internal Error"));
+                    }
+                    if let Some(started) = started {
+                        started(500, String::from("Internal Error"), None);
+                    }
                 });
 
                 tm.send_request(
@@ -1767,8 +2016,74 @@ impl CPMSessionService {
         drop(invitations);
         drop(sessions);
 
-        (message_result_callback)(500, String::from("Internal Error"));
+        if let Some(message) = message {
+            (message.message_result_callback)(500, String::from("Internal Error"));
+        }
+        if let Some(started) = started {
+            started(500, String::from("Internal Error"), None);
+        }
     }
+}
+
+/// Whom an outgoing session is with
+struct Invitee<'a> {
+    /// The Request-URI of the INVITE
+    uri: &'a str,
+    /// The URI of its To
+    to_uri: &'a str,
+    recipient_type: &'a RecipientType,
+    /// What the messages sent before the session starts are sent to, if known
+    known_as: Option<&'a str>,
+    /// The participants and subject of a new group
+    new_group: Option<(&'a [String], Option<&'a str>)>,
+}
+
+/// Told how a session started: 200 and the URI it is known by, or why it did
+/// not
+type Started = Box<dyn FnOnce(u16, String, Option<String>) + Send + Sync>;
+
+/// The body of an INVITE starting a group, with its boundary: its SDP, and
+/// the participants the focus is to invite (RFC 5366 section 4)
+fn group_invitation_body(sdp: &Arc<Body>, participants: &[String]) -> (String, Body) {
+    let boundary = create_raw_alpha_numeric_string(16);
+    let boundary_ = String::from_utf8_lossy(&boundary).into_owned();
+
+    let mut list = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<resource-lists xmlns=\"urn:ietf:params:xml:ns:resource-lists\" \
+xmlns:cp=\"urn:ietf:params:xml:ns:copycontrol\"><list>",
+    );
+    for participant in participants {
+        list += &format!(
+            "<entry uri=\"{}\" cp:copyControl=\"to\"/>",
+            quick_xml::escape::escape(participant)
+        );
+    }
+    list += "</list></resource-lists>";
+    let list = list.into_bytes();
+
+    let parts = vec![
+        Arc::new(Body::Message(MessageBody {
+            headers: vec![
+                Header::new(b"Content-Type", b"application/sdp"),
+                Header::new(b"Content-Length", format!("{}", sdp.estimated_size())),
+            ],
+            body: Arc::clone(sdp),
+        })),
+        Arc::new(Body::Message(MessageBody {
+            headers: vec![
+                Header::new(b"Content-Type", b"application/resource-lists+xml"),
+                Header::new(b"Content-Disposition", b"recipient-list"),
+                Header::new(b"Content-Length", format!("{}", list.len())),
+            ],
+            body: Arc::new(Body::Raw(list)),
+        })),
+    ];
+
+    (
+        boundary_,
+        Body::Multipart(MultipartBody { boundary, parts }),
+    )
 }
 
 struct CPMSessionInviteCallbacks {

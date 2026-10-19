@@ -408,6 +408,9 @@ pub fn try_accept_invitation<'a, 'b>(
                                 registered_public_identity: Arc::clone(registered_public_identity),
                                 rt: Arc::clone(rt),
                             };
+                            sip_session
+                                .get_inner()
+                                .keep_session_end(session_end.clone());
 
                             sip_session.setup_confirmed_dialog(
                                 &dialog,

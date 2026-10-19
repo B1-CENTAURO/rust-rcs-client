@@ -54,6 +54,15 @@ pub type MessageResultCallback = extern "C" fn(
     context: *mut MessageResultCallbackContext,
 );
 
+/// Told how starting a group chat went, with the URI of the group, NULL if it
+/// did not start
+pub type GroupChatResultCallback = extern "C" fn(
+    status_code: u16,
+    reason_phrase: *const c_char,
+    conference_uri: *const c_char,
+    context: *mut MessageResultCallbackContext,
+);
+
 #[repr(C)]
 pub struct MessageResultCallbackContext {
     _data: [u8; 0],

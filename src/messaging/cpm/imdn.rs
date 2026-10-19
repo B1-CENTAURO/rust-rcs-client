@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use rust_rcs_core::cpim::CPIMInfo;
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::imdn::notification::{Dispositions, Imdn, Notification, Status};
-use rust_rcs_core::internet::{syntax, Header};
+use rust_rcs_core::internet::Header;
 use rust_rcs_core::io::Serializable;
 use rust_rcs_core::sip::{SipMessage, SipTransactionManager, SipTransport, MESSAGE};
 use rust_rcs_core::util::rand;
@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 
 use super::sip::cpm_contact::CPMServiceType;
 use super::standalone_messaging::OutgoingPagerModeContext;
-use super::{make_cpim_imdn_body, new_message_id, LOG_TAG};
+use super::{is_media_type, make_cpim_imdn_body, new_message_id, IS_COMPOSING, LOG_TAG};
 
 /// The service a message came by, which notifications of it go by
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,11 +223,10 @@ impl ReceivedMessages {
         cpim_info: &CPIMInfo,
         content_type: &[u8],
     ) -> Option<String> {
-        let media_type = content_type
-            .split(|c| *c == b';')
-            .next()
-            .unwrap_or_default();
-        if syntax::trim(media_type).eq_ignore_ascii_case(b"message/imdn+xml") {
+        // nor an is-composing indication, which asks for nothing
+        if is_media_type(content_type, "message/imdn+xml")
+            || is_media_type(content_type, IS_COMPOSING)
+        {
             return None;
         }
 
@@ -382,6 +381,18 @@ hi",
             None
         );
         assert_eq!(received.displayed("Kn31"), Err(Refusal::Unknown));
+
+        // nor an is-composing indication
+        assert_eq!(
+            receive(
+                &received,
+                "Kn32",
+                Some("positive-delivery, display"),
+                b"application/im-iscomposing+xml"
+            ),
+            None
+        );
+        assert_eq!(received.displayed("Kn32"), Err(Refusal::Unknown));
     }
 
     #[test]
