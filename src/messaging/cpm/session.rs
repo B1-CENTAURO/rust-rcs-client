@@ -80,6 +80,7 @@ use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
 use super::group_chat::{refer_participants, GroupChats, Participant};
+use super::imdn::send_group_imdn;
 use super::session_invitation::{
     try_accept_hanging_invitation, try_accept_invitation, CPMSessionInvitation,
     CPMSessionInvitationResponse,
@@ -106,6 +107,18 @@ pub struct CPMSessionInfo {
 }
 
 impl CPMSessionInfo {
+    /// Whom the messages of the session are from, as the app knows it: a
+    /// group by its focus's URI, which it sends to, else the identity
+    /// asserted
+    pub fn contact_uri(&self) -> String {
+        match self.cpm_contact.service_type {
+            CPMServiceType::Group => {
+                String::from_utf8_lossy(&self.cpm_contact.service_uri).into_owned()
+            }
+            _ => self.asserted_contact_uri.clone(),
+        }
+    }
+
     pub fn get_contact_known_identities(&self) -> ContactKnownIdentities {
         let mut known_identities = ContactKnownIdentities::new();
         known_identities.add_identity(self.asserted_contact_uri.clone());
@@ -1361,6 +1374,57 @@ impl CPMSessionService {
         true
     }
 
+    /// Sends the IMDN document `imdn_xml` in the session with the group at
+    /// `conference_uri`, for its focus to send on to the participant
+    /// `recipient_uri`; false, and nothing sent, if there is no such session
+    pub fn send_group_imdn<F>(
+        &self,
+        conference_uri: &str,
+        imdn_xml: &str,
+        recipient_uri: &str,
+        callback: F,
+        rt: &Arc<Runtime>,
+    ) -> bool
+    where
+        F: Fn(u16, String) + Send + Sync + 'static,
+    {
+        let public_user_identity = match &*self.registered_public_identity.lock().unwrap() {
+            Some((_, public_user_identity, _)) => public_user_identity.clone(),
+            None => return false,
+        };
+        let session = {
+            let sessions = self.ongoing_sessions.lock().unwrap();
+            sessions
+                .iter()
+                .find(|(known_identities, sip_session)| {
+                    known_identities == conference_uri
+                        && matches!(
+                            sip_session
+                                .get_inner()
+                                .get_session_info()
+                                .cpm_contact
+                                .service_type,
+                            CPMServiceType::Group
+                        )
+                })
+                .map(|(_, sip_session)| sip_session.get_inner())
+        };
+        match session {
+            Some(session) => {
+                send_group_imdn(
+                    &session,
+                    imdn_xml,
+                    recipient_uri,
+                    &public_user_identity,
+                    callback,
+                    rt,
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Ends the chat session with `recipient`, with a BYE; whether there was
     /// one. A message sent to `recipient` from now on starts another.
     pub fn end_session(&self, recipient: &str) -> bool {
@@ -1816,7 +1880,7 @@ impl CPMSessionService {
                                                 let rport = connection_address.map_or(r_msrp_info.port, |(_, p)| p);
                                                 let rpath = r_msrp_info.path.to_vec();
 
-                                                let asserted_contact_uri = session_info.asserted_contact_uri.clone();
+                                                let asserted_contact_uri = session_info.contact_uri();
                                                 let service_uri = String::from_utf8_lossy(&session_info.cpm_contact.service_uri).into_owned();
                                                 let asserted_contact_uri_ = asserted_contact_uri.clone();
                                                 // known also by the address the
