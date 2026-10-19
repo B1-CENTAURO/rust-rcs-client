@@ -129,6 +129,19 @@ typedef void (*group_chat_invitation_callback) (const char *conference_uri, cons
 // sets the group chat invitation listener; the context of one set before is released
 extern void rcs_client_set_group_chat_invitation_listener(struct rcs_client *client, group_chat_invitation_callback cb, void *context);
 
+// told of the identifiers of a group chat, once known or changed, for the app to keep and give back with
+// rcs_client_set_group_chat_ids once the client is made again, so that the group is restarted with them and known
+// when its focus restarts it
+typedef void (*group_chat_ids_callback) (const char *conference_uri, const char *conversation_id, const char *contribution_id,
+                                void *context);
+
+// sets the group chat identifiers listener; the context of one set before is released
+extern void rcs_client_set_group_chat_ids_listener(struct rcs_client *client, group_chat_ids_callback cb, void *context);
+
+// gives back the identifiers of a group chat the app kept; nothing if any is NULL or empty
+extern void rcs_client_set_group_chat_ids(struct rcs_client *client, const char *conference_uri, const char *conversation_id,
+                                const char *contribution_id);
+
 // accepts (accept != 0) or declines the invitation to the group chat that waits for the user's answer: 404 if there is none
 extern void rcs_client_answer_group_chat_invitation(struct rcs_runtime *runtime, struct rcs_client *client, const char *conference_uri,
                                 int accept, message_result_callback cb, void *context);

@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 // use backtrace::Backtrace;
 
 use libc::c_char;
+use messaging::cpm::group_chat::GroupIds;
 use messaging::cpm::session::CPMGroupEvent;
 use messaging::cpm::MessagingSessionHandle;
 use rust_rcs_core::security::gba::GbaContext;
@@ -63,13 +64,13 @@ use messaging::ffi::{
     get_recipient_type, DownloadFileProgressCallback, DownloadFileProgressCallbackContext,
     DownloadFileResultCallback, DownloadFileResultCallbackContext,
     DownloadFileResultCallbackContextWrapper, DownloadileProgressCallbackContextWrapper,
-    GroupChatEventCallback, GroupChatInvitationCallback, GroupChatResultCallback,
-    MessageResultCallback, MessageResultCallbackContext, MessageResultCallbackContextWrapper,
-    SendImdnReportResultCallback, SendImdnReportResultCallbackContext,
-    SendImdnReportResultCallbackContextWrapper, UploadFileProgressCallback,
-    UploadFileProgressCallbackContext, UploadFileProgressCallbackContextWrapper,
-    UploadFileResultCallback, UploadFileResultCallbackContext,
-    UploadFileResultCallbackContextWrapper,
+    GroupChatEventCallback, GroupChatIdsCallback, GroupChatInvitationCallback,
+    GroupChatResultCallback, MessageResultCallback, MessageResultCallbackContext,
+    MessageResultCallbackContextWrapper, SendImdnReportResultCallback,
+    SendImdnReportResultCallbackContext, SendImdnReportResultCallbackContextWrapper,
+    UploadFileProgressCallback, UploadFileProgressCallbackContext,
+    UploadFileProgressCallbackContextWrapper, UploadFileResultCallback,
+    UploadFileResultCallbackContext, UploadFileResultCallbackContextWrapper,
 };
 use provisioning::device_configuration::{
     start_auto_config, DeviceConfigurationStatus, RetryReason,
@@ -1017,8 +1018,8 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_listener(
                 }
                 CPMGroupEvent::Left(conference_uri) => (2, conference_uri, None),
                 CPMGroupEvent::InvitationWithdrawn(conference_uri) => (3, conference_uri, None),
-                // told through the invitation listener
-                CPMGroupEvent::Invited(_) => return,
+                // told through listeners of their own
+                CPMGroupEvent::Invited(_) | CPMGroupEvent::Ids(_) => return,
             };
             let conference_uri = c_string(conference_uri);
             let (uri, display_name, status) = match participant {
@@ -1084,6 +1085,65 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_invitation_listener(
                     cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr()),
                 );
             });
+    }
+}
+
+/// Sets what is told of the identifiers of group chats, once known or
+/// changed, for the app to keep and give back with
+/// rcs_client_set_group_chat_ids() once the client is made again. The
+/// context of one set before is let go of.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_group_chat_ids_listener(
+    client: *mut RcsClient,
+    cb: Option<GroupChatIdsCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_set_group_chat_ids_listener()");
+
+    let cb_context = NonNull::new(cb_context)
+        .map(|cb_context| Arc::new(Mutex::new(MessageResultCallbackContextWrapper(cb_context))));
+
+    if let (Some(client), Some(cb)) = (client.as_ref(), cb) {
+        client.engine.set_group_chat_ids_listener(move |ids| {
+            let conference_uri = c_string(ids.conference_uri);
+            let conversation_id = c_string(ids.conversation_id);
+            let contribution_id = c_string(ids.contribution_id);
+            let cb_context = cb_context
+                .as_ref()
+                .map(|cb_context| cb_context.lock().unwrap());
+            cb(
+                conference_uri.as_ptr(),
+                conversation_id.as_ptr(),
+                contribution_id.as_ptr(),
+                cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr()),
+            );
+        });
+    }
+}
+
+/// Gives back the identifiers of the group chat at `conference_uri` the app
+/// kept, for it to be restarted with them, and known when its focus restarts
+/// it; nothing if any is NULL or empty
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_group_chat_ids(
+    client: *mut RcsClient,
+    conference_uri: *const c_char,
+    conversation_id: *const c_char,
+    contribution_id: *const c_char,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_set_group_chat_ids()");
+
+    if let (Some(client), Some(conference_uri), Some(conversation_id), Some(contribution_id)) = (
+        client.as_ref(),
+        optional_string(conference_uri),
+        optional_string(conversation_id),
+        optional_string(contribution_id),
+    ) {
+        client.engine.remember_group_chat_ids(GroupIds {
+            conference_uri,
+            conversation_id,
+            contribution_id,
+        });
     }
 }
 

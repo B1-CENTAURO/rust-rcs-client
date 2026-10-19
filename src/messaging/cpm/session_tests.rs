@@ -40,6 +40,7 @@ use rust_rcs_core::sip::{
 
 use crate::messaging::ffi::RecipientType;
 
+use super::group_chat::GroupIds;
 use super::imdn::{
     acknowledge_delivery, acknowledge_group_delivery, ImdnService, ReceivedMessages,
 };
@@ -74,6 +75,8 @@ pub struct Client {
     pub group_answer: Arc<AtomicU16>,
     /// The same, for one-to-one chat invitations
     pub chat_answer: Arc<AtomicU16>,
+    /// The identifiers of groups the app is told to keep
+    pub group_ids: Receiver<GroupIds>,
 }
 
 impl Client {
@@ -219,6 +222,8 @@ pub fn start(registered: bool) -> (Client, Peer) {
     let group_invites_tx = std::sync::Mutex::new(group_invites_tx);
     let (group_events_tx, group_events) = mpsc::channel();
     let group_events_tx = std::sync::Mutex::new(group_events_tx);
+    let (group_ids_tx, group_ids) = mpsc::channel();
+    let group_ids_tx = std::sync::Mutex::new(group_ids_tx);
     let group_answer = Arc::new(AtomicU16::new(200));
     let group_answer_ = Arc::clone(&group_answer);
     let chat_answer = Arc::new(AtomicU16::new(200));
@@ -323,6 +328,11 @@ pub fn start(registered: bool) -> (Client, Peer) {
                 ),
                 CPMGroupEvent::Left(group) => format!("left {}", group),
                 CPMGroupEvent::InvitationWithdrawn(group) => format!("withdrawn {}", group),
+                // apart, as the app keeps them
+                CPMGroupEvent::Ids(ids) => {
+                    let _ = group_ids_tx.lock().unwrap().send(ids);
+                    return;
+                }
             };
             let _ = group_events_tx.lock().unwrap().send(event);
         },
@@ -413,6 +423,7 @@ pub fn start(registered: bool) -> (Client, Peer) {
             group_events,
             group_answer,
             chat_answer,
+            group_ids,
         },
         Peer {
             rt,
@@ -2737,4 +2748,124 @@ fn the_conversation_id_of_a_group_is_known_once_a_session_with_it_starts() {
     // and not a contact's
     let _one_to_one = incoming_chat(&client, &mut peer, "one-to-one");
     assert_eq!(client.sessions.group_conversation_id(PEER), None);
+}
+
+#[test]
+fn the_ids_of_a_group_are_told_once_known_and_given_back_after_a_restart() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+
+    // told once the group starts
+    let (mut connection, creating, _subscribe, _) = new_group(&client, &mut peer);
+    let ids = client
+        .group_ids
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the ids to keep");
+    assert_eq!(
+        ids,
+        GroupIds {
+            conference_uri: String::from(GROUP),
+            conversation_id: header_value(&creating, "Conversation-ID"),
+            contribution_id: header_value(&creating, "Contribution-ID"),
+        }
+    );
+
+    // and not again as it restarts with the same
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+    let msrp = MsrpPeer::listen(&rt);
+    let _sent = client.send(GROUP, RecipientType::Group, "again");
+    let restart = peer.next_request("INVITE");
+    peer.send(&answer_from(
+        &restart,
+        "200 OK",
+        &focus_contact(),
+        Some(&msrp.sdp("sendrecv")),
+    ));
+    next_requests(&mut peer, &["ACK", "SUBSCRIBE"]);
+    let _connection = msrp.accept(&rt);
+    assert!(
+        client
+            .group_ids
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
+        "the same ids told again"
+    );
+
+    // a client made again, given them back, restarts the group with them
+    let (again, mut peer) = start(true);
+    again.sessions.remember_group_ids(ids.clone());
+    let _sent = again.send(GROUP, RecipientType::Group, "back");
+    let restart = peer.next_request("INVITE");
+    assert_eq!(request_uri(&restart), GROUP);
+    assert_eq!(
+        header_value(&restart, "Conversation-ID"),
+        ids.conversation_id
+    );
+    assert_eq!(
+        header_value(&restart, "Contribution-ID"),
+        ids.contribution_id
+    );
+    assert_eq!(
+        again.sessions.group_conversation_id(GROUP),
+        Some(ids.conversation_id)
+    );
+}
+
+#[test]
+fn a_group_given_back_is_known_when_its_focus_restarts_it() {
+    let (client, mut peer) = start(true);
+    client.group_answer.store(180, Ordering::SeqCst);
+    client.sessions.remember_group_ids(GroupIds {
+        conference_uri: String::from(GROUP),
+        conversation_id: String::from("conversation-1"),
+        contribution_id: String::from("contribution-1"),
+    });
+
+    // taken at once, though the user answers invitations
+    let msrp = group_invitation(&client, &mut peer, "group-known");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "group-known"));
+    peer.next_request("SUBSCRIBE");
+    let _connection = msrp.accept(&client.rt);
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+}
+
+#[test]
+fn a_restart_by_the_focus_of_a_group_being_left_is_declined() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (mut connection, _creating, _subscribe, _) = new_group(&client, &mut peer);
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+
+    // left with no session: restarted first
+    let msrp = MsrpPeer::listen(&rt);
+    let result = leave(&client, GROUP);
+    let restart = peer.next_request("INVITE");
+
+    // the focus restarting it meanwhile is declined
+    let _focus_msrp = group_invitation(&client, &mut peer, "group-crossing");
+    assert_eq!(status_code(&peer.next_response()), 603);
+
+    // and the group left once restarted
+    peer.send(&answer_from(
+        &restart,
+        "200 OK",
+        &focus_contact(),
+        Some(&msrp.sdp("sendrecv")),
+    ));
+    let requests = next_requests(&mut peer, &["ACK", "SUBSCRIBE", "BYE"]);
+    assert_eq!(header_value(&requests[2], "Reason"), LEAVING);
+    peer.send(&answer(&requests[2], "200 OK", None));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
+
+    // no longer being left, an invitation is answered as any other
+    let _msrp = group_invitation(&client, &mut peer, "group-later");
+    assert_eq!(status_code(&peer.next_response()), 200);
 }
