@@ -1591,12 +1591,16 @@ impl RcsEngine {
         }
     }
 
+    /// Downloads the file at `file_uri` to `download_path`, from `start` of
+    /// its `total` size if known, through the download proxy if one is
+    /// provisioned, told what `origin` tells of the message that brought it
     pub fn download_file<PF, RF>(
         &self,
         file_uri: &str,
         download_path: &str,
         start: usize,
         total: Option<usize>,
+        origin: DownloadOrigin<'_>,
         msisdn: Option<&str>,
         http_client: Arc<HttpClient>,
         gba_context: Arc<GbaContext>,
@@ -1611,10 +1615,12 @@ impl RcsEngine {
         let ft_auth = self.ft_http_configs.ft_auth;
 
         if ft_auth == 1 {
-            let file_uri = match &self.ft_http_configs.ft_http_dl_uri {
-                Some(ft_http_dl_uri) => download_through(ft_http_dl_uri, file_uri),
-                None => String::from(file_uri),
-            };
+            let file_uri = download_uri(
+                self.ft_http_configs.ft_http_dl_uri.as_deref(),
+                file_uri,
+                &origin,
+                |other_party| self.cpm_session_service.group_conversation_id(other_party),
+            );
 
             let credentials = self.ft_http_cs_credentials();
 
@@ -2406,17 +2412,57 @@ impl Connector {
     }
 }
 
-/// The URL of the download of `file_uri` through the download proxy at
-/// `ft_http_dl_uri`, the file's URL a value of its query as any other
-fn download_through(ft_http_dl_uri: &str, file_uri: &str) -> String {
-    match Url::parse(ft_http_dl_uri) {
-        Ok(mut url) => {
-            // to-do: the id, op and ci the proxy also takes
-            url.query_pairs_mut().append_pair("url", file_uri);
-            url.to_string()
+/// What the message that brought the URL of a file tells, for the download
+/// proxy to be told (RCC.07 section 4.2.3)
+#[derive(Default)]
+pub struct DownloadOrigin<'a> {
+    /// The imdn.Message-ID of the message
+    pub message_id: Option<&'a str>,
+    /// The other party of the message: a contact, or a group by its URI
+    pub other_party: Option<&'a str>,
+    /// The Conversation-ID of the group chat the message came in
+    pub conversation_id: Option<&'a str>,
+}
+
+/// The URI `file_uri` is downloaded from: the download proxy at
+/// `ft_http_dl_uri` if there is one, its query given the file's URL and what
+/// `origin` tells (RCC.07 section 4.2.3, Table 99), with the Conversation-ID
+/// `conversation_id_of` knows of the other party, a group, if not given; else
+/// the file's URL as it is
+fn download_uri<C>(
+    ft_http_dl_uri: Option<&str>,
+    file_uri: &str,
+    origin: &DownloadOrigin<'_>,
+    conversation_id_of: C,
+) -> String
+where
+    C: Fn(&str) -> Option<String>,
+{
+    let mut url = match ft_http_dl_uri.map(Url::parse) {
+        Some(Ok(url)) => url,
+        _ => return String::from(file_uri),
+    };
+
+    let conversation_id = origin
+        .conversation_id
+        .map(String::from)
+        .or_else(|| origin.other_party.and_then(&conversation_id_of));
+
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("url", file_uri);
+        if let Some(message_id) = origin.message_id {
+            query.append_pair("id", message_id);
         }
-        Err(_) => String::from(file_uri),
+        if let Some(other_party) = origin.other_party {
+            query.append_pair("op", other_party);
+        }
+        if let Some(conversation_id) = &conversation_id {
+            query.append_pair("ci", conversation_id);
+        }
     }
+
+    url.to_string()
 }
 
 /// The transport and public identity the engine is registered with, if it is
@@ -2605,21 +2651,131 @@ async fn open_stream(
 mod tests {
     use std::time::Duration;
 
-    use super::{download_through, reconnect_delay};
+    use super::{download_uri, reconnect_delay, DownloadOrigin};
     use crate::connectivity::retry::Reconnect;
+
+    fn no_group(_: &str) -> Option<String> {
+        None
+    }
 
     #[test]
     fn a_download_through_the_proxy_carries_the_file_url_encoded() {
         assert_eq!(
-            download_through(
-                "https://dl.example.com/dl?op=x",
-                "https://ftcs.example.com/f/1?a=1&b=2"
+            download_uri(
+                Some("https://dl.example.com/dl?op=x"),
+                "https://ftcs.example.com/f/1?a=1&b=2",
+                &DownloadOrigin::default(),
+                no_group,
             ),
             "https://dl.example.com/dl?op=x&url=https%3A%2F%2Fftcs.example.com%2Ff%2F1%3Fa%3D1%26b%3D2"
         );
+        // a query given to a proxy without one
         assert_eq!(
-            download_through("not a url", "https://ftcs.example.com/f/1"),
+            download_uri(
+                Some("https://dl.example.com/dl"),
+                "https://ftcs.example.com/f/1",
+                &DownloadOrigin::default(),
+                no_group,
+            ),
+            "https://dl.example.com/dl?url=https%3A%2F%2Fftcs.example.com%2Ff%2F1"
+        );
+        assert_eq!(
+            download_uri(
+                Some("not a url"),
+                "https://ftcs.example.com/f/1",
+                &DownloadOrigin::default(),
+                no_group,
+            ),
             "https://ftcs.example.com/f/1"
+        );
+    }
+
+    #[test]
+    fn a_download_with_no_proxy_is_from_the_file_url_as_it_is() {
+        let origin = DownloadOrigin {
+            message_id: Some("123456789"),
+            other_party: Some("sip:+491711234567@example.com"),
+            conversation_id: Some("conversation-1"),
+        };
+        assert_eq!(
+            download_uri(None, "https://ftcs.example.com/f/1", &origin, no_group),
+            "https://ftcs.example.com/f/1"
+        );
+    }
+
+    #[test]
+    fn the_proxy_is_told_the_message_as_rcc07_shows() {
+        // the example of RCC.07 section 4.2.3
+        let origin = DownloadOrigin {
+            message_id: Some("123456789"),
+            other_party: Some("sip:+491711234567@ims.mnc001.mcc262.3gppnetwork.org;user=phone"),
+            conversation_id: None,
+        };
+        assert_eq!(
+            download_uri(
+                Some("https://dl.operator.com/path?parm=foo"),
+                "https://ftcontentserver.rcs.mnc001.mcc262.pub.3gppnetwork.org/dl?uid=1234",
+                &origin,
+                no_group,
+            ),
+            "https://dl.operator.com/path?parm=foo\
+&url=https%3A%2F%2Fftcontentserver.rcs.mnc001.mcc262.pub.3gppnetwork.org%2Fdl%3Fuid%3D1234\
+&id=123456789\
+&op=sip%3A%2B491711234567%40ims.mnc001.mcc262.3gppnetwork.org%3Buser%3Dphone"
+        );
+    }
+
+    #[test]
+    fn the_proxy_is_told_the_conversation_of_a_group() {
+        const GROUP: &str = "sip:conf1@conf.example.com";
+        let known = |other_party: &str| {
+            if other_party == GROUP {
+                Some(String::from("known-1"))
+            } else {
+                None
+            }
+        };
+        let proxy = Some("https://dl.example.com/dl");
+        let file = "https://ftcs.example.com/f/1";
+        let url = "url=https%3A%2F%2Fftcs.example.com%2Ff%2F1";
+
+        // as given
+        let given = DownloadOrigin {
+            message_id: None,
+            other_party: Some(GROUP),
+            conversation_id: Some("given-1"),
+        };
+        assert_eq!(
+            download_uri(proxy, file, &given, known),
+            format!(
+                "https://dl.example.com/dl?{}&op=sip%3Aconf1%40conf.example.com&ci=given-1",
+                url
+            )
+        );
+
+        // else as known of the group
+        let group = DownloadOrigin {
+            message_id: None,
+            other_party: Some(GROUP),
+            conversation_id: None,
+        };
+        assert_eq!(
+            download_uri(proxy, file, &group, known),
+            format!(
+                "https://dl.example.com/dl?{}&op=sip%3Aconf1%40conf.example.com&ci=known-1",
+                url
+            )
+        );
+
+        // and none of a contact
+        let contact = DownloadOrigin {
+            message_id: None,
+            other_party: Some("tel:+15550001"),
+            conversation_id: None,
+        };
+        assert_eq!(
+            download_uri(proxy, file, &contact, known),
+            format!("https://dl.example.com/dl?{}&op=tel%3A%2B15550001", url)
         );
     }
 

@@ -2696,3 +2696,45 @@ fn a_chat_invitation_cancelled_while_waiting_is_let_go_of_without_a_group_event(
         "nothing told of a group"
     );
 }
+
+#[test]
+fn the_conversation_id_of_a_group_is_known_once_a_session_with_it_starts() {
+    let (client, mut peer) = start(true);
+    assert_eq!(client.sessions.group_conversation_id(GROUP), None);
+
+    // one the client started, by the Conversation-ID it sent
+    let (_connection, creating, _subscribe, _) = new_group(&client, &mut peer);
+    assert_eq!(
+        client.sessions.group_conversation_id(GROUP),
+        Some(header_value(&creating, "Conversation-ID"))
+    );
+
+    // one it was invited to, by the invitation's
+    let other = "sip:conf2@conf.example.com";
+    let msrp = MsrpPeer::listen(&client.rt);
+    peer.send(&invite(
+        "group-other",
+        &format!(
+            "<{}>;isfocus;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+            other
+        ),
+        FOCUS,
+        "cpm.session",
+        "",
+        "application/sdp",
+        &msrp.sdp("sendrecv"),
+    ));
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "group-other"));
+    peer.next_request("SUBSCRIBE");
+    let _connection = msrp.accept(&client.rt);
+    assert_eq!(
+        client.sessions.group_conversation_id(other),
+        Some(String::from("conversation-1"))
+    );
+
+    // and not a contact's
+    let _one_to_one = incoming_chat(&client, &mut peer, "one-to-one");
+    assert_eq!(client.sessions.group_conversation_id(PEER), None);
+}
