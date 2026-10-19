@@ -40,3 +40,11 @@ walkdir = { version = "2.4" }
 default = []
 android = ["rust-rcs-core/android"]
 ohos = ["rust-rcs-core/ohos"]
+# end-to-end encryption of chats (GSMA RCC.16), on the MLS of rust-rcs-core
+e2ee = ["rust-rcs-core/e2ee"]
+
+# The OpenMLS rust-rcs-core vendors, patched for RCC.16 (see
+# ../rust-rcs-core/vendor/openmls/VENDORED.md): a patch applies only from the
+# manifest built, not from a dependency's
+[patch.crates-io]
+openmls = { path = "../rust-rcs-core/vendor/openmls" }
