@@ -89,6 +89,15 @@ pub type GroupChatInvitationCallback = extern "C" fn(
     context: *mut MessageResultCallbackContext,
 );
 
+/// Told of the identifiers of a group chat, once known or changed, for the
+/// app to keep and give back once the client is made again
+pub type GroupChatIdsCallback = extern "C" fn(
+    conference_uri: *const c_char,
+    conversation_id: *const c_char,
+    contribution_id: *const c_char,
+    context: *mut MessageResultCallbackContext,
+);
+
 #[repr(C)]
 pub struct MessageResultCallbackContext {
     _data: [u8; 0],

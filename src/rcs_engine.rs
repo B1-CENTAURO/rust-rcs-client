@@ -96,7 +96,7 @@ use crate::connectivity::retry::Reconnect;
 use crate::connectivity::{flow::FlowManager, registration::Registration};
 use crate::context::Context;
 use crate::messaging::config::MessagingConfigs;
-use crate::messaging::cpm::group_chat::GroupInvitation;
+use crate::messaging::cpm::group_chat::{GroupIds, GroupInvitation};
 use crate::messaging::cpm::imdn::{
     acknowledge_delivery, acknowledge_group_delivery, send_imdn, ImdnService, ReceivedMessages,
     Refusal,
@@ -124,6 +124,7 @@ const LOG_TAG: &str = "librust_rcs_client";
 
 type GroupChatListener = Arc<dyn Fn(CPMGroupEvent) + Send + Sync>;
 type GroupChatInvitationListener = Arc<dyn Fn(GroupInvitation) + Send + Sync>;
+type GroupChatIdsListener = Arc<dyn Fn(GroupIds) + Send + Sync>;
 
 pub enum RcsEngineConnectionState {
     IDLE,
@@ -166,6 +167,9 @@ pub struct RcsEngine {
 
     /// Told of the invitations to group chats, if the app set one
     group_chat_invitation_listener: Arc<Mutex<Option<GroupChatInvitationListener>>>,
+
+    /// Told of the identifiers of group chats to keep, if the app set one
+    group_chat_ids_listener: Arc<Mutex<Option<GroupChatIdsListener>>>,
 
     // msrp_channels: Arc<MsrpChannelManager>,
     core: Arc<SipCore>,
@@ -211,6 +215,9 @@ impl RcsEngine {
         let group_chat_invitation_listener: Arc<Mutex<Option<GroupChatInvitationListener>>> =
             Arc::new(Mutex::new(None));
         let group_chat_invitation_listener_ = Arc::clone(&group_chat_invitation_listener);
+        let group_chat_ids_listener: Arc<Mutex<Option<GroupChatIdsListener>>> =
+            Arc::new(Mutex::new(None));
+        let group_chat_ids_listener_ = Arc::clone(&group_chat_ids_listener);
 
         #[cfg(not(all(feature = "android", target_os = "android")))]
         let tls_client_config = context.get_tls_client_config();
@@ -699,6 +706,12 @@ impl RcsEngine {
                             listener(invitation);
                         }
                     }
+                    CPMGroupEvent::Ids(ids) => {
+                        let listener = group_chat_ids_listener_.lock().unwrap().clone();
+                        if let Some(listener) = listener {
+                            listener(ids);
+                        }
+                    }
                     event => {
                         let listener = group_chat_listener_.lock().unwrap().clone();
                         if let Some(listener) = listener {
@@ -819,6 +832,8 @@ impl RcsEngine {
             group_chat_listener,
 
             group_chat_invitation_listener,
+
+            group_chat_ids_listener,
 
             // msrp_channels,
             core,
@@ -1206,6 +1221,25 @@ impl RcsEngine {
             .lock()
             .unwrap()
             .replace(Arc::new(listener));
+    }
+
+    /// Sets what is told of the identifiers of group chats, once known or
+    /// changed, for the app to keep and give back once the engine is made
+    /// again
+    pub fn set_group_chat_ids_listener<L>(&self, listener: L)
+    where
+        L: Fn(GroupIds) + Send + Sync + 'static,
+    {
+        self.group_chat_ids_listener
+            .lock()
+            .unwrap()
+            .replace(Arc::new(listener));
+    }
+
+    /// Gives back the identifiers of a group chat the app kept, for it to be
+    /// restarted with them (RCC.07 section 3.2.4.10)
+    pub fn remember_group_chat_ids(&self, ids: GroupIds) {
+        self.cpm_session_service.remember_group_ids(ids);
     }
 
     /// Accepts the invitation to the group chat at `conference_uri` that

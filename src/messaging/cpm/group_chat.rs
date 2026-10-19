@@ -16,7 +16,7 @@
 //! package (RFC 4575) while the session with the group lasts, and adding
 //! participants to one (RFC 5368)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 
 use quick_xml::events::Event;
@@ -64,6 +64,15 @@ pub struct GroupInvitation {
     /// are not accepted automatically (AutAcceptGroupChat 0); else it is
     /// being accepted
     pub pending: bool,
+}
+
+/// The identifiers a group chat is restarted with (RCC.07 section 3.2.4.10),
+/// for the app to keep and give back once the client starts again
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupIds {
+    pub conference_uri: String,
+    pub conversation_id: String,
+    pub contribution_id: String,
 }
 
 /// A user of a conference-info document
@@ -301,6 +310,9 @@ pub struct GroupChats {
     /// its last session had them, for it to be restarted with (RCC.07
     /// section 3.2.4.10)
     ids: Mutex<HashMap<String, (String, String)>>,
+    /// The groups by their URIs being left, through a session started to
+    /// leave in
+    leaving: Mutex<HashSet<String>>,
     registered_public_identity: Arc<Mutex<Option<(Arc<SipTransport>, String, String)>>>,
     pub(crate) listener: Arc<dyn Fn(CPMGroupEvent) + Send + Sync>,
 }
@@ -313,6 +325,7 @@ impl GroupChats {
         GroupChats {
             core: Mutex::new(None),
             ids: Mutex::new(HashMap::new()),
+            leaving: Mutex::new(HashSet::new()),
             registered_public_identity,
             listener,
         }
@@ -327,6 +340,30 @@ impl GroupChats {
     /// had in its last session, if there was one
     pub(crate) fn ids_of(&self, conference_uri: &str) -> Option<(String, String)> {
         self.ids.lock().unwrap().get(conference_uri).cloned()
+    }
+
+    /// Takes note of the identifiers of a group the app kept, to restart it
+    /// with as if a session with it had been had
+    pub(crate) fn remember(&self, ids: GroupIds) {
+        self.ids.lock().unwrap().insert(
+            ids.conference_uri,
+            (ids.conversation_id, ids.contribution_id),
+        );
+    }
+
+    /// Takes note of the group at `conference_uri` being left, or no longer
+    pub(crate) fn set_leaving(&self, conference_uri: &str, leaving: bool) {
+        let mut guard = self.leaving.lock().unwrap();
+        if leaving {
+            guard.insert(String::from(conference_uri));
+        } else {
+            guard.remove(conference_uri);
+        }
+    }
+
+    /// Whether the group at `conference_uri` is being left
+    pub(crate) fn is_leaving(&self, conference_uri: &str) -> bool {
+        self.leaving.lock().unwrap().contains(conference_uri)
     }
 
     /// Whether `conversation_id` is that of a group a session was had with
@@ -354,10 +391,20 @@ impl GroupChats {
         if let (Some(conversation_id), Some(contribution_id)) =
             (&session_info.conversation_id, &session_info.contribution_id)
         {
-            self.ids.lock().unwrap().insert(
-                conference_uri.clone(),
-                (conversation_id.clone(), contribution_id.clone()),
-            );
+            let ids = (conversation_id.clone(), contribution_id.clone());
+            let previous = self
+                .ids
+                .lock()
+                .unwrap()
+                .insert(conference_uri.clone(), ids.clone());
+            // the app told those it is to keep, once known or changed
+            if previous.as_ref() != Some(&ids) {
+                (self.listener)(CPMGroupEvent::Ids(GroupIds {
+                    conference_uri: conference_uri.clone(),
+                    conversation_id: ids.0,
+                    contribution_id: ids.1,
+                }));
+            }
         }
 
         (self.listener)(CPMGroupEvent::Joined(conference_uri.clone()));

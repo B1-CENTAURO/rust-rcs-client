@@ -79,7 +79,7 @@ use uuid::Uuid;
 use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
-use super::group_chat::{refer_participants, GroupChats, GroupInvitation, Participant};
+use super::group_chat::{refer_participants, GroupChats, GroupIds, GroupInvitation, Participant};
 use super::imdn::send_group_imdn;
 use super::session_invitation::{
     decline_hanging_invitation, end_cancelled_invitation, try_accept_hanging_invitation,
@@ -1192,6 +1192,8 @@ pub enum CPMGroupEvent {
     /// The invitation to the group at the URI, which waited for the user's
     /// answer, cancelled by whoever sent it
     InvitationWithdrawn(String),
+    /// The identifiers of a group, once known or changed, for the app to keep
+    Ids(GroupIds),
     /// The session with the group at the URI started
     Joined(String),
     /// What the focus of the group at the URI tells of a participant
@@ -1313,6 +1315,13 @@ impl CPMSessionService {
             group_invite_handler_function: Box::new(group_invite_handler_function),
             group_chats,
         }
+    }
+
+    /// Takes note of the identifiers of a group the app kept from before, for
+    /// the group to be restarted with them, and known when its focus
+    /// restarts it (RCC.07 section 3.2.4.10)
+    pub fn remember_group_ids(&self, ids: GroupIds) {
+        self.group_chats.remember(ids);
     }
 
     /// The Conversation-ID of the group at `conference_uri`, as its last
@@ -1531,6 +1540,9 @@ impl CPMSessionService {
             return;
         }
 
+        // a restart of the group by its focus meanwhile declined
+        self.group_chats.set_leaving(conference_uri, true);
+        let group_chats = Arc::clone(&self.group_chats);
         let ongoing_sessions = Arc::clone(&self.ongoing_sessions);
         let group = String::from(conference_uri);
         self.invite(
@@ -1545,6 +1557,7 @@ impl CPMSessionService {
             },
             None,
             Some(Box::new(move |status_code, reason_phrase, _| {
+                group_chats.set_leaving(&group, false);
                 if status_code != 200 {
                     callback(status_code, reason_phrase);
                     return;
@@ -2763,6 +2776,35 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                             &session_info.conversation_id,
                                             &session_info.contribution_id,
                                         ) {
+                                            // a restart of a group being left
+                                            // declined, as the user asked to
+                                            // leave it (RCC.07 sections
+                                            // 3.2.4.10 and 3.2.4.11)
+                                            if self
+                                                .service
+                                                .group_chats
+                                                .is_leaving(&session_info.contact_uri())
+                                            {
+                                                if let Some(resp_message) =
+                                                    server_transaction::make_response(
+                                                        message,
+                                                        transaction.to_tag(),
+                                                        603,
+                                                        b"Decline",
+                                                    )
+                                                {
+                                                    if let Some((tx, _)) = channels.take() {
+                                                        server_transaction::send_response(
+                                                            Arc::clone(transaction),
+                                                            resp_message,
+                                                            tx,
+                                                            rt,
+                                                        );
+                                                    }
+                                                }
+                                                return true;
+                                            }
+
                                             // a group taken part in, which its
                                             // focus restarts, is taken part in
                                             // again at once (RCC.07 section
