@@ -72,6 +72,8 @@ pub struct Client {
     /// How the app answers group chat invitations: 200, or 180 to answer
     /// later
     pub group_answer: Arc<AtomicU16>,
+    /// The same, for one-to-one chat invitations
+    pub chat_answer: Arc<AtomicU16>,
 }
 
 impl Client {
@@ -219,6 +221,8 @@ pub fn start(registered: bool) -> (Client, Peer) {
     let group_events_tx = std::sync::Mutex::new(group_events_tx);
     let group_answer = Arc::new(AtomicU16::new(200));
     let group_answer_ = Arc::clone(&group_answer);
+    let chat_answer = Arc::new(AtomicU16::new(200));
+    let chat_answer_ = Arc::clone(&chat_answer);
 
     // the messages taken are acknowledged as the engine does, once the
     // transport is registered
@@ -286,7 +290,7 @@ pub fn start(registered: bool) -> (Client, Peer) {
         },
         |_msrp_info| allocate_msrp_socket(),
         |sock, raddr, rport, _tls| connect_msrp_socket(sock, raddr, rport),
-        |_, _, _, _, _| 200,
+        move |_, _, _, _, _| chat_answer_.load(Ordering::SeqCst),
         move |_, _, _, subject, referred_by_name, _, _| {
             let _ = group_invites_tx
                 .lock()
@@ -318,6 +322,7 @@ pub fn start(registered: bool) -> (Client, Peer) {
                     participant.status
                 ),
                 CPMGroupEvent::Left(group) => format!("left {}", group),
+                CPMGroupEvent::InvitationWithdrawn(group) => format!("withdrawn {}", group),
             };
             let _ = group_events_tx.lock().unwrap().send(event);
         },
@@ -407,6 +412,7 @@ pub fn start(registered: bool) -> (Client, Peer) {
             received_messages,
             group_events,
             group_answer,
+            chat_answer,
         },
         Peer {
             rt,
@@ -2504,6 +2510,9 @@ fn a_group_joined_is_restarted_with_the_ids_it_was_joined_with() {
     assert_eq!(header_value(&restart, "Contribution-ID"), "contribution-1");
 }
 
+/// The identity the focus asserts, other than the group's URI
+const FOCUS: &str = "sip:focus@conf.example.com";
+
 /// An invitation from the focus of the group, by Alice, its MSRP peer
 /// listening
 fn group_invitation(client: &Client, peer: &mut Peer, call_id: &str) -> MsrpPeer {
@@ -2511,13 +2520,29 @@ fn group_invitation(client: &Client, peer: &mut Peer, call_id: &str) -> MsrpPeer
     peer.send(&invite(
         call_id,
         &focus_contact(),
-        GROUP,
+        FOCUS,
         "cpm.session",
         "Subject: Friends\r\nReferred-By: \"Alice\" <sip:+15550001@example.com>\r\n",
         "application/sdp",
         &msrp.sdp("sendrecv"),
     ));
     msrp
+}
+
+/// The CANCEL of the INVITE invite() made with `call_id`, from `asserted`
+fn cancel(call_id: &str, asserted: &str) -> String {
+    format!(
+        "CANCEL sip:+15551234@{};transport=tcp SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bK{}\r\n\
+From: <{}>;tag=peer1\r\n\
+To: <{}>\r\n\
+Call-ID: {}\r\n\
+CSeq: 1 CANCEL\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\
+\r\n",
+        TRANSPORT_ADDRESS, call_id, asserted, IMPU, call_id
+    )
 }
 
 /// Whether the dialogs the client has come to `count` within a second
@@ -2620,5 +2645,54 @@ fn a_group_restarted_by_its_focus_is_taken_part_in_again_at_once() {
         next_group_event(&client),
         format!("joined {}", GROUP),
         "not told of as an invitation"
+    );
+}
+
+#[test]
+fn a_group_invitation_cancelled_while_waiting_is_withdrawn_and_let_go_of() {
+    let (client, mut peer) = start(true);
+    client.group_answer.store(180, Ordering::SeqCst);
+
+    let _msrp = group_invitation(&client, &mut peer, "group-cancelled");
+    assert_eq!(status_code(&peer.next_response()), 180);
+    assert!(next_group_event(&client).ends_with(" pending"));
+    assert!(dialogs_come_to(&client, 1), "its early dialog");
+
+    // cancelled by the focus: the CANCEL answered, the INVITE ended
+    peer.send(&cancel("group-cancelled", FOCUS));
+    let mut answers: Vec<u16> = (0..2).map(|_| status_code(&peer.next_response())).collect();
+    answers.sort();
+    assert_eq!(answers, [200, 487]);
+
+    // and the app told, the invitation no longer one to answer
+    assert_eq!(next_group_event(&client), format!("withdrawn {}", GROUP));
+    assert!(!client.sessions.answer_invitation(GROUP, true, &client.rt));
+    assert!(dialogs_come_to(&client, 0), "its early dialog went");
+    peer.silence();
+}
+
+#[test]
+fn a_chat_invitation_cancelled_while_waiting_is_let_go_of_without_a_group_event() {
+    let (client, mut peer) = start(true);
+    client.chat_answer.store(180, Ordering::SeqCst);
+    let msrp = MsrpPeer::listen(&client.rt);
+
+    peer.send(&chat_invite("chat-cancelled", &msrp.sdp("sendrecv")));
+    assert_eq!(status_code(&peer.next_response()), 180);
+    assert!(dialogs_come_to(&client, 1), "its early dialog");
+
+    peer.send(&cancel("chat-cancelled", PEER));
+    let mut answers: Vec<u16> = (0..2).map(|_| status_code(&peer.next_response())).collect();
+    answers.sort();
+    assert_eq!(answers, [200, 487]);
+
+    assert!(dialogs_come_to(&client, 0), "its early dialog went");
+    assert!(!client.sessions.answer_invitation(PEER, true, &client.rt));
+    assert!(
+        client
+            .group_events
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
+        "nothing told of a group"
     );
 }

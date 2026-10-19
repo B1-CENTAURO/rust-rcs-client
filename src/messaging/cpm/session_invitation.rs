@@ -63,6 +63,7 @@ pub enum CPMSessionInvitationResponse {
     Accept,
     /// The user declines it
     Decline,
+    /// Whoever sent it cancels it
     Dispose,
 }
 
@@ -116,6 +117,19 @@ pub fn decline_hanging_invitation(
         rt,
     );
     ongoing_dialogs.remove_dialog(&invitation.dialog);
+}
+
+/// Lets go of `invitation`, which whoever sent it cancelled, and of its early
+/// dialog; the URI of the group it was to, if one
+pub fn end_cancelled_invitation(
+    invitation: CPMSessionInvitation,
+    ongoing_dialogs: &Arc<Mutex<Vec<Arc<SipDialog>>>>,
+) -> Option<String> {
+    ongoing_dialogs.remove_dialog(&invitation.dialog);
+    match invitation.session_info.cpm_contact.service_type {
+        CPMServiceType::Group => Some(invitation.session_info.contact_uri()),
+        _ => None,
+    }
 }
 
 pub fn try_accept_hanging_invitation(

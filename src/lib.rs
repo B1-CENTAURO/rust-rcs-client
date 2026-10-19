@@ -994,8 +994,9 @@ unsafe fn participant_list(
 }
 
 /// Sets what is told of the group chats taken part in: joined (0), a
-/// participant's status (1), left (2). The context of one set before is let
-/// go of.
+/// participant's status (1), left (2), and of an invitation that waited for
+/// the user's answer being withdrawn (3). The context of one set before is
+/// let go of.
 #[no_mangle]
 pub unsafe extern "C" fn rcs_client_set_group_chat_listener(
     client: *mut RcsClient,
@@ -1015,6 +1016,7 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_listener(
                     (1, conference_uri, Some(participant))
                 }
                 CPMGroupEvent::Left(conference_uri) => (2, conference_uri, None),
+                CPMGroupEvent::InvitationWithdrawn(conference_uri) => (3, conference_uri, None),
                 // told through the invitation listener
                 CPMGroupEvent::Invited(_) => return,
             };

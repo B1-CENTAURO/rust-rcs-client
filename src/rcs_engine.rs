@@ -1184,7 +1184,8 @@ impl RcsEngine {
     }
 
     /// Sets what is told of the group chats taken part in: joined, a
-    /// participant's status, left
+    /// participant's status, left, and of an invitation that waited for the
+    /// user's answer being withdrawn
     pub fn set_group_chat_listener<L>(&self, listener: L)
     where
         L: Fn(CPMGroupEvent) + Send + Sync + 'static,

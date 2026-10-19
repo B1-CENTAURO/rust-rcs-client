@@ -64,7 +64,8 @@ pub type GroupChatResultCallback = extern "C" fn(
 );
 
 /// Told of a group chat taken part in: joined (0), a participant's status
-/// (1), with its URI, display name or NULL, and status, or left (2)
+/// (1), with its URI, display name or NULL, and status, or left (2); or that
+/// an invitation to one that waited for the user's answer was withdrawn (3)
 pub type GroupChatEventCallback = extern "C" fn(
     event: i32,
     conference_uri: *const c_char,
