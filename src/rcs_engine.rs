@@ -111,6 +111,7 @@ use crate::messaging::ft_http::download_file;
 use crate::messaging::ft_http::upload_file;
 use crate::messaging::ft_http::FileInfo;
 use crate::messaging::ft_http::FileTransferOverHTTPService;
+use crate::messaging::ft_http::{ContentServer, Credentials};
 
 use super::provisioning::characteristic::Characteristic;
 use super::provisioning::ims_application::ImsApplication;
@@ -1172,6 +1173,18 @@ impl RcsEngine {
         }
     }
 
+    /// The host of ftHTTPCSURI, with ftHTTPCSUser and ftHTTPCSPwd, if all are
+    /// provisioned
+    fn ft_http_cs_credentials(&self) -> Option<(String, String, String)> {
+        let configs = &self.ft_http_configs;
+        let url = Url::parse(configs.ft_http_cs_uri.as_deref()?).ok()?;
+        Some((
+            String::from(url.host_str()?),
+            configs.ft_http_cs_user.clone()?,
+            configs.ft_http_cs_pwd.clone()?,
+        ))
+    }
+
     pub fn upload_file<PF, RF>(
         &self,
         tid: &str,
@@ -1203,6 +1216,7 @@ impl RcsEngine {
                         let ft_http_service = Arc::clone(&self.ft_http_service);
 
                         let ft_http_cs_uri = String::from(ft_http_cs_uri);
+                        let credentials = self.ft_http_cs_credentials();
                         let msisdn = match msisdn {
                             Some(msisdn) => Some(String::from(msisdn)),
                             None => None,
@@ -1266,16 +1280,27 @@ impl RcsEngine {
                                 Box::new(upload_file_progress_callback);
                             let progress_callback = Arc::new(progress_callback);
 
+                            let server = ContentServer {
+                                http_client: &http_client,
+                                gba_context: &gba_context,
+                                security_context: &security_context,
+                                credentials: credentials.as_ref().map(|(host, user, password)| {
+                                    Credentials {
+                                        host,
+                                        user,
+                                        password,
+                                    }
+                                }),
+                                msisdn: msisdn.as_deref(),
+                            };
+
                             match upload_file(
                                 &ft_http_service,
                                 &ft_http_cs_uri,
                                 tid,
                                 file,
                                 thumbnail,
-                                msisdn.as_deref(),
-                                &http_client,
-                                &gba_context,
-                                &security_context,
+                                &server,
                                 &progress_callback,
                             )
                             .await
@@ -1328,22 +1353,11 @@ impl RcsEngine {
 
         if ft_auth == 1 {
             let file_uri = match &self.ft_http_configs.ft_http_dl_uri {
-                Some(ft_http_dl_uri) => match Url::parse(ft_http_dl_uri) {
-                    Ok(mut url) => {
-                        let query = if let Some(query) = url.query() {
-                            format!("{}&url={}", query, file_uri) // to-do: requires id, op, ci
-                        } else {
-                            format!("url={}", file_uri) // to-do: requires id, op, ci
-                        };
-
-                        url.set_query(Some(&query));
-
-                        url.to_string()
-                    }
-                    Err(_) => String::from(file_uri),
-                },
+                Some(ft_http_dl_uri) => download_through(ft_http_dl_uri, file_uri),
                 None => String::from(file_uri),
             };
+
+            let credentials = self.ft_http_cs_credentials();
 
             let download_path = String::from(download_path);
 
@@ -1353,16 +1367,26 @@ impl RcsEngine {
             };
 
             rt.spawn(async move {
+                let server = ContentServer {
+                    http_client: &http_client,
+                    gba_context: &gba_context,
+                    security_context: &security_context,
+                    credentials: credentials
+                        .as_ref()
+                        .map(|(host, user, password)| Credentials {
+                            host,
+                            user,
+                            password,
+                        }),
+                    msisdn: msisdn.as_deref(),
+                };
+
                 match download_file(
                     &file_uri,
                     &download_path,
                     start,
                     total,
-                    msisdn.as_deref(),
-                    &http_client,
-                    &gba_context,
-                    &security_context,
-                    None,
+                    &server,
                     download_file_progress_callback,
                 )
                 .await
@@ -2123,6 +2147,19 @@ impl Connector {
     }
 }
 
+/// The URL of the download of `file_uri` through the download proxy at
+/// `ft_http_dl_uri`, the file's URL a value of its query as any other
+fn download_through(ft_http_dl_uri: &str, file_uri: &str) -> String {
+    match Url::parse(ft_http_dl_uri) {
+        Ok(mut url) => {
+            // to-do: the id, op and ci the proxy also takes
+            url.query_pairs_mut().append_pair("url", file_uri);
+            url.to_string()
+        }
+        Err(_) => String::from(file_uri),
+    }
+}
+
 /// The transport and public identity the engine is registered with, if it is
 fn registered_identity(
     state: &Mutex<(RcsEngineConnectionState, RcsEngineRegistrationState)>,
@@ -2309,8 +2346,23 @@ async fn open_stream(
 mod tests {
     use std::time::Duration;
 
-    use super::reconnect_delay;
+    use super::{download_through, reconnect_delay};
     use crate::connectivity::retry::Reconnect;
+
+    #[test]
+    fn a_download_through_the_proxy_carries_the_file_url_encoded() {
+        assert_eq!(
+            download_through(
+                "https://dl.example.com/dl?op=x",
+                "https://ftcs.example.com/f/1?a=1&b=2"
+            ),
+            "https://dl.example.com/dl?op=x&url=https%3A%2F%2Fftcs.example.com%2Ff%2F1%3Fa%3D1%26b%3D2"
+        );
+        assert_eq!(
+            download_through("not a url", "https://ftcs.example.com/f/1"),
+            "https://ftcs.example.com/f/1"
+        );
+    }
 
     #[test]
     fn a_lost_registration_is_made_again_at_once_only_after_a_success() {

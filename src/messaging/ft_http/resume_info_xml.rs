@@ -23,11 +23,40 @@ pub struct ResumeInfo {
     pub data_url: String,
 }
 
+/// Reads to the end of the element whose start was just read
+fn skip_element<R>(xml_reader: &mut Reader<R>, buf: &mut Vec<u8>)
+where
+    R: std::io::BufRead,
+{
+    let mut level = 1;
+
+    loop {
+        match xml_reader.read_event_into(buf) {
+            Ok(Event::Start(ref _e)) => {
+                level += 1;
+            }
+
+            Ok(Event::End(_)) => {
+                level -= 1;
+                if level == 0 {
+                    break;
+                }
+            }
+
+            Ok(Event::Eof) | Err(_) => {
+                break;
+            }
+
+            _ => {}
+        }
+    }
+}
+
 fn parse_file_range_element<R>(
     xml_reader: &mut Reader<R>,
     buf: &mut Vec<u8>,
     e: &BytesStart,
-    _level: i32,
+    level: i32,
 ) -> Option<(usize, usize)>
 where
     R: std::io::BufRead,
@@ -53,27 +82,10 @@ where
         }
     }
 
-    let mut level = 1;
-
-    loop {
-        match xml_reader.read_event_into(buf) {
-            Ok(Event::Start(ref _e)) => {
-                level += 1;
-            }
-
-            Ok(Event::End(_)) => {
-                level -= 1;
-                if level == 0 {
-                    break;
-                }
-            }
-
-            Ok(Event::Eof) | Err(_) => {
-                break;
-            }
-
-            _ => {}
-        }
+    // the rest of the element, if it has any: an empty one ends where it
+    // starts
+    if level > 0 {
+        skip_element(xml_reader, buf);
     }
 
     if let (Some(start), Some(end)) = (start, end) {
@@ -87,7 +99,7 @@ fn parse_data_element<R>(
     xml_reader: &mut Reader<R>,
     buf: &mut Vec<u8>,
     e: &BytesStart,
-    _level: i32,
+    level: i32,
 ) -> Option<String>
 where
     R: std::io::BufRead,
@@ -104,27 +116,10 @@ where
         }
     }
 
-    let mut level = 1;
-
-    loop {
-        match xml_reader.read_event_into(buf) {
-            Ok(Event::Start(ref _e)) => {
-                level += 1;
-            }
-
-            Ok(Event::End(_)) => {
-                level -= 1;
-                if level == 0 {
-                    break;
-                }
-            }
-
-            Ok(Event::Eof) | Err(_) => {
-                break;
-            }
-
-            _ => {}
-        }
+    // the rest of the element, if it has any: an empty one ends where it
+    // starts
+    if level > 0 {
+        skip_element(xml_reader, buf);
     }
 
     return url;
@@ -227,4 +222,38 @@ pub fn parse_xml(data: &[u8]) -> Option<ResumeInfo> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_xml;
+
+    #[test]
+    fn resume_info_is_read_with_empty_elements_and_with_content() {
+        for xml in [
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<file-resume-info>\n\
+  <file-range start=\"0\" end=\"4499\"/>\n\
+  <data url=\"https://ftcs.example.com/upload/1?a=1&amp;b=2\"/>\n\
+</file-resume-info>",
+            "<file-resume-info><file-range start=\"0\" end=\"4499\"></file-range>\
+<data url=\"https://ftcs.example.com/upload/1?a=1&amp;b=2\"><x/></data></file-resume-info>",
+        ] {
+            let info = parse_xml(xml.as_bytes()).expect(xml);
+            assert_eq!((info.range_start, info.range_end), (0, 4499));
+            assert_eq!(info.data_url, "https://ftcs.example.com/upload/1?a=1&b=2");
+        }
+    }
+
+    #[test]
+    fn resume_info_without_a_range_or_a_url_is_not_read() {
+        assert!(parse_xml(
+            b"<file-resume-info><data url=\"https://a.example.com/\"/></file-resume-info>"
+        )
+        .is_none());
+        assert!(parse_xml(
+            b"<file-resume-info><file-range start=\"0\" end=\"1\"/></file-resume-info>"
+        )
+        .is_none());
+    }
 }
