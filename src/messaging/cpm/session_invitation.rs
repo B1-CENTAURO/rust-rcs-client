@@ -61,6 +61,8 @@ use super::{
 
 pub enum CPMSessionInvitationResponse {
     Accept,
+    /// The user declines it
+    Decline,
     Dispose,
 }
 
@@ -96,6 +98,24 @@ impl CPMSessionInvitation {
             dialog,
         }
     }
+}
+
+/// Declines `invitation` with 603 Decline, its early dialog let go of
+pub fn decline_hanging_invitation(
+    invitation: CPMSessionInvitation,
+    ongoing_dialogs: &Arc<Mutex<Vec<Arc<SipDialog>>>>,
+    rt: &Arc<Runtime>,
+) {
+    let transaction = invitation.server_transaction;
+    reject(
+        &transaction,
+        transaction.message(),
+        invitation.tx,
+        603,
+        b"Decline",
+        rt,
+    );
+    ongoing_dialogs.remove_dialog(&invitation.dialog);
 }
 
 pub fn try_accept_hanging_invitation(

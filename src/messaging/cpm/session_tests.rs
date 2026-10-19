@@ -16,6 +16,7 @@
 //! place of the connection to the P-CSCF, MSRP over TCP on localhost
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +69,9 @@ pub struct Client {
     pub received_messages: Arc<ReceivedMessages>,
     /// What the app is told of the group chats taken part in
     pub group_events: Receiver<String>,
+    /// How the app answers group chat invitations: 200, or 180 to answer
+    /// later
+    pub group_answer: Arc<AtomicU16>,
 }
 
 impl Client {
@@ -213,6 +217,8 @@ pub fn start(registered: bool) -> (Client, Peer) {
     let group_invites_tx = std::sync::Mutex::new(group_invites_tx);
     let (group_events_tx, group_events) = mpsc::channel();
     let group_events_tx = std::sync::Mutex::new(group_events_tx);
+    let group_answer = Arc::new(AtomicU16::new(200));
+    let group_answer_ = Arc::clone(&group_answer);
 
     // the messages taken are acknowledged as the engine does, once the
     // transport is registered
@@ -286,11 +292,23 @@ pub fn start(registered: bool) -> (Client, Peer) {
                 .lock()
                 .unwrap()
                 .send((String::from(subject), String::from(referred_by_name)));
-            200
+            group_answer_.load(Ordering::SeqCst)
         },
         move |event| {
             let event = match event {
-                CPMGroupEvent::OnInvite => String::from("invited"),
+                CPMGroupEvent::Invited(invitation) => format!(
+                    "invited {} {} {} {} {} {}",
+                    invitation.conference_uri,
+                    invitation.conversation_id,
+                    invitation.subject.as_deref().unwrap_or("-"),
+                    invitation.inviter_uri.as_deref().unwrap_or("-"),
+                    invitation.inviter_name.as_deref().unwrap_or("-"),
+                    if invitation.pending {
+                        "pending"
+                    } else {
+                        "accepted"
+                    }
+                ),
                 CPMGroupEvent::Joined(group) => format!("joined {}", group),
                 CPMGroupEvent::Participant(group, participant) => format!(
                     "participant {} {} {} {}",
@@ -388,6 +406,7 @@ pub fn start(registered: bool) -> (Client, Peer) {
             group_invites,
             received_messages,
             group_events,
+            group_answer,
         },
         Peer {
             rt,
@@ -1166,6 +1185,13 @@ fn a_group_invitation_reaches_the_group_handler() {
         Ok((String::from("Friends"), String::from("Alice")))
     );
     assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(
+        next_group_event(&client),
+        format!(
+            "invited {} conversation-1 Friends sip:+15550001@example.com Alice accepted",
+            GROUP
+        )
+    );
 }
 
 /// A CPIM message from the peer to the client, its content as given
@@ -2175,6 +2201,13 @@ fn a_group_invitation_without_subject_or_inviter_name_is_taken() {
     // taken, and once started its participants followed
     let ok = peer.next_response();
     assert_eq!(status_code(&ok), 200);
+    assert_eq!(
+        next_group_event(&client),
+        format!(
+            "invited {} conversation-1 - sip:+15550001@example.com - accepted",
+            GROUP
+        )
+    );
     peer.send(&ack(&ok, "group-plain"));
     let subscribe = peer.next_request("SUBSCRIBE");
     assert_eq!(request_uri(&subscribe), GROUP);
@@ -2469,4 +2502,123 @@ fn a_group_joined_is_restarted_with_the_ids_it_was_joined_with() {
     assert_eq!(request_uri(&restart), GROUP);
     assert_eq!(header_value(&restart, "Conversation-ID"), "conversation-1");
     assert_eq!(header_value(&restart, "Contribution-ID"), "contribution-1");
+}
+
+/// An invitation from the focus of the group, by Alice, its MSRP peer
+/// listening
+fn group_invitation(client: &Client, peer: &mut Peer, call_id: &str) -> MsrpPeer {
+    let msrp = MsrpPeer::listen(&client.rt);
+    peer.send(&invite(
+        call_id,
+        &focus_contact(),
+        GROUP,
+        "cpm.session",
+        "Subject: Friends\r\nReferred-By: \"Alice\" <sip:+15550001@example.com>\r\n",
+        "application/sdp",
+        &msrp.sdp("sendrecv"),
+    ));
+    msrp
+}
+
+/// Whether the dialogs the client has come to `count` within a second
+fn dialogs_come_to(client: &Client, count: usize) -> bool {
+    (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        client.core.get_ongoing_dialogs().lock().unwrap().len() == count
+    })
+}
+
+#[test]
+fn a_group_invitation_not_accepted_automatically_waits_for_the_user() {
+    let (client, mut peer) = start(true);
+    client.group_answer.store(180, Ordering::SeqCst);
+
+    let msrp = group_invitation(&client, &mut peer, "group-pending");
+    assert_eq!(status_code(&peer.next_response()), 180);
+    assert_eq!(
+        next_group_event(&client),
+        format!(
+            "invited {} conversation-1 Friends sip:+15550001@example.com Alice pending",
+            GROUP
+        )
+    );
+    peer.silence();
+
+    // accepted, it is taken part in
+    assert!(client.sessions.answer_invitation(GROUP, true, &client.rt));
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert_eq!(header_value(&ok, "Call-ID"), "group-pending");
+    peer.send(&ack(&ok, "group-pending"));
+    peer.next_request("SUBSCRIBE");
+    let _connection = msrp.accept(&client.rt);
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+
+    // once
+    assert!(!client.sessions.answer_invitation(GROUP, true, &client.rt));
+}
+
+#[test]
+fn a_group_invitation_declined_is_answered_603_and_let_go_of() {
+    let (client, mut peer) = start(true);
+    client.group_answer.store(180, Ordering::SeqCst);
+
+    let _msrp = group_invitation(&client, &mut peer, "group-declined");
+    assert_eq!(status_code(&peer.next_response()), 180);
+    assert!(next_group_event(&client).ends_with(" pending"));
+    assert!(dialogs_come_to(&client, 1), "its early dialog");
+
+    assert!(client.sessions.answer_invitation(GROUP, false, &client.rt));
+    assert!(
+        !client.sessions.answer_invitation(GROUP, true, &client.rt),
+        "answered once"
+    );
+    assert_eq!(status_code(&peer.next_response()), 603);
+    assert!(dialogs_come_to(&client, 0), "its early dialog went");
+    peer.silence();
+}
+
+#[test]
+fn a_group_restarted_by_its_focus_is_taken_part_in_again_at_once() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+
+    let msrp = group_invitation(&client, &mut peer, "group-first");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "group-first"));
+    peer.next_request("SUBSCRIBE");
+    let mut connection = msrp.accept(&rt);
+    assert!(client
+        .group_invites
+        .recv_timeout(Duration::from_secs(5))
+        .is_ok());
+
+    // its session ended, as its focus does once it idles
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+    assert!(next_group_event(&client).ends_with(" accepted"));
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+    assert_eq!(next_group_event(&client), format!("left {}", GROUP));
+
+    // restarted by its focus, with the Conversation-ID known, it is taken
+    // at once, though the user answers invitations
+    client.group_answer.store(180, Ordering::SeqCst);
+    let msrp = group_invitation(&client, &mut peer, "group-again");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert!(
+        client.group_invites.try_recv().is_err(),
+        "the user not asked"
+    );
+    peer.send(&ack(&ok, "group-again"));
+    peer.next_request("SUBSCRIBE");
+    let _connection = msrp.accept(&rt);
+    assert_eq!(
+        next_group_event(&client),
+        format!("joined {}", GROUP),
+        "not told of as an invitation"
+    );
 }

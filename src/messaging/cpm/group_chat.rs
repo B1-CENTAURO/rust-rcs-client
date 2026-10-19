@@ -49,6 +49,23 @@ pub struct Participant {
     pub status: String,
 }
 
+/// An invitation to a group chat not known before (RCC.07 section 3.2.4.4)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupInvitation {
+    /// The URI of the group, as its focus tells
+    pub conference_uri: String,
+    pub conversation_id: String,
+    /// What the invitation tells, if it does: the subject of the group, and
+    /// the URI and display name of whoever invited
+    pub subject: Option<String>,
+    pub inviter_uri: Option<String>,
+    pub inviter_name: Option<String>,
+    /// Whether it waits for the user to accept or decline it, as group chats
+    /// are not accepted automatically (AutAcceptGroupChat 0); else it is
+    /// being accepted
+    pub pending: bool,
+}
+
 /// A user of a conference-info document
 #[derive(Debug, Default)]
 struct User {
@@ -310,6 +327,15 @@ impl GroupChats {
     /// had in its last session, if there was one
     pub(crate) fn ids_of(&self, conference_uri: &str) -> Option<(String, String)> {
         self.ids.lock().unwrap().get(conference_uri).cloned()
+    }
+
+    /// Whether `conversation_id` is that of a group a session was had with
+    pub(crate) fn knows(&self, conversation_id: &str) -> bool {
+        self.ids
+            .lock()
+            .unwrap()
+            .values()
+            .any(|(known, _)| known == conversation_id)
     }
 
     /// Takes note of `sip_session` starting, which if with a group is

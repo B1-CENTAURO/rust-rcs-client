@@ -79,11 +79,11 @@ use uuid::Uuid;
 use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
-use super::group_chat::{refer_participants, GroupChats, Participant};
+use super::group_chat::{refer_participants, GroupChats, GroupInvitation, Participant};
 use super::imdn::send_group_imdn;
 use super::session_invitation::{
-    try_accept_hanging_invitation, try_accept_invitation, CPMSessionInvitation,
-    CPMSessionInvitationResponse,
+    decline_hanging_invitation, try_accept_hanging_invitation, try_accept_invitation,
+    CPMSessionInvitation, CPMSessionInvitationResponse,
 };
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMContact, CPMServiceType};
@@ -1187,7 +1187,8 @@ impl MsrpDataWriter for IsComposingWriter {
 }
 
 pub enum CPMGroupEvent {
-    OnInvite,
+    /// Invited to a group not known before
+    Invited(GroupInvitation),
     /// The session with the group at the URI started
     Joined(String),
     /// What the focus of the group at the URI tells of a participant
@@ -1349,19 +1350,37 @@ impl CPMSessionService {
     }
 
     pub fn accept_and_open_session(&self, recipient: &str, rt: &Arc<Runtime>) {
-        let guard = self.ongoing_incoming_invitations.lock().unwrap();
-        for invitation in &*guard {
-            let (invitation, tx) = invitation.as_ref();
-            if invitation == recipient {
+        self.answer_invitation(recipient, true, rt);
+    }
+
+    /// Accepts the invitation from `recipient`, a contact or a group, that
+    /// waits for the user's answer, or declines it; false if there is none
+    pub fn answer_invitation(&self, recipient: &str, accept: bool, rt: &Arc<Runtime>) -> bool {
+        let invitation = {
+            let mut guard = self.ongoing_incoming_invitations.lock().unwrap();
+            guard
+                .iter()
+                .position(|invitation| {
+                    let (known_identities, _) = invitation.as_ref();
+                    known_identities == recipient
+                })
+                .map(|idx| guard.swap_remove(idx))
+        };
+        match invitation {
+            Some(invitation) => {
+                let (_, tx) = invitation.as_ref();
                 let tx = tx.clone();
+                let response = if accept {
+                    CPMSessionInvitationResponse::Accept
+                } else {
+                    CPMSessionInvitationResponse::Decline
+                };
                 rt.spawn(async move {
-                    match tx.send(CPMSessionInvitationResponse::Accept).await {
-                        Ok(()) => {}
-                        Err(e) => {}
-                    }
+                    let _ = tx.send(response).await;
                 });
-                return;
+                true
             }
+            None => false,
         }
     }
 
@@ -2718,6 +2737,8 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                 get_cpm_session_info_from_message(message, false)
                             {
                                 let auto_accept_response_code: u16;
+                                // told once answered or waiting for an answer
+                                let mut invited: Option<GroupInvitation> = None;
 
                                 let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
@@ -2731,6 +2752,18 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                             &session_info.conversation_id,
                                             &session_info.contribution_id,
                                         ) {
+                                            // a group taken part in, which its
+                                            // focus restarts, is taken part in
+                                            // again at once (RCC.07 section
+                                            // 3.2.4.10)
+                                            if let MsrpDirection::SendReceive = msrp_info.direction
+                                            {
+                                                if self.service.group_chats.knows(conversation_id) {
+                                                    auto_accept_response_code = 200;
+                                                    break;
+                                                }
+                                            }
+
                                             let subject = session_info
                                                 .subject
                                                 .as_deref()
@@ -2781,15 +2814,22 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                         &referred_by_uri,
                                                         cancel_rx,
                                                     );
+                                                    let told = |s: String| {
+                                                        Some(s).filter(|s| !s.is_empty())
+                                                    };
+                                                    invited = Some(GroupInvitation {
+                                                        conference_uri: session_info.contact_uri(),
+                                                        conversation_id: conversation_id.clone(),
+                                                        subject: told(subject),
+                                                        inviter_uri: told(referred_by_uri),
+                                                        inviter_name: told(referred_by_name),
+                                                        pending: (100..200)
+                                                            .contains(&auto_accept_response_code),
+                                                    });
                                                     break;
                                                 }
 
-                                                _ => {
-                                                    (self.service.group_chats.listener)(
-                                                        CPMGroupEvent::OnInvite,
-                                                    );
-                                                    return false;
-                                                }
+                                                _ => return false,
                                             }
                                         }
 
@@ -2898,7 +2938,13 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                             &self.service.group_chats,
                                             &self.tm,
                                             rt,
-                                        )
+                                        );
+
+                                        if let Some(invited) = invited {
+                                            (self.service.group_chats.listener)(
+                                                CPMGroupEvent::Invited(invited),
+                                            );
+                                        }
                                     } else {
                                         // 500
                                     }
@@ -3035,12 +3081,19 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                             );
                                                         }
                                                         Some(
+                                                            CPMSessionInvitationResponse::Decline,
+                                                        ) => decline_hanging_invitation(
+                                                            invitation,
+                                                            &ongoing_dialogs,
+                                                            &rt_,
+                                                        ),
+                                                        Some(
                                                             CPMSessionInvitationResponse::Dispose,
                                                         ) => match cancel_tx.send(()) {
                                                             Ok(()) => {}
                                                             Err(()) => {}
                                                         },
-                                                        _ => {}
+                                                        None => {}
                                                     }
 
                                                     let mut guard = ongoing_incoming_invitations_
@@ -3088,6 +3141,14 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                     // &timer,
                                                     rt,
                                                 );
+
+                                                // once ringing, for the app to
+                                                // answer as it is told
+                                                if let Some(invited) = invited {
+                                                    (self.service.group_chats.listener)(
+                                                        CPMGroupEvent::Invited(invited),
+                                                    );
+                                                }
 
                                                 return true;
                                             }
