@@ -158,9 +158,8 @@ fn is_store_and_forward_server(uri: &[u8]) -> bool {
 pub(crate) const MLS_OPAQUE_TOKEN: &[u8] = b"MLS-Opaque-Token";
 
 /// The value of an MLS-Opaque-Token header, if it is one (RCC.16 section
-/// 7.2.4)
+/// 7.2.4), as the parser gives header values, trimmed
 pub(crate) fn mls_opaque_token_value(value: &[u8]) -> Option<String> {
-    let value = value.trim_ascii();
     let valid = !value.is_empty()
         && value
             .iter()
