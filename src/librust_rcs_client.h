@@ -82,6 +82,16 @@ extern void rcs_client_setup(struct rcs_runtime *runtime, struct rcs_client *cli
 
 extern void rcs_client_connect(struct rcs_runtime *runtime, struct rcs_client *client);
 
+// capability discovery (RCC.07 section 2.6.1.1): told what a contact answered an OPTIONS with, to be taken as RCC.07
+// table 6 says: its final status code (0 if none came, 403 if the client is not registered to ask), and the feature
+// tags of the Contact of a 200, ';' separated
+typedef void (*capabilities_callback) (uint16_t status_code, const char *feature_tags, void *context);
+
+// asks contact_uri for its capabilities over SIP OPTIONS, telling it those of this client; 400 if it is NULL or empty;
+// the context is released with message_result_callback_context_release
+extern void rcs_client_query_capabilities(struct rcs_runtime *runtime, struct rcs_client *client, const char *contact_uri,
+                                capabilities_callback cb, void *context);
+
 // end-to-end encryption (GSMA RCC.16), in a library built with the e2ee feature; the contexts below are
 // released with message_result_callback_context_release()
 //

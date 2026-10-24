@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod capability;
 pub mod chat_bot;
 pub mod conference;
 pub mod connection;
@@ -75,6 +76,8 @@ use messaging::ffi::{
 use provisioning::device_configuration::{
     start_auto_config, DeviceConfigurationStatus, RetryReason,
 };
+
+use capability::Capabilities;
 
 #[cfg(feature = "e2ee")]
 use messaging::e2ee::device::E2eeDevice;
@@ -696,8 +699,11 @@ pub unsafe extern "C" fn rcs_client_set_e2ee(
         return -3;
     };
 
+    let device = Arc::new(device);
     client.context.set_acs_parameters(acs_parameters);
-    client.e2ee = Some(Arc::new(device));
+    // told in OPTIONS exchanges while the Home KDS holds KeyPackages
+    device.advertise_on(&client.engine);
+    client.e2ee = Some(device);
     0
 }
 
@@ -742,6 +748,57 @@ pub unsafe extern "C" fn rcs_client_e2ee_enrol(
             });
         }
         _ => tell(-1),
+    }
+}
+
+/// Told what a contact answered an OPTIONS with, to be taken as RCC.07
+/// table 6 says: its final status code (0 if none came, 403 if the client is
+/// not registered to ask), and the feature tags of the Contact of a 200,
+/// `;` separated
+pub type CapabilitiesCallback = extern "C" fn(
+    status_code: u16,
+    feature_tags: *const c_char,
+    context: *mut MessageResultCallbackContext,
+);
+
+/// Asks `contact_uri` for its capabilities over SIP OPTIONS, telling it
+/// those of this client (RCC.07 section 2.6.1.1); 400 if it is NULL or empty
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_query_capabilities(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    contact_uri: *const c_char,
+    cb: Option<CapabilitiesCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_query_capabilities()");
+
+    let cb_context = NonNull::new(cb_context).map(MessageResultCallbackContextWrapper);
+    let tell = move |capabilities: Capabilities| {
+        if let Some(cb) = cb {
+            let feature_tags = c_string(capabilities.feature_tags);
+            cb(
+                capabilities.status_code,
+                feature_tags.as_ptr(),
+                cb_context
+                    .as_ref()
+                    .map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr()),
+            );
+        }
+    };
+
+    if let (Some(rcs_runtime), Some(client)) = (rcs_runtime.as_ref(), client.as_ref()) {
+        match optional_string(contact_uri) {
+            Some(contact_uri) => {
+                client
+                    .engine
+                    .query_capabilities(&contact_uri, tell, &rcs_runtime.rt)
+            }
+            None => tell(Capabilities {
+                status_code: 400,
+                feature_tags: String::new(),
+            }),
+        }
     }
 }
 

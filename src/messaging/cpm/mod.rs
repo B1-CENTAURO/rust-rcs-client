@@ -283,7 +283,7 @@ pub fn make_cpim_imdn_body(
 }
 
 #[cfg(test)]
-mod session_tests;
+pub(crate) mod session_tests;
 
 #[cfg(test)]
 mod tests {

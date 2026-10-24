@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -124,7 +125,7 @@ pub(super) struct Kds {
     /// The chain it issues; unavailable without
     issuing: Option<Vec<Vec<u8>>>,
     /// Whether it takes KeyPackages
-    taking: bool,
+    pub(super) taking: AtomicBool,
     /// What it has for the Participants asked for; unavailable without
     directory: Option<Vec<(String, Fetched)>>,
     /// The app, to tell what it had kept by an upload
@@ -139,7 +140,7 @@ impl Kds {
     pub(super) fn issuing(certificates: &[&str], app: &Arc<App>) -> Kds {
         Kds {
             issuing: Some(chain(certificates)),
-            taking: true,
+            taking: AtomicBool::new(true),
             app: Some(Arc::clone(app)),
             ..Kds::default()
         }
@@ -170,7 +171,7 @@ impl KeyDistribution for Kds {
     }
 
     fn upload(&self, key_packages: Vec<Vec<u8>>) -> KdsFuture<()> {
-        let taking = self.taking;
+        let taking = self.taking.load(Ordering::SeqCst);
         if taking {
             let kept = self.app.as_ref().and_then(|app| app.last());
             self.uploads.lock().unwrap().push((key_packages, kept));
@@ -369,8 +370,8 @@ fn a_device_the_kds_does_not_enrol_is_left_as_it_was() {
 #[test]
 fn key_packages_not_uploaded_are_uploaded_again() {
     let app = Arc::new(App::default());
-    let mut kds = Kds::issuing(&[ALICE, CA], &app);
-    kds.taking = false;
+    let kds = Kds::issuing(&[ALICE, CA], &app);
+    kds.taking.store(false, Ordering::SeqCst);
     let (device, enrolled) = enrolling(&app, &kds, ALICE_TEL, TODAY);
     assert_eq!(
         enrolled,
@@ -384,7 +385,7 @@ fn key_packages_not_uploaded_are_uploaded_again() {
         "enrolled"
     );
 
-    kds.taking = true;
+    kds.taking.store(true, Ordering::SeqCst);
     assert_eq!(
         block_on(upload_key_packages(&device, &kds, 2, false)),
         Ok(())
