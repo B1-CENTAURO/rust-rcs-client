@@ -196,7 +196,12 @@ pub async fn upload_key_packages(
         })
         .map_err(EnrolmentError::Store)?;
 
-    kds.upload(key_packages).await.map_err(EnrolmentError::Kds)
+    kds.upload(key_packages)
+        .await
+        .map_err(EnrolmentError::Kds)?;
+    store
+        .set_key_packages_uploaded()
+        .map_err(EnrolmentError::Store)
 }
 
 /// The KeyPackages of `recipients` the Home KDS returns, each in one of

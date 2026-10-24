@@ -48,6 +48,8 @@ use rust_rcs_core::{
     },
 };
 
+use crate::capability::FEATURE_TAGS;
+
 use super::{
     authentication_type::AuthenticationType,
     flow::{on_registration_authenticated, FlowManager, SubscriptionEvent},
@@ -821,12 +823,13 @@ fn make_request(
     req_message.add_header(Header::new(
         b"Contact",
         format!(
-            "<{}>;+sip.instance=\"<urn:uuid:{}>\";+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session,urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session.group,urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg,urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.largemsg,urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.systemmsg,urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.filetransfer\";+g.3gpp.iari-ref=\"urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.ftthumb,urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.fthttp,urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.ftsms,urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.chatbot.sa,urn%3Aurn-7%3A3gpp-application.ims.iari.rcse.im,urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.geopush,urn%3Aurn-7%3A3gpp-application.ims.iari.rcs.geosm\";+g.gsma.rcs.cpm.pager-large;+g.gsma.rcs.botversion=\"#=1,#=2\"{};expires={}",
+            "<{}>;+sip.instance=\"<urn:uuid:{}>\";{}{};expires={}",
             registration.contact_uri(),
             registration
                 .sip_instance_id
                 .hyphenated()
                 .encode_lower(&mut Uuid::encode_buffer()),
+            FEATURE_TAGS,
             if guard.outbound {
                 format!(";reg-id={}", registration.registration_id)
             } else {

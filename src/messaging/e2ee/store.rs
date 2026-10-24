@@ -31,8 +31,9 @@ use rust_rcs_core::mls::{
     self, Credential, CredentialValidator, ErrorKind, MlsClient, MlsConfig, MlsConversation,
 };
 
-/// Starts the state kept: the Participant Key, then the client
-const STATE_MAGIC: &[u8] = b"RCS-E2EE1";
+/// Starts the state kept: the Participant Key, whether the KeyPackages of the
+/// client were uploaded, then the client
+const STATE_MAGIC: &[u8] = b"RCS-E2EE2";
 
 /// Keeps the state given, encrypted, in place of the one kept before; false if
 /// it could not. Called with the store locked, it must not call into it.
@@ -61,6 +62,8 @@ struct State {
     /// The Participant Key, made the first time it is asked for
     participant: Option<ParticipantKey>,
     client: Option<MlsClient>,
+    /// Whether KeyPackages of the client reached the Home KDS
+    uploaded: bool,
     /// The state last kept, which a change that could not be kept is undone to
     saved: Vec<u8>,
     /// The groups loaded, as they hold what only lives in memory: a Commit of
@@ -83,6 +86,7 @@ impl MlsStore {
             state: Mutex::new(State {
                 participant: None,
                 client: None,
+                uploaded: false,
                 saved: Vec::new(),
                 conversations: HashMap::new(),
             }),
@@ -98,12 +102,13 @@ impl MlsStore {
         // locked while kept, as the states are kept in the order they come
         let mut state = self.state.lock().unwrap();
         let client = make(self.config, self.shared_validator()).map_err(StoreError::Mls)?;
-        let saved = pack(state.participant.as_ref(), Some(&client))?;
+        let saved = pack(state.participant.as_ref(), Some(&client), false)?;
         if !(self.save)(&saved) {
             return Err(StoreError::NotSaved);
         }
 
         state.client = Some(client);
+        state.uploaded = false;
         state.saved = saved;
         state.conversations.clear();
         Ok(())
@@ -112,14 +117,34 @@ impl MlsStore {
     /// Takes on the Participant Key and the client in `saved`, a state the app
     /// kept
     pub fn restore(&self, saved: &[u8]) -> Result<(), StoreError> {
-        let (participant, client) = self.unpack(saved)?;
+        let (participant, client, uploaded) = self.unpack(saved)?;
 
         let mut state = self.state.lock().unwrap();
         state.participant = participant;
         state.client = client;
+        state.uploaded = uploaded;
         state.saved = saved.to_vec();
         state.conversations.clear();
         Ok(())
+    }
+
+    /// Whether KeyPackages of the client reached the Home KDS
+    pub fn key_packages_uploaded(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.client.is_some() && state.uploaded
+    }
+
+    /// Keeps that KeyPackages of the client reached the Home KDS
+    pub fn set_key_packages_uploaded(&self) -> Result<(), StoreError> {
+        let mut state = self.state.lock().unwrap();
+        if state.client.is_none() {
+            return Err(StoreError::NoClient);
+        }
+        if state.uploaded {
+            return Ok(());
+        }
+        state.uploaded = true;
+        self.save(&mut state)
     }
 
     /// The public key of the MLS signature key of the client, if there is one
@@ -242,7 +267,7 @@ impl MlsStore {
     fn participant<'a>(&self, state: &'a mut State) -> Result<&'a ParticipantKey, StoreError> {
         if state.participant.is_none() {
             let participant = ParticipantKey::generate();
-            let saved = pack(Some(&participant), state.client.as_ref())?;
+            let saved = pack(Some(&participant), state.client.as_ref(), state.uploaded)?;
             if !(self.save)(&saved) {
                 return Err(StoreError::NotSaved);
             }
@@ -260,7 +285,7 @@ impl MlsStore {
             None => return Err(StoreError::NoClient),
         };
 
-        if let Ok(saved) = pack(state.participant.as_ref(), Some(client)) {
+        if let Ok(saved) = pack(state.participant.as_ref(), Some(client), state.uploaded) {
             if (self.save)(&saved) {
                 state.saved = saved;
                 return Ok(());
@@ -269,25 +294,33 @@ impl MlsStore {
 
         // the groups as loaded hold the state undone
         state.conversations.clear();
-        state.client = self
+        let (client, uploaded) = self
             .unpack(&state.saved)
-            .ok()
-            .and_then(|(_, client)| client);
+            .map(|(_, client, uploaded)| (client, uploaded))
+            .unwrap_or_default();
+        state.client = client;
+        state.uploaded = uploaded;
         Err(StoreError::NotSaved)
     }
 
-    /// The Participant Key and the client of a state kept
+    /// The Participant Key, the client, and whether its KeyPackages were
+    /// uploaded, of a state kept
     fn unpack(
         &self,
         saved: &[u8],
-    ) -> Result<(Option<ParticipantKey>, Option<MlsClient>), StoreError> {
+    ) -> Result<(Option<ParticipantKey>, Option<MlsClient>, bool), StoreError> {
         let bad_format = StoreError::Mls(ErrorKind::BadFormat);
-        let (participant, client) = saved
+        let (participant, uploaded, client) = saved
             .strip_prefix(STATE_MAGIC)
             .and_then(|rest| rest.split_first())
             .and_then(|(length, rest)| {
-                (rest.len() >= *length as usize).then(|| rest.split_at(*length as usize))
+                (rest.len() > *length as usize).then(|| rest.split_at(*length as usize))
             })
+            .and_then(|(participant, rest)| {
+                let (uploaded, client) = rest.split_first()?;
+                Some((participant, *uploaded, client))
+            })
+            .filter(|(_, uploaded, _)| *uploaded <= 1)
             .ok_or(bad_format)?;
 
         let participant = match participant {
@@ -301,7 +334,7 @@ impl MlsStore {
                     .map_err(StoreError::Mls)?,
             ),
         };
-        Ok((participant, client))
+        Ok((participant, client, uploaded == 1))
     }
 
     fn shared_validator(&self) -> Box<dyn CredentialValidator> {
@@ -309,10 +342,12 @@ impl MlsStore {
     }
 }
 
-/// The state to keep: the Participant Key, its length first, then the client
+/// The state to keep: the Participant Key, its length first, whether the
+/// KeyPackages of the client were uploaded, then the client
 fn pack(
     participant: Option<&ParticipantKey>,
     client: Option<&MlsClient>,
+    uploaded: bool,
 ) -> Result<Vec<u8>, StoreError> {
     let participant = participant
         .map(ParticipantKey::to_bytes)
@@ -320,6 +355,7 @@ fn pack(
     let mut saved = STATE_MAGIC.to_vec();
     saved.push(participant.len() as u8);
     saved.extend_from_slice(&participant);
+    saved.push(u8::from(uploaded && client.is_some()));
     if let Some(client) = client {
         saved.extend_from_slice(&client.snapshot().map_err(StoreError::Mls)?);
     }

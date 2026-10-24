@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use futures::executor::block_on;
@@ -23,7 +24,7 @@ use crate::provisioning::ims_application::ImsApplication;
 use crate::provisioning::rcs_application::RcsApplication;
 
 use super::device::{participant_tel_uri, DeviceError, E2eeDevice, Enrolled, CIPHERSUITE};
-use super::kds::{EnrolmentError, KeyDistribution};
+use super::kds::{EnrolmentError, KdsError, KeyDistribution};
 use super::kds_tests::certificates::*;
 use super::kds_tests::{
     credential, signer, validator, App, Kds, ALICE_TEL, HOME_KDS, LATER, TODAY,
@@ -64,14 +65,19 @@ pub(super) fn rcs_config(proof: Option<&str>) -> String {
     )
 }
 
-fn provision(device: &E2eeDevice, identities: &[&str], proof: Option<&str>) {
+pub(super) fn provision(device: &E2eeDevice, identities: &[&str], proof: Option<&str>) {
     let ims = ims_config(identities).parse::<Characteristic>().unwrap();
     let rcs = rcs_config(proof).parse::<Characteristic>().unwrap();
     device.provisioned(&ImsApplication::new(&ims), &RcsApplication::new(&rcs), None);
 }
 
 /// Alice's device, kept by `app`, on `date`, from `saved` if given
-fn alice(app: &Arc<App>, kds: &Arc<Kds>, date: &str, saved: Option<&[u8]>) -> E2eeDevice {
+pub(super) fn alice(
+    app: &Arc<App>,
+    kds: &Arc<Kds>,
+    date: &str,
+    saved: Option<&[u8]>,
+) -> E2eeDevice {
     let keeping = Arc::clone(app);
     E2eeDevice::new(
         validator(date),
@@ -219,4 +225,47 @@ fn a_saved_state_that_is_not_one_is_refused() {
         Some(b"not a state"),
     );
     assert_eq!(device.err(), Some(StoreError::Mls(ErrorKind::BadFormat)));
+}
+
+#[test]
+fn e2ee_is_told_while_the_kds_holds_key_packages_of_the_device() {
+    let app = Arc::new(App::default());
+    let kds = Arc::new(Kds::issuing(&[ALICE, CA], &app));
+    let device = alice(&app, &kds, TODAY, None);
+    assert_eq!(device.mls_feature_tags(), None, "not enrolled");
+
+    // certified, but none of its KeyPackages taken
+    kds.taking.store(false, Ordering::SeqCst);
+    provision(&device, &["tel:+491701234567"], None);
+    assert_eq!(
+        block_on(device.enrol()),
+        Err(DeviceError::Enrolment(EnrolmentError::Kds(
+            KdsError::Refused(String::from("quota"))
+        )))
+    );
+    assert_eq!(device.store().credential(), Some(credential(&[ALICE, CA])));
+    assert_eq!(device.mls_feature_tags(), None);
+
+    // enrolling again uploads them, and does only that
+    kds.taking.store(true, Ordering::SeqCst);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    assert_eq!(kds.enrolments.lock().unwrap().len(), 1);
+    assert_eq!(kds.uploads().len(), 1);
+    assert_eq!(kds.uploads()[0].0.len(), 11);
+    let told = Some(String::from(
+        "+g.gsma.rcs.mls.mls-version=\"v1\";+g.gsma.rcs.mls.mls-kds=\"42\"",
+    ));
+    assert_eq!(device.mls_feature_tags(), told);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Already));
+
+    // told until the certificate expires
+    let saved = app.last().unwrap();
+    assert_eq!(
+        alice(&app, &kds, LATER, Some(&saved)).mls_feature_tags(),
+        told
+    );
+    assert_eq!(
+        alice(&app, &kds, "2026-11-02", Some(&saved)).mls_feature_tags(),
+        None
+    );
 }

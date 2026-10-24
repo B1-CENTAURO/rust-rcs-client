@@ -18,12 +18,14 @@
 use std::sync::{Arc, Mutex};
 
 use rust_rcs_core::mls::rcs::certificate::RcsCredentialValidator;
+use rust_rcs_core::mls::rcs::{MlsCapability, MLS_VERSION_V1};
 use rust_rcs_core::mls::{
     Ciphersuite, CredentialValidator, ErrorKind, MlsConfig, SignatureKeyPair,
 };
 
 use crate::provisioning::ims_application::ImsApplication;
 use crate::provisioning::rcs_application::RcsApplication;
+use crate::rcs_engine::RcsEngine;
 
 use super::kds::{self, EnrolmentError, KeyDistribution};
 use super::provisioning;
@@ -132,7 +134,14 @@ impl E2eeDevice {
                 .validate_query(&credential, &signature_key, &tel_uri)
                 .is_ok()
             {
-                return Ok(Enrolled::Already);
+                if self.store.key_packages_uploaded() {
+                    return Ok(Enrolled::Already);
+                }
+                // certified, but none of its KeyPackages reached the Home KDS
+                return kds::upload_key_packages(&self.store, &*self.kds, KEY_PACKAGES, true)
+                    .await
+                    .map(|()| Enrolled::Now)
+                    .map_err(DeviceError::Enrolment);
             }
         }
 
@@ -153,6 +162,38 @@ impl E2eeDevice {
         .await
         .map(|()| Enrolled::Now)
         .map_err(DeviceError::Enrolment)
+    }
+
+    /// The feature tags of the E2EE capability of the device, while the Home
+    /// KDS holds KeyPackages of its client with an unexpired certificate
+    /// (RCC.16 sections 5.1, 5.2)
+    pub fn mls_feature_tags(&self) -> Option<String> {
+        let credential = self.store.credential()?;
+        let signature_key = self.store.signature_key()?;
+        if !self.store.key_packages_uploaded()
+            || self
+                .validator
+                .validate_credential(&credential, &signature_key)
+                .is_err()
+        {
+            return None;
+        }
+        let capability = MlsCapability {
+            version: MLS_VERSION_V1.to_vec(),
+            home_kds: Some(self.home_kds),
+        };
+        Some(capability.feature_tags().join(";"))
+    }
+
+    /// Has `engine` tell the E2EE capability of the device in OPTIONS
+    /// exchanges while it applies, for as long as the device is kept
+    pub fn advertise_on(self: &Arc<Self>, engine: &RcsEngine) {
+        let device = Arc::downgrade(self);
+        engine.set_extra_feature_tags(move || {
+            device
+                .upgrade()
+                .and_then(|device| device.mls_feature_tags())
+        });
     }
 
     /// Has the device enrol with the keys `make_signer` makes

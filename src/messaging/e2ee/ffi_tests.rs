@@ -28,13 +28,15 @@ use rust_rcs_core::mls::{Ciphersuite, ErrorKind};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
+use crate::capability::FEATURE_TAGS;
 use crate::messaging::ffi::{MessageResultCallbackContext, MessageResultCallbackContextWrapper};
 use crate::{
-    destroy_rcs_client, new_rcs_client, rcs_client_e2ee_enrol, rcs_client_set_e2ee,
-    rcs_client_setup, RcsRuntime,
+    destroy_rcs_client, new_rcs_client, rcs_client_e2ee_enrol, rcs_client_query_capabilities,
+    rcs_client_set_e2ee, rcs_client_setup, RcsRuntime,
 };
 
 use super::device::{DeviceError, Enrolled};
+use super::device_tests::{alice, provision};
 use super::device_tests::{ims_config, rcs_config};
 use super::ffi::{
     app_save_state, enrolment_status, rcs_kds_request_add_key_packages, rcs_kds_request_enrolled,
@@ -42,7 +44,7 @@ use super::ffi::{
 };
 use super::kds::{Enrolment, EnrolmentError, Fetched, KdsError, KeyDistribution, Recipient};
 use super::kds_tests::certificates::*;
-use super::kds_tests::{bytes, ALICE_TEL};
+use super::kds_tests::{bytes, App as Keeping, Kds, ALICE_TEL, TODAY};
 use super::store::StoreError;
 
 /// How the app answers
@@ -69,6 +71,7 @@ struct App {
     kept: Mutex<Vec<Vec<u8>>>,
     refusing: AtomicBool,
     statuses: Mutex<Vec<i32>>,
+    capabilities: Mutex<Vec<(u16, String)>>,
 }
 
 impl App {
@@ -255,6 +258,21 @@ extern "C" fn save(
         .unwrap()
         .push(unsafe { bytes_of(state, state_len) });
     1
+}
+
+extern "C" fn capable(
+    status_code: u16,
+    feature_tags: *const c_char,
+    context: *mut MessageResultCallbackContext,
+) {
+    let feature_tags = unsafe { CStr::from_ptr(feature_tags) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { app(context) }
+        .capabilities
+        .lock()
+        .unwrap()
+        .push((status_code, feature_tags));
 }
 
 extern "C" fn told(status: i32, context: *mut MessageResultCallbackContext) {
@@ -572,6 +590,10 @@ impl Client {
         unsafe { &*self.client }.context.get_acs_parameters()
     }
 
+    fn feature_tags(&self) -> String {
+        unsafe { &*self.client }.engine.feature_tags()
+    }
+
     fn has_e2ee(&self) -> bool {
         unsafe { &*self.client }.e2ee.is_some()
     }
@@ -619,6 +641,11 @@ fn an_app_sets_e2ee_and_enrols_once_configured() {
     assert!(client.acs_parameters().is_empty());
 
     assert_eq!(client.set_e2ee(&app, &[bytes(ROOT)], None), 0);
+    assert_eq!(
+        client.feature_tags(),
+        FEATURE_TAGS,
+        "not told before enrolling"
+    );
     let parameters = client.acs_parameters();
     let names: Vec<&str> = parameters.iter().map(|(name, _)| &name[..]).collect();
     assert_eq!(names, ["participant_public_key", "home_kds"]);
@@ -691,4 +718,57 @@ fn e2ee_is_not_set_with_what_is_not_right() {
     let again = Client::new();
     assert_eq!(again.set_e2ee(&app, &[bytes(ROOT)], Some(&kept)), 0);
     assert_eq!(again.acs_parameters(), parameters);
+}
+
+#[test]
+fn a_device_tells_its_e2ee_capability_on_the_client_once_enrolled() {
+    let client = Client::new();
+    let keeping = Arc::new(Keeping::default());
+    let kds = Arc::new(Kds::issuing(&[ALICE, CA], &keeping));
+    let device = Arc::new(alice(&keeping, &kds, TODAY, None));
+    device.advertise_on(&unsafe { &*client.client }.engine);
+    assert_eq!(client.feature_tags(), FEATURE_TAGS, "not enrolled");
+
+    provision(&device, &[ALICE_TEL], None);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    assert_eq!(
+        client.feature_tags(),
+        format!(
+            "{};+g.gsma.rcs.mls.mls-version=\"v1\";+g.gsma.rcs.mls.mls-kds=\"42\"",
+            FEATURE_TAGS
+        )
+    );
+
+    drop(device);
+    assert_eq!(client.feature_tags(), FEATURE_TAGS, "the device let go of");
+}
+
+#[test]
+fn capabilities_are_asked_through_the_client() {
+    let app = App::default();
+    let client = Client::new();
+    let runtime = &*client.runtime as *const RcsRuntime as *mut RcsRuntime;
+
+    // not registered, then with no contact
+    let contact = CString::new("sip:+15559876@example.com").unwrap();
+    unsafe {
+        rcs_client_query_capabilities(
+            runtime,
+            client.client,
+            contact.as_ptr(),
+            Some(capable),
+            app.context(),
+        );
+        rcs_client_query_capabilities(
+            runtime,
+            client.client,
+            ptr::null(),
+            Some(capable),
+            app.context(),
+        );
+    }
+    assert_eq!(
+        *app.capabilities.lock().unwrap(),
+        vec![(403, String::new()), (400, String::new())]
+    );
 }

@@ -344,7 +344,7 @@ fn a_state_with_a_participant_key_that_is_not_one_is_refused() {
     let device = store(&app);
     device.participant_public_key().unwrap();
     let kept = app.last();
-    let key_length = b"RCS-E2EE1".len();
+    let key_length = b"RCS-E2EE2".len();
 
     let mut short = kept.clone();
     short[key_length] = 200;
@@ -358,4 +358,79 @@ fn a_state_with_a_participant_key_that_is_not_one_is_refused() {
             Err(StoreError::Mls(ErrorKind::BadFormat))
         );
     }
+}
+
+#[test]
+fn whether_key_packages_were_uploaded_is_kept_with_the_client() {
+    let app = Arc::new(App::default());
+    let device = store(&app);
+    assert_eq!(
+        device.set_key_packages_uploaded(),
+        Err(StoreError::NoClient)
+    );
+    device
+        .create(|config, validator| MlsClient::new(b"alice", CIPHERSUITE, config, validator))
+        .unwrap();
+    assert!(!device.key_packages_uploaded());
+
+    // not kept, not taken on
+    app.refuse(true);
+    assert_eq!(
+        device.set_key_packages_uploaded(),
+        Err(StoreError::NotSaved)
+    );
+    assert!(!device.key_packages_uploaded());
+    app.refuse(false);
+
+    let kept = app.kept();
+    device.set_key_packages_uploaded().unwrap();
+    assert!(device.key_packages_uploaded());
+    device.set_key_packages_uploaded().unwrap();
+    assert_eq!(app.kept(), kept + 1, "kept once");
+
+    // along with the changes that follow
+    let (group_id, _bobs) = group_with(&device, &member("bob"));
+    let again = store(&app);
+    again.restore(&app.last()).unwrap();
+    assert!(again.key_packages_uploaded());
+
+    // and through a change undone
+    app.refuse(true);
+    assert_eq!(
+        encrypt(&device, &group_id, "one"),
+        Err(StoreError::NotSaved)
+    );
+    app.refuse(false);
+    assert!(device.key_packages_uploaded());
+
+    // none of a new client's
+    device
+        .create(|config, validator| MlsClient::new(b"alice", CIPHERSUITE, config, validator))
+        .unwrap();
+    assert!(!device.key_packages_uploaded());
+    let again = store(&app);
+    again.restore(&app.last()).unwrap();
+    assert!(!again.key_packages_uploaded());
+}
+
+#[test]
+fn a_state_of_another_layout_is_refused() {
+    let app = Arc::new(App::default());
+    let device = store(&app);
+    device.participant_public_key().unwrap();
+    let kept = app.last();
+    let uploaded_at = b"RCS-E2EE2".len() + 1 + 32;
+
+    let mut not_a_flag = kept.clone();
+    not_a_flag[uploaded_at] = 2;
+    let mut older = kept.clone();
+    older[..9].copy_from_slice(b"RCS-E2EE1");
+    let cut = kept[..uploaded_at].to_vec();
+    for state in [not_a_flag, older, cut] {
+        assert_eq!(
+            store(&app).restore(&state),
+            Err(StoreError::Mls(ErrorKind::BadFormat))
+        );
+    }
+    assert!(store(&app).restore(&kept).is_ok());
 }

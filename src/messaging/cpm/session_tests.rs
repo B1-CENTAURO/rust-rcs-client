@@ -141,6 +141,15 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// The other side of `stream`, on `rt`
+    pub fn over(rt: Arc<Runtime>, stream: DuplexStream) -> Peer {
+        Peer {
+            rt,
+            stream,
+            parser: SipParser::new(),
+        }
+    }
+
     pub fn next_within(&mut self, timeout: Duration) -> Option<SipMessage> {
         let Peer {
             rt, stream, parser, ..
@@ -1498,7 +1507,7 @@ fn cpim_of(message: &SipMessage) -> CPIMMessage {
     CPIMMessage::try_from(&Body::construct_message(&body_data(message)).unwrap()).unwrap()
 }
 
-fn request_uri(message: &SipMessage) -> String {
+pub fn request_uri(message: &SipMessage) -> String {
     match message {
         SipMessage::Request(line, _, _) => String::from_utf8_lossy(&line.uri).into_owned(),
         _ => panic!("not a request"),

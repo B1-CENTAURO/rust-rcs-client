@@ -72,6 +72,7 @@ use tokio::runtime::Runtime;
 use url::Url;
 use uuid::Uuid;
 
+use crate::capability::{Capabilities, CapabilityService, CapabilityServiceWrapper};
 use crate::chat_bot;
 use crate::chat_bot::chatbot_config::ChatbotConfig;
 use crate::chat_bot::chatbot_sip_uri::AsChatbotSipUri;
@@ -158,6 +159,9 @@ pub struct RcsEngine {
     ft_http_configs: FileTransferOverHTTPConfigs,
 
     conference_service_v1: Arc<MultiConferenceServiceV1>,
+
+    /// Telling and asking capabilities over SIP OPTIONS
+    capability_service: Arc<CapabilityService>,
 
     /// The messages last taken, and the notifications each asks for
     received_messages: Arc<ReceivedMessages>,
@@ -729,7 +733,12 @@ impl RcsEngine {
         let allowed_methods: Vec<&'static [u8]> =
             [ACK, BYE, CANCEL, INVITE, MESSAGE, NOTIFY, OPTIONS, UPDATE].to_vec();
 
+        let capability_service = Arc::new(CapabilityService::new());
+
         let mut transaction_handlers: Vec<Box<dyn TransactionHandler + Send + Sync>> = Vec::new();
+        transaction_handlers.push(Box::new(CapabilityServiceWrapper {
+            service: Arc::clone(&capability_service),
+        }));
         transaction_handlers.push(Box::new(StandaloneMessagingServiceWrapper {
             service: Arc::clone(&standalone_messaging_service),
             tm: Arc::clone(&tm),
@@ -784,6 +793,8 @@ impl RcsEngine {
 
                 conference_service_v1: Arc::clone(&multi_conference_service_v1),
 
+                capability_service: Arc::clone(&capability_service),
+
                 subscription_id,
 
                 settings: Mutex::new(ConnectSettings {
@@ -826,6 +837,8 @@ impl RcsEngine {
             ft_http_configs: FileTransferOverHTTPConfigs::new(),
 
             conference_service_v1: multi_conference_service_v1,
+
+            capability_service,
 
             received_messages,
 
@@ -1318,6 +1331,35 @@ impl RcsEngine {
     /// Tells `recipient`, in the chat session there is with it, that the user
     /// is composing a message, or no longer is. No session is started for it:
     /// 404 if there is none.
+    /// Asks `contact_uri` for its capabilities over SIP OPTIONS (RCC.07
+    /// section 2.6.1.1); `callback` is told what it answered
+    pub fn query_capabilities<F>(&self, contact_uri: &str, callback: F, rt: &Arc<Runtime>)
+    where
+        F: FnOnce(Capabilities) + Send + 'static,
+    {
+        self.capability_service.query(
+            contact_uri,
+            callback,
+            &self.core.get_transaction_manager(),
+            rt,
+        );
+    }
+
+    /// Has the feature tags `extra` gives, when it gives any, told in OPTIONS
+    /// exchanges besides those of the services of this client
+    pub fn set_extra_feature_tags(
+        &self,
+        extra: impl Fn() -> Option<String> + Send + Sync + 'static,
+    ) {
+        self.capability_service.set_extra_feature_tags(extra);
+    }
+
+    /// The feature tags told in OPTIONS exchanges as they apply now
+    #[cfg(test)]
+    pub(crate) fn feature_tags(&self) -> String {
+        self.capability_service.feature_tags()
+    }
+
     pub fn send_is_composing<F>(
         &self,
         recipient: &str,
@@ -2038,6 +2080,8 @@ struct Connector {
 
     conference_service_v1: Arc<MultiConferenceServiceV1>,
 
+    capability_service: Arc<CapabilityService>,
+
     subscription_id: i32,
 
     settings: Mutex<ConnectSettings>,
@@ -2360,6 +2404,12 @@ impl Connector {
                         sip_instance_id.clone(),
                         Arc::clone(transport),
                     );
+
+                self.capability_service.set_registered_public_identity(
+                    unbarred_impu.clone(),
+                    sip_instance_id.clone(),
+                    Arc::clone(transport),
+                );
 
                 self.retry.lock().unwrap().failures = 0;
 
