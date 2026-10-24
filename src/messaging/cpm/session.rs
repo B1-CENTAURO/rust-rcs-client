@@ -106,6 +106,9 @@ pub struct CPMSessionInfo {
     pub contact_alias: Option<String>,
     pub conversation_supports_anonymization: bool,
     pub conversation_is_using_anonymization_token: bool,
+    /// The MLS-Opaque-Token the message carried, for the requests of the
+    /// conversation to carry from now on (RCC.16 section 6.1.3)
+    pub mls_opaque_token: Option<String>,
 }
 
 impl CPMSessionInfo {
@@ -150,6 +153,27 @@ fn is_store_and_forward_server(uri: &[u8]) -> bool {
     user_part.len() >= 13 && user_part[..13].eq_ignore_ascii_case(b"rcse-standfw@")
 }
 
+/// The SIP header with which Messaging Servers have the requests of a
+/// conversation identify its Conversation Focus (RCC.16 sections 6.1.3, 7.2.4)
+pub(crate) const MLS_OPAQUE_TOKEN: &[u8] = b"MLS-Opaque-Token";
+
+/// The value of an MLS-Opaque-Token header, if it is one (RCC.16 section
+/// 7.2.4), as the parser gives header values, trimmed
+pub(crate) fn mls_opaque_token_value(value: &[u8]) -> Option<String> {
+    let valid = !value.is_empty()
+        && value
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b".!%*_+`'~".contains(b));
+    valid.then(|| String::from_utf8_lossy(value).into_owned())
+}
+
+/// Has `message` carry `mls_opaque_token`, if there is one
+pub(crate) fn add_mls_opaque_token(message: &mut SipMessage, mls_opaque_token: Option<String>) {
+    if let Some(mls_opaque_token) = mls_opaque_token {
+        message.add_header(Header::new(MLS_OPAQUE_TOKEN, mls_opaque_token));
+    }
+}
+
 pub fn get_cpm_session_info_from_message(
     message: &SipMessage,
     is_outgoing: bool,
@@ -165,6 +189,7 @@ pub fn get_cpm_session_info_from_message(
 
         let mut conversation_id: Option<&[u8]> = None;
         let mut contribution_id: Option<&[u8]> = None;
+        let mut opaque_token: Option<&[u8]> = None;
 
         for header in headers {
             if header.get_name().eq_ignore_ascii_case(b"Contact") {
@@ -178,6 +203,8 @@ pub fn get_cpm_session_info_from_message(
                 conversation_id = Some(header.get_value());
             } else if header.get_name().eq_ignore_ascii_case(b"Contribution-ID") {
                 contribution_id = Some(header.get_value());
+            } else if header.get_name().eq_ignore_ascii_case(MLS_OPAQUE_TOKEN) {
+                opaque_token = Some(header.get_value());
             } else if header.get_name().eq_ignore_ascii_case(b"Subject") {
                 subject_header = Some(header);
             } else if header.get_name().eq_ignore_ascii_case(b"Referred-By") {
@@ -374,6 +401,7 @@ pub fn get_cpm_session_info_from_message(
                             contact_alias,
                             conversation_supports_anonymization,
                             conversation_is_using_anonymization_token,
+                            mls_opaque_token: opaque_token.and_then(mls_opaque_token_value),
                         });
                     }
                 }
@@ -446,12 +474,16 @@ pub struct CPMSession {
     session_end: Mutex<Option<SessionEnd>>,
     /// Set when the session ends, for any number to watch
     ended_watch: watch::Sender<bool>,
+    /// The MLS-Opaque-Token the requests of the conversation carry, as it
+    /// changes, set as a session with a group starts
+    mls_opaque_token: Arc<Mutex<Option<String>>>,
 }
 
 impl CPMSession {
     pub fn new(session_info: CPMSessionInfo) -> CPMSession {
         CPMSession {
             session_info,
+            mls_opaque_token: Arc::new(Mutex::new(None)),
             session_state: Arc::new(Mutex::new(CPMSessionState::Negotiating(
                 CPMSessionNegotiationState::NoneSet,
             ))),
@@ -461,6 +493,12 @@ impl CPMSession {
             session_end: Mutex::new(None),
             ended_watch: watch::channel(false).0,
         }
+    }
+
+    /// The MLS-Opaque-Token the requests of the conversation carry, as it
+    /// changes
+    pub(crate) fn mls_opaque_token(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.mls_opaque_token)
     }
 
     /// Whether the session ended, as it changes: true once it has
@@ -1001,10 +1039,12 @@ impl SessionEnd {
     }
 
     /// Sends `message` over the registered transport, if there is one
-    fn send<C>(&self, message: SipMessage, callbacks: C)
+    fn send<C>(&self, mut message: SipMessage, callbacks: C)
     where
         C: ClientTransactionCallbacks + Send + Sync + 'static,
     {
+        let mls_opaque_token = self.sip_session.get_inner().mls_opaque_token();
+        add_mls_opaque_token(&mut message, mls_opaque_token.lock().unwrap().clone());
         let transport = match &*self.registered_public_identity.lock().unwrap() {
             Some((transport, _, _)) => Some(Arc::clone(transport)),
             None => None,
@@ -1372,7 +1412,7 @@ impl CPMSessionService {
     pub fn group_conversation_id(&self, conference_uri: &str) -> Option<String> {
         self.group_chats
             .ids_of(conference_uri)
-            .map(|(conversation_id, _)| conversation_id)
+            .map(|ids| ids.conversation_id)
     }
 
     /// The core the conference events of groups are subscribed to with
@@ -1995,6 +2035,14 @@ impl CPMSessionService {
                     (RecipientType::Group, None) => self.group_chats.ids_of(recipient),
                     _ => None,
                 };
+                // and the token its focus gave (RCC.16 section 6.1.3)
+                add_mls_opaque_token(
+                    &mut invite_message,
+                    stored_ids
+                        .as_ref()
+                        .and_then(|ids| ids.mls_opaque_token.clone()),
+                );
+                let stored_ids = stored_ids.map(|ids| (ids.conversation_id, ids.contribution_id));
                 let (conversation_id, contribution_id) = stored_ids.unwrap_or_else(|| {
                     let new_id = || {
                         String::from(

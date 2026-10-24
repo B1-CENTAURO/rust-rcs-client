@@ -33,7 +33,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::session::{CPMGroupEvent, CPMSession, SessionEnd};
+use super::session::{
+    add_mls_opaque_token, mls_opaque_token_value, CPMGroupEvent, CPMSession, SessionEnd,
+};
 use super::sip::cpm_contact::CPMServiceType;
 use super::standalone_messaging::OutgoingPagerModeContext;
 use super::{is_media_type, LOG_TAG};
@@ -73,6 +75,9 @@ pub struct GroupIds {
     pub conference_uri: String,
     pub conversation_id: String,
     pub contribution_id: String,
+    /// The MLS-Opaque-Token its focus gave, which the requests of the
+    /// conversation carry (RCC.16 section 6.1.3)
+    pub mls_opaque_token: Option<String>,
 }
 
 /// A user of a conference-info document
@@ -306,10 +311,9 @@ impl Roster {
 /// last
 pub struct GroupChats {
     core: Mutex<Option<Weak<SipCore>>>,
-    /// The Conversation-ID and Contribution-ID of each group by its URI, as
-    /// its last session had them, for it to be restarted with (RCC.07
-    /// section 3.2.4.10)
-    ids: Mutex<HashMap<String, (String, String)>>,
+    /// The identifiers of each group by its URI, as its last session had
+    /// them, for it to be restarted with (RCC.07 section 3.2.4.10)
+    ids: Mutex<HashMap<String, GroupIds>>,
     /// The groups by their URIs being left, through a session started to
     /// leave in
     leaving: Mutex<HashSet<String>>,
@@ -336,19 +340,23 @@ impl GroupChats {
         self.core.lock().unwrap().replace(Arc::downgrade(core));
     }
 
-    /// The Conversation-ID and Contribution-ID the group at `conference_uri`
-    /// had in its last session, if there was one
-    pub(crate) fn ids_of(&self, conference_uri: &str) -> Option<(String, String)> {
+    /// The identifiers the group at `conference_uri` had in its last
+    /// session, if there was one
+    pub(crate) fn ids_of(&self, conference_uri: &str) -> Option<GroupIds> {
         self.ids.lock().unwrap().get(conference_uri).cloned()
     }
 
     /// Takes note of the identifiers of a group the app kept, to restart it
     /// with as if a session with it had been had
-    pub(crate) fn remember(&self, ids: GroupIds) {
-        self.ids.lock().unwrap().insert(
-            ids.conference_uri,
-            (ids.conversation_id, ids.contribution_id),
-        );
+    pub(crate) fn remember(&self, mut ids: GroupIds) {
+        // a token not one is not sent
+        ids.mls_opaque_token = ids
+            .mls_opaque_token
+            .and_then(|token| mls_opaque_token_value(token.as_bytes()));
+        self.ids
+            .lock()
+            .unwrap()
+            .insert(ids.conference_uri.clone(), ids);
     }
 
     /// Takes note of the group at `conference_uri` being left, or no longer
@@ -372,7 +380,7 @@ impl GroupChats {
             .lock()
             .unwrap()
             .values()
-            .any(|(known, _)| known == conversation_id)
+            .any(|ids| ids.conversation_id == conversation_id)
     }
 
     /// Takes note of `sip_session` starting, which if with a group is
@@ -391,19 +399,30 @@ impl GroupChats {
         if let (Some(conversation_id), Some(contribution_id)) =
             (&session_info.conversation_id, &session_info.contribution_id)
         {
-            let ids = (conversation_id.clone(), contribution_id.clone());
-            let previous = self
-                .ids
-                .lock()
-                .unwrap()
-                .insert(conference_uri.clone(), ids.clone());
-            // the app told those it is to keep, once known or changed
-            if previous.as_ref() != Some(&ids) {
-                (self.listener)(CPMGroupEvent::Ids(GroupIds {
+            let changed = {
+                let mut known = self.ids.lock().unwrap();
+                let previous = known.get(&conference_uri);
+                // the token given last, until another is (RCC.16 section
+                // 6.1.3), for the conversation it was given in
+                let mls_opaque_token = session_info.mls_opaque_token.clone().or_else(|| {
+                    previous
+                        .filter(|previous| previous.conversation_id == *conversation_id)
+                        .and_then(|previous| previous.mls_opaque_token.clone())
+                });
+                *session.mls_opaque_token().lock().unwrap() = mls_opaque_token.clone();
+                let ids = GroupIds {
                     conference_uri: conference_uri.clone(),
-                    conversation_id: ids.0,
-                    contribution_id: ids.1,
-                }));
+                    conversation_id: conversation_id.clone(),
+                    contribution_id: contribution_id.clone(),
+                    mls_opaque_token,
+                };
+                let changed = previous != Some(&ids);
+                known.insert(conference_uri.clone(), ids.clone());
+                changed.then_some(ids)
+            };
+            // the app told those it is to keep, once known or changed
+            if let Some(ids) = changed {
+                (self.listener)(CPMGroupEvent::Ids(ids));
             }
         }
 
@@ -418,6 +437,7 @@ impl GroupChats {
                 &transport,
                 &impu,
                 &instance_id,
+                session.mls_opaque_token(),
                 &self.listener,
                 rt,
             )
@@ -456,6 +476,7 @@ fn subscribe(
     transport: &Arc<SipTransport>,
     impu: &str,
     instance_id: &str,
+    mls_opaque_token: Arc<Mutex<Option<String>>>,
     listener: &Arc<dyn Fn(CPMGroupEvent) + Send + Sync>,
     rt: &Arc<Runtime>,
 ) -> Option<Arc<Subscriber>> {
@@ -495,7 +516,10 @@ fn subscribe(
             SubscriberEvent::NearExpiration(_) => {}
         },
         move |dialog, expiration| {
-            build_subscribe(dialog, expiration, &conference_uri, &impu, &instance_id)
+            let mut message =
+                build_subscribe(dialog, expiration, &conference_uri, &impu, &instance_id)?;
+            add_mls_opaque_token(&mut message, mls_opaque_token.lock().unwrap().clone());
+            Ok(message)
         },
     ));
 
@@ -601,6 +625,8 @@ where
         Ok(message) => message,
         Err(_) => return false,
     };
+    let mls_opaque_token = session_end.sip_session.get_inner().mls_opaque_token();
+    add_mls_opaque_token(&mut message, mls_opaque_token.lock().unwrap().clone());
 
     let content_id = format!(
         "{}@rcs",
