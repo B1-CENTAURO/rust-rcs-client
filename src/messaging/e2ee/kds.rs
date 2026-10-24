@@ -22,11 +22,14 @@
 use std::future::Future;
 use std::iter;
 use std::pin::Pin;
+use std::time::SystemTime;
 
 use rust_rcs_core::mls::rcs::certificate::{
     x509_credential, CertificateError, RcsCredentialValidator,
 };
+use rust_rcs_core::mls::rcs::ClientIdentity;
 use rust_rcs_core::mls::{self, key_package_info, Ciphersuite, MlsClient, SignatureKeyPair};
+use uuid::Uuid;
 
 use super::store::{MlsStore, StoreError};
 
@@ -50,7 +53,14 @@ pub struct Enrolment {
     pub ciphersuite: Ciphersuite,
     /// The public key of the MLS signature key of the device
     pub signature_key: Vec<u8>,
-    /// The Signed Encryption Identity Proof, if ACS gave one (section 4.1)
+    /// The Client ID, a UUIDv4, for the commonName of the Subject (A.3.6)
+    pub client_id: String,
+    /// The ParticipantInformation extension, DER encoded, signed for the
+    /// Client ID, the Vendor ID of the Home KDS, the signature key and the tel
+    /// URI (A.3.8.9)
+    pub participant_information: Vec<u8>,
+    /// The Signed Encryption Identity Proof, if ACS gave one (section 4.1),
+    /// for the ACS Participant Information extension (A.3.8.10)
     pub identity_proof: Option<Vec<u8>>,
 }
 
@@ -107,10 +117,11 @@ pub enum EnrolmentError {
     Store(StoreError),
 }
 
-/// Enrols the device with its Home KDS for the Participant at `tel_uri`, with
-/// `signer` as its MLS signature key: the client made with the certificate
-/// issued takes the place of any in `store`, and `key_packages` KeyPackages
-/// of it are uploaded, with one of last resort (RCC.16 sections 4.2, 5.1)
+/// Enrols the device with its Home KDS, whose Vendor ID is `home_kds`, for
+/// the Participant at `tel_uri`, with `signer` as its MLS signature key: the
+/// client made with the certificate issued takes the place of any in `store`,
+/// and `key_packages` KeyPackages of it are uploaded, with one of last resort
+/// (RCC.16 sections 4.2, 5.1)
 ///
 /// `validator` is the one of `store`. Once the client is made, the device is
 /// enrolled: KeyPackages that could not be uploaded are to be uploaded again
@@ -119,17 +130,33 @@ pub async fn enrol(
     store: &MlsStore,
     kds: &dyn KeyDistribution,
     validator: &RcsCredentialValidator,
+    home_kds: u32,
     tel_uri: &str,
     identity_proof: Option<Vec<u8>>,
     ciphersuite: Ciphersuite,
     signer: SignatureKeyPair,
     key_packages: usize,
 ) -> Result<(), EnrolmentError> {
+    let client_id = Uuid::new_v4().to_string();
+    let participant_information = store
+        .participant_information(
+            &ClientIdentity {
+                client_id: &client_id,
+                vendor_id: u64::from(home_kds),
+                signature_key: signer.public(),
+                tel_uris: &[tel_uri],
+            },
+            SystemTime::now(),
+        )
+        .map_err(EnrolmentError::Store)?;
+
     let chain = kds
         .enrol(Enrolment {
             tel_uri: String::from(tel_uri),
             ciphersuite,
             signature_key: signer.public().to_vec(),
+            client_id,
+            participant_information,
             identity_proof,
         })
         .await

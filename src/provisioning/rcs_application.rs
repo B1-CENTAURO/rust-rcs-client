@@ -140,6 +140,14 @@ impl Messaging<'_> {
         0
     }
 
+    /// The ACS Signed Encryption Identity Proof, base64 encoded (RCC.07
+    /// section A.2.4, RCC.16 section 4.1)
+    pub fn get_signed_encryption_identity_proof(&self) -> Option<String> {
+        self.root
+            .get_parameter("signedEncryptionIdentityProof")
+            .map(String::from)
+    }
+
     pub fn get_chat_config(&self) -> Option<Chat> {
         if let Some(c) = self.root.get_child_characteristic("Chat") {
             return Some(Chat { root: c });

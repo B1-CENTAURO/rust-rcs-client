@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The MLS state of the device: one MLS client, and the groups it takes part
-//! in, kept by the app
+//! The MLS state of the device: the Participant Key of its user, one MLS
+//! client, and the groups it takes part in, kept by the app
 //!
 //! The state holds the private keys of the device and the secrets of every
 //! group. A change to it has to be kept before anything it produced is sent:
@@ -24,10 +24,15 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
+use rust_rcs_core::mls::rcs::{ClientIdentity, ParticipantKey};
 use rust_rcs_core::mls::{
     self, Credential, CredentialValidator, ErrorKind, MlsClient, MlsConfig, MlsConversation,
 };
+
+/// Starts the state kept: the Participant Key, then the client
+const STATE_MAGIC: &[u8] = b"RCS-E2EE1";
 
 /// Keeps the state given, encrypted, in place of the one kept before; false if
 /// it could not. Called with the store locked, it must not call into it.
@@ -39,6 +44,8 @@ pub enum StoreError {
     NoClient,
     /// What MLS made of the call
     Mls(ErrorKind),
+    /// The Participant Key could not sign for the client
+    Participant,
     /// The state the call left could not be kept, and is undone
     NotSaved,
 }
@@ -51,6 +58,8 @@ pub struct MlsStore {
 }
 
 struct State {
+    /// The Participant Key, made the first time it is asked for
+    participant: Option<ParticipantKey>,
     client: Option<MlsClient>,
     /// The state last kept, which a change that could not be kept is undone to
     saved: Vec<u8>,
@@ -72,6 +81,7 @@ impl MlsStore {
             validator,
             save,
             state: Mutex::new(State {
+                participant: None,
                 client: None,
                 saved: Vec::new(),
                 conversations: HashMap::new(),
@@ -88,7 +98,7 @@ impl MlsStore {
         // locked while kept, as the states are kept in the order they come
         let mut state = self.state.lock().unwrap();
         let client = make(self.config, self.shared_validator()).map_err(StoreError::Mls)?;
-        let saved = client.snapshot().map_err(StoreError::Mls)?;
+        let saved = pack(state.participant.as_ref(), Some(&client))?;
         if !(self.save)(&saved) {
             return Err(StoreError::NotSaved);
         }
@@ -99,16 +109,37 @@ impl MlsStore {
         Ok(())
     }
 
-    /// Takes on the client in `saved`, a state the app kept
+    /// Takes on the Participant Key and the client in `saved`, a state the app
+    /// kept
     pub fn restore(&self, saved: &[u8]) -> Result<(), StoreError> {
-        let client = MlsClient::restore(saved, self.config, self.shared_validator())
-            .map_err(StoreError::Mls)?;
+        let (participant, client) = self.unpack(saved)?;
 
         let mut state = self.state.lock().unwrap();
-        state.client = Some(client);
+        state.participant = participant;
+        state.client = client;
         state.saved = saved.to_vec();
         state.conversations.clear();
         Ok(())
+    }
+
+    /// The public key of the Participant Key, as a DER encoded
+    /// SubjectPublicKeyInfo (RCC.16 section 4.1)
+    pub fn participant_public_key(&self) -> Result<Vec<u8>, StoreError> {
+        let mut state = self.state.lock().unwrap();
+        self.participant(&mut state).map(ParticipantKey::public_key)
+    }
+
+    /// The ParticipantInformation, DER encoded, the Client Certificate of
+    /// `client` is to carry (RCC.16 Annex A.3.8.9)
+    pub fn participant_information(
+        &self,
+        client: &ClientIdentity,
+        now: SystemTime,
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut state = self.state.lock().unwrap();
+        self.participant(&mut state)?
+            .participant_information(client, now)
+            .map_err(|_| StoreError::Participant)
     }
 
     /// The credential of the client, if there is one
@@ -198,6 +229,20 @@ impl MlsStore {
         result.map_err(StoreError::Mls)
     }
 
+    /// The Participant Key, made and kept if there is none yet
+    fn participant<'a>(&self, state: &'a mut State) -> Result<&'a ParticipantKey, StoreError> {
+        if state.participant.is_none() {
+            let participant = ParticipantKey::generate();
+            let saved = pack(Some(&participant), state.client.as_ref())?;
+            if !(self.save)(&saved) {
+                return Err(StoreError::NotSaved);
+            }
+            state.participant = Some(participant);
+            state.saved = saved;
+        }
+        Ok(state.participant.as_ref().unwrap())
+    }
+
     /// Has the app keep the state of the client, or else undoes it to the
     /// one last kept
     fn save(&self, state: &mut State) -> Result<(), StoreError> {
@@ -206,23 +251,70 @@ impl MlsStore {
             None => return Err(StoreError::NoClient),
         };
 
-        let snapshot = client.snapshot().map_err(StoreError::Mls);
-        if let Ok(snapshot) = &snapshot {
-            if (self.save)(snapshot) {
-                state.saved = snapshot.clone();
+        if let Ok(saved) = pack(state.participant.as_ref(), Some(client)) {
+            if (self.save)(&saved) {
+                state.saved = saved;
                 return Ok(());
             }
         }
 
         // the groups as loaded hold the state undone
         state.conversations.clear();
-        state.client = MlsClient::restore(&state.saved, self.config, self.shared_validator()).ok();
+        state.client = self
+            .unpack(&state.saved)
+            .ok()
+            .and_then(|(_, client)| client);
         Err(StoreError::NotSaved)
+    }
+
+    /// The Participant Key and the client of a state kept
+    fn unpack(
+        &self,
+        saved: &[u8],
+    ) -> Result<(Option<ParticipantKey>, Option<MlsClient>), StoreError> {
+        let bad_format = StoreError::Mls(ErrorKind::BadFormat);
+        let (participant, client) = saved
+            .strip_prefix(STATE_MAGIC)
+            .and_then(|rest| rest.split_first())
+            .and_then(|(length, rest)| {
+                (rest.len() >= *length as usize).then(|| rest.split_at(*length as usize))
+            })
+            .ok_or(bad_format)?;
+
+        let participant = match participant {
+            [] => None,
+            key => Some(ParticipantKey::from_bytes(key).map_err(|_| bad_format)?),
+        };
+        let client = match client {
+            [] => None,
+            snapshot => Some(
+                MlsClient::restore(snapshot, self.config, self.shared_validator())
+                    .map_err(StoreError::Mls)?,
+            ),
+        };
+        Ok((participant, client))
     }
 
     fn shared_validator(&self) -> Box<dyn CredentialValidator> {
         Box::new(SharedValidator(Arc::clone(&self.validator)))
     }
+}
+
+/// The state to keep: the Participant Key, its length first, then the client
+fn pack(
+    participant: Option<&ParticipantKey>,
+    client: Option<&MlsClient>,
+) -> Result<Vec<u8>, StoreError> {
+    let participant = participant
+        .map(ParticipantKey::to_bytes)
+        .unwrap_or_default();
+    let mut saved = STATE_MAGIC.to_vec();
+    saved.push(participant.len() as u8);
+    saved.extend_from_slice(&participant);
+    if let Some(client) = client {
+        saved.extend_from_slice(&client.snapshot().map_err(StoreError::Mls)?);
+    }
+    Ok(saved)
 }
 
 /// The validator of the store, for each client it makes or restores

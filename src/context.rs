@@ -18,7 +18,7 @@ extern crate walkdir;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{iter, panic};
 
 use rustls::pki_types::CertificateDer;
@@ -53,6 +53,10 @@ pub struct Context {
     security_context: Arc<SecurityContext>,
 
     otp_broadcaster: broadcast::Sender<String>,
+
+    /// Parameters the configuration request carries besides those it always
+    /// does, such as those of E2EE (RCC.07 section 2.3.2.2)
+    acs_parameters: Mutex<Vec<(String, String)>>,
 }
 
 impl Context {
@@ -80,6 +84,8 @@ impl Context {
             security_context: Arc::new(SecurityContext::new()),
 
             otp_broadcaster,
+
+            acs_parameters: Mutex::new(Vec::new()),
         }
     }
 
@@ -111,6 +117,16 @@ impl Context {
         if let Err(e) = self.otp_broadcaster.send(String::from(otp)) {
             platform_log(LOG_TAG, format!("broadcast_otp failed with error {}", &e));
         }
+    }
+
+    /// Has the configuration requests from now on carry `parameters`, by name
+    /// and value, besides those they always do
+    pub fn set_acs_parameters(&self, parameters: Vec<(String, String)>) {
+        *self.acs_parameters.lock().unwrap() = parameters;
+    }
+
+    pub fn get_acs_parameters(&self) -> Vec<(String, String)> {
+        self.acs_parameters.lock().unwrap().clone()
     }
 
     pub fn make_gba_context(

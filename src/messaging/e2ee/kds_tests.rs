@@ -13,13 +13,17 @@
 // limitations under the License.
 
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use futures::executor::block_on;
+use uuid::{Uuid, Version};
 
 use rust_rcs_core::mls::rcs::certificate::{
     x509_credential, CertificateError, RcsCredentialValidator,
 };
+use rust_rcs_core::mls::rcs::ClientIdentity;
 use rust_rcs_core::mls::{
     key_package_info, Ciphersuite, Credential, MlsClient, MlsConfig, SignatureKeyPair,
 };
@@ -28,6 +32,7 @@ use super::kds::{
     enrol, fetch_key_packages, upload_key_packages, Enrolment, EnrolmentError, Fetched, KdsError,
     KdsFuture, KeyDistribution, Recipient,
 };
+use super::provisioning::acs_parameters;
 use super::store::{MlsStore, StoreError};
 
 // the certificates rust-rcs-core is tested with, beside which the client is
@@ -41,6 +46,8 @@ use certificates::*;
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
 
 const ALICE_TEL: &str = "tel:+491701234567";
+/// The Vendor ID of the root of the test certificates
+const HOME_KDS: u32 = 42;
 const BOB_TEL: &str = "tel:+491707654321";
 
 /// When the certificates have 30 days left at least
@@ -203,6 +210,7 @@ fn enrolling(
         &device,
         kds,
         &validator(date),
+        HOME_KDS,
         tel_uri,
         Some(b"identity proof".to_vec()),
         CIPHERSUITE,
@@ -210,6 +218,38 @@ fn enrolling(
         3,
     ));
     (device, enrolled)
+}
+
+/// Whether the ParticipantInformation of `enrolment`, made since `before`,
+/// is the one the Participant Key of `device` signs for its Client ID, the
+/// Vendor ID of the Home KDS, Alice's key and `tel_uri`
+fn signed_for(
+    device: &MlsStore,
+    enrolment: &Enrolment,
+    tel_uri: &str,
+    before: &SystemTime,
+) -> bool {
+    let identity = ClientIdentity {
+        client_id: &enrolment.client_id,
+        vendor_id: u64::from(HOME_KDS),
+        signature_key: &bytes(ALICE_PUBLIC_KEY),
+        tel_uris: &[tel_uri],
+    };
+    // ECDSA signatures of P-256 keys are deterministic (RFC 6979), and the
+    // signature is valid from a whole second
+    let since = before
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let until = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    (since..=until).any(|second| {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(second);
+        device.participant_information(&identity, at)
+            == Ok(enrolment.participant_information.clone())
+    })
 }
 
 /// Bob, as a client of his own
@@ -252,18 +292,22 @@ fn joins(device: &MlsStore, bob: &MlsClient, key_package: &[u8]) -> bool {
 fn an_enrolled_device_is_certified_and_others_can_add_it() {
     let app = Arc::new(App::default());
     let kds = Kds::issuing(&[ALICE, CA], &app);
+    let before = SystemTime::now();
     let (device, enrolled) = enrolling(&app, &kds, ALICE_TEL, TODAY);
     assert_eq!(enrolled, Ok(()));
 
+    let enrolments = kds.enrolments.lock().unwrap().clone();
+    assert_eq!(enrolments.len(), 1);
+    let enrolment = &enrolments[0];
+    assert_eq!(enrolment.tel_uri, ALICE_TEL);
+    assert_eq!(enrolment.ciphersuite, CIPHERSUITE);
+    assert_eq!(enrolment.signature_key, bytes(ALICE_PUBLIC_KEY));
+    assert_eq!(enrolment.identity_proof, Some(b"identity proof".to_vec()));
     assert_eq!(
-        *kds.enrolments.lock().unwrap(),
-        vec![Enrolment {
-            tel_uri: String::from(ALICE_TEL),
-            ciphersuite: CIPHERSUITE,
-            signature_key: bytes(ALICE_PUBLIC_KEY),
-            identity_proof: Some(b"identity proof".to_vec()),
-        }]
+        Uuid::parse_str(&enrolment.client_id).unwrap().get_version(),
+        Some(Version::Random)
     );
+    assert!(signed_for(&device, enrolment, ALICE_TEL, &before));
     assert_eq!(device.credential(), Some(credential(&[ALICE, CA])));
 
     let uploads = kds.uploads();
@@ -306,7 +350,8 @@ fn a_certificate_others_would_refuse_is_not_taken_on() {
         let (device, enrolled) = enrolling(&app, &kds, tel_uri, date);
         assert_eq!(enrolled, Err(EnrolmentError::Certificate(refused)));
         assert_eq!(device.credential(), None);
-        assert_eq!(app.kept(), 0);
+        assert_eq!(app.kept(), 1, "the Participant Key only");
+        assert_eq!(restored(&app.last().unwrap()).credential(), None);
         assert!(kds.uploads().is_empty());
     }
 }
@@ -318,7 +363,7 @@ fn a_device_the_kds_does_not_enrol_is_left_as_it_was() {
     let (device, enrolled) = enrolling(&app, &kds, ALICE_TEL, TODAY);
     assert_eq!(enrolled, Err(EnrolmentError::Kds(KdsError::Unavailable)));
     assert_eq!(device.credential(), None);
-    assert_eq!(app.kept(), 0);
+    assert_eq!(app.kept(), 1, "the Participant Key only");
 }
 
 #[test]
@@ -479,5 +524,41 @@ fn an_unreachable_kds_is_told() {
     assert_eq!(
         fetching(&Kds::default(), TODAY, &[CIPHERSUITE]),
         Err(KdsError::Unavailable)
+    );
+}
+
+#[test]
+fn the_participant_key_given_to_acs_signs_at_enrolment() {
+    let app = Arc::new(App::default());
+    let kds = Kds::issuing(&[ALICE, CA], &app);
+    let device = store(&app, validator(TODAY));
+    let given = acs_parameters(&device, HOME_KDS).unwrap();
+    let given = URL_SAFE_NO_PAD.decode(&given[0].1).unwrap();
+
+    let before = SystemTime::now();
+    let enrolled = block_on(enrol(
+        &device,
+        &kds,
+        &validator(TODAY),
+        HOME_KDS,
+        ALICE_TEL,
+        None,
+        CIPHERSUITE,
+        signer(ALICE_KEY, ALICE_PUBLIC_KEY),
+        1,
+    ));
+    assert_eq!(enrolled, Ok(()));
+    let enrolment = kds.enrolments.lock().unwrap()[0].clone();
+    assert!(signed_for(&device, &enrolment, ALICE_TEL, &before));
+    assert!(enrolment
+        .participant_information
+        .windows(given.len())
+        .any(|w| w == given));
+    assert_eq!(enrolment.identity_proof, None);
+
+    // and still does once the device is restored
+    assert_eq!(
+        restored(&app.last().unwrap()).participant_public_key(),
+        Ok(given)
     );
 }
