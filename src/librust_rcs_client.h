@@ -82,6 +82,77 @@ extern void rcs_client_setup(struct rcs_runtime *runtime, struct rcs_client *cli
 
 extern void rcs_client_connect(struct rcs_runtime *runtime, struct rcs_client *client);
 
+// end-to-end encryption (GSMA RCC.16), in a library built with the e2ee feature; the contexts below are
+// released with message_result_callback_context_release()
+//
+// in order: new_rcs_client, rcs_client_set_e2ee, rcs_client_start_config, rcs_client_setup,
+// rcs_client_e2ee_enrol, then rcs_client_connect once enrolled, or without E2EE if it failed
+
+// a request to the app's Home KDS, answered once with one of the rcs_kds_request_* functions, at once or later,
+// from any thread
+struct rcs_kds_request;
+
+// asks the app to enrol the device: its tel URI and Cipher Suite, its MLS signature key, the Client ID and the DER
+// encoded ParticipantInformation for its Client Certificate, and the ACS Signed Encryption Identity Proof (NULL if
+// there is none); answered with rcs_kds_request_enrolled or rcs_kds_request_failed
+typedef void (*rcs_kds_enrol_function) (const char *tel_uri, uint16_t ciphersuite, const uint8_t *signature_key,
+                                size_t signature_key_len, const char *client_id, const uint8_t *participant_information,
+                                size_t participant_information_len, const uint8_t *identity_proof, size_t identity_proof_len,
+                                struct rcs_kds_request *request, void *context);
+
+// asks the app to upload KeyPackages of the device; answered with rcs_kds_request_uploaded or rcs_kds_request_failed
+typedef void (*rcs_kds_upload_function) (const uint8_t *const *key_packages, const size_t *key_package_lens, size_t count,
+                                struct rcs_kds_request *request, void *context);
+
+// asks the app for the KeyPackages of Participants, by tel URI and Home KDS capability value, in the first of the
+// Cipher Suites all of them have; answered with rcs_kds_request_add_key_packages for each Participant then
+// rcs_kds_request_fetched, or with rcs_kds_request_failed
+typedef void (*rcs_kds_fetch_function) (const uint16_t *ciphersuites, size_t ciphersuite_count, const char *const *tel_uris,
+                                const char *const *home_kds, size_t recipient_count, struct rcs_kds_request *request,
+                                void *context);
+
+// has the app keep the MLS state of the device, encrypted, in place of the one kept before; not 0 if it did; it must
+// not call into the client
+typedef int32_t (*rcs_e2ee_save_state_function) (const uint8_t *state, size_t state_len, void *context);
+
+// answers an enrolment with the certificate chain the Home KDS issued, Client Certificate first
+extern void rcs_kds_request_enrolled(struct rcs_kds_request *request, const uint8_t *const *certificates,
+                                const size_t *certificate_lens, size_t count);
+
+// answers an upload as done
+extern void rcs_kds_request_uploaded(struct rcs_kds_request *request);
+
+// adds to the answer of a fetch what the Home KDS has for the Participant at tel_uri: its KeyPackages (status 0), or
+// that it was not found (1), its number was malformed (2), it has no Cipher Suite in common (3), or it is unavailable (4)
+extern void rcs_kds_request_add_key_packages(struct rcs_kds_request *request, const char *tel_uri, int32_t status,
+                                const uint8_t *const *key_packages, const size_t *key_package_lens, size_t count);
+
+// answers a fetch with what was added to it
+extern void rcs_kds_request_fetched(struct rcs_kds_request *request);
+
+// answers a request as failed: the Home KDS could not be reached (refused 0), or refused it for reason (may be NULL)
+extern void rcs_kds_request_failed(struct rcs_kds_request *request, int32_t refused, const char *reason);
+
+// has the client encrypt end to end with the Home KDS of Vendor ID home_kds, trusting the DER encoded roots; its MLS
+// state is taken from saved_state (NULL if none) and kept from now on with save, called at once to keep a Participant
+// Key made; the configuration requests from now on carry what ACS signs the encryption identity of the device for;
+// 0 if done, -1 for an argument missing or a root not one, -2 for a saved state not one, -3 if the state could not be
+// kept
+extern int32_t rcs_client_set_e2ee(struct rcs_client *client, uint32_t home_kds, const uint8_t *const *roots,
+                                const size_t *root_lens, size_t root_count, const uint8_t *saved_state, size_t saved_state_len,
+                                rcs_e2ee_save_state_function save, rcs_kds_enrol_function enrol, rcs_kds_upload_function upload,
+                                rcs_kds_fetch_function fetch, void *context);
+
+// told how enrolling went: 0 enrolled, 1 already was, -1 E2EE not set or no tel URI configured, -2 the Home KDS could not
+// be reached, -3 it refused, -4 the certificate it issued is not one others would add the device with, -5 the MLS state
+// could not be made or kept
+typedef void (*rcs_e2ee_enrol_result_callback) (int32_t status, void *context);
+
+// enrols the device with its Home KDS for the identity it was configured with, unless it holds a certificate others
+// would still add it with; once configured, before connecting
+extern void rcs_client_e2ee_enrol(struct rcs_runtime *runtime, struct rcs_client *client, rcs_e2ee_enrol_result_callback cb,
+                                void *context);
+
 extern void rcs_client_disconnect(struct rcs_runtime *runtime, struct rcs_client *client);
 
 // messaging

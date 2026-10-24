@@ -122,6 +122,15 @@ impl MlsStore {
         Ok(())
     }
 
+    /// The public key of the MLS signature key of the client, if there is one
+    pub fn signature_key(&self) -> Option<Vec<u8>> {
+        let state = self.state.lock().unwrap();
+        state
+            .client
+            .as_ref()
+            .map(|client| client.signer().public().to_vec())
+    }
+
     /// The public key of the Participant Key, as a DER encoded
     /// SubjectPublicKeyInfo (RCC.16 section 4.1)
     pub fn participant_public_key(&self) -> Result<Vec<u8>, StoreError> {
