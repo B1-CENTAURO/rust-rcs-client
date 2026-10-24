@@ -1851,6 +1851,15 @@ const GROUP: &str = "sip:conf1@conf.example.com";
 /// connection up, with the INVITE and the SUBSCRIBE to its conference
 /// events, answered
 fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage, SipMessage, String) {
+    new_group_with(client, peer, "")
+}
+
+/// As new_group(), the focus answering with the headers `extra` too
+fn new_group_with(
+    client: &Client,
+    peer: &mut Peer,
+    extra: &str,
+) -> (MsrpConnection, SipMessage, SipMessage, String) {
     let rt = Arc::clone(&client.rt);
     let msrp = MsrpPeer::listen(&rt);
 
@@ -1882,7 +1891,10 @@ fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage, S
     )
     .replacen(
         "Contact:",
-        "P-Asserted-Identity: <sip:focus@conf.example.com>\r\nContact:",
+        &format!(
+            "P-Asserted-Identity: <sip:focus@conf.example.com>\r\n{}Contact:",
+            extra
+        ),
         1,
     );
     peer.send(&ok);
@@ -3016,6 +3028,7 @@ fn the_ids_of_a_group_are_told_once_known_and_given_back_after_a_restart() {
             conference_uri: String::from(GROUP),
             conversation_id: header_value(&creating, "Conversation-ID"),
             contribution_id: header_value(&creating, "Contribution-ID"),
+            mls_opaque_token: None,
         }
     );
 
@@ -3071,6 +3084,7 @@ fn a_group_given_back_is_known_when_its_focus_restarts_it() {
         conference_uri: String::from(GROUP),
         conversation_id: String::from("conversation-1"),
         contribution_id: String::from("contribution-1"),
+        mls_opaque_token: None,
     });
 
     // taken at once, though the user answers invitations
@@ -3081,6 +3095,204 @@ fn a_group_given_back_is_known_when_its_focus_restarts_it() {
     peer.next_request("SUBSCRIBE");
     let _connection = msrp.accept(&client.rt);
     assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+}
+
+/// A token as RCC.16 section 7.2.4 has them, with each kind of character
+const TOKEN: &str = "Focus.1!%*_+`'~z";
+
+#[test]
+fn the_mls_opaque_token_of_a_group_is_carried_by_its_requests_from_then_on() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (mut connection, creating, subscribe, _) = new_group_with(
+        &client,
+        &mut peer,
+        &format!("MLS-Opaque-Token: {}\r\n", TOKEN),
+    );
+    assert_eq!(header_value(&creating, "MLS-Opaque-Token"), "", "none yet");
+
+    // kept by the app
+    assert_eq!(
+        client.group_ids.recv_timeout(Duration::from_secs(5)),
+        Ok(GroupIds {
+            conference_uri: String::from(GROUP),
+            conversation_id: header_value(&creating, "Conversation-ID"),
+            contribution_id: header_value(&creating, "Contribution-ID"),
+            mls_opaque_token: Some(String::from(TOKEN)),
+        })
+    );
+
+    // and carried by the requests of the conversation
+    assert_eq!(header_value(&subscribe, "MLS-Opaque-Token"), TOKEN);
+    assert!(client
+        .sessions
+        .add_participants(GROUP, &[String::from("tel:+15550004")], |_, _| {}));
+    let refer = peer.next_request("REFER");
+    assert_eq!(header_value(&refer, "MLS-Opaque-Token"), TOKEN);
+    peer.send(&answer(&refer, "202 Accepted", None));
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    assert_eq!(header_value(&bye, "MLS-Opaque-Token"), TOKEN);
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+
+    // in sessions to come too, the focus not giving it again
+    let msrp = MsrpPeer::listen(&rt);
+    let result = leave(&client, GROUP);
+    let restart = peer.next_request("INVITE");
+    assert_eq!(header_value(&restart, "MLS-Opaque-Token"), TOKEN);
+    peer.send(&answer_from(
+        &restart,
+        "200 OK",
+        &focus_contact(),
+        Some(&msrp.sdp("sendrecv")),
+    ));
+    let requests = next_requests(&mut peer, &["ACK", "SUBSCRIBE", "BYE"]);
+    assert_eq!(header_value(&requests[1], "MLS-Opaque-Token"), TOKEN);
+    assert_eq!(header_value(&requests[2], "MLS-Opaque-Token"), TOKEN);
+    peer.send(&answer(&requests[2], "200 OK", None));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
+    assert!(
+        client
+            .group_ids
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
+        "the same ids told again"
+    );
+}
+
+#[test]
+fn a_new_mls_opaque_token_from_the_focus_replaces_the_one_kept() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    client.sessions.remember_group_ids(GroupIds {
+        conference_uri: String::from(GROUP),
+        conversation_id: String::from("conversation-1"),
+        contribution_id: String::from("contribution-1"),
+        mls_opaque_token: Some(String::from("first")),
+    });
+
+    // restarted by the focus, with a new one
+    let msrp = MsrpPeer::listen(&rt);
+    peer.send(&invite(
+        "group-new-token",
+        &focus_contact(),
+        FOCUS,
+        "cpm.session",
+        "MLS-Opaque-Token: second\r\n",
+        "application/sdp",
+        &msrp.sdp("sendrecv"),
+    ));
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "group-new-token"));
+    let subscribe = peer.next_request("SUBSCRIBE");
+    assert_eq!(header_value(&subscribe, "MLS-Opaque-Token"), "second");
+    let _connection = msrp.accept(&rt);
+    assert_eq!(
+        client
+            .group_ids
+            .recv_timeout(Duration::from_secs(5))
+            .map(|ids| ids.mls_opaque_token),
+        Ok(Some(String::from("second")))
+    );
+}
+
+#[test]
+fn an_mls_opaque_token_given_back_is_carried_by_the_restart() {
+    let (client, mut peer) = start(true);
+    client.sessions.remember_group_ids(GroupIds {
+        conference_uri: String::from(GROUP),
+        conversation_id: String::from("conversation-1"),
+        contribution_id: String::from("contribution-1"),
+        mls_opaque_token: Some(String::from(TOKEN)),
+    });
+    let _sent = client.send(GROUP, RecipientType::Group, "back");
+    let restart = peer.next_request("INVITE");
+    assert_eq!(header_value(&restart, "Conversation-ID"), "conversation-1");
+    assert_eq!(header_value(&restart, "MLS-Opaque-Token"), TOKEN);
+
+    // nor one given back that is not one
+    client.sessions.remember_group_ids(GroupIds {
+        conference_uri: String::from("sip:conf8@conf.example.com"),
+        conversation_id: String::from("conversation-8"),
+        contribution_id: String::from("contribution-8"),
+        mls_opaque_token: Some(String::from("token\r\nInjected: header")),
+    });
+    let _sent = client.send("sip:conf8@conf.example.com", RecipientType::Group, "back");
+    let restart = peer.next_request("INVITE");
+    assert_eq!(header_value(&restart, "Conversation-ID"), "conversation-8");
+    assert_eq!(header_value(&restart, "MLS-Opaque-Token"), "");
+    assert_eq!(header_value(&restart, "Injected"), "");
+
+    // and not by the requests to other groups
+    let other = "sip:conf9@conf.example.com";
+    let _sent = client.send(other, RecipientType::Group, "hello");
+    let invite = peer.next_request("INVITE");
+    assert_eq!(request_uri(&invite), other);
+    assert_eq!(header_value(&invite, "MLS-Opaque-Token"), "");
+}
+
+#[test]
+fn the_mls_opaque_token_of_another_conversation_is_not_carried() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    client.sessions.remember_group_ids(GroupIds {
+        conference_uri: String::from(GROUP),
+        conversation_id: String::from("conversation-0"),
+        contribution_id: String::from("contribution-0"),
+        mls_opaque_token: Some(String::from(TOKEN)),
+    });
+
+    // the group at the same URI, in another conversation, with no token
+    let msrp = group_invitation(&client, &mut peer, "group-other-conversation");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "group-other-conversation"));
+    let subscribe = peer.next_request("SUBSCRIBE");
+    assert_eq!(header_value(&subscribe, "MLS-Opaque-Token"), "");
+    let _connection = msrp.accept(&rt);
+    assert_eq!(
+        client
+            .group_ids
+            .recv_timeout(Duration::from_secs(5))
+            .map(|ids| (ids.conversation_id, ids.mls_opaque_token)),
+        Ok((String::from("conversation-1"), None))
+    );
+}
+
+#[test]
+fn an_mls_opaque_token_not_one_is_not_taken() {
+    for not_one in [
+        "",
+        "two words",
+        "semi;colon",
+        "quoted\"",
+        "<angle>",
+        "at@host",
+    ] {
+        let (client, mut peer) = start(true);
+        let (_connection, _creating, subscribe, _) = new_group_with(
+            &client,
+            &mut peer,
+            &format!("MLS-Opaque-Token: {}\r\n", not_one),
+        );
+        assert_eq!(
+            header_value(&subscribe, "MLS-Opaque-Token"),
+            "",
+            "{}",
+            not_one
+        );
+        assert_eq!(
+            client
+                .group_ids
+                .recv_timeout(Duration::from_secs(5))
+                .map(|ids| ids.mls_opaque_token),
+            Ok(None),
+            "{}",
+            not_one
+        );
+    }
 }
 
 #[test]

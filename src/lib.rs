@@ -1320,6 +1320,7 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_ids_listener(
             let conference_uri = c_string(ids.conference_uri);
             let conversation_id = c_string(ids.conversation_id);
             let contribution_id = c_string(ids.contribution_id);
+            let mls_opaque_token = ids.mls_opaque_token.map(c_string);
             let cb_context = cb_context
                 .as_ref()
                 .map(|cb_context| cb_context.lock().unwrap());
@@ -1327,6 +1328,9 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_ids_listener(
                 conference_uri.as_ptr(),
                 conversation_id.as_ptr(),
                 contribution_id.as_ptr(),
+                mls_opaque_token
+                    .as_ref()
+                    .map_or(ptr::null(), |mls_opaque_token| mls_opaque_token.as_ptr()),
                 cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr()),
             );
         });
@@ -1335,13 +1339,14 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_ids_listener(
 
 /// Gives back the identifiers of the group chat at `conference_uri` the app
 /// kept, for it to be restarted with them, and known when its focus restarts
-/// it; nothing if any is NULL or empty
+/// it; nothing if any but `mls_opaque_token`, which may be, is NULL or empty
 #[no_mangle]
 pub unsafe extern "C" fn rcs_client_set_group_chat_ids(
     client: *mut RcsClient,
     conference_uri: *const c_char,
     conversation_id: *const c_char,
     contribution_id: *const c_char,
+    mls_opaque_token: *const c_char,
 ) {
     platform_log(LOG_TAG, "calling rcs_client_set_group_chat_ids()");
 
@@ -1355,6 +1360,7 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_ids(
             conference_uri,
             conversation_id,
             contribution_id,
+            mls_opaque_token: optional_string(mls_opaque_token),
         });
     }
 }

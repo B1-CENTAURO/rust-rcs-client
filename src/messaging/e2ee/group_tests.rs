@@ -192,6 +192,13 @@ fn a_group_is_not_encrypted_unless_each_participant_advertises_e2ee_v1() {
     let others = [
         ("not registered", answered(480, "")),
         (
+            "not available, whatever it tells",
+            Capabilities {
+                status_code: 480,
+                ..mls("42")
+            },
+        ),
+        (
             "without E2EE",
             answered(
                 200,
@@ -291,6 +298,19 @@ fn a_group_is_made_for_the_focus_to_accept_with_the_clients_of_each_participant(
     assert_eq!(bobs_group.era(), Some(0));
     assert_eq!(bobs_group.epoch(), 1);
     assert_eq!(bundle.epoch_authenticator, bobs_group.epoch_authenticator());
+    // with the continuity token of the group, 256 bits (section 8.3.1.1)
+    let continuity_token = device
+        .store()
+        .with_client(|client| client.group_metadata(CONVERSATION.as_bytes()))
+        .unwrap()
+        .continuity_token;
+    assert_eq!(continuity_token.len(), 32);
+    assert_eq!(
+        bob.group_metadata(CONVERSATION.as_bytes())
+            .unwrap()
+            .continuity_token,
+        continuity_token
+    );
 
     // Alice's applied once the focus accepts it
     assert_eq!(epoch(&device, CONVERSATION), Ok((0, true)));

@@ -214,16 +214,18 @@ extern void rcs_client_set_group_chat_invitation_listener(struct rcs_client *cli
 
 // told of the identifiers of a group chat, once known or changed, for the app to keep and give back with
 // rcs_client_set_group_chat_ids once the client is made again, so that the group is restarted with them and known
-// when its focus restarts it
+// when its focus restarts it; mls_opaque_token is what the requests of the conversation carry for its focus (RCC.16
+// section 6.1.3), NULL if the focus gave none
 typedef void (*group_chat_ids_callback) (const char *conference_uri, const char *conversation_id, const char *contribution_id,
-                                void *context);
+                                const char *mls_opaque_token, void *context);
 
 // sets the group chat identifiers listener; the context of one set before is released
 extern void rcs_client_set_group_chat_ids_listener(struct rcs_client *client, group_chat_ids_callback cb, void *context);
 
-// gives back the identifiers of a group chat the app kept; nothing if any is NULL or empty
+// gives back the identifiers of a group chat the app kept; nothing if any but mls_opaque_token (NULL if none was
+// given) is NULL or empty
 extern void rcs_client_set_group_chat_ids(struct rcs_client *client, const char *conference_uri, const char *conversation_id,
-                                const char *contribution_id);
+                                const char *contribution_id, const char *mls_opaque_token);
 
 // accepts (accept != 0) or declines the invitation to the group chat that waits for the user's answer: 404 if there is none
 extern void rcs_client_answer_group_chat_invitation(struct rcs_runtime *runtime, struct rcs_client *client, const char *conference_uri,

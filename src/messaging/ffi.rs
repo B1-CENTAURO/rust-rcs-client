@@ -90,11 +90,13 @@ pub type GroupChatInvitationCallback = extern "C" fn(
 );
 
 /// Told of the identifiers of a group chat, once known or changed, for the
-/// app to keep and give back once the client is made again
+/// app to keep and give back once the client is made again; the
+/// MLS-Opaque-Token is null if its focus gave none
 pub type GroupChatIdsCallback = extern "C" fn(
     conference_uri: *const c_char,
     conversation_id: *const c_char,
     contribution_id: *const c_char,
+    mls_opaque_token: *const c_char,
     context: *mut MessageResultCallbackContext,
 );
 
