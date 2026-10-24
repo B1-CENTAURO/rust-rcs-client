@@ -87,6 +87,8 @@ use messaging::e2ee::ffi::{
     KdsEnrolFunction, KdsFetchFunction, KdsUploadFunction, SaveStateFunction,
 };
 #[cfg(feature = "e2ee")]
+use messaging::e2ee::group::DeviceGroups;
+#[cfg(feature = "e2ee")]
 use provisioning::characteristic::Characteristic;
 #[cfg(feature = "e2ee")]
 use provisioning::ims_application::ImsApplication;
@@ -703,6 +705,13 @@ pub unsafe extern "C" fn rcs_client_set_e2ee(
     client.context.set_acs_parameters(acs_parameters);
     // told in OPTIONS exchanges while the Home KDS holds KeyPackages
     device.advertise_on(&client.engine);
+    // and group chats created encrypted when they can be
+    client
+        .engine
+        .set_group_encryption(Arc::new(DeviceGroups::new(
+            &device,
+            client.engine.capability_query(),
+        )));
     client.e2ee = Some(device);
     0
 }

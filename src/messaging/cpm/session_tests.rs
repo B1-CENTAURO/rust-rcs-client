@@ -21,6 +21,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{engine::general_purpose, Engine as _};
+use futures::future::BoxFuture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::runtime::Runtime;
@@ -40,6 +42,7 @@ use rust_rcs_core::sip::{
 
 use crate::messaging::ffi::RecipientType;
 
+use super::encryption::GroupEncryption;
 use super::group_chat::GroupIds;
 use super::imdn::{
     acknowledge_delivery, acknowledge_group_delivery, ImdnService, ReceivedMessages,
@@ -2051,6 +2054,243 @@ fn a_group_chat_the_factory_refuses_is_reported_and_not_known() {
 
     // the factory is no one to send to in its session
     assert!(!client.sessions.has_session_with(FACTORY));
+}
+
+/// The encryption of group chats as the tests script it: the CPIM message it
+/// prepares for each, if any, and what it is asked and given
+#[derive(Default)]
+struct ScriptedEncryption {
+    cpim: Option<Vec<u8>>,
+    /// The Conversation-ID, from, to and participants of each prepared
+    prepared: std::sync::Mutex<Vec<(String, String, String, Vec<String>)>>,
+    server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    abandoned: std::sync::Mutex<Vec<String>>,
+}
+
+impl GroupEncryption for ScriptedEncryption {
+    fn prepare(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participants: Vec<String>,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.prepared
+            .lock()
+            .unwrap()
+            .push((conversation_id, from, to, participants));
+        let cpim = self.cpim.clone();
+        Box::pin(async move { cpim })
+    }
+
+    fn on_server_message(&self, conversation_id: &str, body: &[u8]) {
+        self.server_messages
+            .lock()
+            .unwrap()
+            .push((String::from(conversation_id), body.to_vec()));
+    }
+
+    fn abandon(&self, conversation_id: &str) {
+        self.abandoned
+            .lock()
+            .unwrap()
+            .push(String::from(conversation_id));
+    }
+}
+
+/// The client with group chats encrypted as `cpim` makes them
+fn encrypting(client: &Client, cpim: Option<&[u8]>) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: cpim.map(<[u8]>::to_vec),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+/// The content type and content of each part of the body of `message`
+fn parts_of(message: &SipMessage) -> Vec<(String, Vec<u8>)> {
+    use std::io::Read;
+
+    let content_type = header_value(message, "Content-Type");
+    let boundary = content_type
+        .split_once("boundary=")
+        .expect("a multipart body")
+        .1;
+    let Body::Multipart(multipart) =
+        Body::construct_multipart(&body_data(message), boundary.as_bytes()).unwrap()
+    else {
+        panic!("not multipart");
+    };
+    multipart
+        .parts
+        .iter()
+        .map(|part| match &**part {
+            Body::Message(part) => {
+                let content_type = header::search(&part.headers, b"Content-Type", true)
+                    .map(|h| String::from_utf8_lossy(h.get_value()).into_owned())
+                    .unwrap_or_default();
+                let mut content = Vec::new();
+                part.body
+                    .reader()
+                    .unwrap()
+                    .read_to_end(&mut content)
+                    .unwrap();
+                (content_type, content)
+            }
+            _ => panic!("a part with no headers"),
+        })
+        .collect()
+}
+
+/// A CPIM message carrying an MLS message from the Conversation Focus,
+/// MLS messages being binary
+const MLS_GROUP_CPIM: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x00\xff\x12\x80";
+
+#[test]
+fn an_encrypted_group_chat_is_invited_with_its_mls_group() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = encrypting(&client, Some(MLS_GROUP_CPIM));
+    let (mut connection, invite, _subscribe, focus_path) = new_group(&client, &mut peer);
+
+    // its MLS group made under its Conversation-ID
+    let prepared = encryption.prepared.lock().unwrap().clone();
+    assert_eq!(prepared.len(), 1);
+    let (conversation_id, from, to, participants) = &prepared[0];
+    assert_eq!(header_value(&invite, "Conversation-ID"), *conversation_id);
+    assert_eq!(
+        uuid::Uuid::parse_str(conversation_id).map(|id| id.get_version_num()),
+        Ok(4)
+    );
+    assert_eq!((&from[..], &to[..]), (IMPU, FACTORY));
+    assert_eq!(participants, &[ALICE, BOB]);
+
+    // which the INVITE carries, along with the participants
+    let parts = parts_of(&invite);
+    let content_types: Vec<&str> = parts.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(
+        content_types,
+        [
+            "application/sdp",
+            "application/resource-lists+xml",
+            "message/cpim"
+        ]
+    );
+    assert_eq!(parts[2].1, MLS_GROUP_CPIM);
+    let sdp = String::from_utf8_lossy(&parts[0].1).into_owned();
+    assert_eq!(
+        sdp_attribute(&sdp, "accept-wrapped-types").as_deref(),
+        Some("multipart/mixed text/plain application/vnd.gsma.rcs-ft-http+xml application/vnd.gsma.rcspushlocation+xml message/imdn+xml message/mls message/mls-rcs-server")
+    );
+    let our_path = sdp_attribute(&sdp, "path").expect("an a=path in the offer");
+
+    // what the focus sends of the MLS group goes to the encryption, and not
+    // to the app
+    let mls = general_purpose::STANDARD.encode(b"\x0a\x03abc\xff");
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &format!(
+            "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-18T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: focus-message-1\r\n\
+\r\n\
+Content-Type: message/mls-rcs-server\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+{}",
+            GROUP, IMPU, mls
+        ),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &group_cpim(ALICE, "", "hi all"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|(_, content_type, content)| (content_type, content)),
+        Ok((String::from("text/plain"), String::from("hi all")))
+    );
+    assert_eq!(
+        *encryption.server_messages.lock().unwrap(),
+        [(conversation_id.clone(), b"\x0a\x03abc\xff".to_vec())]
+    );
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_group_chat_that_cannot_be_encrypted_is_invited_as_one_that_is_not() {
+    let (client, mut peer) = start(true);
+    let encryption = encrypting(&client, None);
+    let (_connection, invite, _subscribe, _) = new_group(&client, &mut peer);
+
+    assert_eq!(encryption.prepared.lock().unwrap().len(), 1);
+    let parts = parts_of(&invite);
+    assert_eq!(parts.len(), 2);
+    let sdp = String::from_utf8_lossy(&parts[0].1).into_owned();
+    assert!(!sdp.contains("message/mls"), "{}", sdp);
+}
+
+/// The client starting a group chat with Alice, and a receiver of how it
+/// started
+fn starting_group(client: &Client) -> Receiver<(u16, Option<String>)> {
+    let (started_tx, started) = mpsc::channel();
+    client.sessions.create_group_chat(
+        FACTORY,
+        &[String::from(ALICE)],
+        None,
+        move |status_code, _, conference_uri| {
+            let _ = started_tx.send((status_code, conference_uri));
+        },
+        &client.core,
+        &client.rt,
+    );
+    started
+}
+
+#[test]
+fn the_mls_group_of_a_group_chat_that_does_not_start_is_let_go_of() {
+    for cpim in [Some(MLS_GROUP_CPIM), None] {
+        let (client, mut peer) = start(true);
+        let encryption = encrypting(&client, cpim);
+        let started = starting_group(&client);
+        let invite = peer.next_request("INVITE");
+        peer.send(&answer(&invite, "403 Forbidden", None));
+        assert_eq!(
+            started.recv_timeout(Duration::from_secs(5)),
+            Ok((403, None))
+        );
+        peer.next_request("ACK");
+
+        let abandoned = encryption.abandoned.lock().unwrap().clone();
+        match cpim {
+            Some(_) => assert_eq!(abandoned, [header_value(&invite, "Conversation-ID")]),
+            // there is none
+            None => assert!(abandoned.is_empty()),
+        }
+    }
+}
+
+#[test]
+fn a_group_chat_is_not_encrypted_by_a_client_not_registered() {
+    let (client, mut peer) = start(false);
+    let encryption = encrypting(&client, Some(MLS_GROUP_CPIM));
+    let started = starting_group(&client);
+    assert!(started.recv_timeout(Duration::from_secs(5)).is_ok());
+    assert!(encryption.prepared.lock().unwrap().is_empty());
+    peer.silence();
 }
 
 const ALICE: &str = "sip:+15550001@example.com";

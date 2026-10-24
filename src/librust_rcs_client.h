@@ -187,7 +187,9 @@ extern void rcs_client_send_message_with_imdn_id(struct rcs_runtime *runtime, st
 typedef void (*group_chat_result_callback) (uint16_t status_code, const char *reason_phrase, const char *conference_uri, void *context);
 
 // starts a new group chat through the provisioned conference factory, about subject unless NULL;
-// the callback is told the URI of the group once it starts (NULL if it did not), messages to it being sent with recipient_type_group
+// the callback is told the URI of the group once it starts (NULL if it did not), messages to it being sent with recipient_type_group;
+// with E2EE set and enrolled, the group is created encrypted (RCC.16 section 8.1) when every participant advertises E2EE v1
+// and the Home KDS has KeyPackages of each, and unencrypted otherwise
 extern void rcs_client_create_group_chat(struct rcs_runtime *runtime, struct rcs_client *client,
                                 const char *const *participants, size_t participant_count, const char *subject,
                                 group_chat_result_callback cb, void *context);

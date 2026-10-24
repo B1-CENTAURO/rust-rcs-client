@@ -72,7 +72,9 @@ use tokio::runtime::Runtime;
 use url::Url;
 use uuid::Uuid;
 
-use crate::capability::{Capabilities, CapabilityService, CapabilityServiceWrapper};
+use crate::capability::{
+    Capabilities, CapabilityQuery, CapabilityService, CapabilityServiceWrapper,
+};
 use crate::chat_bot;
 use crate::chat_bot::chatbot_config::ChatbotConfig;
 use crate::chat_bot::chatbot_sip_uri::AsChatbotSipUri;
@@ -97,6 +99,7 @@ use crate::connectivity::retry::Reconnect;
 use crate::connectivity::{flow::FlowManager, registration::Registration};
 use crate::context::Context;
 use crate::messaging::config::MessagingConfigs;
+use crate::messaging::cpm::encryption::GroupEncryption;
 use crate::messaging::cpm::group_chat::{GroupIds, GroupInvitation};
 use crate::messaging::cpm::imdn::{
     acknowledge_delivery, acknowledge_group_delivery, send_imdn, ImdnService, ReceivedMessages,
@@ -1345,6 +1348,36 @@ impl RcsEngine {
         );
     }
 
+    /// Asks contacts for their capabilities, as query_capabilities() does
+    pub fn capability_query(&self) -> CapabilityQuery {
+        let service = Arc::clone(&self.capability_service);
+        let tm = self.core.get_transaction_manager();
+        let rt = Arc::clone(&self.connector.rt);
+        Arc::new(move |contact_uri| {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            service.query(
+                &contact_uri,
+                move |capabilities| {
+                    let _ = tx.send(capabilities);
+                },
+                &tm,
+                &rt,
+            );
+            Box::pin(async move {
+                rx.await.unwrap_or(Capabilities {
+                    status_code: 0,
+                    feature_tags: String::new(),
+                })
+            })
+        })
+    }
+
+    /// Has the group chats created from now on encrypted end to end by
+    /// `encryption` when they can be (RCC.16 section 8.1)
+    pub fn set_group_encryption(&self, encryption: Arc<dyn GroupEncryption>) {
+        self.cpm_session_service.set_group_encryption(encryption);
+    }
+
     /// Has the feature tags `extra` gives, when it gives any, told in OPTIONS
     /// exchanges besides those of the services of this client
     pub fn set_extra_feature_tags(
@@ -1355,7 +1388,7 @@ impl RcsEngine {
     }
 
     /// The feature tags told in OPTIONS exchanges as they apply now
-    #[cfg(test)]
+    #[cfg(all(test, feature = "e2ee"))]
     pub(crate) fn feature_tags(&self) -> String {
         self.capability_service.feature_tags()
     }
