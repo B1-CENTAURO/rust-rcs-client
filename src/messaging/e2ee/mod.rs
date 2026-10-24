@@ -14,10 +14,16 @@
 
 //! End-to-end encryption of chats (GSMA RCC.16), on the MLS of rust-rcs-core
 
+pub mod device;
+pub mod ffi;
 pub mod kds;
 pub mod provisioning;
 pub mod store;
 
+#[cfg(test)]
+mod device_tests;
+#[cfg(test)]
+mod ffi_tests;
 #[cfg(test)]
 mod kds_tests;
 #[cfg(test)]

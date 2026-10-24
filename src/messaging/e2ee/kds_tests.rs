@@ -39,30 +39,30 @@ use super::store::{MlsStore, StoreError};
 // built
 #[allow(dead_code)]
 #[path = "../../../../rust-rcs-core/src/mls/rcs/testdata/certificates.rs"]
-mod certificates;
+pub(super) mod certificates;
 
 use certificates::*;
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
 
-const ALICE_TEL: &str = "tel:+491701234567";
+pub(super) const ALICE_TEL: &str = "tel:+491701234567";
 /// The Vendor ID of the root of the test certificates
-const HOME_KDS: u32 = 42;
+pub(super) const HOME_KDS: u32 = 42;
 const BOB_TEL: &str = "tel:+491707654321";
 
 /// When the certificates have 30 days left at least
-const TODAY: &str = "2026-09-15";
+pub(super) const TODAY: &str = "2026-09-15";
 /// When they have less
-const LATER: &str = "2026-10-15";
+pub(super) const LATER: &str = "2026-10-15";
 
-fn bytes(hex: &str) -> Vec<u8> {
+pub(super) fn bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect()
 }
 
-fn validator(date: &str) -> RcsCredentialValidator {
+pub(super) fn validator(date: &str) -> RcsCredentialValidator {
     let now: SystemTime = chrono::DateTime::parse_from_rfc3339(&format!("{}T00:00:00Z", date))
         .unwrap()
         .into();
@@ -75,13 +75,13 @@ fn chain(certificates: &[&str]) -> Vec<Vec<u8>> {
     certificates.iter().map(|c| bytes(c)).collect()
 }
 
-fn credential(certificates: &[&str]) -> Credential {
+pub(super) fn credential(certificates: &[&str]) -> Credential {
     let chain = chain(certificates);
     let chain: Vec<&[u8]> = chain.iter().map(|c| &c[..]).collect();
     x509_credential(&chain)
 }
 
-fn signer(key: &str, public_key: &str) -> SignatureKeyPair {
+pub(super) fn signer(key: &str, public_key: &str) -> SignatureKeyPair {
     SignatureKeyPair::from_raw(
         CIPHERSUITE.signature_algorithm(),
         bytes(key),
@@ -91,16 +91,16 @@ fn signer(key: &str, public_key: &str) -> SignatureKeyPair {
 
 /// What the app keeps of the state, as it is given it
 #[derive(Default)]
-struct App {
-    kept: Mutex<Vec<Vec<u8>>>,
+pub(super) struct App {
+    pub(super) kept: Mutex<Vec<Vec<u8>>>,
 }
 
 impl App {
-    fn kept(&self) -> usize {
+    pub(super) fn kept(&self) -> usize {
         self.kept.lock().unwrap().len()
     }
 
-    fn last(&self) -> Option<Vec<u8>> {
+    pub(super) fn last(&self) -> Option<Vec<u8>> {
         self.kept.lock().unwrap().last().cloned()
     }
 }
@@ -120,7 +120,7 @@ fn store(app: &Arc<App>, validator: RcsCredentialValidator) -> MlsStore {
 
 /// A Home KDS of the tests
 #[derive(Default)]
-struct Kds {
+pub(super) struct Kds {
     /// The chain it issues; unavailable without
     issuing: Option<Vec<Vec<u8>>>,
     /// Whether it takes KeyPackages
@@ -129,14 +129,14 @@ struct Kds {
     directory: Option<Vec<(String, Fetched)>>,
     /// The app, to tell what it had kept by an upload
     app: Option<Arc<App>>,
-    enrolments: Mutex<Vec<Enrolment>>,
+    pub(super) enrolments: Mutex<Vec<Enrolment>>,
     /// The KeyPackages uploaded, with the state the app had kept by then
     uploads: Mutex<Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)>>,
     queries: Mutex<Vec<(Vec<Ciphersuite>, Vec<Recipient>)>>,
 }
 
 impl Kds {
-    fn issuing(certificates: &[&str], app: &Arc<App>) -> Kds {
+    pub(super) fn issuing(certificates: &[&str], app: &Arc<App>) -> Kds {
         Kds {
             issuing: Some(chain(certificates)),
             taking: true,
@@ -157,7 +157,7 @@ impl Kds {
         }
     }
 
-    fn uploads(&self) -> Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
+    pub(super) fn uploads(&self) -> Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
         self.uploads.lock().unwrap().clone()
     }
 }

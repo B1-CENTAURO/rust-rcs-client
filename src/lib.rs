@@ -76,6 +76,22 @@ use provisioning::device_configuration::{
     start_auto_config, DeviceConfigurationStatus, RetryReason,
 };
 
+#[cfg(feature = "e2ee")]
+use messaging::e2ee::device::E2eeDevice;
+#[cfg(feature = "e2ee")]
+use messaging::e2ee::ffi::{
+    app_save_state, byte_arrays, enrolment_status, AppKds, E2eeEnrolResultCallback,
+    KdsEnrolFunction, KdsFetchFunction, KdsUploadFunction, SaveStateFunction,
+};
+#[cfg(feature = "e2ee")]
+use provisioning::characteristic::Characteristic;
+#[cfg(feature = "e2ee")]
+use provisioning::ims_application::ImsApplication;
+#[cfg(feature = "e2ee")]
+use provisioning::rcs_application::RcsApplication;
+#[cfg(feature = "e2ee")]
+use rust_rcs_core::mls::rcs::certificate::RcsCredentialValidator;
+
 use rcs_engine::{DownloadOrigin, RcsEngine};
 
 const LOG_TAG: &str = "librust_rcs_client";
@@ -128,6 +144,9 @@ pub struct RcsClient {
     engine: RcsEngine,
     // engine_itf: RcsEngineInterface,
     engine_gba_context: Option<Arc<GbaContext>>,
+
+    #[cfg(feature = "e2ee")]
+    e2ee: Option<Arc<E2eeDevice>>,
 }
 
 impl RcsClient {
@@ -274,6 +293,9 @@ impl RcsClient {
             engine,
             // engine_itf,
             engine_gba_context: None,
+
+            #[cfg(feature = "e2ee")]
+            e2ee: None,
         }
     }
 }
@@ -586,6 +608,20 @@ pub unsafe extern "C" fn rcs_client_setup(
         let ims_config = CStr::from_ptr(ims_config).to_string_lossy().into_owned();
         let rcs_config = CStr::from_ptr(rcs_config).to_string_lossy().into_owned();
 
+        // the identity to enrol with the Home KDS, and the proof of ACS
+        #[cfg(feature = "e2ee")]
+        if let (Some(device), Ok(ims_app), Ok(rcs_app)) = (
+            &client.e2ee,
+            ims_config.parse::<Characteristic>(),
+            rcs_config.parse::<Characteristic>(),
+        ) {
+            device.provisioned(
+                &ImsApplication::new(&ims_app),
+                &RcsApplication::new(&rcs_app),
+                client.msisdn.as_deref(),
+            );
+        }
+
         let gba_context = client.context.make_gba_context(
             &client.imsi,
             client.mcc,
@@ -596,6 +632,116 @@ pub unsafe extern "C" fn rcs_client_setup(
 
         client.engine.configure(ims_config, rcs_config);
         client.engine_gba_context.replace(gba_context);
+    }
+}
+
+/// Has the client encrypt end to end (RCC.16) with the Home KDS of Vendor ID
+/// `home_kds`, as the app's `enrol`, `upload` and `fetch` reach it, trusting
+/// the DER encoded root certificates `roots`; its MLS state is taken from
+/// `saved_state`, if the app kept one, and kept from now on with `save`,
+/// which is called at once to keep a Participant Key made. The configuration
+/// requests from now on carry what ACS signs the encryption identity of the
+/// device for. 0 if done, -1 for an argument missing or a root not one, -2 for
+/// a saved state not one, -3 if the state could not be kept; `context` is let
+/// go of when not taken.
+#[cfg(feature = "e2ee")]
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_e2ee(
+    client: *mut RcsClient,
+    home_kds: u32,
+    roots: *const *const u8,
+    root_lens: *const usize,
+    root_count: usize,
+    saved_state: *const u8,
+    saved_state_len: usize,
+    save: Option<SaveStateFunction>,
+    enrol: Option<KdsEnrolFunction>,
+    upload: Option<KdsUploadFunction>,
+    fetch: Option<KdsFetchFunction>,
+    context: *mut MessageResultCallbackContext,
+) -> i32 {
+    platform_log(LOG_TAG, "calling rcs_client_set_e2ee()");
+
+    let context = NonNull::new(context)
+        .map(|context| Arc::new(Mutex::new(MessageResultCallbackContextWrapper(context))));
+
+    let (Some(client), Some(save), Some(enrol), Some(upload), Some(fetch), Some(roots)) = (
+        client.as_mut(),
+        save,
+        enrol,
+        upload,
+        fetch,
+        byte_arrays(roots, root_lens, root_count),
+    ) else {
+        return -1;
+    };
+    let roots: Vec<&[u8]> = roots.iter().map(|root| &root[..]).collect();
+    let Ok(validator) = RcsCredentialValidator::new(&roots) else {
+        return -1;
+    };
+    let saved_state =
+        (!saved_state.is_null()).then(|| std::slice::from_raw_parts(saved_state, saved_state_len));
+
+    let kds = AppKds::new(enrol, upload, fetch, context.clone());
+    let Ok(device) = E2eeDevice::new(
+        validator,
+        home_kds,
+        Arc::new(kds),
+        app_save_state(save, context),
+        saved_state,
+    ) else {
+        return -2;
+    };
+    let Ok(acs_parameters) = device.acs_parameters() else {
+        return -3;
+    };
+
+    client.context.set_acs_parameters(acs_parameters);
+    client.e2ee = Some(Arc::new(device));
+    0
+}
+
+/// Enrols the device with its Home KDS for the identity it was configured
+/// with, unless it holds a certificate others would still add it with; to be
+/// called once configured, before connecting (RCC.16 section 4.2). `cb` is
+/// told 0 if enrolled, 1 if it already was, -1 if E2EE is not set or the
+/// device was not configured with a tel URI, -2 if the Home KDS could not be
+/// reached, -3 if it refused, -4 if the certificate it issued is not one
+/// others would add the device with, -5 if the MLS state could not be made
+/// or kept.
+#[cfg(feature = "e2ee")]
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_e2ee_enrol(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    cb: Option<E2eeEnrolResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_e2ee_enrol()");
+
+    let cb_context = NonNull::new(cb_context).map(MessageResultCallbackContextWrapper);
+    let tell = move |status: i32| {
+        if let Some(cb) = cb {
+            cb(
+                status,
+                cb_context
+                    .as_ref()
+                    .map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr()),
+            );
+        }
+    };
+
+    match (
+        rcs_runtime.as_ref(),
+        client.as_ref().and_then(|client| client.e2ee.clone()),
+    ) {
+        (Some(rcs_runtime), Some(device)) => {
+            rcs_runtime.rt.spawn(async move {
+                let status = enrolment_status(&device.enrol().await);
+                tell(status);
+            });
+        }
+        _ => tell(-1),
     }
 }
 
