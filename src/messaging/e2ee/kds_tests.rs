@@ -49,7 +49,7 @@ const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256
 pub(super) const ALICE_TEL: &str = "tel:+491701234567";
 /// The Vendor ID of the root of the test certificates
 pub(super) const HOME_KDS: u32 = 42;
-const BOB_TEL: &str = "tel:+491707654321";
+pub(super) const BOB_TEL: &str = "tel:+491707654321";
 
 /// When the certificates have 30 days left at least
 pub(super) const TODAY: &str = "2026-09-15";
@@ -133,7 +133,7 @@ pub(super) struct Kds {
     pub(super) enrolments: Mutex<Vec<Enrolment>>,
     /// The KeyPackages uploaded, with the state the app had kept by then
     uploads: Mutex<Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)>>,
-    queries: Mutex<Vec<(Vec<Ciphersuite>, Vec<Recipient>)>>,
+    pub(super) queries: Mutex<Vec<(Vec<Ciphersuite>, Vec<Recipient>)>>,
 }
 
 impl Kds {
@@ -147,6 +147,11 @@ impl Kds {
     }
 
     fn knowing(directory: Vec<(&str, Fetched)>) -> Kds {
+        Kds::default().knowing_too(directory)
+    }
+
+    /// The KDS, having `directory` for the Participants asked for too
+    pub(super) fn knowing_too(self, directory: Vec<(&str, Fetched)>) -> Kds {
         Kds {
             directory: Some(
                 directory
@@ -154,7 +159,7 @@ impl Kds {
                     .map(|(tel_uri, fetched)| (String::from(tel_uri), fetched))
                     .collect(),
             ),
-            ..Kds::default()
+            ..self
         }
     }
 
@@ -254,7 +259,7 @@ fn signed_for(
 }
 
 /// Bob, as a client of his own
-fn bob() -> MlsClient {
+pub(super) fn bob() -> MlsClient {
     MlsClient::with_credential(
         credential(&[BOB, CA]),
         signer(BOB_KEY, BOB_PUBLIC_KEY),

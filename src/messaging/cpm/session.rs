@@ -79,6 +79,7 @@ use uuid::Uuid;
 use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
+use super::encryption::{GroupEncryption, CONTENT_TYPE_MLS_RCS_SERVER};
 use super::group_chat::{refer_participants, GroupChats, GroupIds, GroupInvitation, Participant};
 use super::imdn::send_group_imdn;
 use super::session_invitation::{
@@ -1257,6 +1258,9 @@ pub struct CPMSessionService {
     /// The group chats taken part in, told of through the group event
     /// listener
     group_chats: Arc<GroupChats>,
+    /// The end-to-end encryption of the group chats created, if the client
+    /// has it
+    group_encryption: Arc<Mutex<Option<Arc<dyn GroupEncryption>>>>,
 }
 
 impl CPMSessionService {
@@ -1303,6 +1307,38 @@ impl CPMSessionService {
             Arc::new(group_invite_event_listener_function),
         ));
 
+        // what the Conversation Focus sends of the MLS group of a session
+        // goes to the encryption, not to the app
+        let group_encryption: Arc<Mutex<Option<Arc<dyn GroupEncryption>>>> =
+            Arc::new(Mutex::new(None));
+        let encryption = Arc::clone(&group_encryption);
+        let message_receive_listener =
+            move |session: &Arc<SipSession<CPMSession>>,
+                  contact: &[u8],
+                  cpim_info: &CPIMInfo,
+                  content_type: &[u8],
+                  content_body: &[u8]| {
+                if !content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS_RCS_SERVER) {
+                    message_receive_listener(
+                        session,
+                        contact,
+                        cpim_info,
+                        content_type,
+                        content_body,
+                    );
+                    return;
+                }
+                let encryption = encryption.lock().unwrap().clone();
+                let conversation_id = session
+                    .get_inner()
+                    .get_session_info()
+                    .conversation_id
+                    .clone();
+                if let (Some(encryption), Some(conversation_id)) = (encryption, conversation_id) {
+                    encryption.on_server_message(&conversation_id, content_body);
+                }
+            };
+
         CPMSessionService {
             ongoing_sessions: Arc::new(Mutex::new(Vec::new())),
             ongoing_incoming_invitations: Arc::new(Mutex::new(Vec::new())),
@@ -1314,7 +1350,14 @@ impl CPMSessionService {
             conversation_invite_handler_function: Box::new(conversation_invite_handler_function),
             group_invite_handler_function: Box::new(group_invite_handler_function),
             group_chats,
+            group_encryption,
         }
+    }
+
+    /// Has the group chats created from now on encrypted end to end by
+    /// `encryption` when they can be
+    pub fn set_group_encryption(&self, encryption: Arc<dyn GroupEncryption>) {
+        *self.group_encryption.lock().unwrap() = Some(encryption);
     }
 
     /// Takes note of the identifiers of a group the app kept from before, for
@@ -1709,8 +1752,12 @@ impl CPMSessionService {
     /// the conference factory at `factory_uri` (RFC 5366). `callback` is told
     /// the URI of the group once its session starts, a message to which goes
     /// in the session, or else why it did not start.
+    ///
+    /// The group is encrypted end to end if the encryption set can make its
+    /// MLS group (RCC.16 section 8.1), which is let go of if the group does
+    /// not start.
     pub fn create_group_chat<F>(
-        &self,
+        self: &Arc<Self>,
         factory_uri: &str,
         participants: &[String],
         subject: Option<&str>,
@@ -1720,6 +1767,82 @@ impl CPMSessionService {
     ) where
         F: FnOnce(u16, String, Option<String>) + Send + Sync + 'static,
     {
+        let encryption = self.group_encryption.lock().unwrap().clone();
+        let identity = self
+            .registered_public_identity
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, public_user_identity, _)| public_user_identity.clone());
+        let (Some(encryption), Some(public_user_identity)) = (encryption, identity) else {
+            self.invite_new_group(
+                factory_uri,
+                participants,
+                subject,
+                None,
+                Box::new(callback),
+                core,
+                rt,
+            );
+            return;
+        };
+
+        let conversation_id = String::from(
+            Uuid::new_v4()
+                .as_hyphenated()
+                .encode_lower(&mut Uuid::encode_buffer()),
+        );
+        let preparing = encryption.prepare(
+            conversation_id.clone(),
+            public_user_identity,
+            String::from(factory_uri),
+            participants.to_vec(),
+        );
+        let service = Arc::clone(self);
+        let factory_uri = String::from(factory_uri);
+        let participants = participants.to_vec();
+        let subject = subject.map(String::from);
+        let core = Arc::clone(core);
+        let rt_ = Arc::clone(rt);
+        rt.spawn(async move {
+            let bundle = preparing.await;
+            let started: Started = match &bundle {
+                Some(_) => {
+                    let conversation_id = conversation_id.clone();
+                    Box::new(move |status_code, reason_phrase, conference_uri| {
+                        if status_code != 200 {
+                            encryption.abandon(&conversation_id);
+                        }
+                        callback(status_code, reason_phrase, conference_uri);
+                    })
+                }
+                None => Box::new(callback),
+            };
+            let encrypted = bundle
+                .as_ref()
+                .map(|bundle| (&conversation_id[..], &bundle[..]));
+            service.invite_new_group(
+                &factory_uri,
+                &participants,
+                subject.as_deref(),
+                encrypted,
+                started,
+                &core,
+                &rt_,
+            );
+        });
+    }
+
+    fn invite_new_group(
+        &self,
+        factory_uri: &str,
+        participants: &[String],
+        subject: Option<&str>,
+        encrypted: Option<(&str, &[u8])>,
+        started: Started,
+        core: &Arc<SipCore>,
+        rt: &Arc<Runtime>,
+    ) {
         let sessions = self.ongoing_sessions.lock().unwrap();
         let invitations = self.ongoing_outgoing_invitations.lock().unwrap();
 
@@ -1733,10 +1856,14 @@ impl CPMSessionService {
                 // the group is known by its own URI once it starts, not by
                 // the factory's
                 known_as: None,
-                new_group: Some((participants, subject)),
+                new_group: Some(NewGroup {
+                    participants,
+                    subject,
+                    encrypted,
+                }),
             },
             None,
-            Some(Box::new(callback)),
+            Some(started),
             core,
             rt,
         );
@@ -1759,6 +1886,10 @@ impl CPMSessionService {
         let recipient = invitee.uri;
         let recipient_uri = invitee.to_uri;
         let recipient_type = invitee.recipient_type;
+        let encrypted = invitee
+            .new_group
+            .as_ref()
+            .is_some_and(|new_group| new_group.encrypted.is_some());
 
         if let Ok((sock, host, port, tls, active_setup, ipv6)) =
             (self.msrp_socket_allocator_function)(None)
@@ -1799,6 +1930,10 @@ impl CPMSessionService {
                 },
                 accept_wrapped_types: if let RecipientType::Chatbot = recipient_type {
                     Some(b"multipart/mixed text/plain application/vnd.gsma.rcs-ft-http+xml application/vnd.gsma.rcspushlocation+xml message/imdn+xml application/vnd.gsma.botmessage.v1.0+json application/vnd.gsma.botsuggestion.v1.0+json application/commontemplate+xml")
+                } else if encrypted {
+                    // and what the Conversation Focus sends of the MLS group
+                    // (RCC.16 sections 7.5.6, 7.9)
+                    Some(b"multipart/mixed text/plain application/vnd.gsma.rcs-ft-http+xml application/vnd.gsma.rcspushlocation+xml message/imdn+xml message/mls message/mls-rcs-server")
                 } else {
                     Some(b"multipart/mixed text/plain application/vnd.gsma.rcs-ft-http+xml application/vnd.gsma.rcspushlocation+xml message/imdn+xml")
                 },
@@ -1868,7 +2003,13 @@ impl CPMSessionService {
                                 .encode_lower(&mut Uuid::encode_buffer()),
                         )
                     };
-                    (new_id(), new_id())
+                    // the MLS group of an encrypted one is made under it
+                    let conversation_id = invitee
+                        .new_group
+                        .as_ref()
+                        .and_then(|new_group| new_group.encrypted)
+                        .map_or_else(new_id, |(conversation_id, _)| String::from(conversation_id));
+                    (conversation_id, new_id())
                 });
                 invite_message.add_header(Header::new(b"Conversation-ID", conversation_id.clone()));
                 invite_message.add_header(Header::new(b"Contribution-ID", contribution_id.clone()));
@@ -1902,7 +2043,11 @@ impl CPMSessionService {
 
                 match invitee.new_group {
                     // the participants for the focus to invite (RFC 5366)
-                    Some((participants, subject)) => {
+                    Some(NewGroup {
+                        participants,
+                        subject,
+                        encrypted,
+                    }) => {
                         invite_message
                             .add_header(Header::new(b"Require", b"recipient-list-invite"));
 
@@ -1912,7 +2057,11 @@ impl CPMSessionService {
                             invite_message.add_header(Header::new(b"Subject", subject));
                         }
 
-                        let (boundary, body) = group_invitation_body(&sdp, participants);
+                        let (boundary, body) = group_invitation_body(
+                            &sdp,
+                            participants,
+                            encrypted.map(|(_, bundle)| bundle),
+                        );
                         invite_message.add_header(Header::new(
                             b"Content-Type",
                             format!("multipart/mixed; boundary={}", boundary),
@@ -2336,17 +2485,30 @@ struct Invitee<'a> {
     recipient_type: &'a RecipientType,
     /// What the messages sent before the session starts are sent to, if known
     known_as: Option<&'a str>,
-    /// The participants and subject of a new group
-    new_group: Option<(&'a [String], Option<&'a str>)>,
+    new_group: Option<NewGroup<'a>>,
+}
+
+/// A group to start
+struct NewGroup<'a> {
+    participants: &'a [String],
+    subject: Option<&'a str>,
+    /// Its Conversation-ID, and the CPIM message of its MLS group, if it is
+    /// encrypted (RCC.16 section 8.1.2)
+    encrypted: Option<(&'a str, &'a [u8])>,
 }
 
 /// Told how a session started: 200 and the URI it is known by, or why it did
 /// not
 type Started = Box<dyn FnOnce(u16, String, Option<String>) + Send + Sync>;
 
-/// The body of an INVITE starting a group, with its boundary: its SDP, and
-/// the participants the focus is to invite (RFC 5366 section 4)
-fn group_invitation_body(sdp: &Arc<Body>, participants: &[String]) -> (String, Body) {
+/// The body of an INVITE starting a group, with its boundary: its SDP, the
+/// participants the focus is to invite (RFC 5366 section 4), and the CPIM
+/// message of its MLS group if it is encrypted (RCC.16 section 8.1.2)
+fn group_invitation_body(
+    sdp: &Arc<Body>,
+    participants: &[String],
+    encrypted: Option<&[u8]>,
+) -> (String, Body) {
     let boundary = create_raw_alpha_numeric_string(16);
     let boundary_ = String::from_utf8_lossy(&boundary).into_owned();
 
@@ -2364,7 +2526,7 @@ xmlns:cp=\"urn:ietf:params:xml:ns:copycontrol\"><list>",
     list += "</list></resource-lists>";
     let list = list.into_bytes();
 
-    let parts = vec![
+    let mut parts = vec![
         Arc::new(Body::Message(MessageBody {
             headers: vec![
                 Header::new(b"Content-Type", b"application/sdp"),
@@ -2381,6 +2543,15 @@ xmlns:cp=\"urn:ietf:params:xml:ns:copycontrol\"><list>",
             body: Arc::new(Body::Raw(list)),
         })),
     ];
+    if let Some(cpim) = encrypted {
+        parts.push(Arc::new(Body::Message(MessageBody {
+            headers: vec![
+                Header::new(b"Content-Type", b"message/cpim"),
+                Header::new(b"Content-Length", format!("{}", cpim.len())),
+            ],
+            body: Arc::new(Body::Raw(cpim.to_vec())),
+        })));
+    }
 
     (
         boundary_,

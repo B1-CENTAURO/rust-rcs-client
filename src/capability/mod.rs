@@ -20,6 +20,8 @@ mod tests;
 
 use std::sync::{Arc, Mutex};
 
+use futures::future::BoxFuture;
+
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::internet::header::{self, HeaderSearch};
 use rust_rcs_core::internet::header_field::AsHeaderField;
@@ -50,6 +52,9 @@ pub struct Capabilities {
     /// The feature tags of the Contact of a 200, as given, `;` separated
     pub feature_tags: String,
 }
+
+/// Asks a contact for its capabilities, as CapabilityService::query() does
+pub type CapabilityQuery = Arc<dyn Fn(String) -> BoxFuture<'static, Capabilities> + Send + Sync>;
 
 /// Feature tags told besides FEATURE_TAGS while they apply, `;` separated
 type ExtraFeatureTags = Box<dyn Fn() -> Option<String> + Send + Sync>;

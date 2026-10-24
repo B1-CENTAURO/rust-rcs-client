@@ -16,6 +16,7 @@
 
 pub mod device;
 pub mod ffi;
+pub mod group;
 pub mod kds;
 pub mod provisioning;
 pub mod store;
@@ -24,6 +25,8 @@ pub mod store;
 mod device_tests;
 #[cfg(test)]
 mod ffi_tests;
+#[cfg(test)]
+mod group_tests;
 #[cfg(test)]
 mod kds_tests;
 #[cfg(test)]

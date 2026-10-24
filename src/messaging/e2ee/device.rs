@@ -98,6 +98,14 @@ impl E2eeDevice {
         &self.store
     }
 
+    pub(super) fn kds(&self) -> &dyn KeyDistribution {
+        &*self.kds
+    }
+
+    pub(super) fn validator(&self) -> &RcsCredentialValidator {
+        &self.validator
+    }
+
     /// The parameters of the configuration request for ACS to sign the
     /// encryption identity of the device (RCC.16 section 4.1)
     pub fn acs_parameters(&self) -> Result<Vec<(String, String)>, StoreError> {
