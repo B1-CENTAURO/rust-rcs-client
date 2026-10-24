@@ -335,6 +335,37 @@ async fn try_otp_configuration_request_inner(
     Err(DeviceConfigurationStatus::Retry(RetryReason::NetworkIO, 0))
 }
 
+/// The URI of a configuration request, with `parameters` besides those it
+/// always carries
+fn configuration_request_uri(
+    https_uri: &str,
+    vers_version: i64,
+    imsi: &str,
+    imei: &str,
+    msisdn: Option<&str>,
+    token_string: Option<&str>,
+    parameters: &[(String, String)],
+) -> String {
+    let uri = match (msisdn, token_string) {
+        (Some(msisdn), Some(token_string)) => format!("{}?vers={}&IMSI={}&IMEI={}&msisdn={}&token={}&Channel_ID=&rcs_version=11.0&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0", https_uri, vers_version, imsi, imei, msisdn, token_string),
+        (None, Some(token_string)) => format!("{}?vers={}&IMSI={}&IMEI={}&msisdn=&token={}&Channel_ID=&rcs_version=11.0&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0", https_uri, vers_version, imsi, imei, token_string),
+        (Some(msisdn), None) => format!("{}?vers={}&IMSI={}&IMEI={}&msisdn={}&token=&SMS_port={}&Channel_ID=&rcs_version=11.0&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0", https_uri, vers_version, imsi, imei, msisdn, DEFAULT_APPLICATION_PORT),
+        (None, None) => format!("{}?vers={}&IMSI={}&IMEI={}&msisdn=&token=&SMS_port={}&Channel_ID=&rcs_version=11.0&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0", https_uri, vers_version, imsi, imei, DEFAULT_APPLICATION_PORT),
+    };
+    with_parameters(uri, parameters)
+}
+
+/// `uri` with `parameters` added to its query, by name and value
+fn with_parameters(mut uri: String, parameters: &[(String, String)]) -> String {
+    for (name, value) in parameters {
+        uri.push('&');
+        uri.push_str(&urlencoding::encode(name));
+        uri.push('=');
+        uri.push_str(&urlencoding::encode(value));
+    }
+    uri
+}
+
 fn try_https_configuration_request<'a, 'b: 'a>(
     server: ConfigurationServer,
     access_control_info: Option<AccessControlInfo<'a>>,
@@ -388,12 +419,15 @@ async fn try_https_configuration_request_inner(
 ) -> Result<Option<String>, DeviceConfigurationStatus> {
     let https_uri = server.https_uri();
 
-    let uri = match (msisdn, token_string) {
-        (Some(msisdn), Some(token_string)) => format!("{}?vers={}&IMSI={}&IMEI={}&msisdn={}&token={}&Channel_ID=&rcs_version=11.0&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0", https_uri, vers_version, imsi, imei, msisdn, token_string),
-        (None, Some(token_string)) => format!("{}?vers={}&IMSI={}&IMEI={}&msisdn=&token={}&Channel_ID=&rcs_version=11.0&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0", https_uri, vers_version, imsi, imei, token_string),
-        (Some(msisdn), None) => format!("{}?vers={}&IMSI={}&IMEI={}&msisdn={}&token=&SMS_port={}&Channel_ID=&rcs_version=11.0&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0", https_uri, vers_version, imsi, imei, msisdn, DEFAULT_APPLICATION_PORT),
-        (None, None) => format!("{}?vers={}&IMSI={}&IMEI={}&msisdn=&token=&SMS_port={}&Channel_ID=&rcs_version=11.0&rcs_profile=UP_2.4&provisioning_version=5.0&app=ap2001&app=ap2002&app=urn%3Aoma%3Amo%3Aext-3gpp-ims%3A1.0", https_uri, vers_version, imsi, imei, DEFAULT_APPLICATION_PORT),
-    };
+    let uri = configuration_request_uri(
+        &https_uri,
+        vers_version,
+        imsi,
+        imei,
+        msisdn,
+        token_string,
+        &context.get_acs_parameters(),
+    );
 
     if let Ok(url) = Url::parse(&uri) {
         match context.get_http_client().connect(&url, false).await {
@@ -1372,5 +1406,76 @@ where
         return Err(DeviceConfigurationStatus::Forbidden);
     } else {
         Err(DeviceConfigurationStatus::InvalidArgument)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{configuration_request_uri, with_parameters};
+
+    #[test]
+    fn a_configuration_request_carries_the_parameters_of_e2ee() {
+        let parameters = [
+            (
+                String::from("participant_public_key"),
+                String::from("MFkw_-A"),
+            ),
+            (String::from("home_kds"), String::from("42")),
+        ];
+        for (msisdn, token) in [
+            (Some("+491701234567"), Some("token")),
+            (None, Some("token")),
+            (Some("+491701234567"), None),
+            (None, None),
+        ] {
+            let uri = configuration_request_uri(
+                "https://config.rcs.example.com/",
+                3,
+                "262011234567890",
+                "35000000000000",
+                msisdn,
+                token,
+                &parameters,
+            );
+            assert!(uri.starts_with(
+                "https://config.rcs.example.com/?vers=3&IMSI=262011234567890&IMEI=35000000000000&"
+            ));
+            assert!(
+                uri.ends_with("&participant_public_key=MFkw_-A&home_kds=42"),
+                "{}",
+                uri
+            );
+        }
+        assert!(!configuration_request_uri(
+            "https://config.rcs.example.com/",
+            3,
+            "262011234567890",
+            "35000000000000",
+            None,
+            None,
+            &[]
+        )
+        .contains("home_kds"));
+    }
+
+    #[test]
+    fn a_configuration_request_carries_the_parameters_added() {
+        let uri = String::from("https://config.rcs.example.com/?vers=0&IMSI=1");
+        assert_eq!(with_parameters(uri.clone(), &[]), uri);
+        assert_eq!(
+            with_parameters(
+                uri,
+                &[
+                    (
+                        String::from("participant_public_key"),
+                        String::from("MFkw_-A")
+                    ),
+                    (String::from("home_kds"), String::from("42")),
+                    (String::from("odd name"), String::from("a&b=c")),
+                ]
+            ),
+            "https://config.rcs.example.com/?vers=0&IMSI=1\
+             &participant_public_key=MFkw_-A&home_kds=42&odd%20name=a%26b%3Dc"
+        );
     }
 }

@@ -15,9 +15,12 @@
 //! End-to-end encryption of chats (GSMA RCC.16), on the MLS of rust-rcs-core
 
 pub mod kds;
+pub mod provisioning;
 pub mod store;
 
 #[cfg(test)]
 mod kds_tests;
+#[cfg(test)]
+mod provisioning_tests;
 #[cfg(test)]
 mod tests;

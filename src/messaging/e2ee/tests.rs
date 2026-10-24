@@ -270,3 +270,92 @@ fn a_store_is_shared_between_threads() {
     fn shared<T: Send + Sync>() {}
     shared::<MlsStore>();
 }
+
+#[test]
+fn the_participant_key_is_made_once_and_kept_with_the_state() {
+    let app = Arc::new(App::default());
+    let device = store(&app);
+    let participant_key = device.participant_public_key().unwrap();
+    assert_eq!(app.kept(), 1, "the Participant Key made");
+    assert_eq!(device.participant_public_key(), Ok(participant_key.clone()));
+    assert_eq!(app.kept(), 1);
+
+    // kept along with the client, and its changes
+    device
+        .create(|config, validator| MlsClient::new(b"alice", CIPHERSUITE, config, validator))
+        .unwrap();
+    let made = store(&app);
+    made.restore(&app.last()).unwrap();
+    assert_eq!(made.participant_public_key(), Ok(participant_key.clone()));
+    assert_eq!(app.kept(), 2, "the client made");
+    let bob = member("bob");
+    let (group_id, _bobs) = group_with(&device, &bob);
+    encrypt(&device, &group_id, "one").unwrap();
+
+    let again = store(&app);
+    again.restore(&app.last()).unwrap();
+    assert_eq!(again.participant_public_key(), Ok(participant_key.clone()));
+    assert_eq!(again.credential(), device.credential());
+
+    // and through a change undone
+    app.refuse(true);
+    assert_eq!(
+        encrypt(&device, &group_id, "two"),
+        Err(StoreError::NotSaved)
+    );
+    app.refuse(false);
+    assert_eq!(device.participant_public_key(), Ok(participant_key));
+}
+
+#[test]
+fn a_participant_key_that_cannot_be_kept_is_not_taken_on() {
+    let app = Arc::new(App::default());
+    let device = store(&app);
+    app.refuse(true);
+    assert_eq!(device.participant_public_key(), Err(StoreError::NotSaved));
+    app.refuse(false);
+    let participant_key = device.participant_public_key().unwrap();
+
+    let again = store(&app);
+    again.restore(&app.last()).unwrap();
+    assert_eq!(again.participant_public_key(), Ok(participant_key));
+    assert_eq!(app.kept(), 1);
+}
+
+#[test]
+fn a_client_is_kept_without_a_participant_key_until_one_is_asked_for() {
+    let app = Arc::new(App::default());
+    let device = device(&app, "alice");
+    let again = store(&app);
+    again.restore(&app.last()).unwrap();
+    assert_eq!(again.credential(), device.credential());
+
+    // made for the client restored, and kept with it
+    let participant_key = again.participant_public_key().unwrap();
+    let once_more = store(&app);
+    once_more.restore(&app.last()).unwrap();
+    assert_eq!(once_more.credential(), device.credential());
+    assert_eq!(once_more.participant_public_key(), Ok(participant_key));
+}
+
+#[test]
+fn a_state_with_a_participant_key_that_is_not_one_is_refused() {
+    let app = Arc::new(App::default());
+    let device = store(&app);
+    device.participant_public_key().unwrap();
+    let kept = app.last();
+    let key_length = b"RCS-E2EE1".len();
+
+    let mut short = kept.clone();
+    short[key_length] = 200;
+    let mut not_a_key = kept.clone();
+    for byte in &mut not_a_key[key_length + 1..key_length + 33] {
+        *byte = 0xff;
+    }
+    for state in [short, not_a_key] {
+        assert_eq!(
+            store(&app).restore(&state),
+            Err(StoreError::Mls(ErrorKind::BadFormat))
+        );
+    }
+}
