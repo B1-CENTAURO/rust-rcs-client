@@ -628,17 +628,9 @@ pub(crate) fn refer_participants<F>(
 where
     F: FnOnce(u16, String, bool) + Send + Sync + 'static,
 {
-    let transport = match &*session_end.registered_public_identity.lock().unwrap() {
-        Some((transport, _, _)) => Arc::clone(transport),
-        None => return Err(callback),
+    let Some((mut message, transport)) = new_refer(session_end) else {
+        return Err(callback);
     };
-
-    let mut message = match session_end.dialog.make_request(b"REFER", None) {
-        Ok(message) => message,
-        Err(_) => return Err(callback),
-    };
-    let mls_opaque_token = session_end.sip_session.get_inner().mls_opaque_token();
-    add_mls_opaque_token(&mut message, mls_opaque_token.lock().unwrap().clone());
 
     let content_id = format!(
         "{}@rcs",
@@ -697,6 +689,68 @@ where
         }
     }
 
+    send_refer(session_end, message, &transport, callback);
+    Ok(())
+}
+
+/// Asks the focus of the session `session_end` ends to remove `participant`
+/// from the group, by sending it a BYE (RFC 4579, RCC.07 section 3.2.4.12),
+/// with the CPIM message `control_message` of the Commit removing its
+/// Clients from the MLS group if it is encrypted (RCC.16 section 9.3);
+/// otherwise as refer_participants()
+pub(crate) fn refer_removal<F>(
+    session_end: &SessionEnd,
+    participant: &str,
+    control_message: Option<&[u8]>,
+    callback: F,
+) -> Result<(), F>
+where
+    F: FnOnce(u16, String, bool) + Send + Sync + 'static,
+{
+    let Some((mut message, transport)) = new_refer(session_end) else {
+        return Err(callback);
+    };
+
+    message.add_header(Header::new(
+        b"Refer-To",
+        format!("<{};method=BYE>", participant),
+    ));
+    message.add_header(Header::new(b"Refer-Sub", b"false"));
+    // without, the transaction gives it its Content-Length
+    if let Some(cpim) = control_message {
+        message.add_header(Header::new(b"Content-Type", b"message/cpim"));
+        message.add_header(Header::new(b"Content-Length", format!("{}", cpim.len())));
+        message.set_body(Arc::new(Body::Raw(cpim.to_vec())));
+    }
+
+    send_refer(session_end, message, &transport, callback);
+    Ok(())
+}
+
+/// A REFER in the dialog of the session `session_end` ends, with the
+/// MLS-Opaque-Token of its group, and the transport it goes by; None if the
+/// session is not up to it
+fn new_refer(session_end: &SessionEnd) -> Option<(SipMessage, Arc<SipTransport>)> {
+    let transport = match &*session_end.registered_public_identity.lock().unwrap() {
+        Some((transport, _, _)) => Arc::clone(transport),
+        None => return None,
+    };
+    let mut message = session_end.dialog.make_request(b"REFER", None).ok()?;
+    let mls_opaque_token = session_end.sip_session.get_inner().mls_opaque_token();
+    add_mls_opaque_token(&mut message, mls_opaque_token.lock().unwrap().clone());
+    Some((message, transport))
+}
+
+/// Sends the REFER `message` over `transport`, `callback` told how it was
+/// answered
+fn send_refer<F>(
+    session_end: &SessionEnd,
+    message: SipMessage,
+    transport: &Arc<SipTransport>,
+    callback: F,
+) where
+    F: FnOnce(u16, String, bool) + Send + Sync + 'static,
+{
     let (client_transaction_tx, mut client_transaction_rx) = mpsc::channel(1);
     session_end.rt.spawn(async move {
         if let Some((status_code, reason_phrase, refusal_follows)) =
@@ -708,15 +762,13 @@ where
 
     session_end.tm.send_request(
         message,
-        &transport,
+        transport,
         ReferAnswer {
             client_transaction_tx,
             rt: Arc::clone(&session_end.rt),
         },
         &session_end.rt,
     );
-
-    Ok(())
 }
 
 /// Tells how a REFER was answered: its status code and reason phrase, and

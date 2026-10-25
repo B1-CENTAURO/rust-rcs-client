@@ -29,13 +29,13 @@ use rust_rcs_core::mls::rcs::wire::{
     VerifiableDeliveryImdn, VerifiableDerivedContent, VerifiableDisplayImdn,
 };
 use rust_rcs_core::mls::rcs::{
-    credential_tel_uris, is_unencrypted_cpim_header, same_tel_uri, ClientFailureReason,
-    SecretPayloadType, CPIM_HEADER_DERIVED_CONTENT_SIGNATURE, CPIM_HEADER_EPOCH_AUTHENTICATOR,
-    CPIM_HEADER_ERA_ID, CPIM_NAMESPACE, CPIM_NAMESPACE_PREFIX,
+    credential_tel_uris, is_unencrypted_cpim_header, ClientFailureReason, SecretPayloadType,
+    CPIM_HEADER_DERIVED_CONTENT_SIGNATURE, CPIM_HEADER_EPOCH_AUTHENTICATOR, CPIM_HEADER_ERA_ID,
+    CPIM_NAMESPACE, CPIM_NAMESPACE_PREFIX,
 };
-use rust_rcs_core::mls::{Credential, ErrorKind};
+use rust_rcs_core::mls::ErrorKind;
 
-use super::device::{participant_tel_uri, E2eeDevice};
+use super::device::{is_of, participant_tel_uri, E2eeDevice};
 use super::store::StoreError;
 
 const IMDN_NAMESPACE: &[u8] = b"urn:ietf:params:imdn";
@@ -101,15 +101,6 @@ fn told_sender(cpim_info: &CPIMInfo) -> Option<String> {
     let uri = String::from_utf8_lossy(&uri.string_representation_without_query_and_fragment())
         .into_owned();
     participant_tel_uri(std::iter::once(uri.as_str()), None)
-}
-
-/// Whether `told`, the tel URI of a participant, is one of those of the
-/// credential `credential`
-fn is_of(credential: &Credential, told: &str) -> bool {
-    credential_tel_uris(credential)
-        .unwrap_or_default()
-        .iter()
-        .any(|uri| same_tel_uri(uri, told))
 }
 
 /// What the signature of the notification `imdn` covers, sent in the CPIM

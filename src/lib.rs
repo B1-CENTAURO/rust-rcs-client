@@ -1424,6 +1424,35 @@ pub unsafe extern "C" fn rcs_client_add_group_chat_participants(
     callback(403, String::from("Forbidden"));
 }
 
+/// Asks the focus of the group at `conference_uri`, in the session there is
+/// with it, to remove `participant`: 404 if there is no session
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_remove_group_chat_participant(
+    client: *mut RcsClient,
+    conference_uri: *const c_char,
+    participant: *const c_char,
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(
+        LOG_TAG,
+        "calling rcs_client_remove_group_chat_participant()",
+    );
+
+    let callback = message_result_closure(cb, cb_context);
+
+    if let Some(client) = client.as_ref() {
+        let conference_uri = CStr::from_ptr(conference_uri).to_string_lossy();
+        let participant = CStr::from_ptr(participant).to_string_lossy();
+        client
+            .engine
+            .remove_group_chat_participant(&conference_uri, &participant, callback);
+        return;
+    }
+
+    callback(403, String::from("Forbidden"));
+}
+
 /// Tells `recipient`, in the chat session there is with it, that the user is
 /// composing a message if `active` is not 0, or no longer is. No session is
 /// started for it: 404 if there is none.

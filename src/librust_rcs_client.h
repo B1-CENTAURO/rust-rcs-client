@@ -239,6 +239,11 @@ extern void rcs_client_add_group_chat_participants(struct rcs_client *client, co
                                 const char *const *participants, size_t participant_count,
                                 message_result_callback cb, void *context);
 
+// asks the focus of the group, in the session there is with it, to remove a participant: 404 if there is no session;
+// in an encrypted group, 488 if the participant cannot be removed from its MLS group
+extern void rcs_client_remove_group_chat_participant(struct rcs_client *client, const char *conference_uri,
+                                const char *participant, message_result_callback cb, void *context);
+
 // leaves the group chat for good, where ending its session leaves it only until the next; its session is restarted first if there is none;
 // a restart refused with 404 or 403 means the user already takes no part in the group
 extern void rcs_client_leave_group_chat(struct rcs_runtime *runtime, struct rcs_client *client, const char *conference_uri,

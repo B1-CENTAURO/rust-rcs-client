@@ -1314,6 +1314,40 @@ impl RcsEngine {
         }
     }
 
+    /// Asks the focus of the group at `conference_uri` to remove
+    /// `participant`, in the session there is with it: 404 if there is none
+    pub fn remove_group_chat_participant<F>(
+        &self,
+        conference_uri: &str,
+        participant: &str,
+        result_callback: F,
+    ) where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        if participant.is_empty() {
+            result_callback(400, String::from("Bad Request"));
+            return;
+        }
+        let result_callback = Arc::new(Mutex::new(Some(result_callback)));
+        let result_callback_ = Arc::clone(&result_callback);
+        let asked = self.cpm_session_service.remove_participant(
+            conference_uri,
+            participant,
+            move |status_code, reason_phrase| {
+                let result_callback = result_callback_.lock().unwrap().take();
+                if let Some(result_callback) = result_callback {
+                    result_callback(status_code, reason_phrase);
+                }
+            },
+        );
+        if !asked {
+            let result_callback = result_callback.lock().unwrap().take();
+            if let Some(result_callback) = result_callback {
+                result_callback(404, String::from("Not Found"));
+            }
+        }
+    }
+
     /// Leaves the group chat at `conference_uri` for good, its session
     /// restarted first if there is none (RCC.07 section 3.2.4.11). `callback`
     /// is told how the focus answered; a restart refused with 404 or 403

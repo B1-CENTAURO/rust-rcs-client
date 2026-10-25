@@ -19,6 +19,7 @@ use std::io::Read;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use futures::future::BoxFuture;
 use futures::Future;
 
 use rust_rcs_core::cpim::{CPIMInfo, CPIMMessage};
@@ -81,7 +82,9 @@ use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{GroupEncryption, CONTENT_TYPE_MLS, CONTENT_TYPE_MLS_RCS_SERVER};
-use super::group_chat::{refer_participants, GroupChats, GroupIds, GroupInvitation, Participant};
+use super::group_chat::{
+    refer_participants, refer_removal, GroupChats, GroupIds, GroupInvitation, Participant,
+};
 use super::imdn::send_group_imdn;
 use super::session_invitation::{
     decline_hanging_invitation, end_cancelled_invitation, try_accept_hanging_invitation,
@@ -1599,6 +1602,77 @@ impl CPMSessionService {
     where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
+        let to = String::from(conference_uri);
+        let added = participants.to_vec();
+        let invited = participants.to_vec();
+        self.change_members(
+            conference_uri,
+            move |encryption, conversation_id, from| {
+                encryption.prepare_add(conversation_id, from, to, added)
+            },
+            move |session_end, control_message, answered| {
+                refer_participants(session_end, &invited, control_message, answered)
+            },
+            callback,
+        )
+    }
+
+    /// Asks the focus of the group at `conference_uri`, in the session there
+    /// is with it, to remove `participant` (RCC.07 section 3.2.4.12),
+    /// `callback` told how it answered; false, and nothing asked, if there is
+    /// no such session
+    ///
+    /// In an encrypted group, all its Clients are removed from its MLS group
+    /// with the same REFER (RCC.16 section 9.3), and the removal refused with
+    /// 488 if they cannot be; the Commit removing them is let go of if the
+    /// focus answers with an error.
+    pub fn remove_participant<F>(
+        &self,
+        conference_uri: &str,
+        participant: &str,
+        callback: F,
+    ) -> bool
+    where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        let to = String::from(conference_uri);
+        let removed = String::from(participant);
+        let referred = String::from(participant);
+        self.change_members(
+            conference_uri,
+            move |encryption, conversation_id, from| {
+                encryption.prepare_remove(conversation_id, from, to, removed)
+            },
+            move |session_end, control_message, answered| {
+                refer_removal(session_end, &referred, control_message, answered)
+            },
+            callback,
+        )
+    }
+
+    /// Sends the REFER `refer` makes to change the participants of the group
+    /// at `conference_uri`, in the session there is with it, `callback` told
+    /// how the focus answered; false, and nothing asked, if there is no such
+    /// session
+    ///
+    /// In an encrypted group, the REFER carries the control message
+    /// `prepare` makes for the change (RCC.16 sections 9.2, 9.3), and is not
+    /// sent, the change refused with 488, if it makes none; the Commit is let
+    /// go of if the focus answers with an error.
+    fn change_members<P, R, F>(
+        &self,
+        conference_uri: &str,
+        prepare: P,
+        refer: R,
+        callback: F,
+    ) -> bool
+    where
+        P: FnOnce(&dyn GroupEncryption, String, String) -> BoxFuture<'static, Option<Vec<u8>>>,
+        R: FnOnce(&SessionEnd, Option<&[u8]>, ReferAnswered) -> Result<(), ReferAnswered>
+            + Send
+            + 'static,
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
         let Some(session_end) =
             group_session_end(&self.ongoing_sessions.lock().unwrap(), conference_uri)
         else {
@@ -1613,9 +1687,11 @@ impl CPMSessionService {
                 .zip(session_info.conversation_id.clone())
         };
         let Some((encryption, conversation_id)) = encrypted else {
-            return refer_participants(&session_end, participants, None, |status, reason, _| {
-                callback(status, reason)
-            })
+            return refer(
+                &session_end,
+                None,
+                Box::new(move |status, reason, _| callback(status, reason)),
+            )
             .is_ok();
         };
         let Some(public_user_identity) = self
@@ -1628,32 +1704,25 @@ impl CPMSessionService {
             return false;
         };
 
-        let preparing = encryption.prepare_add(
-            conversation_id.clone(),
-            public_user_identity,
-            String::from(conference_uri),
-            participants.to_vec(),
-        );
-        let participants = participants.to_vec();
+        let preparing = prepare(&*encryption, conversation_id.clone(), public_user_identity);
         let rt = Arc::clone(&session_end.rt);
         rt.spawn(async move {
             let Some(control_message) = preparing.await else {
                 callback(488, String::from("Not Acceptable Here"));
                 return;
             };
-            let asked = refer_participants(
+            let asked = refer(
                 &session_end,
-                &participants,
                 Some(&control_message),
-                move |status_code, reason_phrase, refusal_follows| {
+                Box::new(move |status_code, reason_phrase, refusal_follows| {
                     if !(200..300).contains(&status_code) {
                         encryption.discard(&conversation_id, refusal_follows);
                     }
                     callback(status_code, reason_phrase);
-                },
+                }),
             );
-            if let Err(callback) = asked {
-                callback(0, String::from("Not Sent"), false);
+            if let Err(answered) = asked {
+                answered(0, String::from("Not Sent"), false);
             }
         });
         true
@@ -2784,6 +2853,10 @@ struct NewGroup<'a> {
 /// Told how a session started: 200 and the URI it is known by, or why it did
 /// not
 type Started = Box<dyn FnOnce(u16, String, Option<String>) + Send + Sync>;
+
+/// Told how a REFER was answered, and whether an MLS refusal of what it
+/// carried may follow (RCC.16 section 7.2.6)
+type ReferAnswered = Box<dyn FnOnce(u16, String, bool) + Send + Sync>;
 
 /// The body of an INVITE starting a group, with its boundary: its SDP, the
 /// participants the focus is to invite (RFC 5366 section 4), and the CPIM

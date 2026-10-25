@@ -2092,6 +2092,10 @@ struct ScriptedEncryption {
     /// The Conversation-ID of each Commit let go of, and whether a refusal
     /// of it was to follow
     discarded: std::sync::Mutex<Vec<(String, bool)>>,
+    /// The CPIM message it prepares for each removal, if any
+    removing: Option<Vec<u8>>,
+    /// The Conversation-ID, from, to and participant of each removal
+    removed: std::sync::Mutex<Vec<(String, String, String, String)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     /// Whether the IMDNs it is given refuse a control message of the client
     refusing: bool,
@@ -2147,6 +2151,21 @@ impl GroupEncryption for ScriptedEncryption {
             .unwrap()
             .push((conversation_id, from, to, participants));
         let cpim = self.adding.clone();
+        Box::pin(async move { cpim })
+    }
+
+    fn prepare_remove(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participant: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.removed
+            .lock()
+            .unwrap()
+            .push((conversation_id, from, to, participant));
+        let cpim = self.removing.clone();
         Box::pin(async move { cpim })
     }
 
@@ -2799,6 +2818,17 @@ impl GroupEncryption for EncryptingPrepared {
         participants: Vec<String>,
     ) -> BoxFuture<'static, Option<Vec<u8>>> {
         self.0.prepare_add(conversation_id, from, to, participants)
+    }
+
+    fn prepare_remove(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participant: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0
+            .prepare_remove(conversation_id, from, to, participant)
     }
 
     fn discard(&self, conversation_id: &str, refusal_follows: bool) {
@@ -4543,6 +4573,135 @@ fn participants_that_cannot_be_added_to_an_encrypted_group_are_not_referred() {
     let result = add_carol_and_dave(&client);
     assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(488));
     assert_eq!(encryption.added.lock().unwrap().len(), 1);
+    peer.silence();
+    assert!(encryption.discarded.lock().unwrap().is_empty());
+}
+
+/// Removes the participant Carol from the group, what the client is told
+/// of how the focus answered given to `result`
+fn remove_carol(client: &Client) -> mpsc::Receiver<u16> {
+    let (result_tx, result) = mpsc::channel();
+    let result_tx = std::sync::Mutex::new(result_tx);
+    assert!(client.sessions.remove_participant(
+        GROUP,
+        "sip:+15550003@example.com",
+        move |status_code, _| {
+            let _ = result_tx.lock().unwrap().send(status_code);
+        },
+    ));
+    result
+}
+
+#[test]
+fn a_participant_is_removed_by_a_refer_asking_the_focus_to_send_a_bye() {
+    let (client, mut peer) = start(true);
+    let (_connection, invite, _subscribe, _) = new_group(&client, &mut peer);
+    let result = remove_carol(&client);
+
+    let refer = peer.next_request("REFER");
+    assert_eq!(request_uri(&refer), GROUP, "to the focus");
+    assert_eq!(
+        header_value(&refer, "Call-ID"),
+        header_value(&invite, "Call-ID"),
+        "in the session's dialog"
+    );
+    assert_eq!(
+        header_value(&refer, "Refer-To"),
+        "<sip:+15550003@example.com;method=BYE>"
+    );
+    assert_eq!(header_value(&refer, "Refer-Sub"), "false");
+    assert_eq!(header_value(&refer, "Require"), "", "one participant");
+    let lengths: Vec<_> = refer
+        .headers()
+        .unwrap()
+        .iter()
+        .filter(|header| header.get_name().eq_ignore_ascii_case(b"Content-Length"))
+        .map(|header| header.get_value().to_vec())
+        .collect();
+    assert_eq!(lengths, [b"0".to_vec()], "one Content-Length");
+    assert!(body_data(&refer).is_empty());
+    peer.send(&answer(&refer, "202 Accepted", None));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(202));
+
+    // no group is not asked, nor a one-to-one chat
+    assert!(!client
+        .sessions
+        .remove_participant("sip:conf9@conf.example.com", ALICE, |_, _| {}));
+    let _one_to_one = incoming_chat(&client, &mut peer, "one-to-one-removal");
+    assert!(!client.sessions.remove_participant(PEER, ALICE, |_, _| {}));
+}
+
+/// What the scripted encryption makes a REFER removing a participant carry
+const REMOVING_CPIM: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x03\x04removing";
+
+/// The client with the group `conversation-1` encrypted, participants
+/// removed from it with REMOVING_CPIM if `removing`
+fn removing_from(client: &Client, removing: bool) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        removing: removing.then(|| REMOVING_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+#[test]
+fn a_participant_is_removed_from_an_encrypted_group_with_the_commit_in_the_refer() {
+    let (client, mut peer) = start(true);
+    let encryption = removing_from(&client, true);
+    let (_connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-removing");
+
+    // a REFER the focus answers with an error, no refusal to follow
+    let result = remove_carol(&client);
+    let refer = peer.next_request("REFER");
+    assert_eq!(
+        header_value(&refer, "Refer-To"),
+        "<sip:+15550003@example.com;method=BYE>"
+    );
+    assert_eq!(header_value(&refer, "Content-Type"), "message/cpim");
+    assert_eq!(body_data(&refer), REMOVING_CPIM, "the control message");
+    assert_eq!(
+        *encryption.removed.lock().unwrap(),
+        [(
+            String::from("conversation-1"),
+            String::from(IMPU),
+            String::from(GROUP),
+            String::from("sip:+15550003@example.com")
+        )]
+    );
+    peer.send(&answer(&refer, "400 Bad Request", None).replacen(
+        "Content-Length: 0",
+        "Warning: 399 operator.com \"451 Non-MLS error\"\r\nContent-Length: 0",
+        1,
+    ));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(400));
+    assert_eq!(
+        *encryption.discarded.lock().unwrap(),
+        [(String::from("conversation-1"), false)]
+    );
+
+    // and one it accepts
+    let result = remove_carol(&client);
+    let refer = peer.next_request("REFER");
+    peer.send(&answer(&refer, "202 Accepted", None));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(202));
+    assert_eq!(encryption.discarded.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_participant_that_cannot_be_removed_from_an_encrypted_group_is_not_referred() {
+    let (client, mut peer) = start(true);
+    let encryption = removing_from(&client, false);
+    let (_connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-not-removing");
+
+    let result = remove_carol(&client);
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(488));
+    assert_eq!(encryption.removed.lock().unwrap().len(), 1);
     peer.silence();
     assert!(encryption.discarded.lock().unwrap().is_empty());
 }
