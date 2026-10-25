@@ -1117,8 +1117,15 @@ fn messages_are_not_sent_in_a_group_whose_commit_is_not_accepted() {
     let groups = DeviceGroups::new(&device, query)
         .with_acceptance_wait(std::time::Duration::from_millis(300));
     assert_eq!(
-        rt.block_on(groups.encrypt(CONVERSATION, &plaintext("message-8", None))),
-        None
+        rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                groups.encrypt(CONVERSATION, &plaintext("message-8", None)),
+            )
+            .await
+        }),
+        Ok(None),
+        "given up after the wait"
     );
 
     // nor what cannot be, nor once the device is let go of
