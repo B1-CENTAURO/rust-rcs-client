@@ -4611,7 +4611,14 @@ fn a_participant_is_removed_by_a_refer_asking_the_focus_to_send_a_bye() {
     );
     assert_eq!(header_value(&refer, "Refer-Sub"), "false");
     assert_eq!(header_value(&refer, "Require"), "", "one participant");
-    assert_eq!(header_value(&refer, "Content-Length"), "0");
+    let lengths: Vec<_> = refer
+        .headers()
+        .unwrap()
+        .iter()
+        .filter(|header| header.get_name().eq_ignore_ascii_case(b"Content-Length"))
+        .map(|header| header.get_value().to_vec())
+        .collect();
+    assert_eq!(lengths, [b"0".to_vec()], "one Content-Length");
     assert!(body_data(&refer).is_empty());
     peer.send(&answer(&refer, "202 Accepted", None));
     assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(202));

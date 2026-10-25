@@ -716,13 +716,11 @@ where
         format!("<{};method=BYE>", participant),
     ));
     message.add_header(Header::new(b"Refer-Sub", b"false"));
-    match control_message {
-        Some(cpim) => {
-            message.add_header(Header::new(b"Content-Type", b"message/cpim"));
-            message.add_header(Header::new(b"Content-Length", format!("{}", cpim.len())));
-            message.set_body(Arc::new(Body::Raw(cpim.to_vec())));
-        }
-        None => message.add_header(Header::new(b"Content-Length", b"0")),
+    // without, the transaction gives it its Content-Length
+    if let Some(cpim) = control_message {
+        message.add_header(Header::new(b"Content-Type", b"message/cpim"));
+        message.add_header(Header::new(b"Content-Length", format!("{}", cpim.len())));
+        message.set_body(Arc::new(Body::Raw(cpim.to_vec())));
     }
 
     send_refer(session_end, message, &transport, callback);
