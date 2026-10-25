@@ -109,6 +109,9 @@ pub struct CPMSessionInfo {
     /// The MLS-Opaque-Token the message carried, for the requests of the
     /// conversation to carry from now on (RCC.16 section 6.1.3)
     pub mls_opaque_token: Option<String>,
+    /// Whether the conversation is encrypted end to end, its MLS group
+    /// joined (RCC.16 section 8.1)
+    pub encrypted: bool,
 }
 
 impl CPMSessionInfo {
@@ -171,6 +174,63 @@ pub(crate) fn mls_opaque_token_value(value: &[u8]) -> Option<String> {
 pub(crate) fn add_mls_opaque_token(message: &mut SipMessage, mls_opaque_token: Option<String>) {
     if let Some(mls_opaque_token) = mls_opaque_token {
         message.add_header(Header::new(MLS_OPAQUE_TOKEN, mls_opaque_token));
+    }
+}
+
+/// The SDP of an incoming INVITE, as its body or its `application/sdp` part,
+/// and the `message/mls-rcs-server` its Conversation Focus sent along,
+/// in a CPIM message or a part of its own (RCC.16 sections 7.9.3, 8.1)
+fn invitation_contents(
+    content_type: Option<&[u8]>,
+    body: &Arc<Body>,
+) -> (Option<Arc<Body>>, Option<Vec<u8>>) {
+    let Body::Multipart(multipart) = body.as_ref() else {
+        let sdp = content_type
+            .filter(|content_type| is_media_type(content_type, "application/sdp"))
+            .map(|_| Arc::clone(body));
+        return (sdp, None);
+    };
+
+    let mut sdp = None;
+    let mut server_message = None;
+    for part in &multipart.parts {
+        let Body::Message(part) = part.as_ref() else {
+            continue;
+        };
+        let Some(content_type) = header::search(&part.headers, b"Content-Type", true) else {
+            continue;
+        };
+        let content_type = content_type.get_value();
+        if is_media_type(content_type, "application/sdp") {
+            sdp = Some(Arc::clone(&part.body));
+        } else if server_message.is_none() {
+            server_message = if is_media_type(content_type, "message/cpim") {
+                CPIMMessage::try_from(&part.body)
+                    .ok()
+                    .and_then(|cpim| server_message_of(&cpim))
+            } else if is_media_type(content_type, "message/mls-rcs-server") {
+                match part.body.as_ref() {
+                    Body::Raw(raw) => Some(raw.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        }
+    }
+    (sdp, server_message)
+}
+
+/// The `message/mls-rcs-server` the CPIM message `cpim` carries, if it does
+fn server_message_of(cpim: &CPIMMessage) -> Option<Vec<u8>> {
+    let (content_type, content, base64_encoded) = cpim.get_message_body()?;
+    if !is_media_type(content_type?, "message/mls-rcs-server") {
+        return None;
+    }
+    if base64_encoded {
+        decode_base64(content).ok()
+    } else {
+        Some(content.to_vec())
     }
 }
 
@@ -402,6 +462,7 @@ pub fn get_cpm_session_info_from_message(
                             conversation_supports_anonymization,
                             conversation_is_using_anonymization_token,
                             mls_opaque_token: opaque_token.and_then(mls_opaque_token_value),
+                            encrypted: false,
                         });
                     }
                 }
@@ -2953,35 +3014,27 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                 }
 
                 if is_cpm_session_invitation {
-                    let mut sdp = None;
-
-                    for header in req_headers {
-                        if header.get_name().eq_ignore_ascii_case(b"Content-Type") {
-                            if let Some(content_type) =
-                                header.get_value().as_header_field().as_content_type()
-                            {
-                                if content_type.major_type.eq_ignore_ascii_case(b"application")
-                                    && content_type.sub_type.eq_ignore_ascii_case(b"sdp")
-                                {
-                                    match req_body.as_ref() {
-                                        Body::Raw(raw) => {
-                                            sdp = raw.as_sdp();
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let content_type =
+                        header::search(req_headers, b"Content-Type", true).map(|h| h.get_value());
+                    let (sdp_body, mls_group) = invitation_contents(content_type, req_body);
+                    let sdp = sdp_body.as_deref().and_then(|body| match body {
+                        Body::Raw(raw) => raw.as_sdp(),
+                        _ => None,
+                    });
+                    // the session made with the SDP of a multipart body
+                    let req_body = sdp_body.as_ref().unwrap_or(req_body);
 
                     if let Some(sdp) = sdp {
                         if let Some(msrp_info) = sdp.as_msrp_info() {
-                            if let Some(session_info) =
+                            if let Some(mut session_info) =
                                 get_cpm_session_info_from_message(message, false)
                             {
                                 let auto_accept_response_code: u16;
                                 // told once answered or waiting for an answer
                                 let mut invited: Option<GroupInvitation> = None;
+                                // the MLS group joined, let go of unless the
+                                // invitation is accepted
+                                let mut joined: Option<(Arc<dyn GroupEncryption>, String)> = None;
 
                                 let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
@@ -3075,6 +3128,51 @@ impl TransactionHandler for CPMSessionServiceWrapper {
 
                                             match msrp_info.direction {
                                                 MsrpDirection::SendReceive => {
+                                                    // an encrypted group joined
+                                                    // first, or not taken part
+                                                    // in (RCC.16 section 8.1)
+                                                    if let Some(server_message) = &mls_group {
+                                                        let encryption = self
+                                                            .service
+                                                            .group_encryption
+                                                            .lock()
+                                                            .unwrap()
+                                                            .clone()
+                                                            .filter(|encryption| {
+                                                                encryption.join(
+                                                                    conversation_id,
+                                                                    server_message,
+                                                                )
+                                                            });
+                                                        let Some(encryption) = encryption else {
+                                                            if let Some(resp_message) =
+                                                                server_transaction::make_response(
+                                                                    message,
+                                                                    transaction.to_tag(),
+                                                                    488,
+                                                                    b"Not Acceptable Here",
+                                                                )
+                                                            {
+                                                                if let Some((tx, _)) =
+                                                                    channels.take()
+                                                                {
+                                                                    server_transaction::send_response(
+                                                                        Arc::clone(transaction),
+                                                                        resp_message,
+                                                                        tx,
+                                                                        rt,
+                                                                    );
+                                                                }
+                                                            }
+                                                            return true;
+                                                        };
+                                                        session_info.encrypted = true;
+                                                        joined = Some((
+                                                            encryption,
+                                                            conversation_id.clone(),
+                                                        ));
+                                                    }
+
                                                     auto_accept_response_code = (self
                                                         .service
                                                         .group_invite_handler_function)(
@@ -3097,6 +3195,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                         inviter_name: told(referred_by_name),
                                                         pending: (100..200)
                                                             .contains(&auto_accept_response_code),
+                                                        encrypted: session_info.encrypted,
                                                     });
                                                     break;
                                                 }
@@ -3371,14 +3470,24 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                         }
                                                         Some(
                                                             CPMSessionInvitationResponse::Decline,
-                                                        ) => decline_hanging_invitation(
-                                                            invitation,
-                                                            &ongoing_dialogs,
-                                                            &rt_,
-                                                        ),
+                                                        ) => {
+                                                            if let Some((encryption, id)) = &joined
+                                                            {
+                                                                encryption.abandon(id);
+                                                            }
+                                                            decline_hanging_invitation(
+                                                                invitation,
+                                                                &ongoing_dialogs,
+                                                                &rt_,
+                                                            )
+                                                        }
                                                         Some(
                                                             CPMSessionInvitationResponse::Dispose,
                                                         ) => {
+                                                            if let Some((encryption, id)) = &joined
+                                                            {
+                                                                encryption.abandon(id);
+                                                            }
                                                             let _ = cancel_tx.send(());
                                                             if let Some(conference_uri) =
                                                                 end_cancelled_invitation(
@@ -3446,6 +3555,11 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                     }
 
                                     return true;
+                                }
+
+                                // not taken part in
+                                if let Some((encryption, id)) = &joined {
+                                    encryption.abandon(id);
                                 }
                             }
 

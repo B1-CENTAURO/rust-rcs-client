@@ -86,6 +86,7 @@ pub type GroupChatInvitationCallback = extern "C" fn(
     inviter_uri: *const c_char,
     inviter_name: *const c_char,
     pending: i32,
+    encrypted: i32,
     context: *mut MessageResultCallbackContext,
 );
 

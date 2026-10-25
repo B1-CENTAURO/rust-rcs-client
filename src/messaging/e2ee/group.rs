@@ -140,6 +140,54 @@ impl E2eeDevice {
         Ok(control_message(from, to, &client_message))
     }
 
+    /// Joins the MLS group of the group chat `conversation_id` with the
+    /// Welcome the Conversation Focus sent in `server_message`, the group the
+    /// one of the conversation, and any message bundled with it decrypted in
+    /// it (RCC.16 sections 6.1.1, 6.2.6, 7.9.3, 8.1)
+    ///
+    /// The members' certificates are checked as joining does (Annex
+    /// A.4.1.4); the Commit that added the device is for those who were
+    /// members before it.
+    pub fn join_group(
+        &self,
+        conversation_id: &str,
+        server_message: &[u8],
+    ) -> Result<(), StoreError> {
+        let message: ServerMlsRcsMessage =
+            proto::decode(server_message).map_err(StoreError::Mls)?;
+        let bundle = match message.payload {
+            Some(server_mls_rcs_message::Payload::ServerCommitBundle(bundle))
+                if !bundle.welcome.is_empty() =>
+            {
+                bundle
+            }
+            _ => return Err(StoreError::Mls(ErrorKind::UnexpectedMessage)),
+        };
+
+        self.store()
+            .add_conversation(|client| {
+                let mut conversation =
+                    client.join_conversation(&bundle.welcome, &bundle.ratchet_tree)?;
+                let joined = if conversation.group_id() != conversation_id.as_bytes() {
+                    Err(ErrorKind::Rejected)
+                } else if bundle.private_message.is_empty() {
+                    Ok(())
+                } else {
+                    conversation
+                        .process(client, &bundle.private_message)
+                        .map(|_| ())
+                };
+                match joined {
+                    Ok(()) => Ok((conversation, ())),
+                    Err(e) => {
+                        let _ = conversation.delete(client);
+                        Err(e)
+                    }
+                }
+            })
+            .map(|_| ())
+    }
+
     /// Takes what the Conversation Focus of the group `conversation_id` sent
     /// of its MLS group (RCC.16 sections 6.2.4, 7.9)
     pub fn on_server_message(
@@ -246,6 +294,19 @@ impl GroupEncryption for DeviceGroups {
                 }
             }
         })
+    }
+
+    fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
+        let Some(device) = self.device.upgrade() else {
+            return false;
+        };
+        match device.join_group(conversation_id, server_message) {
+            Ok(()) => true,
+            Err(e) => {
+                platform_log(LOG_TAG, format!("group not joined: {:?}", e));
+                false
+            }
+        }
     }
 
     fn on_server_message(&self, conversation_id: &str, body: &[u8]) {
