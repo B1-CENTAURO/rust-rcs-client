@@ -2001,3 +2001,289 @@ fn a_notification_as_the_client_makes_one_is_signed() {
         .verify_signature(&bob, &signature, &derived(&cpim_id, content))
         .is_ok());
 }
+
+/// A day both of the phones of the user and Bob have certificates for
+const LATER: &str = "2026-10-01";
+
+/// A client of `certificate` and its keys, checking certificates as of
+/// LATER
+fn client_later(certificate: &str, key: &str, public_key: &str) -> MlsClient {
+    MlsClient::with_credential(
+        credential(&[certificate, CA]),
+        signer(key, public_key),
+        CIPHERSUITE,
+        MlsConfig::default(),
+        Box::new(validator(LATER)),
+    )
+    .unwrap()
+}
+
+/// The device as of LATER, in the group of the conversation with the other
+/// phone of the user, its Commit accepted, both in epoch 1: the device, the
+/// other phone and its group, and Bob, of whom the Home KDS has a KeyPackage
+fn group_to_add_bob_to() -> (Arc<E2eeDevice>, MlsClient, MlsConversation, MlsClient) {
+    let phone = client_later(ALICE_RENEWED, ALICE_RENEWED_KEY, ALICE_RENEWED_PUBLIC_KEY);
+    let bob = client_later(BOB, BOB_KEY, BOB_PUBLIC_KEY);
+    let phones = phone.generate_key_package(false).unwrap();
+    let bobs = bob.generate_key_package(false).unwrap();
+
+    let app = Arc::new(App::default());
+    let kds = Arc::new(Kds::issuing(&[ALICE, CA], &app).knowing_too(vec![
+        (ALICE_TEL, Fetched::KeyPackages(vec![phones])),
+        (BOB_TEL, Fetched::KeyPackages(vec![bobs])),
+    ]));
+    let device = alice(&app, &kds, LATER, None);
+    provision(&device, &[ALICE_TEL], None);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    let device = Arc::new(device);
+
+    let cpim =
+        block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(ALICE_TEL)]))
+            .unwrap();
+    let phones_group = joined(&phone, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    (device, phone, phones_group, bob)
+}
+
+/// What the Conversation Focus forwards of a Commit it accepted, its
+/// CommitList as the device sent it
+fn forwarded(bundle: &WelcomeCommitBundle) -> Vec<u8> {
+    proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: bundle.commit_list.clone(),
+                ..ServerCommitBundle::default()
+            },
+        )),
+    })
+}
+
+#[test]
+fn participants_are_added_with_a_commit_the_focus_forwards_back() {
+    let (device, phone, mut phones_group, bob) = group_to_add_bob_to();
+    let cpim =
+        block_on(device.add_to_group(CONVERSATION, IMPU, GROUP_URI, vec![recipient(BOB_TEL)]))
+            .unwrap();
+
+    // the Commit, a Welcome for Bob, the GroupInfo and Epoch Authenticator,
+    // without the tree the Focus keeps (RCC.16 section 7.9.2)
+    let info = cpim_message(&cpim);
+    let info = info.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"negative-delivery"[..])
+    );
+    let bundle = bundle_of(&cpim);
+    assert!(!bundle.welcome.is_empty());
+    assert!(!bundle.group_info.is_empty());
+    assert!(!bundle.epoch_authenticator.is_empty());
+    assert!(bundle.ratchet_tree.is_empty());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+
+    // applied once forwarded back
+    match device
+        .on_server_message(CONVERSATION, &forwarded(&bundle))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { added, .. }] => {
+            assert_eq!(added, &vec![credential(&[BOB, CA])])
+        }
+        other => panic!("{} messages", other.len()),
+    }
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+
+    // Bob in the group, with the tree the Focus gives him, and the other
+    // phone in the epoch too
+    let tree = device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, _| {
+            conversation.ratchet_tree()
+        })
+        .unwrap();
+    let mut bobs_group = bob.join_conversation(&bundle.welcome, &tree).unwrap();
+    assert!(phones_group
+        .process_commit_bundle(
+            &phone,
+            &ServerCommitBundle {
+                commit_list: bundle.commit_list.clone(),
+                ..ServerCommitBundle::default()
+            }
+        )
+        .is_ok());
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-16", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
+    );
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&phone, &mut phones_group, &sent))
+            .ends_with("hello Bob")
+    );
+}
+
+#[test]
+fn participants_are_not_added_unless_each_can_be() {
+    let (device, _, _, _) = group_to_add_bob_to();
+
+    // one the Home KDS has no Client of
+    assert_eq!(
+        block_on(device.add_to_group(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            vec![recipient(BOB_TEL), recipient(CAROL_TEL)]
+        )),
+        Err(GroupError::NotEncryptable(
+            String::from(CAROL_TEL),
+            Fetched::NotFound
+        ))
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    // nor to a group there is not
+    assert_eq!(
+        block_on(device.add_to_group("another", IMPU, GROUP_URI, vec![recipient(BOB_TEL)])),
+        Err(GroupError::Store(StoreError::Mls(ErrorKind::UnknownGroup)))
+    );
+
+    // nor while a Commit of the device waits, no KeyPackage taken for it
+    let (_, bobs) = bob_with_key_package();
+    let (device, kds) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    assert_eq!(kds.queries.lock().unwrap().len(), 1);
+    assert_eq!(
+        block_on(device.add_to_group(CONVERSATION, IMPU, GROUP_URI, vec![recipient(BOB_TEL)])),
+        Err(GroupError::Pending)
+    );
+    assert_eq!(kds.queries.lock().unwrap().len(), 1);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, true)));
+}
+
+#[test]
+fn a_commit_whose_request_the_focus_answers_with_an_error_is_discarded() {
+    let (device, phone, mut phones_group, _) = group_to_add_bob_to();
+    let control_id = |cpim: &[u8]| {
+        String::from_utf8(
+            cpim_message(cpim)
+                .get_info()
+                .unwrap()
+                .imdn_message_id
+                .to_vec(),
+        )
+        .unwrap()
+    };
+
+    // a refusal to follow, which is then taken
+    let cpim =
+        block_on(device.add_to_group(CONVERSATION, IMPU, GROUP_URI, vec![recipient(BOB_TEL)]))
+            .unwrap();
+    assert_eq!(device.discard_commit(CONVERSATION, true), Ok(()));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert_eq!(
+        device.on_imdn(
+            CONVERSATION,
+            &refusal(&control_id(&cpim), "incorrect-epoch")
+        ),
+        Ok(Some(ServerFailureReason::IncorrectEpoch))
+    );
+
+    // none to follow
+    let cpim =
+        block_on(device.add_to_group(CONVERSATION, IMPU, GROUP_URI, vec![recipient(BOB_TEL)]))
+            .unwrap();
+    assert_eq!(device.discard_commit(CONVERSATION, false), Ok(()));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")),
+        Ok(None)
+    );
+
+    // messages sent in the epoch the others are in
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-17", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&phone, &mut phones_group, &sent))
+            .ends_with("hello Bob")
+    );
+}
+
+#[test]
+fn the_groups_of_the_device_are_added_to_once_its_commit_is_accepted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let phone = client_later(ALICE_RENEWED, ALICE_RENEWED_KEY, ALICE_RENEWED_PUBLIC_KEY);
+    let bob = client_later(BOB, BOB_KEY, BOB_PUBLIC_KEY);
+    let app = Arc::new(App::default());
+    let kds = Arc::new(Kds::issuing(&[ALICE, CA], &app).knowing_too(vec![
+        (
+            ALICE_TEL,
+            Fetched::KeyPackages(vec![phone.generate_key_package(false).unwrap()]),
+        ),
+        (
+            BOB_TEL,
+            Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+        ),
+    ]));
+    let device = alice(&app, &kds, LATER, None);
+    provision(&device, &[ALICE_TEL], None);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    let device = Arc::new(device);
+    block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(ALICE_TEL)])).unwrap();
+    let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // Bob added once the Commit making the group is accepted
+    let adding = rt.spawn(groups.prepare_add(
+        String::from(CONVERSATION),
+        String::from(IMPU),
+        String::from(GROUP_URI),
+        vec![String::from(BOB_TEL)],
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!adding.is_finished(), "waits for the Commit");
+    groups.on_server_message(
+        CONVERSATION,
+        &accepted(epoch_identifier(&device, CONVERSATION)),
+    );
+    let cpim = rt.block_on(adding).unwrap().expect("added once accepted");
+    assert!(!bundle_of(&cpim).welcome.is_empty());
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+
+    // a message waiting for that Commit sent once it is let go of
+    let waiting = rt.spawn(groups.encrypt(CONVERSATION, &plaintext("message-18", None)));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!waiting.is_finished(), "waits for the Commit");
+    groups.discard(CONVERSATION, false);
+    assert!(rt.block_on(waiting).unwrap().is_some(), "sent in epoch 1");
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    // none who cannot encrypt, nor once the device is let go of
+    assert_eq!(
+        rt.block_on(groups.prepare_add(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            vec![String::from(CAROL_TEL)],
+        )),
+        None
+    );
+    drop(device);
+    assert_eq!(
+        rt.block_on(groups.prepare_add(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            vec![String::from(BOB_TEL)],
+        )),
+        None
+    );
+}

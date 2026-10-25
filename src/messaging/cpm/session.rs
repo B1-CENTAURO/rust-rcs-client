@@ -1585,6 +1585,11 @@ impl CPMSessionService {
     /// Asks the focus of the group at `conference_uri`, in the session there
     /// is with it, to invite `participants` (RFC 5368), `callback` told how
     /// it answered; false, and nothing asked, if there is no such session
+    ///
+    /// In an encrypted group, they are added to its MLS group with the same
+    /// REFER (RCC.16 section 9.2), and refused with 488 if they cannot be;
+    /// the Commit adding them is let go of if the focus answers with an
+    /// error.
     pub fn add_participants<F>(
         &self,
         conference_uri: &str,
@@ -1594,11 +1599,64 @@ impl CPMSessionService {
     where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
-        let session_end = group_session_end(&self.ongoing_sessions.lock().unwrap(), conference_uri);
-        match session_end {
-            Some(session_end) => refer_participants(&session_end, participants, callback),
-            None => false,
-        }
+        let Some(session_end) =
+            group_session_end(&self.ongoing_sessions.lock().unwrap(), conference_uri)
+        else {
+            return false;
+        };
+        let encrypted = {
+            let inner = session_end.sip_session.get_inner();
+            let session_info = inner.get_session_info();
+            session_info
+                .encryption
+                .clone()
+                .zip(session_info.conversation_id.clone())
+        };
+        let Some((encryption, conversation_id)) = encrypted else {
+            return refer_participants(&session_end, participants, None, |status, reason, _| {
+                callback(status, reason)
+            })
+            .is_ok();
+        };
+        let Some(public_user_identity) = self
+            .registered_public_identity
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, public_user_identity, _)| public_user_identity.clone())
+        else {
+            return false;
+        };
+
+        let preparing = encryption.prepare_add(
+            conversation_id.clone(),
+            public_user_identity,
+            String::from(conference_uri),
+            participants.to_vec(),
+        );
+        let participants = participants.to_vec();
+        let rt = Arc::clone(&session_end.rt);
+        rt.spawn(async move {
+            let Some(control_message) = preparing.await else {
+                callback(488, String::from("Not Acceptable Here"));
+                return;
+            };
+            let asked = refer_participants(
+                &session_end,
+                &participants,
+                Some(&control_message),
+                move |status_code, reason_phrase, refusal_follows| {
+                    if !(200..300).contains(&status_code) {
+                        encryption.discard(&conversation_id, refusal_follows);
+                    }
+                    callback(status_code, reason_phrase);
+                },
+            );
+            if let Err(callback) = asked {
+                callback(0, String::from("Not Sent"), false);
+            }
+        });
+        true
     }
 
     pub fn set_registered_public_identity(
