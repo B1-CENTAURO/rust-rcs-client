@@ -45,7 +45,8 @@ const HEAL_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 /// Where self-healing a group stands
 #[derive(Default)]
 struct Heal {
-    /// Its state is out of step with that of its Conversation Focus
+    /// Its state is out of step with that of its Conversation Focus; never
+    /// while it is being self-healed
     wanted: bool,
     ongoing: bool,
     /// When it was self-healed, within HEAL_PERIOD
@@ -68,14 +69,14 @@ impl Heals {
         }
     }
 
-    /// Whether the group `conversation_id` is to be self-healed, and is not
-    /// being already
+    /// Whether the group `conversation_id` is to be self-healed, which it is
+    /// not while it is being
     fn wanted(&self, conversation_id: &str) -> bool {
         self.0
             .lock()
             .unwrap()
             .get(conversation_id)
-            .is_some_and(|heal| heal.wanted && !heal.ongoing)
+            .is_some_and(|heal| heal.wanted)
     }
 
     /// Whether the group `conversation_id` is being self-healed
@@ -94,7 +95,7 @@ impl Heals {
         let Some(heal) = heals.get_mut(conversation_id) else {
             return false;
         };
-        if !heal.wanted || heal.ongoing {
+        if !heal.wanted {
             return false;
         }
         heal.wanted = false;

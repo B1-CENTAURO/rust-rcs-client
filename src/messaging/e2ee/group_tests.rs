@@ -3142,9 +3142,13 @@ fn the_group_info_is_pulled_when_the_enhanced_one_is_not_given() {
         ]
     );
 
-    // no MLS group with the Focus: nothing comes of it (RCC.16 section 6.3.1)
+    // no MLS group with the Focus, its enhanced GroupInfo not even read:
+    // nothing comes of it (RCC.16 section 6.3.1)
     assert!(received_from_bob(&device, &bob, &mut bobs_group).is_err());
-    let (pull, asked) = focus_answering(vec![Some((469, Vec::new())), Some((469, Vec::new()))]);
+    let (pull, asked) = focus_answering(vec![
+        Some((200, b"not an MlsEnhancedGroupInfo".to_vec())),
+        Some((469, Vec::new())),
+    ]);
     assert_eq!(
         rt.block_on(groups.heal(
             String::from(CONVERSATION),
@@ -3251,6 +3255,10 @@ fn a_group_is_self_healed_once_at_a_time_and_not_too_often() {
         "signed once healed"
     );
     assert!(!groups.needs_healing(CONVERSATION));
+    // nor again until something fails again
+    let (pull, asked) = focus_answering(vec![Some((200, up_to_date()))]);
+    assert_eq!(rt.block_on(heal(pull)), None);
+    assert!(asked.lock().unwrap().is_empty());
 
     // four more times in a day, and no more (RCC.16 section 10.1)
     for _ in 0..4 {
@@ -3350,4 +3358,24 @@ fn a_commit_of_the_device_the_focus_kept_is_applied_by_healing() {
         device.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")),
         Ok(None)
     );
+}
+
+#[test]
+fn the_group_info_of_another_group_is_not_rejoined_in_its_stead() {
+    let (device, bob, _) = alice_and_bob();
+    let mut bobs_other = bob.create_conversation(Some(b"another group"), 0).unwrap();
+    let output = bobs_other.update_keys(&bob).unwrap();
+    bobs_other.merge_pending_commit(&bob).unwrap();
+    let group_info = MlsGroupInfo {
+        group_info: output.group_info,
+        ratchet_tree: bobs_other.ratchet_tree().unwrap(),
+        pending_proposals: Vec::new(),
+    };
+    assert_eq!(
+        device.rejoin_group(CONVERSATION, IMPU, GROUP_URI, &group_info),
+        Err(GroupError::Store(StoreError::Mls(
+            ErrorKind::UnexpectedMessage
+        )))
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
 }

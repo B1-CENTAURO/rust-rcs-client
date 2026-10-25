@@ -5297,3 +5297,45 @@ fn a_group_in_step_is_not_healed() {
     peer.silence();
     assert!(encryption.healed.lock().unwrap().is_empty());
 }
+
+#[test]
+fn the_info_requests_of_a_self_healing_carry_the_mls_opaque_token() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        out_of_step: std::sync::atomic::AtomicBool::new(true),
+        pulling: vec![(
+            &b"MLS-Enhanced-Group-Info-Pull"[..],
+            Some(b"epoch 1".to_vec()),
+        )],
+        ..ScriptedEncryption::default()
+    });
+    client.sessions.set_group_encryption(
+        Arc::new(EncryptingPrepared(Arc::clone(&encryption))) as Arc<dyn GroupEncryption>
+    );
+    let (mut connection, invite, _subscribe, msrp_path) = new_group_with(
+        &client,
+        &mut peer,
+        &format!("MLS-Opaque-Token: {}\r\n", TOKEN),
+    );
+    let sdp = String::from_utf8_lossy(&parts_of(&invite)[0].1).into_owned();
+    let our_path = sdp_attribute(&sdp, "path").expect("an a=path in the offer");
+
+    connection.send_content(
+        &rt,
+        &msrp_path,
+        &our_path,
+        "message/cpim",
+        &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let info = peer.next_request("INFO");
+    assert_eq!(header_value(&info, "MLS-Opaque-Token"), TOKEN);
+    peer.send(&answer(&info, "469 Bad Info Package", None));
+    let healed = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.healed.lock().unwrap().is_empty()
+    });
+    assert!(healed);
+}
