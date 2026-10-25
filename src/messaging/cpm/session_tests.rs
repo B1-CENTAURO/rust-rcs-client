@@ -2550,6 +2550,23 @@ fn the_mls_group_of_an_invitation_not_accepted_is_let_go_of() {
 }
 
 #[test]
+fn an_invitation_whose_body_is_not_an_sdp_is_refused() {
+    let (client, mut peer) = start(true);
+    let msrp = MsrpPeer::listen(&client.rt);
+    peer.send(&invite(
+        "group-not-sdp",
+        &focus_contact(),
+        FOCUS,
+        "cpm.session",
+        "",
+        "text/plain",
+        &msrp.sdp("sendrecv"),
+    ));
+    assert_eq!(status_code(&peer.next_response()), 400);
+    peer.silence();
+}
+
+#[test]
 fn a_group_invitation_with_its_sdp_among_other_parts_is_taken() {
     let (client, mut peer) = start(true);
     let encryption = joining(&client, true);

@@ -177,8 +177,8 @@ pub(crate) fn add_mls_opaque_token(message: &mut SipMessage, mls_opaque_token: O
     }
 }
 
-/// The SDP of an incoming INVITE, as its body or its first `application/sdp`
-/// part, and the `message/mls-rcs-server` its Conversation Focus sent along,
+/// The SDP of an incoming INVITE, as its body or its `application/sdp` part,
+/// and the `message/mls-rcs-server` its Conversation Focus sent along,
 /// in a CPIM message or a part of its own (RCC.16 sections 7.9.3, 8.1)
 fn invitation_contents(
     content_type: Option<&[u8]>,
@@ -201,7 +201,7 @@ fn invitation_contents(
             continue;
         };
         let content_type = content_type.get_value();
-        if sdp.is_none() && is_media_type(content_type, "application/sdp") {
+        if is_media_type(content_type, "application/sdp") {
             sdp = Some(Arc::clone(&part.body));
         } else if server_message.is_none() {
             server_message = if is_media_type(content_type, "message/cpim") {
