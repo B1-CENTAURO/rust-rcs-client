@@ -3682,6 +3682,40 @@ fn a_group_another_member_moves_to_unencrypted_is_unencrypted() {
 }
 
 #[test]
+fn a_group_is_moved_to_unencrypted_for_the_reason_given() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    for (reason, end_mls_reason) in [
+        (
+            EndReason::ClientFailureEncryptionNotAvailable,
+            EndMlsReason::ClientFailureEncryptionNotAvailable,
+        ),
+        (
+            EndReason::ServerFailureEncryptionNotAvailable,
+            EndMlsReason::ServerFailureEncryptionNotAvailable,
+        ),
+    ] {
+        let (device, _, _) = alice_and_bob();
+        let (query, _) = answering(&[]);
+        let groups = DeviceGroups::new(&device, query);
+        let cpim = rt
+            .block_on(groups.end_encryption(
+                String::from(CONVERSATION),
+                String::from(IMPU),
+                String::from(GROUP_URI),
+                reason,
+            ))
+            .expect("a control message");
+        groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim));
+        assert_eq!(
+            encryption_ended_reason(&device, CONVERSATION),
+            Some(end_mls_reason)
+        );
+        // nor is a group not kept taken as moved
+        assert!(!groups.encryption_ended("another"));
+    }
+}
+
+#[test]
 fn a_group_moved_to_unencrypted_stays_so_once_the_device_is_restored() {
     let (bob, bobs) = bob_with_key_package();
     let (device, kds, app) =
