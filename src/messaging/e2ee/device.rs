@@ -28,6 +28,7 @@ use crate::provisioning::ims_application::ImsApplication;
 use crate::provisioning::rcs_application::RcsApplication;
 use crate::rcs_engine::RcsEngine;
 
+use super::heal::Heals;
 use super::kds::{self, EnrolmentError, KeyDistribution};
 use super::provisioning;
 use super::store::{MlsStore, SaveState, StoreError};
@@ -68,6 +69,8 @@ pub struct E2eeDevice {
     /// By group, the Message-ID of the control message carrying the Commit
     /// of the device last sent, for as long as the device runs
     control_messages: Mutex<HashMap<String, String>>,
+    /// The groups to self-heal and being self-healed
+    heals: Heals,
 }
 
 impl E2eeDevice {
@@ -96,6 +99,7 @@ impl E2eeDevice {
             provisioned: Mutex::new(None),
             make_signer: Box::new(|| SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).ok()),
             control_messages: Mutex::new(HashMap::new()),
+            heals: Heals::default(),
         })
     }
 
@@ -105,6 +109,10 @@ impl E2eeDevice {
 
     pub(super) fn control_messages(&self) -> &Mutex<HashMap<String, String>> {
         &self.control_messages
+    }
+
+    pub(super) fn heals(&self) -> &Heals {
+        &self.heals
     }
 
     pub(super) fn kds(&self) -> &dyn KeyDistribution {

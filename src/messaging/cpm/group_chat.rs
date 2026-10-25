@@ -37,10 +37,10 @@ use rust_rcs_core::sip::{
 };
 use rust_rcs_core::util::rand::create_raw_alpha_numeric_string;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use super::encryption::says_no_refusal_follows;
+use super::encryption::{says_no_refusal_follows, GroupInfoPull, CONTENT_TYPE_MLS_RCS};
 use super::session::{
     add_mls_opaque_token, mls_opaque_token_value, CPMGroupEvent, CPMSession, SessionEnd,
 };
@@ -697,7 +697,7 @@ pub(crate) fn refer_participants<F>(
 where
     F: FnOnce(u16, String, bool) + Send + Sync + 'static,
 {
-    let Some((mut message, transport)) = new_refer(session_end) else {
+    let Some((mut message, transport)) = new_request(session_end, b"REFER") else {
         return Err(callback);
     };
 
@@ -776,7 +776,7 @@ pub(crate) fn refer_removal<F>(
 where
     F: FnOnce(u16, String, bool) + Send + Sync + 'static,
 {
-    let Some((mut message, transport)) = new_refer(session_end) else {
+    let Some((mut message, transport)) = new_request(session_end, b"REFER") else {
         return Err(callback);
     };
 
@@ -796,15 +796,15 @@ where
     Ok(())
 }
 
-/// A REFER in the dialog of the session `session_end` ends, with the
-/// MLS-Opaque-Token of its group, and the transport it goes by; None if the
-/// session is not up to it
-fn new_refer(session_end: &SessionEnd) -> Option<(SipMessage, Arc<SipTransport>)> {
+/// A `method` request in the dialog of the session `session_end` ends, with
+/// the MLS-Opaque-Token of its group, and the transport it goes by; None if
+/// the session is not up to it
+fn new_request(session_end: &SessionEnd, method: &[u8]) -> Option<(SipMessage, Arc<SipTransport>)> {
     let transport = match &*session_end.registered_public_identity.lock().unwrap() {
         Some((transport, _, _)) => Arc::clone(transport),
         None => return None,
     };
-    let mut message = session_end.dialog.make_request(b"REFER", None).ok()?;
+    let mut message = session_end.dialog.make_request(method, None).ok()?;
     let mls_opaque_token = session_end.sip_session.get_inner().mls_opaque_token();
     add_mls_opaque_token(&mut message, mls_opaque_token.lock().unwrap().clone());
     Some((message, transport))
@@ -882,6 +882,63 @@ impl ClientTransactionCallbacks for FocusAnswer {
         self.rt.spawn(async move {
             let _ = tx.send((0, String::from("Transport Error"), false)).await;
         });
+    }
+}
+
+/// Asks the focus of the session `session_end` ends for the GroupInfo of its
+/// MLS group, with INFO requests in the session's dialog, as GroupInfoPull
+/// does (RCC.16 sections 6.3.1, 6.3.2, 7.10)
+pub(crate) fn group_info_pull(session_end: &SessionEnd) -> GroupInfoPull {
+    let session_end = session_end.clone();
+    Arc::new(move |package, body| {
+        let (tx, rx) = oneshot::channel();
+        if let Some((mut message, transport)) = new_request(&session_end, b"INFO") {
+            message.add_header(Header::new(b"Info-Package", package));
+            // without, the transaction gives it its Content-Length
+            if let Some(body) = body {
+                message.add_header(Header::new(b"Content-Type", CONTENT_TYPE_MLS_RCS));
+                message.add_header(Header::new(b"Content-Disposition", b"Info-Package"));
+                message.add_header(Header::new(b"Content-Length", format!("{}", body.len())));
+                message.set_body(Arc::new(Body::Raw(body)));
+            }
+            session_end.tm.send_request(
+                message,
+                &transport,
+                InfoAnswer(Mutex::new(Some(tx))),
+                &session_end.rt,
+            );
+        }
+        Box::pin(async move { rx.await.ok().flatten() })
+    })
+}
+
+/// Tells the status code and body of the final response to an INFO request,
+/// or None if none came
+struct InfoAnswer(Mutex<Option<oneshot::Sender<Option<(u16, Vec<u8>)>>>>);
+
+impl InfoAnswer {
+    fn tell(&self, answer: Option<(u16, Vec<u8>)>) {
+        if let Some(tx) = self.0.lock().unwrap().take() {
+            let _ = tx.send(answer);
+        }
+    }
+}
+
+impl ClientTransactionCallbacks for InfoAnswer {
+    fn on_provisional_response(&self, _message: SipMessage) {}
+
+    fn on_final_response(&self, message: SipMessage) {
+        let body = match message.get_body().as_deref() {
+            Some(Body::Raw(data)) => data.clone(),
+            _ => Vec::new(),
+        };
+        if let SipMessage::Response(l, _, _) = message {
+            self.tell(Some((l.status_code, body)));
+        }
+    }
+
+    fn on_transport_error(&self) {
+        self.tell(None);
     }
 }
 

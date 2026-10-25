@@ -42,7 +42,7 @@ use rust_rcs_core::sip::{
 
 use crate::messaging::ffi::RecipientType;
 
-use super::encryption::GroupEncryption;
+use super::encryption::{GroupEncryption, GroupInfoPull};
 use super::group_chat::GroupIds;
 use super::imdn::{
     acknowledge_delivery, acknowledge_group_delivery, ImdnService, ReceivedMessages,
@@ -2111,6 +2111,16 @@ struct ScriptedEncryption {
     /// The Conversation-ID, from, to and participant of each removal by the
     /// server
     removed_for_server: std::sync::Mutex<Vec<(String, String, String, String)>>,
+    /// Whether its groups are to be self-healed, until one is
+    out_of_step: std::sync::atomic::AtomicBool,
+    /// What it asks the focus with each INFO when self-healing: its
+    /// Info-Package and body
+    pulling: Vec<(&'static [u8], Option<Vec<u8>>)>,
+    /// The CPIM message it sends once healed, if any
+    healing: Option<Vec<u8>>,
+    /// The Conversation-ID, from and to of each self-healing, and the
+    /// answers of the focus
+    healed: Arc<std::sync::Mutex<Vec<(String, String, String, Vec<Option<(u16, Vec<u8>)>>)>>>,
     /// The Conversation-ID, from and to of each leave
     left: std::sync::Mutex<Vec<(String, String, String)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
@@ -2268,6 +2278,34 @@ impl GroupEncryption for ScriptedEncryption {
             .lock()
             .unwrap()
             .push(String::from(conversation_id));
+    }
+
+    fn needs_healing(&self, _conversation_id: &str) -> bool {
+        self.out_of_step
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn heal(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        pull: GroupInfoPull,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let pulling = self.pulling.clone();
+        let cpim = self.healing.clone();
+        let healed = Arc::clone(&self.healed);
+        Box::pin(async move {
+            let mut answers = Vec::new();
+            for (package, body) in pulling {
+                answers.push(pull(package, body).await);
+            }
+            healed
+                .lock()
+                .unwrap()
+                .push((conversation_id, from, to, answers));
+            cpim
+        })
     }
 
     fn encrypts(&self, conversation_id: &str) -> bool {
@@ -2944,6 +2982,20 @@ impl GroupEncryption for EncryptingPrepared {
 
     fn abandon(&self, conversation_id: &str) {
         self.0.abandon(conversation_id)
+    }
+
+    fn needs_healing(&self, conversation_id: &str) -> bool {
+        self.0.needs_healing(conversation_id)
+    }
+
+    fn heal(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        pull: GroupInfoPull,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.heal(conversation_id, from, to, pull)
     }
 
     fn encrypts(&self, conversation_id: &str) -> bool {
@@ -5099,4 +5151,149 @@ state=\"partial\" version=\"1\"><users><user entity=\"{}\"><endpoint entity=\"{}
     assert_eq!(status_code(&peer.next_response()), 200);
     std::thread::sleep(Duration::from_millis(200));
     assert!(encryption.removed_for_server.lock().unwrap().is_empty());
+}
+
+/// What the scripted encryption makes the External Commit of a self-healing
+/// carry
+const HEALING_CPIM: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x09\x0bhealing";
+
+/// The client with the group `conversation-1` encrypted and out of step with
+/// its focus: healed by asking for the enhanced GroupInfo, then for the
+/// GroupInfo, and sending HEALING_CPIM
+fn healing_in(client: &Client) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        out_of_step: std::sync::atomic::AtomicBool::new(true),
+        pulling: vec![
+            (
+                &b"MLS-Enhanced-Group-Info-Pull"[..],
+                Some(b"epoch 1".to_vec()),
+            ),
+            (&b"MLS-Group-Info-Pull"[..], None),
+        ],
+        healing: Some(HEALING_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+#[test]
+fn a_group_out_of_step_is_healed_with_info_requests_in_its_session() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = healing_in(&client);
+    let (mut connection, msrp_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-healing");
+
+    // a message the encryption cannot decrypt
+    connection.send_content(
+        &rt,
+        &msrp_path,
+        &our_path,
+        "message/cpim",
+        &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+
+    // the enhanced GroupInfo asked for in the session's dialog (RCC.16
+    // sections 6.3.2, 7.10.2)
+    let info = peer.next_request("INFO");
+    assert_eq!(request_uri(&info), GROUP, "to the focus");
+    assert_eq!(header_value(&info, "Call-ID"), "group-healing");
+    assert_eq!(
+        header_value(&info, "Info-Package"),
+        "MLS-Enhanced-Group-Info-Pull"
+    );
+    assert_eq!(header_value(&info, "Content-Type"), "message/mls-rcs");
+    assert_eq!(header_value(&info, "Content-Disposition"), "Info-Package");
+    assert_eq!(body_data(&info), b"epoch 1");
+    peer.send(
+        &answer(&info, "200 OK", Some("a page"))
+            .replace("application/sdp", "message/mls-rcs-server"),
+    );
+
+    // then the GroupInfo (section 6.3.1)
+    let info = peer.next_request("INFO");
+    assert_eq!(header_value(&info, "Info-Package"), "MLS-Group-Info-Pull");
+    assert_eq!(header_value(&info, "Content-Type"), "");
+    assert!(body_data(&info).is_empty());
+    peer.send(&answer(&info, "469 Bad Info Package", None));
+
+    // the External Commit sent to the focus, as it is (section 9.5.1)
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    assert_eq!(send.body, HEALING_CPIM);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        *encryption.healed.lock().unwrap(),
+        [(
+            String::from("conversation-1"),
+            String::from(IMPU),
+            String::from(GROUP),
+            vec![Some((200, b"a page".to_vec())), Some((469, Vec::new()))]
+        )]
+    );
+}
+
+#[test]
+fn what_the_focus_sends_of_a_group_out_of_step_has_it_healed() {
+    for (call_id, cpim) in [
+        (
+            "group-healing-1",
+            encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
+        ),
+        // a refusal saying it is out of step
+        ("group-healing-2", group_imdn_cpim("message-1", REFUSED)),
+        // or a control message that cannot be applied
+        ("group-healing-3", from_the_focus("not to be applied")),
+    ] {
+        let (client, mut peer) = start(true);
+        let rt = Arc::clone(&client.rt);
+        let encryption = healing_in(&client);
+        let (mut connection, msrp_path, our_path) =
+            joined_encrypted_group(&client, &mut peer, call_id);
+        connection.send_content(&rt, &msrp_path, &our_path, "message/cpim", &cpim);
+        assert!(connection.next_response(&rt).first_line.contains(" 200"));
+
+        let info = peer.next_request("INFO");
+        assert_eq!(
+            header_value(&info, "Info-Package"),
+            "MLS-Enhanced-Group-Info-Pull",
+            "{}",
+            call_id
+        );
+        peer.send(&answer(&info, "469 Bad Info Package", None));
+        let info = peer.next_request("INFO");
+        peer.send(&answer(&info, "469 Bad Info Package", None));
+        let send = connection.next_message(&rt);
+        connection.respond(&rt, &send, "200 OK");
+        assert_eq!(encryption.healed.lock().unwrap().len(), 1, "{}", call_id);
+    }
+}
+
+#[test]
+fn a_group_in_step_is_not_healed() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = healing_in(&client);
+    encryption
+        .out_of_step
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let (mut connection, msrp_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-in-step");
+    connection.send_content(
+        &rt,
+        &msrp_path,
+        &our_path,
+        "message/cpim",
+        &from_the_focus("a control message"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    peer.silence();
+    assert!(encryption.healed.lock().unwrap().is_empty());
 }

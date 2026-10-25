@@ -158,6 +158,11 @@ impl E2eeDevice {
         conversation_id: &str,
         cpim: &[u8],
     ) -> Result<Vec<u8>, MessageError> {
+        // nothing is sent while the group is self-healed (RCC.16 section
+        // 10.1.1)
+        if self.heals().ongoing(conversation_id) {
+            return Err(MessageError::Pending);
+        }
         let body = Body::construct_message(cpim).map_err(|_| MessageError::NotCpim)?;
         let message = CPIMMessage::try_from(&body).map_err(|_| MessageError::NotCpim)?;
         let message_id = message
@@ -299,7 +304,13 @@ impl E2eeDevice {
             .with_conversation(conversation_id.as_bytes(), |conversation, client| {
                 conversation.decrypt(client, mls_message, cpim_info.imdn_message_id)
             })
-            .map_err(MessageError::Store)?;
+            .map_err(|e| {
+                // as when the group missed a Commit (RCC.16 section 10.1)
+                if e == StoreError::Mls(ErrorKind::Rejected) {
+                    self.heals().want(conversation_id);
+                }
+                MessageError::Store(e)
+            })?;
         let payload = match (decrypted.payload_type, decrypted.payload) {
             (SecretPayloadType::Application, Some(payload)) => payload,
             // Re-Sent Messages are not taken yet
@@ -343,6 +354,9 @@ impl E2eeDevice {
         conversation_id: &str,
         cpim: &[u8],
     ) -> Result<Vec<u8>, MessageError> {
+        if self.heals().ongoing(conversation_id) {
+            return Err(MessageError::Pending);
+        }
         let body = Body::construct_message(cpim).map_err(|_| MessageError::NotCpim)?;
         let message = CPIMMessage::try_from(&body).map_err(|_| MessageError::NotCpim)?;
         let info = message.get_info().map_err(|_| MessageError::NotCpim)?;
