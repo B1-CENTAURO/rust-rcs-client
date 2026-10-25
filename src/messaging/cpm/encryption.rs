@@ -12,14 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! End-to-end encryption of the group chats this client creates, when it has
-//! it (RCC.16 section 8.1)
+//! End-to-end encryption of the group chats this client takes part in, when
+//! it has it (RCC.16 sections 8.1, 9.1.1)
 
 use futures::future::BoxFuture;
+use rust_rcs_core::cpim::CPIMInfo;
 
 /// Content-Type of what the Conversation Focus sends of the MLS group of a
 /// conversation (RCC.16 section 7.9)
 pub const CONTENT_TYPE_MLS_RCS_SERVER: &[u8] = b"message/mls-rcs-server";
+
+/// Content-Type of an encrypted message (RCC.16 section 7.5.6)
+pub const CONTENT_TYPE_MLS: &[u8] = b"message/mls";
 
 pub trait GroupEncryption: Send + Sync {
     /// The CPIM message carrying a `message/mls-rcs-client` that a new group
@@ -48,4 +52,25 @@ pub trait GroupEncryption: Send + Sync {
     /// Lets go of the MLS group `conversation_id`, as its chat did not start
     /// or its invitation was not accepted
     fn abandon(&self, conversation_id: &str);
+
+    /// Whether the group chat `conversation_id` is encrypted, its MLS group
+    /// kept
+    fn encrypts(&self, conversation_id: &str) -> bool;
+
+    /// The CPIM message `cpim` encrypted in the group chat `conversation_id`,
+    /// as the CPIM message carrying it as `message/mls` (RCC.16 sections 7.5,
+    /// 9.1.1), once a Commit of this client the Conversation Focus is yet to
+    /// accept is; None if it cannot be
+    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>>;
+
+    /// The CPIM message the `message/mls` `mls_message` of the group chat
+    /// `conversation_id` carried, delivered in the CPIM message `cpim_info`
+    /// tells of; its From the MLS identity of the sender if that is another
+    /// (RCC.16 sections 7.5.3.1, 9.1.1); None if it cannot be decrypted
+    fn decrypt(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        mls_message: &[u8],
+    ) -> Option<Vec<u8>>;
 }

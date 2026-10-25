@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::runtime::Runtime;
 
-use rust_rcs_core::cpim::CPIMMessage;
+use rust_rcs_core::cpim::{CPIMInfo, CPIMMessage};
 use rust_rcs_core::imdn::notification::{Dispositions, Imdn, Notification, Status};
 use rust_rcs_core::internet::{header, Body};
 use rust_rcs_core::io::network::stream::ClientSocket;
@@ -2087,6 +2087,17 @@ struct ScriptedEncryption {
     joined: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     abandoned: std::sync::Mutex<Vec<String>>,
+    /// The groups it encrypts
+    encrypting: Vec<String>,
+    /// What it encrypts the messages of those as, if it can
+    ciphertext: Option<String>,
+    /// The Conversation-ID and CPIM message of each message to encrypt
+    encrypted: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    /// The CPIM message it decrypts the encrypted messages to, if it can
+    plaintext: Option<String>,
+    /// The Conversation-ID, CPIM From and Message-ID, and content of each
+    /// message to decrypt
+    decrypted: std::sync::Mutex<Vec<(String, String, String, Vec<u8>)>>,
 }
 
 impl GroupEncryption for ScriptedEncryption {
@@ -2125,6 +2136,34 @@ impl GroupEncryption for ScriptedEncryption {
             .lock()
             .unwrap()
             .push(String::from(conversation_id));
+    }
+
+    fn encrypts(&self, conversation_id: &str) -> bool {
+        self.encrypting.iter().any(|id| id == conversation_id)
+    }
+
+    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.encrypted
+            .lock()
+            .unwrap()
+            .push((String::from(conversation_id), cpim.to_vec()));
+        let ciphertext = self.ciphertext.clone().map(String::into_bytes);
+        Box::pin(async move { ciphertext })
+    }
+
+    fn decrypt(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        mls_message: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.decrypted.lock().unwrap().push((
+            String::from(conversation_id),
+            String::from_utf8_lossy(cpim_info.from).into_owned(),
+            String::from_utf8_lossy(cpim_info.imdn_message_id).into_owned(),
+            mls_message.to_vec(),
+        ));
+        self.plaintext.clone().map(String::into_bytes)
     }
 }
 
@@ -2591,6 +2630,368 @@ fn a_group_invitation_with_its_sdp_among_other_parts_is_taken() {
         )
     );
     peer.silence();
+}
+
+/// The client encrypting the messages of the group `conversation_id` as
+/// `ciphertext`, and decrypting those it receives to `plaintext`
+fn encrypting_messages(
+    client: &Client,
+    conversation_id: &str,
+    ciphertext: Option<&str>,
+    plaintext: Option<&str>,
+) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from(conversation_id)],
+        ciphertext: ciphertext.map(String::from),
+        plaintext: plaintext.map(String::from),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+/// What the scripted encryption makes of a message
+const CIPHERTEXT: &str = "From: <sip:+15551234@example.com>\r\nTo: <sip:conf1@conf.example.com>\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: encrypted-1\r\n\r\nContent-Type: message/mls\r\n\r\nciphertext";
+
+#[test]
+fn the_messages_of_an_encrypted_group_are_sent_encrypted() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    // the group made encrypted, whichever its Conversation-ID
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        ciphertext: Some(String::from(CIPHERTEXT)),
+        ..ScriptedEncryption::default()
+    });
+    let encryption = {
+        let prepared = Arc::clone(&encryption);
+        client.sessions.set_group_encryption(
+            Arc::new(EncryptingPrepared(prepared)) as Arc<dyn GroupEncryption>
+        );
+        encryption
+    };
+    let (mut connection, invite, _subscribe, _) = new_group(&client, &mut peer);
+    let conversation_id = header_value(&invite, "Conversation-ID");
+
+    // a message
+    let result = client.send_with_id(GROUP, RecipientType::Group, "hello all", "encrypted-1");
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    assert_eq!(String::from_utf8_lossy(&send.body), CIPHERTEXT);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    let (encrypted_in, plaintext) = encryption.encrypted.lock().unwrap()[0].clone();
+    assert_eq!(encrypted_in, conversation_id);
+    assert_eq!(cpim_text(&plaintext), "hello all");
+    let cpim = CPIMMessage::try_from(&Body::construct_message(&plaintext).unwrap()).unwrap();
+    assert_eq!(
+        id_and_dispositions(&cpim),
+        (String::from("encrypted-1"), DELIVERY_AND_DISPLAY)
+    );
+
+    // and an is-composing indication
+    assert!(client
+        .sessions
+        .send_is_composing(GROUP, &RecipientType::Group, true, |_, _| {}, &rt));
+    let send = connection.next_message(&rt);
+    assert_eq!(String::from_utf8_lossy(&send.body), CIPHERTEXT);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(encryption.encrypted.lock().unwrap().len(), 2);
+    assert!(
+        String::from_utf8_lossy(&encryption.encrypted.lock().unwrap()[1].1)
+            .contains("Content-Type: application/im-iscomposing+xml"),
+    );
+}
+
+/// An encryption that encrypts the groups it prepares
+struct EncryptingPrepared(Arc<ScriptedEncryption>);
+
+impl GroupEncryption for EncryptingPrepared {
+    fn prepare(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participants: Vec<String>,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.prepare(conversation_id, from, to, participants)
+    }
+
+    fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
+        self.0.join(conversation_id, server_message)
+    }
+
+    fn on_server_message(&self, conversation_id: &str, body: &[u8]) {
+        self.0.on_server_message(conversation_id, body)
+    }
+
+    fn abandon(&self, conversation_id: &str) {
+        self.0.abandon(conversation_id)
+    }
+
+    fn encrypts(&self, conversation_id: &str) -> bool {
+        self.0
+            .prepared
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(prepared, _, _, _)| prepared == conversation_id)
+    }
+
+    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.encrypt(conversation_id, cpim)
+    }
+
+    fn decrypt(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        mls_message: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.0.decrypt(conversation_id, cpim_info, mls_message)
+    }
+}
+
+#[test]
+fn a_message_that_cannot_be_encrypted_is_not_sent() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = encrypting_messages(&client, "conversation-1", None, None);
+    let msrp = encrypted_group_invitation(&client, &mut peer, "group-not-encrypting");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "group-not-encrypting"));
+    peer.next_request("SUBSCRIBE");
+    let mut connection = msrp.accept(&rt);
+
+    let result = client.send(GROUP, RecipientType::Group, "secret");
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(500)
+    );
+    assert_eq!(encryption.encrypted.lock().unwrap().len(), 1);
+    connection.quiet(&rt);
+}
+
+/// The group joined encrypted, its session up, with the MSRP connection,
+/// the path of the focus and the client's
+fn joined_encrypted_group(
+    client: &Client,
+    peer: &mut Peer,
+    call_id: &str,
+) -> (MsrpConnection, String, String) {
+    let msrp = encrypted_group_invitation(client, peer, call_id);
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, call_id));
+    peer.next_request("SUBSCRIBE");
+    let connection = msrp.accept(&client.rt);
+    let our_path = sdp_attribute(&body(&ok), "path").expect("an a=path in the answer");
+    (connection, msrp.path, our_path)
+}
+
+/// An encrypted message from `from` through the focus, asking for
+/// notifications as `cpim_headers` do
+fn encrypted_group_cpim(from: &str, cpim_headers: &str, content: &str) -> String {
+    format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+NS: mls <http://www.gsma.com/rcs/mls>\r\n\
+imdn.Message-ID: peer-message-1\r\n\
+{}\
+mls.Epoch-Authenticator: YXV0aA==\r\n\
+mls.Era-ID: 0\r\n\
+\r\n\
+Content-Type: message/mls\r\n\
+\r\n\
+{}",
+        from, GROUP, cpim_headers, content
+    )
+}
+
+#[test]
+fn an_encrypted_message_is_given_to_the_app_decrypted() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let plaintext = format!(
+        "From: <tel:+15550002>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: peer-message-1\r\n{}\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
+        GROUP,
+        ASKING,
+        general_purpose::STANDARD.encode("decrypted hi")
+    );
+    let encryption = encrypting_messages(
+        &client,
+        "conversation-1",
+        Some(CIPHERTEXT),
+        Some(&plaintext),
+    );
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-decrypting");
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &encrypted_group_cpim(ALICE, ASKING, "ciphertext"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| (r.1, r.2)),
+        Ok((String::from("text/plain"), String::from("decrypted hi")))
+    );
+    assert_eq!(
+        *encryption.decrypted.lock().unwrap(),
+        [(
+            String::from("conversation-1"),
+            format!("<{}>", ALICE),
+            String::from("peer-message-1"),
+            b"ciphertext".to_vec()
+        )]
+    );
+
+    // its delivery told, as the plaintext says, unencrypted
+    let send = connection.next_message(&rt);
+    let (cpim, imdn) = group_notification(&send);
+    assert_eq!(
+        cpim.get_info().unwrap().to,
+        b"<tel:+15550002>",
+        "to the sender MLS tells of"
+    );
+    assert_eq!(imdn.message_id, "peer-message-1");
+    connection.respond(&rt, &send, "200 OK");
+    assert!(
+        encryption.encrypted.lock().unwrap().is_empty(),
+        "the notification not encrypted"
+    );
+}
+
+#[test]
+fn an_encrypted_message_that_cannot_be_decrypted_is_not_given_to_the_app() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = encrypting_messages(&client, "conversation-1", Some(CIPHERTEXT), None);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-undecryptable");
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &encrypted_group_cpim(ALICE, "", "garbage"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    // the next taken first
+    connection.send_cpim(&rt, &focus_path, &our_path, &group_cpim(ALICE, "", "plain"));
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| r.2),
+        Ok(String::from("plain"))
+    );
+    assert_eq!(encryption.decrypted.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn an_encrypted_message_in_a_group_not_encrypted_is_not_given_to_the_app() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = encrypting_messages(&client, "another", Some(CIPHERTEXT), Some("not used"));
+    let (mut connection, invite, _subscribe, focus_path) = new_group(&client, &mut peer);
+    let our_path = sdp_attribute(&String::from_utf8_lossy(&body_data(&invite)), "path").unwrap();
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &encrypted_group_cpim(ALICE, "", "ciphertext"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    connection.send_cpim(&rt, &focus_path, &our_path, &group_cpim(ALICE, "", "plain"));
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| r.2),
+        Ok(String::from("plain"))
+    );
+    assert!(encryption.decrypted.lock().unwrap().is_empty());
+    assert!(encryption.encrypted.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_encrypted_group_restarted_is_encrypted_again() {
+    // by the client
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = encrypting_messages(&client, "conversation-1", Some(CIPHERTEXT), None);
+    let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-first");
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+
+    let msrp = MsrpPeer::listen(&rt);
+    let result = client.send(GROUP, RecipientType::Group, "again");
+    let restart = peer.next_request("INVITE");
+    assert_eq!(header_value(&restart, "Conversation-ID"), "conversation-1");
+    let offer = String::from_utf8_lossy(&body_data(&restart)).into_owned();
+    assert!(
+        sdp_attribute(&offer, "accept-wrapped-types")
+            .unwrap()
+            .ends_with(" message/mls message/mls-rcs-server"),
+        "{}",
+        offer
+    );
+    peer.send(&answer_from(
+        &restart,
+        "200 OK",
+        &focus_contact(),
+        Some(&msrp.sdp("sendrecv")),
+    ));
+    next_requests(&mut peer, &["ACK", "SUBSCRIBE"]);
+    let mut connection = msrp.accept(&rt);
+    let send = connection.next_message(&rt);
+    assert_eq!(String::from_utf8_lossy(&send.body), CIPHERTEXT);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    assert!(cpim_text(&encryption.encrypted.lock().unwrap()[0].1) == "again");
+
+    // and by its focus
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+    let msrp = group_invitation(&client, &mut peer, "group-again");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert!(sdp_attribute(&body(&ok), "accept-wrapped-types")
+        .unwrap()
+        .ends_with(" message/mls message/mls-rcs-server"));
+    peer.send(&ack(&ok, "group-again"));
+    peer.next_request("SUBSCRIBE");
+    let mut connection = msrp.accept(&rt);
+    let _result = client.send(GROUP, RecipientType::Group, "once more");
+    let send = connection.next_message(&rt);
+    assert_eq!(String::from_utf8_lossy(&send.body), CIPHERTEXT);
+    connection.respond(&rt, &send, "200 OK");
 }
 
 #[test]

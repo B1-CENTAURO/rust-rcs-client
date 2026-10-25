@@ -307,7 +307,7 @@ pub fn try_accept_invitation<'a, 'b>(
                     },
                     // and what the Conversation Focus sends of the MLS group
                     // of an encrypted one (RCC.16 sections 7.5.6, 7.9)
-                    CPMServiceType::Group if session_info.encrypted => {
+                    CPMServiceType::Group if session_info.encrypted() => {
                         Some(b"multipart/mixed text/plain application/vnd.gsma.rcs-ft-http+xml application/vnd.gsma.rcspushlocation+xml message/imdn+xml application/im-iscomposing+xml message/mls message/mls-rcs-server")
                     },
                     CPMServiceType::Group => {

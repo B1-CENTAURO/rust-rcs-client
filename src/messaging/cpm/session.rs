@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use futures::Future;
 
 use rust_rcs_core::cpim::{CPIMInfo, CPIMMessage};
+use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::internet::body::message_body::MessageBody;
 use rust_rcs_core::internet::body::multipart_body::MultipartBody;
 use rust_rcs_core::internet::body::VectorReader;
@@ -79,7 +80,7 @@ use uuid::Uuid;
 use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
-use super::encryption::{GroupEncryption, CONTENT_TYPE_MLS_RCS_SERVER};
+use super::encryption::{GroupEncryption, CONTENT_TYPE_MLS, CONTENT_TYPE_MLS_RCS_SERVER};
 use super::group_chat::{refer_participants, GroupChats, GroupIds, GroupInvitation, Participant};
 use super::imdn::send_group_imdn;
 use super::session_invitation::{
@@ -91,7 +92,7 @@ use super::sip::cpm_contact::{AsCPMContact, CPMContact, CPMServiceType};
 use super::standalone_messaging::OutgoingPagerModeContext;
 use super::{
     decode_base64, is_composing_document, is_media_type, make_cpim_message_content_body,
-    new_message_id, understands_cpim_requirements, CPMMessageParam, IS_COMPOSING,
+    new_message_id, understands_cpim_requirements, CPMMessageParam, IS_COMPOSING, LOG_TAG,
 };
 
 // to-do: use enum
@@ -109,12 +110,17 @@ pub struct CPMSessionInfo {
     /// The MLS-Opaque-Token the message carried, for the requests of the
     /// conversation to carry from now on (RCC.16 section 6.1.3)
     pub mls_opaque_token: Option<String>,
-    /// Whether the conversation is encrypted end to end, its MLS group
-    /// joined (RCC.16 section 8.1)
-    pub encrypted: bool,
+    /// The encryption of the conversation, if it is encrypted end to end,
+    /// its MLS group kept (RCC.16 sections 8.1, 9.1.1)
+    pub encryption: Option<Arc<dyn GroupEncryption>>,
 }
 
 impl CPMSessionInfo {
+    /// Whether the conversation is encrypted end to end
+    pub fn encrypted(&self) -> bool {
+        self.encryption.is_some()
+    }
+
     /// Whom the messages of the session are from, as the app knows it: a
     /// group by its focus's URI, which it sends to, else the identity
     /// asserted
@@ -462,7 +468,7 @@ pub fn get_cpm_session_info_from_message(
                             conversation_supports_anonymization,
                             conversation_is_using_anonymization_token,
                             mls_opaque_token: opaque_token.and_then(mls_opaque_token_value),
-                            encrypted: false,
+                            encryption: None,
                         });
                     }
                 }
@@ -786,6 +792,12 @@ impl CPMSession {
 
                     let t_id = String::from(public_user_identity);
                     let public_user_identity = String::from(public_user_identity);
+                    // the messages of an encrypted conversation encrypted
+                    let encryption = self
+                        .session_info
+                        .encryption
+                        .clone()
+                        .zip(self.session_info.conversation_id.clone());
 
                     let rt_ = Arc::clone(rt);
 
@@ -907,6 +919,21 @@ impl CPMSession {
                                             }
                                         }
                                         Err(_) => {} // to-do: early failure
+                                    }
+
+                                    // and never sent unencrypted in an
+                                    // encrypted one (RCC.16 section 9.1.1)
+                                    if let Some((encryption, conversation_id)) = &encryption {
+                                        match encryption.encrypt(conversation_id, &data).await {
+                                            Some(encrypted) => data = encrypted,
+                                            None => {
+                                                (message.message_result_callback)(
+                                                    500,
+                                                    String::from("Internal Error"),
+                                                );
+                                                continue;
+                                            }
+                                        }
                                     }
 
                                     (b"message/cpim".to_vec(), data)
@@ -1419,6 +1446,46 @@ impl CPMSessionService {
                   cpim_info: &CPIMInfo,
                   content_type: &[u8],
                   content_body: &[u8]| {
+                // what an encrypted message carries, decrypted (RCC.16
+                // section 9.1.1); none of an unencrypted one taken
+                if content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS) {
+                    let inner = session.get_inner();
+                    let session_info = inner.get_session_info();
+                    let decrypted = session_info
+                        .encryption
+                        .as_ref()
+                        .zip(session_info.conversation_id.as_ref())
+                        .and_then(|(encryption, conversation_id)| {
+                            encryption.decrypt(conversation_id, cpim_info, content_body)
+                        });
+                    if let Some(cpim) = decrypted {
+                        let message = Body::construct_message(&cpim)
+                            .ok()
+                            .and_then(|body| CPIMMessage::try_from(&body).ok());
+                        let taken = message.as_ref().and_then(|message| {
+                            let info = message.get_info().ok()?;
+                            let (content_type, content, base64_encoded) =
+                                message.get_message_body()?;
+                            let content = if base64_encoded {
+                                decode_base64(content).ok()?
+                            } else {
+                                content.to_vec()
+                            };
+                            message_receive_listener(
+                                session,
+                                contact,
+                                &info,
+                                content_type?,
+                                &content,
+                            );
+                            Some(())
+                        });
+                        if taken.is_none() {
+                            platform_log(LOG_TAG, "message decrypted not a CPIM message");
+                        }
+                    }
+                    return;
+                }
                 if !content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS_RCS_SERVER) {
                     message_receive_listener(
                         session,
@@ -1987,10 +2054,17 @@ impl CPMSessionService {
         let recipient = invitee.uri;
         let recipient_uri = invitee.to_uri;
         let recipient_type = invitee.recipient_type;
-        let encrypted = invitee
-            .new_group
-            .as_ref()
-            .is_some_and(|new_group| new_group.encrypted.is_some());
+        // a new group to be encrypted, or a group whose MLS group is kept
+        let group_encryption = self.group_encryption.lock().unwrap().clone();
+        let encrypted = match (recipient_type, &invitee.new_group) {
+            (_, Some(new_group)) => new_group.encrypted.is_some(),
+            (RecipientType::Group, None) => self
+                .group_chats
+                .ids_of(recipient)
+                .zip(group_encryption.as_ref())
+                .is_some_and(|(ids, encryption)| encryption.encrypts(&ids.conversation_id)),
+            _ => false,
+        };
 
         if let Ok((sock, host, port, tls, active_setup, ipv6)) =
             (self.msrp_socket_allocator_function)(None)
@@ -2252,6 +2326,15 @@ impl CPMSessionService {
                                 // those sent, unless the answer tells others
                                 session_info.conversation_id.get_or_insert(conversation_id);
                                 session_info.contribution_id.get_or_insert(contribution_id);
+                                // encrypted if its MLS group is kept
+                                if let (CPMServiceType::Group, Some(conversation_id)) = (
+                                    &session_info.cpm_contact.service_type,
+                                    session_info.conversation_id.clone(),
+                                ) {
+                                    session_info.encryption = group_encryption
+                                        .clone()
+                                        .filter(|encryption| encryption.encrypts(&conversation_id));
+                                }
 
                                 if let Some(l_sdp) = match l_sdp_body.as_ref() {
                                     Body::Raw(raw) => {
@@ -3038,6 +3121,20 @@ impl TransactionHandler for CPMSessionServiceWrapper {
 
                                 let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
+                                // a group whose MLS group is kept encrypted
+                                if let (CPMServiceType::Group, Some(conversation_id)) = (
+                                    &session_info.cpm_contact.service_type,
+                                    session_info.conversation_id.clone(),
+                                ) {
+                                    session_info.encryption = self
+                                        .service
+                                        .group_encryption
+                                        .lock()
+                                        .unwrap()
+                                        .clone()
+                                        .filter(|encryption| encryption.encrypts(&conversation_id));
+                                }
+
                                 match session_info.cpm_contact.service_type {
                                     CPMServiceType::Group => loop {
                                         // the subject, and who invited, as
@@ -3166,7 +3263,8 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                             }
                                                             return true;
                                                         };
-                                                        session_info.encrypted = true;
+                                                        session_info.encryption =
+                                                            Some(Arc::clone(&encryption));
                                                         joined = Some((
                                                             encryption,
                                                             conversation_id.clone(),
@@ -3195,7 +3293,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                         inviter_name: told(referred_by_name),
                                                         pending: (100..200)
                                                             .contains(&auto_accept_response_code),
-                                                        encrypted: session_info.encrypted,
+                                                        encrypted: session_info.encrypted(),
                                                     });
                                                     break;
                                                 }

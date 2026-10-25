@@ -242,6 +242,17 @@ impl MlsStore {
         result.map_err(StoreError::Mls)
     }
 
+    /// Whether the group `group_id` is kept, as with_conversation() would
+    /// find it; nothing is changed or saved
+    pub fn has_conversation(&self, group_id: &[u8]) -> bool {
+        let state = self.state.lock().unwrap();
+        state.conversations.contains_key(group_id)
+            || state
+                .client
+                .as_ref()
+                .is_some_and(|client| client.load_conversation(group_id).is_ok())
+    }
+
     /// Deletes the group `group_id` and its secrets
     pub fn delete_conversation(&self, group_id: &[u8]) -> Result<(), StoreError> {
         let mut state = self.state.lock().unwrap();
