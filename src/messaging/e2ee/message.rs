@@ -39,6 +39,9 @@ pub enum MessageError {
     /// A Commit of this client waits for the Conversation Focus to accept it,
     /// the group not yet in the epoch the others are in
     Pending,
+    /// The Conversation Focus refused the Commit that made the group, which
+    /// is in no epoch the others are in
+    NotCreated,
     /// What was to be encrypted is not a CPIM message with an IMDN Message-ID
     NotCpim,
     Store(StoreError),
@@ -85,7 +88,8 @@ impl E2eeDevice {
     /// 7.5.7)
     ///
     /// Not while a Commit of this client waits for the Conversation Focus to
-    /// accept it, as the message would be of an epoch the others leave.
+    /// accept it, as the message would be of an epoch the others leave, nor
+    /// once the Focus refused the Commit that made the group.
     pub fn encrypt_message(
         &self,
         conversation_id: &str,
@@ -146,14 +150,18 @@ impl E2eeDevice {
             let _ = reader.read_to_end(&mut payload);
         }
 
-        let pending = self
+        let (pending, epoch) = self
             .store()
             .with_conversation(conversation_id.as_bytes(), |conversation, _| {
-                Ok(conversation.has_pending_commit())
+                Ok((conversation.has_pending_commit(), conversation.epoch()))
             })
             .map_err(MessageError::Store)?;
         if pending {
             return Err(MessageError::Pending);
+        }
+        // the group of the device alone, as no Commit was applied to it
+        if epoch == 0 {
+            return Err(MessageError::NotCreated);
         }
         let (mls_message, epoch_authenticator, era) = self
             .store()

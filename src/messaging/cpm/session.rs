@@ -1486,6 +1486,23 @@ impl CPMSessionService {
                     }
                     return;
                 }
+                // the Conversation Focus refusing a control message of this
+                // client tells the encryption, not the app (RCC.16 section
+                // 6.2.5)
+                if is_media_type(content_type, "message/imdn+xml") {
+                    let inner = session.get_inner();
+                    let session_info = inner.get_session_info();
+                    let refused = session_info
+                        .encryption
+                        .as_ref()
+                        .zip(session_info.conversation_id.as_ref())
+                        .is_some_and(|(encryption, conversation_id)| {
+                            encryption.on_imdn(conversation_id, content_body)
+                        });
+                    if refused {
+                        return;
+                    }
+                }
                 if !content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS_RCS_SERVER) {
                     message_receive_listener(
                         session,
