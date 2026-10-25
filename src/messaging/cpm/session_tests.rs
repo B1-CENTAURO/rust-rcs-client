@@ -2096,6 +2096,10 @@ struct ScriptedEncryption {
     removing: Option<Vec<u8>>,
     /// The Conversation-ID, from, to and participant of each removal
     removed: std::sync::Mutex<Vec<(String, String, String, String)>>,
+    /// The CPIM message it prepares for leaving, if any
+    leaving: Option<Vec<u8>>,
+    /// The Conversation-ID, from and to of each leave
+    left: std::sync::Mutex<Vec<(String, String, String)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     /// Whether the IMDNs it is given refuse a control message of the client
     refusing: bool,
@@ -2166,6 +2170,17 @@ impl GroupEncryption for ScriptedEncryption {
             .unwrap()
             .push((conversation_id, from, to, participant));
         let cpim = self.removing.clone();
+        Box::pin(async move { cpim })
+    }
+
+    fn prepare_leave(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.left.lock().unwrap().push((conversation_id, from, to));
+        let cpim = self.leaving.clone();
         Box::pin(async move { cpim })
     }
 
@@ -2829,6 +2844,15 @@ impl GroupEncryption for EncryptingPrepared {
     ) -> BoxFuture<'static, Option<Vec<u8>>> {
         self.0
             .prepare_remove(conversation_id, from, to, participant)
+    }
+
+    fn prepare_leave(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.prepare_leave(conversation_id, from, to)
     }
 
     fn discard(&self, conversation_id: &str, refusal_follows: bool) {
@@ -4704,4 +4728,103 @@ fn a_participant_that_cannot_be_removed_from_an_encrypted_group_is_not_referred(
     assert_eq!(encryption.removed.lock().unwrap().len(), 1);
     peer.silence();
     assert!(encryption.discarded.lock().unwrap().is_empty());
+}
+
+/// What the scripted encryption makes the BYE leaving a group carry
+const LEAVING_CPIM: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x05\x06leaving";
+
+/// The client with the group `conversation-1` encrypted, left with
+/// LEAVING_CPIM if `leaving`
+fn leaving_from(client: &Client, leaving: bool) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        leaving: leaving.then(|| LEAVING_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+#[test]
+fn an_encrypted_group_is_left_with_the_self_remove_in_the_bye() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = leaving_from(&client, true);
+    let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-leaving");
+
+    let result = leave(&client, GROUP);
+    let bye = peer.next_request("BYE");
+    assert_eq!(request_uri(&bye), GROUP, "to the focus");
+    assert_eq!(header_value(&bye, "Reason"), LEAVING);
+    assert_eq!(header_value(&bye, "Content-Type"), "message/cpim");
+    assert_eq!(body_data(&bye), LEAVING_CPIM, "the control message");
+    let lengths: Vec<_> = bye
+        .headers()
+        .unwrap()
+        .iter()
+        .filter(|header| header.get_name().eq_ignore_ascii_case(b"Content-Length"))
+        .map(|header| header.get_value().to_vec())
+        .collect();
+    assert_eq!(lengths, [format!("{}", LEAVING_CPIM.len()).into_bytes()]);
+    assert_eq!(
+        *encryption.left.lock().unwrap(),
+        [(
+            String::from("conversation-1"),
+            String::from(IMPU),
+            String::from(GROUP)
+        )]
+    );
+    connection.closed(&rt);
+
+    // the MLS group let go of once the focus agrees (RCC.16 section 9.4)
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+    peer.send(&answer(&bye, "200 OK", None));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
+    assert_eq!(*encryption.abandoned.lock().unwrap(), ["conversation-1"]);
+    assert!(encryption.discarded.lock().unwrap().is_empty());
+    assert!(!client.sessions.has_session_with(GROUP));
+}
+
+#[test]
+fn the_self_remove_of_a_bye_the_focus_answers_with_an_error_is_let_go_of() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = leaving_from(&client, true);
+    let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-not-left");
+
+    let result = leave(&client, GROUP);
+    let bye = peer.next_request("BYE");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "400 Bad Request", None).replacen(
+        "Content-Length: 0",
+        "Warning: 399 operator.com \"451 Non-MLS error\"\r\nContent-Length: 0",
+        1,
+    ));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(400));
+    assert_eq!(
+        *encryption.discarded.lock().unwrap(),
+        [(String::from("conversation-1"), false)]
+    );
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_encrypted_group_that_cannot_be_left_is_not_sent_a_bye() {
+    let (client, mut peer) = start(true);
+    let encryption = leaving_from(&client, false);
+    let (_connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-staying");
+
+    let result = leave(&client, GROUP);
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(488));
+    assert_eq!(encryption.left.lock().unwrap().len(), 1);
+    peer.silence();
+    // the session going on as before
+    assert!(client.sessions.has_session_with(GROUP));
+    assert!(encryption.discarded.lock().unwrap().is_empty());
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
 }

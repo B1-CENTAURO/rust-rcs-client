@@ -121,7 +121,21 @@ pub trait GroupEncryption: Send + Sync {
         participant: String,
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
-    /// Lets go of the Commit of this client in the group chat
+    /// The CPIM message carrying a `message/mls-rcs-client` that the BYE of
+    /// the user leaving the group chat `conversation_id` for good is to
+    /// carry, `from` and `to` that of the CPIM message: the self_remove
+    /// Proposal of this client (RCC.16 sections 7.9.4, 9.4), once a Commit of
+    /// this client the Conversation Focus is yet to accept is; None if it
+    /// cannot be made. The MLS group is kept until abandoned once the Focus
+    /// agrees to the leave.
+    fn prepare_leave(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>>;
+
+    /// Lets go of the Commit or the leave of this client in the group chat
     /// `conversation_id`, as the Conversation Focus answered the request
     /// carrying it with an error, a refusal of it to follow if
     /// `refusal_follows` (RCC.16 sections 6.2.5, 7.2.6)
@@ -145,8 +159,8 @@ pub trait GroupEncryption: Send + Sync {
     /// sections 6.2.5, 7.7.2.1)
     fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool;
 
-    /// Lets go of the MLS group `conversation_id`, as its chat did not start
-    /// or its invitation was not accepted
+    /// Lets go of the MLS group `conversation_id`, as its chat did not start,
+    /// its invitation was not accepted, or the user left it
     fn abandon(&self, conversation_id: &str);
 
     /// Whether the group chat `conversation_id` is encrypted, its MLS group

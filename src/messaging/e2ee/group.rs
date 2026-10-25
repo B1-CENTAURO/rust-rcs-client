@@ -248,6 +248,40 @@ impl E2eeDevice {
         Ok(cpim)
     }
 
+    /// The control message for the BYE of the user `from` leaving the group
+    /// chat `conversation_id`, the group `to`, for good: a ProposalList of
+    /// the self_remove Proposal of the device, which another member commits
+    /// (RCC.16 sections 7.9.4, 9.4)
+    ///
+    /// The other Clients of the user stay for that member to remove, as a
+    /// self_remove only ever removes the Client proposing it, and the
+    /// Conversation Focus takes no other Proposal (section 6.2.3). The MLS
+    /// group is kept until the Focus agrees to the leave.
+    pub fn leave_group(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<u8>, GroupError> {
+        let client_message = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                // a self_remove of an epoch the Commit is to end
+                if conversation.has_pending_commit() {
+                    return Ok(Err(GroupError::Pending));
+                }
+                conversation.leave_message(client).map(Ok)
+            })
+            .map_err(GroupError::Store)??;
+
+        let (message_id, cpim) = control_message(from, to, &client_message);
+        self.control_messages()
+            .lock()
+            .unwrap()
+            .insert(String::from(conversation_id), message_id);
+        Ok(cpim)
+    }
+
     /// The KeyPackages of all the Clients of each of `recipients`, as their
     /// Home KDS gives them (RCC.16 section 5.3)
     async fn key_packages(&self, recipients: Vec<Recipient>) -> Result<Vec<Vec<u8>>, GroupError> {
@@ -375,18 +409,16 @@ impl E2eeDevice {
             control_messages.remove(conversation_id);
         }
 
-        self.store()
-            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
-                conversation.discard_pending_commit(client)
-            })?;
+        self.drop_pending(conversation_id)?;
         Ok(Some(reason))
     }
 
-    /// Discards the pending Commit of the device in the group
-    /// `conversation_id`, the request carrying it answered with an error by
-    /// the Conversation Focus; its control message is forgotten unless a
-    /// refusal of it is to follow (RCC.16 sections 6.2.5, 7.2.6)
-    pub fn discard_commit(
+    /// Discards what the device has pending in the group `conversation_id`,
+    /// its Commit or the self_remove Proposal of its leave, the request
+    /// carrying it answered with an error by the Conversation Focus; its
+    /// control message is forgotten unless a refusal of it is to follow
+    /// (RCC.16 sections 6.2.5, 7.2.6)
+    pub fn discard_pending(
         &self,
         conversation_id: &str,
         refusal_follows: bool,
@@ -397,9 +429,17 @@ impl E2eeDevice {
                 .unwrap()
                 .remove(conversation_id);
         }
+        self.drop_pending(conversation_id)
+    }
+
+    /// Drops the pending Commit and Proposals of the device in the group
+    /// `conversation_id`, which the Conversation Focus did not take
+    fn drop_pending(&self, conversation_id: &str) -> Result<(), StoreError> {
         self.store()
             .with_conversation(conversation_id.as_bytes(), |conversation, client| {
-                conversation.discard_pending_commit(client)
+                conversation.discard_pending_commit(client)?;
+                // no Commit is made while its own self_remove is pending
+                conversation.withdraw_own_proposals(client)
             })
     }
 
@@ -623,10 +663,42 @@ impl GroupEncryption for DeviceGroups {
         })
     }
 
+    fn prepare_leave(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let device = self.device.clone();
+        let taken = Arc::clone(&self.taken);
+        let deadline = tokio::time::Instant::now() + self.acceptance_wait;
+        Box::pin(async move {
+            loop {
+                // told of what is taken from now on
+                let notified = taken.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                match device.upgrade()?.leave_group(&conversation_id, &from, &to) {
+                    Ok(cpim) => return Some(cpim),
+                    Err(GroupError::Pending) => {}
+                    Err(e) => {
+                        platform_log(LOG_TAG, format!("group not left: {:?}", e));
+                        return None;
+                    }
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    platform_log(LOG_TAG, "group not left, the Commit not accepted");
+                    return None;
+                }
+            }
+        })
+    }
+
     fn discard(&self, conversation_id: &str, refusal_follows: bool) {
         if let Some(device) = self.device.upgrade() {
-            if let Err(e) = device.discard_commit(conversation_id, refusal_follows) {
-                platform_log(LOG_TAG, format!("Commit not discarded: {:?}", e));
+            if let Err(e) = device.discard_pending(conversation_id, refusal_follows) {
+                platform_log(LOG_TAG, format!("Commit or leave not discarded: {:?}", e));
             }
         }
         // what waits for it is sent, or not, without it
