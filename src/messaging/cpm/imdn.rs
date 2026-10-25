@@ -261,7 +261,7 @@ pub fn send_group_imdn<F>(
         recipient_uri,
         callback,
     )
-    .raw();
+    .notification();
 
     session.send_message(message, rt);
 }

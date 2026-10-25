@@ -342,6 +342,45 @@ impl DeviceGroups {
         self.acceptance_wait = acceptance_wait;
         self
     }
+
+    /// What `make` makes of the CPIM message `cpim` in the group
+    /// `conversation_id`, once a Commit of the device the Conversation Focus
+    /// is yet to accept is, waiting for it no longer than the acceptance
+    /// wait; `failed` tells of it not made
+    fn once_accepted(
+        &self,
+        conversation_id: &str,
+        cpim: &[u8],
+        make: fn(&E2eeDevice, &str, &[u8]) -> Result<Vec<u8>, MessageError>,
+        failed: &'static str,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let device = self.device.clone();
+        let taken = Arc::clone(&self.taken);
+        let deadline = tokio::time::Instant::now() + self.acceptance_wait;
+        let conversation_id = String::from(conversation_id);
+        let cpim = cpim.to_vec();
+        Box::pin(async move {
+            loop {
+                // told of what is taken from now on
+                let notified = taken.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                match make(&*device.upgrade()?, &conversation_id, &cpim) {
+                    Ok(made) => return Some(made),
+                    Err(MessageError::Pending) => {}
+                    Err(e) => {
+                        platform_log(LOG_TAG, format!("{}: {:?}", failed, e));
+                        return None;
+                    }
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    platform_log(LOG_TAG, format!("{}, the Commit not accepted", failed));
+                    return None;
+                }
+            }
+        })
+    }
 }
 
 impl GroupEncryption for DeviceGroups {
@@ -422,32 +461,34 @@ impl GroupEncryption for DeviceGroups {
     }
 
     fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
-        let device = self.device.clone();
-        let taken = Arc::clone(&self.taken);
-        let deadline = tokio::time::Instant::now() + self.acceptance_wait;
-        let conversation_id = String::from(conversation_id);
-        let cpim = cpim.to_vec();
-        Box::pin(async move {
-            loop {
-                // told of what is taken from now on
-                let notified = taken.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
+        self.once_accepted(
+            conversation_id,
+            cpim,
+            E2eeDevice::encrypt_message,
+            "message not encrypted",
+        )
+    }
 
-                match device.upgrade()?.encrypt_message(&conversation_id, &cpim) {
-                    Ok(encrypted) => return Some(encrypted),
-                    Err(MessageError::Pending) => {}
-                    Err(e) => {
-                        platform_log(LOG_TAG, format!("message not encrypted: {:?}", e));
-                        return None;
-                    }
-                }
-                if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                    platform_log(LOG_TAG, "message not sent, the Commit not accepted");
-                    return None;
-                }
+    fn sign(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.once_accepted(
+            conversation_id,
+            cpim,
+            E2eeDevice::sign_notification,
+            "notification not signed",
+        )
+    }
+
+    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> bool {
+        let Some(device) = self.device.upgrade() else {
+            return false;
+        };
+        match device.verify_notification(conversation_id, cpim_info, imdn) {
+            Ok(()) => true,
+            Err(e) => {
+                platform_log(LOG_TAG, format!("notification not verified: {:?}", e));
+                false
             }
-        })
+        }
     }
 
     fn decrypt(

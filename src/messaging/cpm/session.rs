@@ -896,10 +896,21 @@ impl CPMSession {
 
                             while let Some(message) = message_rx.recv().await {
                                 let (content_type, data) = if message.raw {
-                                    (
-                                        message.message_type.as_bytes().to_vec(),
-                                        message.message_content.as_bytes().to_vec(),
-                                    )
+                                    let mut data = message.message_content.as_bytes().to_vec();
+                                    // a notification signed in an encrypted
+                                    // one, else sent unsigned as RCC.16 lets
+                                    // it be (sections 7.7.2.2, 9.1.3, 9.1.4)
+                                    if let (true, Some((encryption, conversation_id))) =
+                                        (message.signed, &encryption)
+                                    {
+                                        match encryption.sign(conversation_id, &data).await {
+                                            Some(signed) => data = signed,
+                                            None => {
+                                                platform_log(LOG_TAG, "notification sent unsigned")
+                                            }
+                                        }
+                                    }
+                                    (message.message_type.as_bytes().to_vec(), data)
                                 } else {
                                     let body = make_cpim_message_content_body(
                                         &message.message_type,
@@ -1309,6 +1320,7 @@ impl MsrpDataWriter for IsComposingWriter {
             to_uri: None,
             payload_type: None,
             disposition_notification: None,
+            mls_derived_content_signature: None,
         };
         (self.callback)(&info, &self.content_type, &self.data);
         Ok(())
@@ -1486,21 +1498,26 @@ impl CPMSessionService {
                     }
                     return;
                 }
-                // the Conversation Focus refusing a control message of this
-                // client tells the encryption, not the app (RCC.16 section
-                // 6.2.5)
                 if is_media_type(content_type, "message/imdn+xml") {
                     let inner = session.get_inner();
                     let session_info = inner.get_session_info();
-                    let refused = session_info
+                    if let Some((encryption, conversation_id)) = session_info
                         .encryption
                         .as_ref()
                         .zip(session_info.conversation_id.as_ref())
-                        .is_some_and(|(encryption, conversation_id)| {
-                            encryption.on_imdn(conversation_id, content_body)
-                        });
-                    if refused {
-                        return;
+                    {
+                        // the Conversation Focus refusing a control message
+                        // of this client tells the encryption, not the app
+                        // (RCC.16 section 6.2.5)
+                        if encryption.on_imdn(conversation_id, content_body) {
+                            return;
+                        }
+                        // nor is one not signed by whom it is from (section
+                        // 7.6.2)
+                        if !encryption.verify(conversation_id, cpim_info, content_body) {
+                            platform_log(LOG_TAG, "notification not taken, its signature not good");
+                            return;
+                        }
                     }
                 }
                 if !content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS_RCS_SERVER) {
