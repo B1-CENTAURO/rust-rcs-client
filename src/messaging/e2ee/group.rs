@@ -41,7 +41,7 @@ use uuid::Uuid;
 use crate::capability::CapabilityQuery;
 use crate::messaging::cpm::encryption::GroupEncryption;
 
-use super::device::{participant_tel_uri, E2eeDevice, CIPHERSUITE};
+use super::device::{is_of, participant_tel_uri, E2eeDevice, CIPHERSUITE};
 use super::kds::{fetch_key_packages, Fetched, KdsError, Recipient};
 use super::message::MessageError;
 use super::store::StoreError;
@@ -60,6 +60,9 @@ pub enum GroupError {
     NotEncryptable(String, Fetched),
     /// A Commit of the device waits for the Conversation Focus to accept it
     Pending,
+    /// No Client of the Participant, by its tel URI, is a member the device
+    /// can remove: the user leaves instead (RCC.16 section 9.4)
+    NotMember(String),
     Store(StoreError),
 }
 
@@ -184,6 +187,58 @@ impl E2eeDevice {
                 })
             })
             .map_err(GroupError::Store)?;
+
+        let (message_id, cpim) = control_message(from, to, &client_message);
+        self.control_messages()
+            .lock()
+            .unwrap()
+            .insert(String::from(conversation_id), message_id);
+        Ok(cpim)
+    }
+
+    /// Removes all the Clients of the participant at `tel_uri` from the MLS
+    /// group `conversation_id`: the CPIM message, `from` and `to` its own,
+    /// carrying the `message/mls-rcs-client` the REFER removing the
+    /// participant is to carry (RCC.16 sections 7.9.2, 9.3)
+    ///
+    /// Not while a Commit of the device waits for the Conversation Focus to
+    /// accept it. The Commit is applied once the Focus accepts it or forwards
+    /// it back, or discarded if it refuses it.
+    pub fn remove_from_group(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        tel_uri: &str,
+    ) -> Result<Vec<u8>, GroupError> {
+        let client_message = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                if conversation.has_pending_commit() {
+                    return Ok(Err(GroupError::Pending));
+                }
+                // the user leaves rather than removes itself
+                if is_of(client.credential(), tel_uri) {
+                    return Ok(Err(GroupError::NotMember(String::from(tel_uri))));
+                }
+                let removed: Vec<_> = conversation
+                    .members()
+                    .into_iter()
+                    .filter(|member| is_of(member, tel_uri))
+                    .collect();
+                if removed.is_empty() {
+                    return Ok(Err(GroupError::NotMember(String::from(tel_uri))));
+                }
+                let output = conversation.remove_members(client, &removed)?;
+                match output.to_client_message() {
+                    Ok(client_message) => Ok(Ok(client_message)),
+                    Err(e) => {
+                        conversation.discard_pending_commit(client)?;
+                        Err(e)
+                    }
+                }
+            })
+            .map_err(GroupError::Store)??;
 
         let (message_id, cpim) = control_message(from, to, &client_message);
         self.control_messages()
@@ -525,6 +580,43 @@ impl GroupEncryption for DeviceGroups {
                 drop(device);
                 if tokio::time::timeout_at(deadline, notified).await.is_err() {
                     platform_log(LOG_TAG, "participants not added, the Commit not accepted");
+                    return None;
+                }
+            }
+        })
+    }
+
+    fn prepare_remove(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participant: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let device = self.device.clone();
+        let taken = Arc::clone(&self.taken);
+        let deadline = tokio::time::Instant::now() + self.acceptance_wait;
+        Box::pin(async move {
+            let tel_uri = participant_tel_uri(std::iter::once(participant.as_str()), None)?;
+            loop {
+                // told of what is taken from now on
+                let notified = taken.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                match device
+                    .upgrade()?
+                    .remove_from_group(&conversation_id, &from, &to, &tel_uri)
+                {
+                    Ok(cpim) => return Some(cpim),
+                    Err(GroupError::Pending) => {}
+                    Err(e) => {
+                        platform_log(LOG_TAG, format!("participant not removed: {:?}", e));
+                        return None;
+                    }
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    platform_log(LOG_TAG, "participant not removed, the Commit not accepted");
                     return None;
                 }
             }

@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rust_rcs_core::mls::rcs::certificate::RcsCredentialValidator;
-use rust_rcs_core::mls::rcs::{MlsCapability, MLS_VERSION_V1};
+use rust_rcs_core::mls::rcs::{credential_tel_uris, same_tel_uri, MlsCapability, MLS_VERSION_V1};
 use rust_rcs_core::mls::{
-    Ciphersuite, CredentialValidator, ErrorKind, MlsConfig, SignatureKeyPair,
+    Ciphersuite, Credential, CredentialValidator, ErrorKind, MlsConfig, SignatureKeyPair,
 };
 
 use crate::provisioning::ims_application::ImsApplication;
@@ -222,6 +222,15 @@ impl E2eeDevice {
         self.make_signer = Box::new(make_signer);
         self
     }
+}
+
+/// Whether `told`, the tel URI of a participant, is one of those of the
+/// credential `credential`
+pub(super) fn is_of(credential: &Credential, told: &str) -> bool {
+    credential_tel_uris(credential)
+        .unwrap_or_default()
+        .iter()
+        .any(|uri| same_tel_uri(uri, told))
 }
 
 /// The tel URI of the user: one of its public user identities, else the

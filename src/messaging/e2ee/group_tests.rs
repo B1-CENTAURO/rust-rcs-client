@@ -22,8 +22,8 @@ use rust_rcs_core::internet::Body;
 use rust_rcs_core::mls::rcs::certificate::CertificateError;
 use rust_rcs_core::mls::rcs::proto::{
     self, client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage,
-    ClientMlsRcsMessage, EpochIdentifier, MlsGroupInfo, ServerCommitBundle, ServerMlsRcsMessage,
-    WelcomeCommitBundle,
+    ClientMlsRcsMessage, CommitBundle, EpochIdentifier, MlsGroupInfo, ServerCommitBundle,
+    ServerMlsRcsMessage, WelcomeCommitBundle,
 };
 use rust_rcs_core::mls::rcs::wire::{
     self, encode_message_list, AuthenticatedData, DeliveryNotificationStatus,
@@ -2283,6 +2283,178 @@ fn the_groups_of_the_device_are_added_to_once_its_commit_is_accepted() {
             String::from(IMPU),
             String::from(GROUP_URI),
             vec![String::from(BOB_TEL)],
+        )),
+        None
+    );
+}
+
+/// The bundle of a Commit without Welcome the CPIM message `cpim` carries
+fn commit_bundle_of(cpim: &[u8]) -> CommitBundle {
+    let message = cpim_message(cpim);
+    let (content_type, content, _) = message.get_message_body().unwrap();
+    assert_eq!(content_type, Some(CONTENT_TYPE_MLS_RCS_CLIENT));
+    match proto::decode::<ClientMlsRcsMessage>(content)
+        .unwrap()
+        .payload
+    {
+        Some(client_mls_rcs_message::Payload::CommitBundle(bundle)) => bundle,
+        _ => panic!("not a CommitBundle"),
+    }
+}
+
+#[test]
+fn a_participant_is_removed_with_all_of_its_clients() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let cpim = device
+        .remove_from_group(CONVERSATION, IMPU, GROUP_URI, BOB_TEL)
+        .unwrap();
+
+    // the Commit, the GroupInfo and the Epoch Authenticator (RCC.16 section
+    // 7.9.2), in a control message from the user to the group
+    let info = cpim_message(&cpim);
+    let info = info.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"negative-delivery"[..])
+    );
+    let bundle = commit_bundle_of(&cpim);
+    assert!(!bundle.group_info.is_empty());
+    assert!(!bundle.epoch_authenticator.is_empty());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+
+    // applied once forwarded back, Bob out of the group
+    let forwarded = ServerCommitBundle {
+        commit_list: bundle.commit_list.clone(),
+        ..ServerCommitBundle::default()
+    };
+    match device
+        .on_server_message(
+            CONVERSATION,
+            &proto::encode(&ServerMlsRcsMessage {
+                payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+                    forwarded.clone(),
+                )),
+            }),
+        )
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { removed, .. }] => {
+            assert_eq!(removed, &vec![credential(&[BOB, CA])])
+        }
+        other => panic!("{} messages", other.len()),
+    }
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    assert!(matches!(
+        bobs_group
+            .process_commit_bundle(&bob, &forwarded)
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Commit {
+            self_removed: true,
+            ..
+        }]
+    ));
+
+    // reading nothing sent after
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-19", None))
+        .unwrap();
+    let sent = cpim_message(&sent);
+    let (_, mls_message, _) = sent.get_message_body().unwrap();
+    assert!(bobs_group
+        .decrypt(&bob, mls_message, sent.get_info().unwrap().imdn_message_id)
+        .is_err());
+}
+
+#[test]
+fn a_participant_is_not_removed_unless_it_can_be() {
+    let (device, _, _) = alice_and_bob();
+    // none of whose Clients is a member, or the user, who leaves instead
+    for tel_uri in [CAROL_TEL, ALICE_TEL] {
+        assert_eq!(
+            device.remove_from_group(CONVERSATION, IMPU, GROUP_URI, tel_uri),
+            Err(GroupError::NotMember(String::from(tel_uri)))
+        );
+    }
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert_eq!(
+        device.remove_from_group("another", IMPU, GROUP_URI, BOB_TEL),
+        Err(GroupError::Store(StoreError::Mls(ErrorKind::UnknownGroup)))
+    );
+
+    // nor while a Commit of the device waits
+    let (device, _) = group_made();
+    assert_eq!(
+        device.remove_from_group(CONVERSATION, IMPU, GROUP_URI, BOB_TEL),
+        Err(GroupError::Pending)
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, true)));
+}
+
+#[test]
+fn the_participants_of_the_groups_of_the_device_are_removed_once_its_commit_is_accepted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, message_id) = group_made();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // Bob, by the SIP URI of his number
+    let removing = rt.spawn(groups.prepare_remove(
+        String::from(CONVERSATION),
+        String::from(IMPU),
+        String::from(GROUP_URI),
+        String::from("sip:+491707654321@ims.example.com"),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!removing.is_finished(), "waits for the Commit");
+    groups.on_server_message(
+        CONVERSATION,
+        &accepted(epoch_identifier(&device, CONVERSATION)),
+    );
+    let cpim = rt
+        .block_on(removing)
+        .unwrap()
+        .expect("removed once accepted");
+    assert!(!commit_bundle_of(&cpim).commit_list.is_empty());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+    // its control message the one now known
+    assert!(!groups.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")));
+    let removal_id = String::from_utf8(
+        cpim_message(&cpim)
+            .get_info()
+            .unwrap()
+            .imdn_message_id
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(groups.on_imdn(CONVERSATION, &refusal(&removal_id, "invalid-commit")));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    // nor one who is no member, nor by a URI of no number, nor once the
+    // device is let go of
+    for participant in ["sip:+491700000001@ims.example.com", "sip:bob@example.com"] {
+        assert_eq!(
+            rt.block_on(groups.prepare_remove(
+                String::from(CONVERSATION),
+                String::from(IMPU),
+                String::from(GROUP_URI),
+                String::from(participant),
+            )),
+            None,
+            "{}",
+            participant
+        );
+    }
+    drop(device);
+    assert_eq!(
+        rt.block_on(groups.prepare_remove(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            String::from(BOB_TEL),
         )),
         None
     );

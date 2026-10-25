@@ -107,6 +107,20 @@ pub trait GroupEncryption: Send + Sync {
         participants: Vec<String>,
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
+    /// The CPIM message carrying a `message/mls-rcs-client` that a REFER
+    /// removing `participant` from the group chat `conversation_id` is to
+    /// carry, `from` and `to` that of the CPIM message (RCC.16 sections
+    /// 7.9.2, 9.3), once a Commit of this client the Conversation Focus is
+    /// yet to accept is; None if it is not to be removed, as when none of its
+    /// Clients is a member
+    fn prepare_remove(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participant: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>>;
+
     /// Lets go of the Commit of this client in the group chat
     /// `conversation_id`, as the Conversation Focus answered the request
     /// carrying it with an error, a refusal of it to follow if
