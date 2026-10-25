@@ -42,7 +42,9 @@ use rust_rcs_core::sip::{
 
 use crate::messaging::ffi::RecipientType;
 
-use super::encryption::{GroupEncryption, GroupInfoPull};
+use super::encryption::{
+    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Verified,
+};
 use super::group_chat::GroupIds;
 use super::imdn::{
     acknowledge_delivery, acknowledge_group_delivery, ImdnService, ReceivedMessages,
@@ -346,6 +348,7 @@ pub fn start(registered: bool) -> (Client, Peer) {
                 ),
                 CPMGroupEvent::Left(group) => format!("left {}", group),
                 CPMGroupEvent::InvitationWithdrawn(group) => format!("withdrawn {}", group),
+                CPMGroupEvent::EncryptionEnded(group) => format!("unencrypted {}", group),
                 // apart, as the app keeps them
                 CPMGroupEvent::Ids(ids) => {
                     let _ = group_ids_tx.lock().unwrap().send(ids);
@@ -2102,6 +2105,8 @@ struct ScriptedEncryption {
     leave_held: Option<Arc<tokio::sync::Notify>>,
     /// Whether what the focus sends carries Proposals
     proposing: bool,
+    /// Whether what the focus sends moves its groups to unencrypted
+    ending_by_focus: bool,
     /// The CPIM message it prepares for committing leaves, if any
     committing: Option<Vec<u8>>,
     /// The Conversation-ID, from and to of each commit of leaves
@@ -2126,6 +2131,14 @@ struct ScriptedEncryption {
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     /// Whether the IMDNs it is given refuse a control message of the client
     refusing: bool,
+    /// Whether the IMDNs it is given tell a recipient cannot decrypt
+    unavailable: bool,
+    /// The CPIM message it prepares for moving to unencrypted, if any
+    ending: Option<Vec<u8>>,
+    /// The Conversation-ID, from, to and reason of each move to unencrypted
+    ended: std::sync::Mutex<Vec<(String, String, String, EndReason)>>,
+    /// Whether its groups were moved to unencrypted
+    unencrypted: bool,
     /// The Conversation-ID and IMDN of each IMDN received in its groups
     imdns: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     abandoned: std::sync::Mutex<Vec<String>>,
@@ -2143,6 +2156,8 @@ struct ScriptedEncryption {
     signed: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     /// Whether the notifications received in its groups are for the app
     verifying: bool,
+    /// Whether they are not signed
+    unsigned: bool,
     /// The Conversation-ID, CPIM From and IMDN of each notification to check
     verified: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
     /// The Conversation-ID, CPIM From and Message-ID, and content of each
@@ -2257,20 +2272,44 @@ impl GroupEncryption for ScriptedEncryption {
         self.joining
     }
 
-    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> bool {
+    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> Taken {
         self.server_messages
             .lock()
             .unwrap()
             .push((String::from(conversation_id), body.to_vec()));
-        self.proposing
+        Taken {
+            proposals: self.proposing,
+            encryption_ended: self.ending_by_focus,
+        }
     }
 
-    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool {
+    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> ImdnTold {
         self.imdns
             .lock()
             .unwrap()
             .push((String::from(conversation_id), imdn.to_vec()));
-        self.refusing
+        if self.refusing {
+            ImdnTold::Refusal
+        } else if self.unavailable {
+            ImdnTold::EncryptionNotAvailable
+        } else {
+            ImdnTold::Nothing
+        }
+    }
+
+    fn end_encryption(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        reason: EndReason,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.ended
+            .lock()
+            .unwrap()
+            .push((conversation_id, from, to, reason));
+        let cpim = self.ending.clone();
+        Box::pin(async move { cpim })
     }
 
     fn abandon(&self, conversation_id: &str) {
@@ -2312,13 +2351,21 @@ impl GroupEncryption for ScriptedEncryption {
         self.encrypting.iter().any(|id| id == conversation_id)
     }
 
-    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
+    fn encryption_ended(&self, _conversation_id: &str) -> bool {
+        self.unencrypted
+    }
+
+    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Sealed> {
         self.encrypted
             .lock()
             .unwrap()
             .push((String::from(conversation_id), cpim.to_vec()));
-        let ciphertext = self.ciphertext.clone().map(String::into_bytes);
-        Box::pin(async move { ciphertext })
+        let sealed = match &self.ciphertext {
+            _ if self.unencrypted => Sealed::Unencrypted,
+            Some(ciphertext) => Sealed::Encrypted(ciphertext.clone().into_bytes()),
+            None => Sealed::Failed,
+        };
+        Box::pin(async move { sealed })
     }
 
     fn sign(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
@@ -2330,13 +2377,19 @@ impl GroupEncryption for ScriptedEncryption {
         Box::pin(async move { signature })
     }
 
-    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> bool {
+    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> Verified {
         self.verified.lock().unwrap().push((
             String::from(conversation_id),
             String::from_utf8_lossy(cpim_info.from).into_owned(),
             imdn.to_vec(),
         ));
-        self.verifying
+        if self.unsigned {
+            Verified::Unsigned
+        } else if self.verifying {
+            Verified::Signed
+        } else {
+            Verified::Forged
+        }
     }
 
     fn decrypt(
@@ -2972,12 +3025,22 @@ impl GroupEncryption for EncryptingPrepared {
         self.0.join(conversation_id, server_message)
     }
 
-    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> bool {
+    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> Taken {
         self.0.on_server_message(conversation_id, body)
     }
 
-    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool {
+    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> ImdnTold {
         self.0.on_imdn(conversation_id, imdn)
+    }
+
+    fn end_encryption(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        reason: EndReason,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.end_encryption(conversation_id, from, to, reason)
     }
 
     fn abandon(&self, conversation_id: &str) {
@@ -3007,7 +3070,11 @@ impl GroupEncryption for EncryptingPrepared {
             .any(|(prepared, _, _, _)| prepared == conversation_id)
     }
 
-    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
+    fn encryption_ended(&self, conversation_id: &str) -> bool {
+        self.0.encryption_ended(conversation_id)
+    }
+
+    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Sealed> {
         self.0.encrypt(conversation_id, cpim)
     }
 
@@ -3015,7 +3082,7 @@ impl GroupEncryption for EncryptingPrepared {
         self.0.sign(conversation_id, cpim)
     }
 
-    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> bool {
+    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> Verified {
         self.0.verify(conversation_id, cpim_info, imdn)
     }
 
@@ -5338,4 +5405,222 @@ fn the_info_requests_of_a_self_healing_carry_the_mls_opaque_token() {
         !encryption.healed.lock().unwrap().is_empty()
     });
     assert!(healed);
+}
+
+/// What the scripted encryption makes a Commit moving a group to unencrypted
+/// carry
+const ENDING_CPIM: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x0b\x0cending";
+
+/// The client with the group `conversation-1` encrypted, its notifications
+/// signed and moved to unencrypted with ENDING_CPIM, the encryption otherwise
+/// as `scripted`
+fn ending_in(client: &Client, scripted: ScriptedEncryption) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        verifying: true,
+        ending: Some(ENDING_CPIM.to_vec()),
+        ..scripted
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+#[test]
+fn what_a_client_not_encrypting_sends_moves_the_group_to_unencrypted() {
+    for (call_id, scripted, cpim, reason) in [
+        // a message
+        (
+            "group-ending-1",
+            ScriptedEncryption::default(),
+            group_cpim(ALICE, "", "plain"),
+            EndReason::ClientFailureEncryptionNotAvailable,
+        ),
+        (
+            "group-ending-2",
+            ScriptedEncryption::default(),
+            group_cpim(ALICE, "", "<file/>")
+                .replace("text/plain", "application/vnd.gsma.rcs-ft-http+xml"),
+            EndReason::ClientFailureEncryptionNotAvailable,
+        ),
+        // a notification not signed
+        (
+            "group-ending-3",
+            ScriptedEncryption {
+                unsigned: true,
+                ..ScriptedEncryption::default()
+            },
+            group_imdn_cpim("message-1", "<delivered/>"),
+            EndReason::ClientFailureEncryptionNotAvailable,
+        ),
+        // the focus telling a recipient cannot decrypt
+        (
+            "group-ending-4",
+            ScriptedEncryption {
+                unavailable: true,
+                ..ScriptedEncryption::default()
+            },
+            group_imdn_cpim(
+                "message-1",
+                "<failed><mls-server-failure-reason><encryption-not-available/></mls-server-failure-reason></failed>",
+            ),
+            EndReason::ServerFailureEncryptionNotAvailable,
+        ),
+    ] {
+        let (client, mut peer) = start(true);
+        let rt = Arc::clone(&client.rt);
+        let encryption = ending_in(&client, scripted);
+        let (mut connection, msrp_path, our_path) =
+            joined_encrypted_group(&client, &mut peer, call_id);
+        connection.send_content(&rt, &msrp_path, &our_path, "message/cpim", &cpim);
+        assert!(connection.next_response(&rt).first_line.contains(" 200"));
+
+        // given to the app all the same
+        assert!(
+            client.received.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "{}",
+            call_id
+        );
+        // the Commit, as it is, for the focus (RCC.16 sections 9.5.1, 11.2)
+        let send = connection.next_message(&rt);
+        assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+        assert_eq!(send.body, ENDING_CPIM, "{}", call_id);
+        connection.respond(&rt, &send, "200 OK");
+        assert_eq!(
+            *encryption.ended.lock().unwrap(),
+            [(
+                String::from("conversation-1"),
+                String::from(IMPU),
+                String::from(GROUP),
+                reason
+            )],
+            "{}",
+            call_id
+        );
+    }
+}
+
+#[test]
+fn what_is_not_an_rcs_message_does_not_move_the_group_to_unencrypted() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = ending_in(&client, ScriptedEncryption::default());
+    let (mut connection, msrp_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-not-ending");
+
+    // an is-composing, a notification signed, nor what the focus sends
+    for (content_type, content) in [
+        (
+            "application/im-iscomposing+xml",
+            super::is_composing_document(true),
+        ),
+        ("message/cpim", group_imdn_cpim("message-1", "<delivered/>")),
+        ("message/cpim", from_the_focus("a control message")),
+    ] {
+        connection.send_content(&rt, &msrp_path, &our_path, content_type, &content);
+        assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    }
+    for _ in 0..2 {
+        assert!(client.received.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    // only a message the next does
+    connection.send_cpim(&rt, &msrp_path, &our_path, &group_cpim(ALICE, "", "plain"));
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| r.2),
+        Ok(String::from("plain"))
+    );
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, ENDING_CPIM);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(encryption.ended.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn the_messages_of_a_group_moved_to_unencrypted_are_sent_as_they_are() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = ending_in(
+        &client,
+        ScriptedEncryption {
+            unencrypted: true,
+            ciphertext: Some(String::from(CIPHERTEXT)),
+            ..ScriptedEncryption::default()
+        },
+    );
+    let (mut connection, msrp_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-unencrypted");
+
+    let result = client.send_with_id(GROUP, RecipientType::Group, "hello all", "plain-1");
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    let cpim = CPIMMessage::try_from(&Body::construct_message(&send.body).unwrap()).unwrap();
+    assert_eq!(
+        id_and_dispositions(&cpim),
+        (String::from("plain-1"), DELIVERY_AND_DISPLAY)
+    );
+    assert_eq!(cpim_text(&send.body), "hello all");
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    assert_eq!(encryption.encrypted.lock().unwrap().len(), 1);
+
+    // nor is it moved to unencrypted again by what others send so
+    connection.send_cpim(&rt, &msrp_path, &our_path, &group_cpim(ALICE, "", "plain"));
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| r.2),
+        Ok(String::from("plain"))
+    );
+    assert!(encryption.ended.lock().unwrap().is_empty());
+    connection.quiet(&rt);
+}
+
+#[test]
+fn a_group_moved_to_unencrypted_is_told_to_the_app() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = ending_in(
+        &client,
+        ScriptedEncryption {
+            ending_by_focus: true,
+            ..ScriptedEncryption::default()
+        },
+    );
+    let (mut connection, msrp_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-ended");
+
+    connection.send_content(
+        &rt,
+        &msrp_path,
+        &our_path,
+        "message/cpim",
+        &from_the_focus("an end_mls Commit"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let unencrypted = format!("unencrypted {}", GROUP);
+    let told = std::iter::from_fn(|| {
+        client
+            .group_events
+            .recv_timeout(Duration::from_secs(5))
+            .ok()
+    })
+    .any(|event| event == unencrypted);
+    assert!(told);
+    assert_eq!(encryption.server_messages.lock().unwrap().len(), 1);
+    // nothing sent of it
+    assert!(encryption.ended.lock().unwrap().is_empty());
+    connection.quiet(&rt);
 }

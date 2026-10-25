@@ -242,6 +242,29 @@ impl MlsStore {
         result.map_err(StoreError::Mls)
     }
 
+    /// What `f` reads of the group `group_id`, which it does not change, so
+    /// that nothing is saved
+    pub fn peek_conversation<R, F>(&self, group_id: &[u8], f: F) -> Result<R, StoreError>
+    where
+        F: FnOnce(&MlsConversation) -> R,
+    {
+        let mut state = self.state.lock().unwrap();
+        let State {
+            client,
+            conversations,
+            ..
+        } = &mut *state;
+        let client = client.as_ref().ok_or(StoreError::NoClient)?;
+
+        if !conversations.contains_key(group_id) {
+            let conversation = client
+                .load_conversation(group_id)
+                .map_err(StoreError::Mls)?;
+            conversations.insert(group_id.to_vec(), conversation);
+        }
+        Ok(f(conversations.get(group_id).unwrap()))
+    }
+
     /// Whether the group `group_id` is kept, as with_conversation() would
     /// find it; nothing is changed or saved
     pub fn has_conversation(&self, group_id: &[u8]) -> bool {

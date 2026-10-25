@@ -59,6 +59,9 @@ pub enum MessageError {
     /// A notification signed by another member than the participant it is
     /// from
     NotFromSigner,
+    /// The group chat is no longer encrypted, its MLS group having the
+    /// end_mls extension (RCC.16 section 11.2)
+    NotEncrypted,
     Store(StoreError),
 }
 
@@ -218,14 +221,21 @@ impl E2eeDevice {
             let _ = reader.read_to_end(&mut payload);
         }
 
-        let (pending, epoch) = self
+        let (pending, epoch, ended) = self
             .store()
             .with_conversation(conversation_id.as_bytes(), |conversation, _| {
-                Ok((conversation.has_pending_commit(), conversation.epoch()))
+                Ok((
+                    conversation.has_pending_commit(),
+                    conversation.epoch(),
+                    conversation.is_encryption_ended(),
+                ))
             })
             .map_err(MessageError::Store)?;
         if pending {
             return Err(MessageError::Pending);
+        }
+        if ended {
+            return Err(MessageError::NotEncrypted);
         }
         // the group of the device alone, as no Commit was applied to it
         if epoch == 0 {
@@ -369,18 +379,23 @@ impl E2eeDevice {
             .ok_or(MessageError::NotCpim)?
             + 2;
 
-        let (pending, epoch, era) = self
+        let (pending, epoch, era, ended) = self
             .store()
             .with_conversation(conversation_id.as_bytes(), |conversation, _| {
                 Ok((
                     conversation.has_pending_commit(),
                     conversation.epoch(),
                     conversation.era(),
+                    conversation.is_encryption_ended(),
                 ))
             })
             .map_err(MessageError::Store)?;
         if pending {
             return Err(MessageError::Pending);
+        }
+        // sent unsigned, as in an unencrypted group chat
+        if ended {
+            return Err(MessageError::NotEncrypted);
         }
         if epoch == 0 {
             return Err(MessageError::NotCreated);
@@ -419,13 +434,17 @@ impl E2eeDevice {
     /// 7.6.2, 9.1.3, 9.1.4)
     ///
     /// A negative delivery may come unsigned: the Conversation Focus sends
-    /// its own so, and a client that cannot sign one (section 7.7.2).
+    /// its own so, and a client that cannot sign one (section 7.7.2). Any
+    /// notification may, once the group chat is unencrypted (section 11.2).
     pub fn verify_notification(
         &self,
         conversation_id: &str,
         cpim_info: &CPIMInfo,
         imdn: &[u8],
     ) -> Result<(), MessageError> {
+        if self.encryption_ended(conversation_id) {
+            return Ok(());
+        }
         let Some(signature) = cpim_info.mls_derived_content_signature else {
             return match Imdn::from_xml(imdn) {
                 Some(notification) if notification.status == Status::Failed => Ok(()),
