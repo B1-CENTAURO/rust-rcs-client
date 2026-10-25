@@ -2986,8 +2986,6 @@ fn group_session<'s>(
         .map(|(_, sip_session)| sip_session)
 }
 
-/// What ending the session with the group at `conference_uri` takes, if
-/// there is such a session and it has not ended
 /// Self-heals the MLS group of `session` if it needs to be, as
 /// SessionEnd::heal_if_needed() does
 fn heal_if_needed(session: &Arc<SipSession<CPMSession>>) {
@@ -2996,6 +2994,8 @@ fn heal_if_needed(session: &Arc<SipSession<CPMSession>>) {
     }
 }
 
+/// What ending the session with the group at `conference_uri` takes, if
+/// there is such a session and it has not ended
 fn group_session_end(
     sessions: &[(ContactKnownIdentities, Arc<SipSession<CPMSession>>)],
     conference_uri: &str,
