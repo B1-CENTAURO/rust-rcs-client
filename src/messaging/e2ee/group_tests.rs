@@ -22,8 +22,9 @@ use rust_rcs_core::internet::Body;
 use rust_rcs_core::mls::rcs::certificate::CertificateError;
 use rust_rcs_core::mls::rcs::proto::{
     self, client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage,
-    ClientMlsRcsMessage, CommitBundle, EpochControlMessages, EpochIdentifier, MlsEnhancedGroupInfo,
-    MlsGroupInfo, ServerCommitBundle, ServerMlsRcsMessage, WelcomeCommitBundle,
+    ClientMlsRcsMessage, CommitBundle, EndMlsReason, EpochControlMessages, EpochIdentifier,
+    MlsEnhancedGroupInfo, MlsGroupInfo, ServerCommitBundle, ServerMlsRcsMessage,
+    WelcomeCommitBundle,
 };
 use rust_rcs_core::mls::rcs::wire::{
     self, encode_message_list, AuthenticatedData, DeliveryNotificationStatus,
@@ -38,7 +39,9 @@ use rust_rcs_core::mls::rcs::{
 use rust_rcs_core::mls::{ErrorKind, IncomingMessage, MlsClient, MlsConfig, MlsConversation};
 
 use crate::capability::{Capabilities, CapabilityQuery};
-use crate::messaging::cpm::encryption::{GroupEncryption, GroupInfoPull};
+use crate::messaging::cpm::encryption::{
+    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Verified,
+};
 use crate::messaging::cpm::make_cpim_imdn_body;
 
 use super::device::{E2eeDevice, Enrolled, CIPHERSUITE};
@@ -131,6 +134,14 @@ fn bob_with_key_package() -> (MlsClient, Vec<u8>) {
     let bob = bob();
     let key_package = bob.generate_key_package(false).unwrap();
     (bob, key_package)
+}
+
+/// The CPIM message `sealed` carries, if the message was encrypted
+fn ciphertext(sealed: Sealed) -> Option<Vec<u8>> {
+    match sealed {
+        Sealed::Encrypted(cpim) => Some(cpim),
+        _ => None,
+    }
 }
 
 /// The epoch of the group `conversation_id` of `device`, and whether a
@@ -1126,7 +1137,7 @@ fn messages_wait_for_the_focus_to_accept_the_commit_of_the_group() {
         CONVERSATION,
         &accepted(epoch_identifier(&device, CONVERSATION)),
     );
-    let encrypted = rt.block_on(waiting).unwrap().expect("sent once accepted");
+    let encrypted = ciphertext(rt.block_on(waiting).unwrap()).expect("sent once accepted");
     assert_eq!(
         cpim_message(&encrypted).get_info().unwrap().imdn_message_id,
         b"message-7"
@@ -1150,17 +1161,20 @@ fn messages_are_not_sent_in_a_group_whose_commit_is_not_accepted() {
             )
             .await
         }),
-        Ok(None),
+        Ok(Sealed::Failed),
         "given up after the wait"
     );
 
     // nor what cannot be, nor once the device is let go of
-    assert_eq!(rt.block_on(groups.encrypt(CONVERSATION, b"not CPIM")), None);
+    assert_eq!(
+        rt.block_on(groups.encrypt(CONVERSATION, b"not CPIM")),
+        Sealed::Failed
+    );
     drop(device);
     assert!(!groups.encrypts(CONVERSATION));
     assert_eq!(
         rt.block_on(groups.encrypt(CONVERSATION, &plaintext("message-9", None))),
-        None
+        Sealed::Failed
     );
 }
 
@@ -1501,10 +1515,8 @@ fn a_commit_of_another_applied_first_voids_the_one_of_the_device() {
     let output = bobs_group.update_keys(&bob).unwrap();
     bobs_group.merge_pending_commit(&bob).unwrap();
     groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit]));
-    let sent = rt
-        .block_on(waiting)
-        .unwrap()
-        .expect("sent in the epoch of the other Commit");
+    let sent =
+        ciphertext(rt.block_on(waiting).unwrap()).expect("sent in the epoch of the other Commit");
     assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
     assert!(
         String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
@@ -1631,26 +1643,35 @@ fn messages_waiting_for_a_commit_the_focus_refuses_are_not_sent() {
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(!waiting.is_finished(), "waits for the Commit");
 
-    assert!(!groups.on_imdn(CONVERSATION, &refusal("another", "invalid-commit")));
+    assert_eq!(
+        groups.on_imdn(CONVERSATION, &refusal("another", "invalid-commit")),
+        ImdnTold::Nothing
+    );
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert!(!waiting.is_finished());
 
     // the reason where section 6.2.5 places it
-    assert!(groups.on_imdn(
-        CONVERSATION,
-        &imdn_with(&message_id, "<failed/>", INVALID_COMMIT)
-    ));
+    assert_eq!(
+        groups.on_imdn(
+            CONVERSATION,
+            &imdn_with(&message_id, "<failed/>", INVALID_COMMIT)
+        ),
+        ImdnTold::Refusal
+    );
     assert_eq!(
         rt.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(5), waiting).await
         })
         .map(|sent| sent.unwrap()),
-        Ok(None),
+        Ok(Sealed::Failed),
         "not sent, at once"
     );
 
     drop(device);
-    assert!(!groups.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")));
+    assert_eq!(
+        groups.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")),
+        ImdnTold::Nothing
+    );
 }
 
 /// An IMDN document of `message_id`, its notification `notification` with
@@ -1961,14 +1982,23 @@ fn the_notifications_of_the_groups_of_the_device_are_signed_once_its_commit_is_a
     ));
     let cpim = signed_by_bob(&bob, &mut bobs_group, BOB_TEL, "imdn-13", &mine, content);
     let info = cpim_message(&cpim);
-    assert!(groups.verify(CONVERSATION, &info.get_info().unwrap(), mine.as_bytes()));
+    assert_eq!(
+        groups.verify(CONVERSATION, &info.get_info().unwrap(), mine.as_bytes()),
+        Verified::Signed
+    );
     let unsigned = cpim_message(&notification_cpim(BOB_TEL, "imdn-14", "", &mine));
-    assert!(!groups.verify(CONVERSATION, &unsigned.get_info().unwrap(), mine.as_bytes()));
+    assert_eq!(
+        groups.verify(CONVERSATION, &unsigned.get_info().unwrap(), mine.as_bytes()),
+        Verified::Unsigned
+    );
 
     // nor what cannot be, nor once the device is let go of
     assert_eq!(rt.block_on(groups.sign(CONVERSATION, b"not CPIM")), None);
     drop(device);
-    assert!(!groups.verify(CONVERSATION, &info.get_info().unwrap(), mine.as_bytes()));
+    assert_eq!(
+        groups.verify(CONVERSATION, &info.get_info().unwrap(), mine.as_bytes()),
+        Verified::Forged
+    );
     assert_eq!(
         rt.block_on(groups.sign(CONVERSATION, &notification_cpim(IMPU, "imdn-15", "", &xml))),
         None
@@ -2266,7 +2296,10 @@ fn the_groups_of_the_device_are_added_to_once_its_commit_is_accepted() {
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(!waiting.is_finished(), "waits for the Commit");
     groups.discard(CONVERSATION, false);
-    assert!(rt.block_on(waiting).unwrap().is_some(), "sent in epoch 1");
+    assert!(
+        ciphertext(rt.block_on(waiting).unwrap()).is_some(),
+        "sent in epoch 1"
+    );
     assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
 
     // none who cannot encrypt, nor once the device is let go of
@@ -2424,7 +2457,10 @@ fn the_participants_of_the_groups_of_the_device_are_removed_once_its_commit_is_a
     assert!(!commit_bundle_of(&cpim).commit_list.is_empty());
     assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
     // its control message the one now known
-    assert!(!groups.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")));
+    assert_eq!(
+        groups.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")),
+        ImdnTold::Nothing
+    );
     let removal_id = String::from_utf8(
         cpim_message(&cpim)
             .get_info()
@@ -2433,7 +2469,10 @@ fn the_participants_of_the_groups_of_the_device_are_removed_once_its_commit_is_a
             .to_vec(),
     )
     .unwrap();
-    assert!(groups.on_imdn(CONVERSATION, &refusal(&removal_id, "invalid-commit")));
+    assert_eq!(
+        groups.on_imdn(CONVERSATION, &refusal(&removal_id, "invalid-commit")),
+        ImdnTold::Refusal
+    );
     assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
 
     // nor one who is no member, nor by a URI of no number, nor once the
@@ -2610,8 +2649,14 @@ fn the_groups_of_the_device_are_left_once_its_commit_is_accepted() {
     );
     let cpim = rt.block_on(leaving).unwrap().expect("left once accepted");
     // its control message the one now known
-    assert!(!groups.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")));
-    assert!(groups.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")));
+    assert_eq!(
+        groups.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")),
+        ImdnTold::Nothing
+    );
+    assert_eq!(
+        groups.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")),
+        ImdnTold::Refusal
+    );
 
     // let go of once the Focus agrees
     groups.abandon(CONVERSATION);
@@ -2816,7 +2861,11 @@ fn a_leave_is_committed_once_the_commit_of_the_device_is_settled() {
         .remove_from_group(CONVERSATION, IMPU, GROUP_URI, BOB_TEL)
         .unwrap();
     let proposal = bobs_group.leave(&bob).unwrap();
-    assert!(groups.on_server_message(CONVERSATION, &forwarded_leave(&proposal)));
+    assert!(
+        groups
+            .on_server_message(CONVERSATION, &forwarded_leave(&proposal))
+            .proposals
+    );
     assert_eq!(
         device.commit_leaves(CONVERSATION, IMPU, GROUP_URI),
         Err(GroupError::Pending)
@@ -2830,10 +2879,13 @@ fn a_leave_is_committed_once_the_commit_of_the_device_is_settled() {
     ));
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(!committing.is_finished(), "waits for the Commit");
-    assert!(groups.on_imdn(
-        CONVERSATION,
-        &refusal(&control_id(&removal), "incorrect-epoch")
-    ));
+    assert_eq!(
+        groups.on_imdn(
+            CONVERSATION,
+            &refusal(&control_id(&removal), "incorrect-epoch")
+        ),
+        ImdnTold::Refusal
+    );
     let cpim = rt
         .block_on(committing)
         .unwrap()
@@ -2851,9 +2903,15 @@ fn a_leave_is_committed_once_the_commit_of_the_device_is_settled() {
 
     // what is not a Proposal leaves nothing to commit, nor once the device
     // is let go of
-    assert!(!groups.on_server_message(CONVERSATION, b"\x0a\xff"));
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, b"\x0a\xff"),
+        Taken::default()
+    );
     drop(device);
-    assert!(!groups.on_server_message(CONVERSATION, &forwarded_leave(&proposal)));
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &forwarded_leave(&proposal)),
+        Taken::default()
+    );
     assert_eq!(
         rt.block_on(groups.commit_leaves(
             String::from(CONVERSATION),
@@ -2929,10 +2987,13 @@ fn the_participants_the_server_removed_from_groups_of_the_device_are_committed_o
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(!removing.is_finished(), "waits for the Commit");
     // which carries no Proposals
-    assert!(!groups.on_server_message(
-        CONVERSATION,
-        &accepted(epoch_identifier(&device, CONVERSATION)),
-    ));
+    assert_eq!(
+        groups.on_server_message(
+            CONVERSATION,
+            &accepted(epoch_identifier(&device, CONVERSATION)),
+        ),
+        Taken::default()
+    );
     let cpim = rt
         .block_on(removing)
         .unwrap()
@@ -3249,7 +3310,10 @@ fn a_group_is_self_healed_once_at_a_time_and_not_too_often() {
     assert!(!signing.is_finished(), "waits for the group to be healed");
     released.notify_one();
     assert_eq!(rt.block_on(healing).unwrap(), None);
-    assert!(rt.block_on(waiting).unwrap().is_some(), "sent once healed");
+    assert!(
+        ciphertext(rt.block_on(waiting).unwrap()).is_some(),
+        "sent once healed"
+    );
     assert!(
         rt.block_on(signing).unwrap().is_some(),
         "signed once healed"
@@ -3378,4 +3442,354 @@ fn the_group_info_of_another_group_is_not_rejoined_in_its_stead() {
         )))
     );
     assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+}
+
+/// Why the group `conversation_id` of `device` was moved to unencrypted, if
+/// it was
+fn encryption_ended_reason(device: &E2eeDevice, conversation_id: &str) -> Option<EndMlsReason> {
+    device
+        .store()
+        .peek_conversation(conversation_id.as_bytes(), |conversation| {
+            conversation.encryption_ended_reason()
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_group_is_moved_to_unencrypted_with_a_commit_adding_end_mls() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let cpim = device
+        .end_encryption(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            EndMlsReason::ClientFailureEncryptionNotAvailable,
+        )
+        .unwrap()
+        .expect("a control message");
+
+    // a Commit (RCC.16 section 7.9.2) in a control message from the user to
+    // the group
+    let message = cpim_message(&cpim);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"negative-delivery"[..])
+    );
+    let bundle = commit_bundle_of(&cpim);
+    assert!(!bundle.group_info.is_empty());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+
+    // messages encrypted until it is applied, which it is once forwarded back
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, &plaintext("message-60", None)),
+        Err(MessageError::Pending)
+    );
+    assert_eq!(
+        device.end_encryption(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            EndMlsReason::ClientFailureEncryptionNotAvailable,
+        ),
+        Err(GroupError::Pending)
+    );
+    assert!(!device.encryption_ended(CONVERSATION));
+    device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap();
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    assert!(device.encryption_ended(CONVERSATION));
+    assert_eq!(
+        encryption_ended_reason(&device, CONVERSATION),
+        Some(EndMlsReason::ClientFailureEncryptionNotAvailable)
+    );
+    // for Bob too
+    bobs_group
+        .process_commit_bundle(
+            &bob,
+            &ServerCommitBundle {
+                commit_list: bundle.commit_list,
+                ..ServerCommitBundle::default()
+            },
+        )
+        .unwrap();
+    assert!(bobs_group.is_encryption_ended());
+
+    // nothing encrypted or signed from now on, and notifications taken
+    // unsigned
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, &plaintext("message-61", None)),
+        Err(MessageError::NotEncrypted)
+    );
+    let xml = notification_xml("bob-1", "delivery-notification", "<delivered/>");
+    assert_eq!(
+        device.sign_notification(CONVERSATION, &notification_cpim(IMPU, "imdn-60", "", &xml)),
+        Err(MessageError::NotEncrypted)
+    );
+    let mine = notification_xml("message-1", "delivery-notification", "<delivered/>");
+    assert_eq!(
+        device.verify_notification(
+            CONVERSATION,
+            &cpim_message(&notification_cpim(BOB_TEL, "imdn-61", "", &mine))
+                .get_info()
+                .unwrap(),
+            mine.as_bytes(),
+        ),
+        Ok(())
+    );
+    // nor moved to unencrypted again
+    assert_eq!(
+        device.end_encryption(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            EndMlsReason::ServerFailureEncryptionNotAvailable,
+        ),
+        Ok(None)
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+}
+
+#[test]
+fn the_groups_of_the_device_are_moved_to_unencrypted_once_its_commit_is_accepted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, _) = group_made();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let end = |reason| {
+        groups.end_encryption(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            reason,
+        )
+    };
+
+    let ending = rt.spawn(end(EndReason::ClientFailureEncryptionNotAvailable));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!ending.is_finished(), "waits for the Commit");
+    assert_eq!(
+        groups.on_server_message(
+            CONVERSATION,
+            &accepted(epoch_identifier(&device, CONVERSATION)),
+        ),
+        Taken::default()
+    );
+    let cpim = rt.block_on(ending).unwrap().expect("ended once accepted");
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+
+    // its control message known, and withdrawn if the Focus refuses it
+    assert_eq!(
+        groups.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")),
+        ImdnTold::Refusal
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert!(!groups.encryption_ended(CONVERSATION));
+
+    // the reason each tells
+    let cpim = rt
+        .block_on(end(EndReason::ServerFailureEncryptionNotAvailable))
+        .expect("ended again");
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
+        Taken {
+            proposals: false,
+            encryption_ended: true,
+        }
+    );
+    assert!(groups.encryption_ended(CONVERSATION));
+    assert!(groups.encrypts(CONVERSATION), "its MLS group kept");
+    assert_eq!(
+        encryption_ended_reason(&device, CONVERSATION),
+        Some(EndMlsReason::ServerFailureEncryptionNotAvailable)
+    );
+
+    // and messages sent as they are
+    assert_eq!(
+        rt.block_on(groups.encrypt(CONVERSATION, &plaintext("message-62", None))),
+        Sealed::Unencrypted
+    );
+    let xml = notification_xml("bob-1", "delivery-notification", "<delivered/>");
+    assert_eq!(
+        rt.block_on(groups.sign(CONVERSATION, &notification_cpim(IMPU, "imdn-62", "", &xml))),
+        None
+    );
+    assert_eq!(
+        rt.block_on(end(EndReason::ClientFailureEncryptionNotAvailable)),
+        None
+    );
+
+    // nor once the device is let go of
+    drop(device);
+    assert!(!groups.encryption_ended(CONVERSATION));
+    assert_eq!(
+        rt.block_on(end(EndReason::ClientFailureEncryptionNotAvailable)),
+        None
+    );
+}
+
+#[test]
+fn a_group_another_member_moves_to_unencrypted_is_unencrypted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // a Commit of no end_mls
+    let output = bobs_group.update_keys(&bob).unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
+        Taken::default()
+    );
+
+    let output = bobs_group
+        .set_encryption_ended(&bob, Some(EndMlsReason::GroupMemberFailsCapabilitiesCheck))
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
+        Taken {
+            proposals: false,
+            encryption_ended: true,
+        }
+    );
+    assert_eq!(
+        encryption_ended_reason(&device, CONVERSATION),
+        Some(EndMlsReason::GroupMemberFailsCapabilitiesCheck)
+    );
+    assert_eq!(
+        rt.block_on(groups.encrypt(CONVERSATION, &plaintext("message-63", None))),
+        Sealed::Unencrypted
+    );
+    let mine = notification_xml("message-1", "delivery-notification", "<delivered/>");
+    let unsigned = cpim_message(&notification_cpim(BOB_TEL, "imdn-63", "", &mine));
+    assert_eq!(
+        groups.verify(CONVERSATION, &unsigned.get_info().unwrap(), mine.as_bytes()),
+        Verified::Signed
+    );
+
+    // which it is told once
+    let output = bobs_group.update_keys(&bob).unwrap();
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
+        Taken::default()
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((4, false)));
+}
+
+#[test]
+fn a_group_is_moved_to_unencrypted_for_the_reason_given() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    for (reason, end_mls_reason) in [
+        (
+            EndReason::ClientFailureEncryptionNotAvailable,
+            EndMlsReason::ClientFailureEncryptionNotAvailable,
+        ),
+        (
+            EndReason::ServerFailureEncryptionNotAvailable,
+            EndMlsReason::ServerFailureEncryptionNotAvailable,
+        ),
+    ] {
+        let (device, _, _) = alice_and_bob();
+        let (query, _) = answering(&[]);
+        let groups = DeviceGroups::new(&device, query);
+        let cpim = rt
+            .block_on(groups.end_encryption(
+                String::from(CONVERSATION),
+                String::from(IMPU),
+                String::from(GROUP_URI),
+                reason,
+            ))
+            .expect("a control message");
+        groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim));
+        assert_eq!(
+            encryption_ended_reason(&device, CONVERSATION),
+            Some(end_mls_reason)
+        );
+        // nor is a group not kept taken as moved
+        assert!(!groups.encryption_ended("another"));
+    }
+}
+
+#[test]
+fn a_group_moved_to_unencrypted_stays_so_once_the_device_is_restored() {
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    let output = bobs_group
+        .set_encryption_ended(
+            &bob,
+            Some(EndMlsReason::ClientFailureEncryptionNotAvailable),
+        )
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    device
+        .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+        .unwrap();
+    let output = bobs_group.update_keys(&bob).unwrap();
+    let (query, _) = answering(&[]);
+
+    // not told again by the next Commit
+    let restored = Arc::new(alice(&app, &kds, TODAY, Some(&app.last().unwrap())));
+    let groups = DeviceGroups::new(&restored, query.clone());
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
+        Taken::default()
+    );
+    assert_eq!(epoch(&restored, CONVERSATION), Ok((3, false)));
+
+    let restored = Arc::new(alice(&app, &kds, TODAY, Some(&app.last().unwrap())));
+    let groups = DeviceGroups::new(&restored, query);
+    assert!(groups.encryption_ended(CONVERSATION));
+    assert!(groups.encrypts(CONVERSATION));
+}
+
+const ENCRYPTION_NOT_AVAILABLE: &str =
+    "<mls-server-failure-reason><encryption-not-available/></mls-server-failure-reason>";
+
+#[test]
+fn a_recipient_unable_to_decrypt_is_told_apart_from_other_failures() {
+    let (device, message_id) = group_made();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // of a message of the client, where section 6.2.5 places the reason, or
+    // as the Focus refuses a control message
+    for imdn in [
+        imdn_with("message-1", "<failed/>", ENCRYPTION_NOT_AVAILABLE),
+        refusal("message-1", "encryption-not-available"),
+    ] {
+        assert_eq!(
+            groups.on_imdn(CONVERSATION, &imdn),
+            ImdnTold::EncryptionNotAvailable
+        );
+    }
+    // not if delivered, nor for another reason
+    for imdn in [
+        imdn_with("message-1", "<delivered/>", ENCRYPTION_NOT_AVAILABLE),
+        refusal("message-1", "transient-error"),
+        imdn("message-1", "<failed/>"),
+    ] {
+        assert_eq!(groups.on_imdn(CONVERSATION, &imdn), ImdnTold::Nothing);
+    }
+    // nor if it refuses a control message of the client
+    assert_eq!(
+        groups.on_imdn(
+            CONVERSATION,
+            &refusal(&message_id, "encryption-not-available")
+        ),
+        ImdnTold::Refusal
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
 }

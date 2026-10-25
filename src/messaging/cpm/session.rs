@@ -81,7 +81,10 @@ use uuid::Uuid;
 use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
-use super::encryption::{GroupEncryption, CONTENT_TYPE_MLS, CONTENT_TYPE_MLS_RCS_SERVER};
+use super::encryption::{
+    EndReason, GroupEncryption, ImdnTold, Sealed, Verified, CONTENT_TYPE_MLS,
+    CONTENT_TYPE_MLS_RCS_SERVER,
+};
 use super::group_chat::{
     focus_answer, group_info_pull, refer_participants, refer_removal, GroupChats, GroupIds,
     GroupInvitation, Participant,
@@ -941,11 +944,14 @@ impl CPMSession {
                                     }
 
                                     // and never sent unencrypted in an
-                                    // encrypted one (RCC.16 section 9.1.1)
+                                    // encrypted one (RCC.16 section 9.1.1),
+                                    // unless it moved to unencrypted
+                                    // (section 11.2)
                                     if let Some((encryption, conversation_id)) = &encryption {
                                         match encryption.encrypt(conversation_id, &data).await {
-                                            Some(encrypted) => data = encrypted,
-                                            None => {
+                                            Sealed::Encrypted(encrypted) => data = encrypted,
+                                            Sealed::Unencrypted => {}
+                                            Sealed::Failed => {
                                                 (message.message_result_callback)(
                                                     500,
                                                     String::from("Internal Error"),
@@ -1495,6 +1501,10 @@ pub enum CPMGroupEvent {
     Participant(String, Participant),
     /// The session with the group at the URI ended
     Left(String),
+    /// The group at the URI is no longer encrypted end to end, a member,
+    /// maybe this client, having moved it to unencrypted (RCC.16 section
+    /// 11.2)
+    EncryptionEnded(String),
 }
 
 pub struct CPMSessionService {
@@ -1606,6 +1616,7 @@ impl CPMSessionService {
         let group_encryption: Arc<Mutex<Option<Arc<dyn GroupEncryption>>>> =
             Arc::new(Mutex::new(None));
         let encryption = Arc::clone(&group_encryption);
+        let group_listener = Arc::clone(&group_chats.listener);
         let message_receive_listener =
             move |session: &Arc<SipSession<CPMSession>>,
                   contact: &[u8],
@@ -1667,17 +1678,52 @@ impl CPMSessionService {
                         // of this client tells the encryption, not the app
                         // (RCC.16 section 6.2.5), and the group healed if
                         // the refusal tells it is out of step
-                        let refused = encryption.on_imdn(conversation_id, content_body);
+                        let told = encryption.on_imdn(conversation_id, content_body);
                         heal_if_needed(session);
-                        if refused {
-                            return;
+                        match told {
+                            ImdnTold::Refusal => return,
+                            // a recipient not able to decrypt moves the
+                            // group to unencrypted (sections 6.2.5, 11.2)
+                            ImdnTold::EncryptionNotAvailable => end_encryption(
+                                session,
+                                EndReason::ServerFailureEncryptionNotAvailable,
+                            ),
+                            ImdnTold::Nothing => {}
                         }
                         // nor is one not signed by whom it is from (section
-                        // 7.6.2)
-                        if !encryption.verify(conversation_id, cpim_info, content_body) {
-                            platform_log(LOG_TAG, "notification not taken, its signature not good");
-                            return;
+                        // 7.6.2); one not signed at all, as a client not
+                        // encrypting sends, moves the group to unencrypted
+                        // (section 11.2)
+                        match encryption.verify(conversation_id, cpim_info, content_body) {
+                            Verified::Signed => {}
+                            Verified::Unsigned => end_encryption(
+                                session,
+                                EndReason::ClientFailureEncryptionNotAvailable,
+                            ),
+                            Verified::Forged => {
+                                platform_log(
+                                    LOG_TAG,
+                                    "notification not taken, its signature not good",
+                                );
+                                return;
+                            }
                         }
+                    }
+                } else if is_plaintext_message(content_type) {
+                    // as does a message sent unencrypted in an encrypted
+                    // group (RCC.16 section 11.2), which the app takes all
+                    // the same
+                    let inner = session.get_inner();
+                    let session_info = inner.get_session_info();
+                    let encrypted = session_info
+                        .encryption
+                        .as_ref()
+                        .zip(session_info.conversation_id.as_ref())
+                        .is_some_and(|(encryption, conversation_id)| {
+                            !encryption.encryption_ended(conversation_id)
+                        });
+                    if encrypted {
+                        end_encryption(session, EndReason::ClientFailureEncryptionNotAvailable);
                     }
                 }
                 if !content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS_RCS_SERVER) {
@@ -1697,14 +1743,27 @@ impl CPMSessionService {
                     .conversation_id
                     .clone();
                 if let (Some(encryption), Some(conversation_id)) = (encryption, conversation_id) {
+                    let taken = encryption.on_server_message(&conversation_id, content_body);
                     // a member's leave for this client to commit (RCC.16
                     // section 9.4)
-                    if encryption.on_server_message(&conversation_id, content_body) {
+                    if taken.proposals {
                         if let Some(session_end) = session.get_inner().session_end() {
                             session_end.commit(|encryption, conversation_id, from, to| {
                                 encryption.commit_leaves(conversation_id, from, to)
                             });
                         }
+                    }
+                    // the group moved to unencrypted (section 11.2)
+                    if taken.encryption_ended {
+                        let conference_uri = String::from_utf8_lossy(
+                            &session
+                                .get_inner()
+                                .get_session_info()
+                                .cpm_contact
+                                .service_uri,
+                        )
+                        .into_owned();
+                        group_listener(CPMGroupEvent::EncryptionEnded(conference_uri));
                     }
                     // or the group healed, if it could not be applied
                     heal_if_needed(session);
@@ -2992,6 +3051,25 @@ fn heal_if_needed(session: &Arc<SipSession<CPMSession>>) {
     if let Some(session_end) = session.get_inner().session_end() {
         session_end.heal_if_needed();
     }
+}
+
+/// Moves the group chat of `session` to unencrypted for `reason`, with a
+/// Commit sent in the session (RCC.16 section 11.2)
+fn end_encryption(session: &Arc<SipSession<CPMSession>>, reason: EndReason) {
+    if let Some(session_end) = session.get_inner().session_end() {
+        session_end.commit(move |encryption, conversation_id, from, to| {
+            encryption.end_encryption(conversation_id, from, to, reason)
+        });
+    }
+}
+
+/// Whether what a session received unencrypted, of `content_type` and not a
+/// notification, is an RCS message, which in an encrypted group comes as
+/// `message/mls` (RCC.16 section 9.1.1), rather than an is-composing or what
+/// the Conversation Focus sends of the MLS group
+fn is_plaintext_message(content_type: &[u8]) -> bool {
+    !is_media_type(content_type, IS_COMPOSING)
+        && !content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS_RCS_SERVER)
 }
 
 /// What ending the session with the group at `conference_uri` takes, if

@@ -38,6 +38,64 @@ pub const CONTENT_TYPE_MLS_RCS: &[u8] = b"message/mls-rcs";
 pub const INFO_PACKAGE_GROUP_INFO_PULL: &[u8] = b"MLS-Group-Info-Pull";
 pub const INFO_PACKAGE_ENHANCED_GROUP_INFO_PULL: &[u8] = b"MLS-Enhanced-Group-Info-Pull";
 
+/// What became of a message to encrypt
+#[derive(Debug, PartialEq)]
+pub enum Sealed {
+    /// The CPIM message carrying it as `message/mls`
+    Encrypted(Vec<u8>),
+    /// To send as it is, the group chat no longer encrypted (RCC.16 section
+    /// 11.2)
+    Unencrypted,
+    /// Not to send
+    Failed,
+}
+
+/// What the signature of a notification received in an encrypted group chat
+/// tells (RCC.16 section 7.6.2)
+#[derive(Debug, PartialEq)]
+pub enum Verified {
+    /// Signed by the participant it is from, or a negative delivery, which
+    /// may come unsigned, as any may once the group chat is unencrypted
+    Signed,
+    /// Not signed, as a client not encrypting sends it, the group chat then
+    /// to move to unencrypted (section 11.2)
+    Unsigned,
+    /// Signed otherwise, or badly: not for the app
+    Forged,
+}
+
+/// What an IMDN received in an encrypted group chat tells the encryption
+#[derive(Debug, PartialEq)]
+pub enum ImdnTold {
+    /// Nothing
+    Nothing,
+    /// The Conversation Focus refusing a control message of this client,
+    /// which is not for the app (RCC.16 section 6.2.5)
+    Refusal,
+    /// A recipient cannot decrypt, the group chat then to move to unencrypted
+    /// (sections 6.2.5, 11.2)
+    EncryptionNotAvailable,
+}
+
+/// What a message of the Conversation Focus brought
+#[derive(Debug, Default, PartialEq)]
+pub struct Taken {
+    /// Proposals, as the leaves commit_leaves() commits (RCC.16 section 9.4)
+    pub proposals: bool,
+    /// The end of encryption: the group chat is unencrypted from now on
+    /// (section 11.2)
+    pub encryption_ended: bool,
+}
+
+/// Why a group chat moves to unencrypted (RCC.16 sections 7.11.2.2, 11.2)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EndReason {
+    /// The Conversation Focus told that a recipient cannot decrypt
+    ServerFailureEncryptionNotAvailable,
+    /// A participant sent a message or a notification unencrypted
+    ClientFailureEncryptionNotAvailable,
+}
+
 /// Sends the Conversation Focus of a session an INFO request of the
 /// Info-Package it is given, carrying the body given if any, giving the status
 /// code and body of its final response, or None if none came (RCC.16 sections
@@ -202,15 +260,28 @@ pub trait GroupEncryption: Send + Sync {
     /// Takes what the Conversation Focus of the group `conversation_id` sent
     /// of its MLS group, as a `message/mls-rcs-server`: its acceptance of a
     /// Commit of this client, and the Commits and Proposals of others
-    /// (sections 6.2.4, 7.9); true if it carried Proposals, as the leaves
-    /// commit_leaves() commits (section 9.4)
-    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> bool;
+    /// (sections 6.2.4, 7.9), telling what they brought
+    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> Taken;
 
     /// Takes the `message/imdn+xml` `imdn` received in the group chat
-    /// `conversation_id`: true if it is the Conversation Focus refusing a
-    /// control message of this client, which is not for the app (RCC.16
+    /// `conversation_id`, telling what it is to the encryption (RCC.16
     /// sections 6.2.5, 7.7.2.1)
-    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool;
+    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> ImdnTold;
+
+    /// The CPIM message carrying a `message/mls-rcs-client` with a Commit
+    /// moving the group chat `conversation_id` to unencrypted for `reason`,
+    /// by adding the end_mls extension to its MLS group, to send to the
+    /// Conversation Focus in the session, `from` and `to` that of the CPIM
+    /// message (RCC.16 sections 7.11.2.2, 9.5.1, 11.2), once a Commit of this
+    /// client the Focus is yet to accept is; None if it is unencrypted
+    /// already, or cannot be
+    fn end_encryption(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        reason: EndReason,
+    ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
     /// Lets go of the MLS group `conversation_id`, as its chat did not start,
     /// its invitation was not accepted, or the user left it
@@ -240,11 +311,17 @@ pub trait GroupEncryption: Send + Sync {
     /// kept
     fn encrypts(&self, conversation_id: &str) -> bool;
 
+    /// Whether the group chat `conversation_id` was moved to unencrypted, its
+    /// MLS group kept all the same (RCC.16 section 11.2): messages are sent
+    /// as they are then, and notifications unsigned
+    fn encryption_ended(&self, conversation_id: &str) -> bool;
+
     /// The CPIM message `cpim` encrypted in the group chat `conversation_id`,
     /// as the CPIM message carrying it as `message/mls` (RCC.16 sections 7.5,
     /// 9.1.1), once a Commit of this client the Conversation Focus is yet to
-    /// accept is; None if it cannot be
-    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>>;
+    /// accept is, or to send as it is once the group chat is unencrypted
+    /// (section 11.2)
+    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Sealed>;
 
     /// The CPIM message `cpim` carrying a notification of the group chat
     /// `conversation_id`, signed over what it tells of (RCC.16 sections
@@ -254,10 +331,10 @@ pub trait GroupEncryption: Send + Sync {
 
     /// Whether the `message/imdn+xml` `imdn` received in the group chat
     /// `conversation_id`, delivered in the CPIM message `cpim_info` tells of,
-    /// is for the app: signed over what it tells of by the participant it is
-    /// from, or a negative delivery, which may come unsigned (RCC.16 sections
-    /// 7.6.2, 7.7)
-    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> bool;
+    /// is signed over what it tells of by the participant it is from, or is a
+    /// negative delivery, which may come unsigned (RCC.16 sections 7.6.2,
+    /// 7.7), as any may once the group chat is unencrypted (section 11.2)
+    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> Verified;
 
     /// The CPIM message the `message/mls` `mls_message` of the group chat
     /// `conversation_id` carried, delivered in the CPIM message `cpim_info`

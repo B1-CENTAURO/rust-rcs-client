@@ -30,7 +30,9 @@ use rust_rcs_core::internet::parameter::ParameterParser;
 use rust_rcs_core::internet::{Body, Header};
 use rust_rcs_core::io::DynamicChain;
 use rust_rcs_core::mls::rcs::imdn::{failure_reason, FailureReason};
-use rust_rcs_core::mls::rcs::proto::{self, server_mls_rcs_message, ServerMlsRcsMessage};
+use rust_rcs_core::mls::rcs::proto::{
+    self, server_mls_rcs_message, EndMlsReason, ServerMlsRcsMessage,
+};
 use rust_rcs_core::mls::rcs::{
     MlsCapability, ServerFailureReason, CONTENT_TYPE_MLS_RCS_CLIENT, MLS_VERSION_V1,
 };
@@ -39,7 +41,9 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::capability::CapabilityQuery;
-use crate::messaging::cpm::encryption::{GroupEncryption, GroupInfoPull};
+use crate::messaging::cpm::encryption::{
+    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Verified,
+};
 
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice, CIPHERSUITE};
 use super::heal::heal_once;
@@ -553,6 +557,56 @@ impl E2eeDevice {
             })
     }
 
+    /// Whether the group chat `conversation_id` was moved to unencrypted,
+    /// its MLS group having the end_mls extension (RCC.16 section 11.2)
+    pub fn encryption_ended(&self, conversation_id: &str) -> bool {
+        self.store()
+            .peek_conversation(conversation_id.as_bytes(), |conversation| {
+                conversation.is_encryption_ended()
+            })
+            .unwrap_or(false)
+    }
+
+    /// Moves the group chat `conversation_id` to unencrypted for `reason`,
+    /// with a Commit adding the end_mls extension to its MLS group: the CPIM
+    /// message, `from` and `to` its own, carrying the
+    /// `message/mls-rcs-client` to send to the Conversation Focus over MSRP
+    /// (RCC.16 sections 7.11.2.2, 9.5.1, 11.2); None if it is unencrypted
+    /// already
+    ///
+    /// Not while a Commit of the device waits for the Focus to accept it.
+    /// Messages are encrypted until the Commit is applied.
+    pub fn end_encryption(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        reason: EndMlsReason,
+    ) -> Result<Option<Vec<u8>>, GroupError> {
+        let client_message = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                if conversation.is_encryption_ended() {
+                    return Ok(Ok(None));
+                }
+                if conversation.has_pending_commit() {
+                    return Ok(Err(GroupError::Pending));
+                }
+                let output = conversation.set_encryption_ended(client, Some(reason))?;
+                match output.to_client_message() {
+                    Ok(client_message) => Ok(Ok(Some(client_message))),
+                    Err(e) => {
+                        conversation.discard_pending_commit(client)?;
+                        Err(e)
+                    }
+                }
+            })
+            .map_err(GroupError::Store)??;
+
+        Ok(client_message
+            .map(|client_message| self.sent_in(conversation_id, from, to, &client_message)))
+    }
+
     /// Lets go of the MLS group `conversation_id`
     pub fn abandon(&self, conversation_id: &str) -> Result<(), StoreError> {
         self.control_messages()
@@ -638,7 +692,7 @@ impl DeviceGroups {
         cpim: &[u8],
         make: fn(&E2eeDevice, &str, &[u8]) -> Result<Vec<u8>, MessageError>,
         failed: &'static str,
-    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+    ) -> BoxFuture<'static, Result<Vec<u8>, MessageError>> {
         let device = self.device.clone();
         let taken = Arc::clone(&self.taken);
         let deadline = tokio::time::Instant::now() + self.acceptance_wait;
@@ -651,17 +705,22 @@ impl DeviceGroups {
                 tokio::pin!(notified);
                 notified.as_mut().enable();
 
-                match make(&*device.upgrade()?, &conversation_id, &cpim) {
-                    Ok(made) => return Some(made),
+                let Some(device) = device.upgrade() else {
+                    return Err(MessageError::Store(StoreError::NoClient));
+                };
+                match make(&device, &conversation_id, &cpim) {
                     Err(MessageError::Pending) => {}
-                    Err(e) => {
-                        platform_log(LOG_TAG, format!("{}: {:?}", failed, e));
-                        return None;
+                    made => {
+                        if let Err(e) = &made {
+                            platform_log(LOG_TAG, format!("{}: {:?}", failed, e));
+                        }
+                        return made;
                     }
                 }
+                drop(device);
                 if tokio::time::timeout_at(deadline, notified).await.is_err() {
                     platform_log(LOG_TAG, format!("{}, the Commit not accepted", failed));
-                    return None;
+                    return Err(MessageError::Pending);
                 }
             }
         })
@@ -859,36 +918,75 @@ impl GroupEncryption for DeviceGroups {
         }
     }
 
-    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> bool {
-        let proposed = match self.device.upgrade() {
-            Some(device) => match device.on_server_message(conversation_id, body) {
-                Ok(taken) => taken
-                    .iter()
-                    .any(|message| matches!(message, IncomingMessage::Proposal { .. })),
-                Err(e) => {
-                    platform_log(LOG_TAG, format!("message of the focus not taken: {:?}", e));
-                    false
+    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> Taken {
+        let taken = match self.device.upgrade() {
+            Some(device) => {
+                let ended = device.encryption_ended(conversation_id);
+                let proposals = match device.on_server_message(conversation_id, body) {
+                    Ok(taken) => taken
+                        .iter()
+                        .any(|message| matches!(message, IncomingMessage::Proposal { .. })),
+                    Err(e) => {
+                        platform_log(LOG_TAG, format!("message of the focus not taken: {:?}", e));
+                        false
+                    }
+                };
+                Taken {
+                    proposals,
+                    encryption_ended: !ended && device.encryption_ended(conversation_id),
                 }
-            },
-            None => false,
+            }
+            None => Taken::default(),
         };
         self.taken.notify_waiters();
-        proposed
+        taken
     }
 
-    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool {
+    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> ImdnTold {
         let Some(device) = self.device.upgrade() else {
-            return false;
+            return ImdnTold::Nothing;
         };
         let refused = match device.on_imdn(conversation_id, imdn) {
-            Ok(None) => return false,
+            Ok(None) => {
+                // of a message a recipient cannot decrypt (RCC.16 section 6.2.5)
+                let failed = Imdn::from_xml(imdn).is_some_and(|imdn| imdn.status == Status::Failed);
+                return match failure_reason(imdn) {
+                    Some(FailureReason::Server(ServerFailureReason::EncryptionNotAvailable))
+                        if failed =>
+                    {
+                        ImdnTold::EncryptionNotAvailable
+                    }
+                    _ => ImdnTold::Nothing,
+                };
+            }
             Ok(Some(reason)) => format!("Commit refused by the focus: {:?}", reason),
             Err(e) => format!("Commit refused by the focus, not discarded: {:?}", e),
         };
         platform_log(LOG_TAG, refused);
         // what waits for it is sent, or not, without it
         self.taken.notify_waiters();
-        true
+        ImdnTold::Refusal
+    }
+
+    fn end_encryption(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        reason: EndReason,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let reason = match reason {
+            EndReason::ServerFailureEncryptionNotAvailable => {
+                EndMlsReason::ServerFailureEncryptionNotAvailable
+            }
+            EndReason::ClientFailureEncryptionNotAvailable => {
+                EndMlsReason::ClientFailureEncryptionNotAvailable
+            }
+        };
+        self.once_settled(
+            move |device| device.end_encryption(&conversation_id, &from, &to, reason),
+            "encryption not ended",
+        )
     }
 
     fn abandon(&self, conversation_id: &str) {
@@ -928,33 +1026,48 @@ impl GroupEncryption for DeviceGroups {
             .is_some_and(|device| device.store().has_conversation(conversation_id.as_bytes()))
     }
 
-    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
-        self.once_accepted(
+    fn encryption_ended(&self, conversation_id: &str) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.encryption_ended(conversation_id))
+    }
+
+    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Sealed> {
+        let encrypting = self.once_accepted(
             conversation_id,
             cpim,
             E2eeDevice::encrypt_message,
             "message not encrypted",
-        )
+        );
+        Box::pin(async move {
+            match encrypting.await {
+                Ok(encrypted) => Sealed::Encrypted(encrypted),
+                Err(MessageError::NotEncrypted) => Sealed::Unencrypted,
+                Err(_) => Sealed::Failed,
+            }
+        })
     }
 
     fn sign(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
-        self.once_accepted(
+        let signing = self.once_accepted(
             conversation_id,
             cpim,
             E2eeDevice::sign_notification,
             "notification not signed",
-        )
+        );
+        Box::pin(async move { signing.await.ok() })
     }
 
-    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> bool {
+    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> Verified {
         let Some(device) = self.device.upgrade() else {
-            return false;
+            return Verified::Forged;
         };
         match device.verify_notification(conversation_id, cpim_info, imdn) {
-            Ok(()) => true,
+            Ok(()) => Verified::Signed,
+            Err(MessageError::NotSigned) => Verified::Unsigned,
             Err(e) => {
                 platform_log(LOG_TAG, format!("notification not verified: {:?}", e));
-                false
+                Verified::Forged
             }
         }
     }

@@ -1230,6 +1230,7 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_listener(
                 }
                 CPMGroupEvent::Left(conference_uri) => (2, conference_uri, None),
                 CPMGroupEvent::InvitationWithdrawn(conference_uri) => (3, conference_uri, None),
+                CPMGroupEvent::EncryptionEnded(conference_uri) => (4, conference_uri, None),
                 // told through listeners of their own
                 CPMGroupEvent::Invited(_) | CPMGroupEvent::Ids(_) => return,
             };
