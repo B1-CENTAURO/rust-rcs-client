@@ -1294,6 +1294,7 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_invitation_listener(
                     as_ptr(&inviter_uri),
                     as_ptr(&inviter_name),
                     i32::from(invitation.pending),
+                    i32::from(invitation.encrypted),
                     cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr()),
                 );
             });

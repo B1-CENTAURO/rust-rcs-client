@@ -317,19 +317,25 @@ pub fn start(registered: bool) -> (Client, Peer) {
         },
         move |event| {
             let event = match event {
-                CPMGroupEvent::Invited(invitation) => format!(
-                    "invited {} {} {} {} {} {}",
-                    invitation.conference_uri,
-                    invitation.conversation_id,
-                    invitation.subject.as_deref().unwrap_or("-"),
-                    invitation.inviter_uri.as_deref().unwrap_or("-"),
-                    invitation.inviter_name.as_deref().unwrap_or("-"),
-                    if invitation.pending {
-                        "pending"
+                CPMGroupEvent::Invited(invitation) => {
+                    format!(
+                        "invited {} {} {} {} {} {}",
+                        invitation.conference_uri,
+                        invitation.conversation_id,
+                        invitation.subject.as_deref().unwrap_or("-"),
+                        invitation.inviter_uri.as_deref().unwrap_or("-"),
+                        invitation.inviter_name.as_deref().unwrap_or("-"),
+                        if invitation.pending {
+                            "pending"
+                        } else {
+                            "accepted"
+                        }
+                    ) + if invitation.encrypted {
+                        " encrypted"
                     } else {
-                        "accepted"
+                        ""
                     }
-                ),
+                }
                 CPMGroupEvent::Joined(group) => format!("joined {}", group),
                 CPMGroupEvent::Participant(group, participant) => format!(
                     "participant {} {} {} {}",
@@ -2073,8 +2079,12 @@ fn a_group_chat_the_factory_refuses_is_reported_and_not_known() {
 #[derive(Default)]
 struct ScriptedEncryption {
     cpim: Option<Vec<u8>>,
+    /// Whether it joins the groups invited to
+    joining: bool,
     /// The Conversation-ID, from, to and participants of each prepared
     prepared: std::sync::Mutex<Vec<(String, String, String, Vec<String>)>>,
+    /// The Conversation-ID and server message of each group to join
+    joined: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     abandoned: std::sync::Mutex<Vec<String>>,
 }
@@ -2093,6 +2103,14 @@ impl GroupEncryption for ScriptedEncryption {
             .push((conversation_id, from, to, participants));
         let cpim = self.cpim.clone();
         Box::pin(async move { cpim })
+    }
+
+    fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
+        self.joined
+            .lock()
+            .unwrap()
+            .push((String::from(conversation_id), server_message.to_vec()));
+        self.joining
     }
 
     fn on_server_message(&self, conversation_id: &str, body: &[u8]) {
@@ -2307,6 +2325,256 @@ fn a_group_chat_is_not_encrypted_by_a_client_not_registered() {
 
 const ALICE: &str = "sip:+15550001@example.com";
 const BOB: &str = "tel:+15550002";
+
+/// The client joining the encrypted groups it is invited to, if `joining`
+fn joining(client: &Client, joining: bool) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        joining,
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+/// What the Conversation Focus sends of the MLS group an invited client is
+/// to join
+const WELCOME: &[u8] = b"\x12\x04welcome bundle";
+
+/// An invitation of the focus to the group, its INVITE carrying the SDP
+/// then `part`, with `part_headers`
+fn multipart_group_invitation(
+    client: &Client,
+    peer: &mut Peer,
+    call_id: &str,
+    part_headers: &str,
+    part: &str,
+) -> MsrpPeer {
+    let msrp = MsrpPeer::listen(&client.rt);
+    let body = format!(
+        "--part-1\r\nContent-Type: application/sdp\r\n\r\n{}\r\n--part-1\r\n{}\r\n{}\r\n--part-1--\r\n",
+        msrp.sdp("sendrecv"),
+        part_headers,
+        part
+    );
+    peer.send(&invite(
+        call_id,
+        &focus_contact(),
+        FOCUS,
+        "cpm.session",
+        "Subject: Friends\r\nReferred-By: \"Alice\" <sip:+15550001@example.com>\r\n",
+        "multipart/mixed; boundary=part-1",
+        &body,
+    ));
+    msrp
+}
+
+/// As multipart_group_invitation(), its MLS group `WELCOME`, base64
+/// encoded in a CPIM message
+fn encrypted_group_invitation(client: &Client, peer: &mut Peer, call_id: &str) -> MsrpPeer {
+    let cpim = format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: welcome-1\r\n\
+\r\n\
+Content-Type: message/mls-rcs-server\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+{}",
+        GROUP,
+        IMPU,
+        general_purpose::STANDARD.encode(WELCOME)
+    );
+    multipart_group_invitation(
+        client,
+        peer,
+        call_id,
+        "Content-Type: message/cpim\r\n",
+        &cpim,
+    )
+}
+
+#[test]
+fn an_encrypted_group_invitation_is_joined_before_it_is_told_of() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = joining(&client, true);
+
+    let msrp = encrypted_group_invitation(&client, &mut peer, "group-encrypted");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert_eq!(
+        *encryption.joined.lock().unwrap(),
+        [(String::from("conversation-1"), WELCOME.to_vec())]
+    );
+    assert_eq!(
+        next_group_event(&client),
+        format!(
+            "invited {} conversation-1 Friends sip:+15550001@example.com Alice accepted encrypted",
+            GROUP
+        )
+    );
+
+    // its session taking what the focus sends of the MLS group
+    assert_eq!(
+        sdp_attribute(&body(&ok), "accept-wrapped-types").as_deref(),
+        Some("multipart/mixed text/plain application/vnd.gsma.rcs-ft-http+xml application/vnd.gsma.rcspushlocation+xml message/imdn+xml application/im-iscomposing+xml message/mls message/mls-rcs-server")
+    );
+    peer.send(&ack(&ok, "group-encrypted"));
+    peer.next_request("SUBSCRIBE");
+    let mut connection = msrp.accept(&rt);
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+    let our_path = sdp_attribute(&body(&ok), "path").expect("an a=path in the answer");
+    connection.send_content(
+        &rt,
+        &msrp.path,
+        &our_path,
+        "message/cpim",
+        &format!(
+            "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:01.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: focus-1\r\n\r\nContent-Type: message/mls-rcs-server\r\n\r\nfrom the focus",
+            GROUP, IMPU
+        ),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let taken = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.server_messages.lock().unwrap().is_empty()
+    });
+    assert!(taken);
+    assert_eq!(
+        *encryption.server_messages.lock().unwrap(),
+        [(String::from("conversation-1"), b"from the focus".to_vec())]
+    );
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_mls_group_of_an_invitation_may_come_in_a_part_of_its_own() {
+    let (client, mut peer) = start(true);
+    let encryption = joining(&client, true);
+    let _msrp = multipart_group_invitation(
+        &client,
+        &mut peer,
+        "group-bare",
+        "Content-Type: message/mls-rcs-server\r\n",
+        "the welcome",
+    );
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(
+        *encryption.joined.lock().unwrap(),
+        [(String::from("conversation-1"), b"the welcome".to_vec())]
+    );
+    assert!(next_group_event(&client).ends_with(" accepted encrypted"));
+    peer.silence();
+}
+
+#[test]
+fn an_encrypted_group_that_cannot_be_joined_is_declined_without_asking() {
+    for set in [true, false] {
+        let (client, mut peer) = start(true);
+        if set {
+            joining(&client, false);
+        }
+        let _msrp = encrypted_group_invitation(&client, &mut peer, "group-not-joined");
+        assert_eq!(status_code(&peer.next_response()), 488, "set {}", set);
+        assert!(
+            client.group_invites.try_recv().is_err(),
+            "the user not asked"
+        );
+        assert!(
+            client
+                .group_events
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "nothing told"
+        );
+        peer.silence();
+    }
+}
+
+#[test]
+fn the_mls_group_of_an_invitation_not_accepted_is_let_go_of() {
+    // declined by the user
+    let (client, mut peer) = start(true);
+    client.group_answer.store(180, Ordering::SeqCst);
+    let encryption = joining(&client, true);
+    let _msrp = encrypted_group_invitation(&client, &mut peer, "group-declined");
+    assert_eq!(status_code(&peer.next_response()), 180);
+    assert!(next_group_event(&client).ends_with(" pending encrypted"));
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+    assert!(client.sessions.answer_invitation(GROUP, false, &client.rt));
+    assert_eq!(status_code(&peer.next_response()), 603);
+    assert_eq!(*encryption.abandoned.lock().unwrap(), ["conversation-1"]);
+    peer.silence();
+
+    // withdrawn by the focus
+    let (client, mut peer) = start(true);
+    client.group_answer.store(180, Ordering::SeqCst);
+    let encryption = joining(&client, true);
+    let _msrp = encrypted_group_invitation(&client, &mut peer, "group-withdrawn");
+    assert_eq!(status_code(&peer.next_response()), 180);
+    peer.send(&cancel("group-withdrawn", FOCUS));
+    let mut answers: Vec<u16> = (0..2).map(|_| status_code(&peer.next_response())).collect();
+    answers.sort();
+    assert_eq!(answers, [200, 487]);
+    let let_go = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.abandoned.lock().unwrap().is_empty()
+    });
+    assert!(let_go);
+    assert_eq!(*encryption.abandoned.lock().unwrap(), ["conversation-1"]);
+    peer.silence();
+
+    // refused by the app at once
+    let (client, mut peer) = start(true);
+    client.group_answer.store(486, Ordering::SeqCst);
+    let encryption = joining(&client, true);
+    let _msrp = encrypted_group_invitation(&client, &mut peer, "group-refused");
+    let _ = peer.next_response();
+    assert_eq!(*encryption.abandoned.lock().unwrap(), ["conversation-1"]);
+    peer.silence();
+
+    // and kept once accepted
+    let (client, mut peer) = start(true);
+    client.group_answer.store(180, Ordering::SeqCst);
+    let encryption = joining(&client, true);
+    let _msrp = encrypted_group_invitation(&client, &mut peer, "group-accepted");
+    assert_eq!(status_code(&peer.next_response()), 180);
+    assert!(client.sessions.answer_invitation(GROUP, true, &client.rt));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+    peer.silence();
+}
+
+#[test]
+fn a_group_invitation_with_its_sdp_among_other_parts_is_taken() {
+    let (client, mut peer) = start(true);
+    let encryption = joining(&client, true);
+
+    // nothing of an MLS group in a CPIM message of another kind
+    let _msrp = multipart_group_invitation(
+        &client,
+        &mut peer,
+        "group-other-part",
+        "Content-Type: message/cpim\r\n",
+        &cpim("Content-Type: text/plain\r\n", "not a welcome"),
+    );
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert!(encryption.joined.lock().unwrap().is_empty());
+    assert!(!body(&ok).contains("message/mls"), "{}", body(&ok));
+    assert_eq!(
+        next_group_event(&client),
+        format!(
+            "invited {} conversation-1 Friends sip:+15550001@example.com Alice accepted",
+            GROUP
+        )
+    );
+    peer.silence();
+}
 
 #[test]
 fn the_participants_of_a_group_are_followed_while_its_session_lasts() {

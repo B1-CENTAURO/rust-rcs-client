@@ -35,10 +35,17 @@ pub trait GroupEncryption: Send + Sync {
         participants: Vec<String>,
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
+    /// Joins the MLS group of the group chat `conversation_id` an invitation
+    /// carries, as the `message/mls-rcs-server` `server_message` with the
+    /// Welcome of the Conversation Focus (RCC.16 sections 6.2.6, 7.9.3, 8.1);
+    /// false if it cannot be
+    fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool;
+
     /// Takes what the Conversation Focus of the group `conversation_id` sent
     /// of its MLS group, as a `message/mls-rcs-server` (section 7.9)
     fn on_server_message(&self, conversation_id: &str, body: &[u8]);
 
     /// Lets go of the MLS group `conversation_id`, as its chat did not start
+    /// or its invitation was not accepted
     fn abandon(&self, conversation_id: &str);
 }

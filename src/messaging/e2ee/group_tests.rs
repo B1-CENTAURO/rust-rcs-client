@@ -20,8 +20,10 @@ use rust_rcs_core::internet::Body;
 use rust_rcs_core::mls::rcs::certificate::CertificateError;
 use rust_rcs_core::mls::rcs::proto::{
     self, client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage,
-    ClientMlsRcsMessage, EpochIdentifier, ServerMlsRcsMessage, WelcomeCommitBundle,
+    ClientMlsRcsMessage, EpochIdentifier, ServerCommitBundle, ServerMlsRcsMessage,
+    WelcomeCommitBundle,
 };
+use rust_rcs_core::mls::rcs::wire::encode_message_list;
 use rust_rcs_core::mls::rcs::{is_unencrypted_cpim_header, CONTENT_TYPE_MLS_RCS_CLIENT};
 use rust_rcs_core::mls::{ErrorKind, IncomingMessage, MlsClient, MlsConfig, MlsConversation};
 
@@ -551,4 +553,202 @@ fn the_groups_of_the_device_are_not_encrypted_when_they_cannot_be() {
         epoch(&device, CONVERSATION),
         Err(StoreError::Mls(ErrorKind::UnknownGroup))
     );
+}
+
+/// A KeyPackage of the device that the Home KDS holds, the `n`th uploaded
+fn uploaded_key_package(kds: &Kds, n: usize) -> Vec<u8> {
+    kds.uploads()[0].0[n].clone()
+}
+
+/// Bob's group `group_id`, to which he adds the device with `key_package`,
+/// and what its Conversation Focus sends the device of it, with
+/// `private_message` bundled
+fn focus_welcome(
+    bob: &MlsClient,
+    group_id: &str,
+    key_package: &[u8],
+    private_message: impl FnOnce(&mut MlsConversation) -> Vec<u8>,
+) -> (MlsConversation, Vec<u8>) {
+    let mut conversation = bob
+        .create_conversation(Some(group_id.as_bytes()), 0)
+        .unwrap();
+    let output = conversation.add_members(bob, &[key_package]).unwrap();
+    conversation.merge_pending_commit(bob).unwrap();
+    let private_message = private_message(&mut conversation);
+    let server_message = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: encode_message_list(&[&output.commit]).unwrap(),
+                welcome: output.welcome.unwrap(),
+                private_message,
+                ratchet_tree: output.ratchet_tree.unwrap(),
+            },
+        )),
+    });
+    (conversation, server_message)
+}
+
+#[test]
+fn a_group_is_joined_with_the_welcome_its_focus_sends() {
+    let (device, kds) = enrolled(None);
+    let bob = bob();
+    let (mut bobs_group, server_message) =
+        focus_welcome(&bob, CONVERSATION, &uploaded_key_package(&kds, 0), |_| {
+            Vec::new()
+        });
+
+    assert_eq!(device.join_group(CONVERSATION, &server_message), Ok(()));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    // in the group with Bob, both ways
+    let sent = bobs_group.encrypt(&bob, b"hello Alice").unwrap();
+    let received = device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, client| {
+            conversation.process(client, &sent)
+        });
+    match received {
+        Ok(IncomingMessage::Application { data, .. }) => assert_eq!(data, b"hello Alice"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    let sent = device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, client| {
+            conversation.encrypt(client, b"hello Bob")
+        })
+        .unwrap();
+    match bobs_group.process(&bob, &sent) {
+        Ok(IncomingMessage::Application { data, .. }) => assert_eq!(data, b"hello Bob"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+
+    // with the continuity token of the group
+    assert_eq!(
+        device
+            .store()
+            .with_client(|client| client.group_metadata(CONVERSATION.as_bytes()))
+            .map(|keys| keys.continuity_token),
+        bob.group_metadata(CONVERSATION.as_bytes())
+            .map(|keys| keys.continuity_token)
+            .map_err(StoreError::Mls)
+    );
+}
+
+#[test]
+fn a_message_bundled_with_the_welcome_is_one_the_group_decrypts() {
+    let (device, kds) = enrolled(None);
+    let bob = bob();
+    let (_, server_message) = focus_welcome(
+        &bob,
+        CONVERSATION,
+        &uploaded_key_package(&kds, 0),
+        |group| group.encrypt(&bob, b"bundled").unwrap(),
+    );
+    assert_eq!(device.join_group(CONVERSATION, &server_message), Ok(()));
+
+    // one that is not, the group not kept
+    let (_, server_message) =
+        focus_welcome(&bob, "group-2", &uploaded_key_package(&kds, 1), |_| {
+            b"not a message".to_vec()
+        });
+    assert!(device.join_group("group-2", &server_message).is_err());
+    assert_eq!(
+        epoch(&device, "group-2"),
+        Err(StoreError::Mls(ErrorKind::UnknownGroup))
+    );
+}
+
+#[test]
+fn a_welcome_to_another_group_than_the_conversation_is_not_joined() {
+    let (device, kds) = enrolled(None);
+    let (_, server_message) = focus_welcome(
+        &bob(),
+        "another-group",
+        &uploaded_key_package(&kds, 0),
+        |_| Vec::new(),
+    );
+    assert_eq!(
+        device.join_group(CONVERSATION, &server_message),
+        Err(StoreError::Mls(ErrorKind::Rejected))
+    );
+    for group_id in [CONVERSATION, "another-group"] {
+        assert_eq!(
+            epoch(&device, group_id),
+            Err(StoreError::Mls(ErrorKind::UnknownGroup)),
+            "{}",
+            group_id
+        );
+    }
+}
+
+#[test]
+fn what_is_not_a_welcome_for_the_device_is_not_joined() {
+    let (device, _) = enrolled(None);
+
+    // one for another client of the user
+    let other_client = MlsClient::with_credential(
+        credential(&[ALICE, CA]),
+        signer(ALICE_KEY, ALICE_PUBLIC_KEY),
+        CIPHERSUITE,
+        MlsConfig::default(),
+        Box::new(validator(TODAY)),
+    )
+    .unwrap();
+    let (_, server_message) = focus_welcome(
+        &bob(),
+        CONVERSATION,
+        &other_client.generate_key_package(false).unwrap(),
+        |_| Vec::new(),
+    );
+    assert!(device.join_group(CONVERSATION, &server_message).is_err());
+
+    // what has none
+    let without = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle::default(),
+        )),
+    });
+    assert_eq!(
+        device.join_group(CONVERSATION, &without),
+        Err(StoreError::Mls(ErrorKind::UnexpectedMessage))
+    );
+    let previous = EpochIdentifier::default();
+    assert_eq!(
+        device.join_group(CONVERSATION, &accepted(previous)),
+        Err(StoreError::Mls(ErrorKind::UnexpectedMessage))
+    );
+    assert_eq!(
+        device.join_group(CONVERSATION, b"\x0a\xff"),
+        Err(StoreError::Mls(ErrorKind::BadFormat))
+    );
+    assert_eq!(
+        epoch(&device, CONVERSATION),
+        Err(StoreError::Mls(ErrorKind::UnknownGroup))
+    );
+}
+
+#[test]
+fn the_groups_of_the_device_are_joined_while_it_is_kept() {
+    let (device, kds) = enrolled(None);
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    let (_, server_message) =
+        focus_welcome(&bob(), CONVERSATION, &uploaded_key_package(&kds, 0), |_| {
+            Vec::new()
+        });
+    assert!(!groups.join("another-group", &server_message));
+    let (_, server_message) =
+        focus_welcome(&bob(), CONVERSATION, &uploaded_key_package(&kds, 1), |_| {
+            Vec::new()
+        });
+    assert!(groups.join(CONVERSATION, &server_message));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    let (_, server_message) =
+        focus_welcome(&bob(), "group-2", &uploaded_key_package(&kds, 2), |_| {
+            Vec::new()
+        });
+    drop(device);
+    assert!(!groups.join("group-2", &server_message));
 }

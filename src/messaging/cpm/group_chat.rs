@@ -66,6 +66,9 @@ pub struct GroupInvitation {
     /// are not accepted automatically (AutAcceptGroupChat 0); else it is
     /// being accepted
     pub pending: bool,
+    /// Whether the group is encrypted end to end, its MLS group joined
+    /// (RCC.16 section 8.1)
+    pub encrypted: bool,
 }
 
 /// The identifiers a group chat is restarted with (RCC.07 section 3.2.4.10),

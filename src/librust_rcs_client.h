@@ -205,9 +205,12 @@ extern void rcs_client_set_group_chat_listener(struct rcs_client *client, group_
 
 // told of an invitation to a group chat not known before: the group's URI and Conversation-ID, then its subject and the URI
 // and display name of whoever invited, each NULL if not told; pending != 0 if it waits for the user's answer, as group chats
-// are not accepted automatically (AutAcceptGroupChat 0), else it is being accepted, and joined (event 0) once it is
+// are not accepted automatically (AutAcceptGroupChat 0), else it is being accepted, and joined (event 0) once it is;
+// encrypted != 0 if the group is encrypted end to end (RCC.16), its MLS group joined; an encrypted group the client cannot
+// join is declined (488) without being told of
 typedef void (*group_chat_invitation_callback) (const char *conference_uri, const char *conversation_id, const char *subject,
-                                const char *inviter_uri, const char *inviter_name, int32_t pending, void *context);
+                                const char *inviter_uri, const char *inviter_name, int32_t pending, int32_t encrypted,
+                                void *context);
 
 // sets the group chat invitation listener; the context of one set before is released
 extern void rcs_client_set_group_chat_invitation_listener(struct rcs_client *client, group_chat_invitation_callback cb, void *context);
