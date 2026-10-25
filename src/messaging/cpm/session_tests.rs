@@ -5541,6 +5541,11 @@ fn what_is_not_an_rcs_message_does_not_move_the_group_to_unencrypted() {
     assert_eq!(send.body, ENDING_CPIM);
     connection.respond(&rt, &send, "200 OK");
     assert_eq!(encryption.ended.lock().unwrap().len(), 1);
+    // nor did the app hear of it moving to unencrypted
+    assert!(client
+        .group_events
+        .try_iter()
+        .all(|event| !event.starts_with("unencrypted")));
 }
 
 #[test]

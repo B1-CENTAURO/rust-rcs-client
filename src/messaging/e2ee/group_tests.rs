@@ -3681,6 +3681,46 @@ fn a_group_another_member_moves_to_unencrypted_is_unencrypted() {
     assert_eq!(epoch(&device, CONVERSATION), Ok((4, false)));
 }
 
+#[test]
+fn a_group_moved_to_unencrypted_stays_so_once_the_device_is_restored() {
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    let output = bobs_group
+        .set_encryption_ended(
+            &bob,
+            Some(EndMlsReason::ClientFailureEncryptionNotAvailable),
+        )
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    device
+        .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+        .unwrap();
+    let output = bobs_group.update_keys(&bob).unwrap();
+    let (query, _) = answering(&[]);
+
+    // not told again by the next Commit
+    let restored = Arc::new(alice(&app, &kds, TODAY, Some(&app.last().unwrap())));
+    let groups = DeviceGroups::new(&restored, query.clone());
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
+        Taken::default()
+    );
+    assert_eq!(epoch(&restored, CONVERSATION), Ok((3, false)));
+
+    let restored = Arc::new(alice(&app, &kds, TODAY, Some(&app.last().unwrap())));
+    let groups = DeviceGroups::new(&restored, query);
+    assert!(groups.encryption_ended(CONVERSATION));
+    assert!(groups.encrypts(CONVERSATION));
+}
+
 const ENCRYPTION_NOT_AVAILABLE: &str =
     "<mls-server-failure-reason><encryption-not-available/></mls-server-failure-reason>";
 
