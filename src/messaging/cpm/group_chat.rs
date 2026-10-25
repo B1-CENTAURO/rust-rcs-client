@@ -1080,10 +1080,16 @@ entity=\"sip:conf1@conf.example.com\" state=\"{}\" version=\"{}\">\
         );
         assert!(changed[0].removed_by_server());
 
+        // kept while nothing tells otherwise
+        let changed = roster.take_in(&document("partial", 3, &user(B, Some("Bob"), "")));
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].status, "booted");
+        assert!(changed[0].removed_by_server());
+
         // a connected endpoint tells no reason, whatever another tells
         let changed = roster.take_in(&document(
             "partial",
-            3,
+            4,
             &user(
                 A,
                 None,

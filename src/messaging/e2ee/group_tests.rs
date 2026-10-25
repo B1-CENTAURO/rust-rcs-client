@@ -2927,10 +2927,11 @@ fn the_participants_the_server_removed_from_groups_of_the_device_are_committed_o
     ));
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(!removing.is_finished(), "waits for the Commit");
-    groups.on_server_message(
+    // which carries no Proposals
+    assert!(!groups.on_server_message(
         CONVERSATION,
         &accepted(epoch_identifier(&device, CONVERSATION)),
-    );
+    ));
     let cpim = rt
         .block_on(removing)
         .unwrap()
