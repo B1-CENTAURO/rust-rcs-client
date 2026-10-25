@@ -21,11 +21,13 @@ use rust_rcs_core::internet::Body;
 use rust_rcs_core::mls::rcs::certificate::CertificateError;
 use rust_rcs_core::mls::rcs::proto::{
     self, client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage,
-    ClientMlsRcsMessage, EpochIdentifier, ServerCommitBundle, ServerMlsRcsMessage,
+    ClientMlsRcsMessage, EpochIdentifier, MlsGroupInfo, ServerCommitBundle, ServerMlsRcsMessage,
     WelcomeCommitBundle,
 };
 use rust_rcs_core::mls::rcs::wire::encode_message_list;
-use rust_rcs_core::mls::rcs::{is_unencrypted_cpim_header, CONTENT_TYPE_MLS_RCS_CLIENT};
+use rust_rcs_core::mls::rcs::{
+    is_unencrypted_cpim_header, ServerFailureReason, CONTENT_TYPE_MLS_RCS_CLIENT,
+};
 use rust_rcs_core::mls::{ErrorKind, IncomingMessage, MlsClient, MlsConfig, MlsConversation};
 
 use crate::capability::{Capabilities, CapabilityQuery};
@@ -327,9 +329,12 @@ fn a_group_is_made_for_the_focus_to_accept_with_the_clients_of_each_participant(
     // Alice's applied once the focus accepts it
     assert_eq!(epoch(&device, CONVERSATION), Ok((0, true)));
     let previous = epoch_identifier(&device, CONVERSATION);
-    match device.on_server_message(CONVERSATION, &accepted(previous)) {
-        Ok(IncomingMessage::Commit { added, .. }) => {
-            assert_eq!(added, vec![credential(&[BOB, CA])])
+    match device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .as_deref()
+    {
+        Ok([IncomingMessage::Commit { added, .. }]) => {
+            assert_eq!(added, &vec![credential(&[BOB, CA])])
         }
         other => panic!("{:?}", other.map(|_| ())),
     }
@@ -363,9 +368,12 @@ fn only_what_the_focus_accepted_of_the_epoch_is_applied() {
         Err(StoreError::Mls(ErrorKind::UnexpectedMessage))
     );
 
-    // what is for members, and what is no message
+    // the GroupInfo, which only answers a request for it, and what is no
+    // message
     let group_info = proto::encode(&ServerMlsRcsMessage {
-        payload: Some(server_mls_rcs_message::Payload::ProposalList(vec![0])),
+        payload: Some(server_mls_rcs_message::Payload::MlsGroupInfo(
+            MlsGroupInfo::default(),
+        )),
     });
     assert_eq!(
         device
@@ -1257,4 +1265,380 @@ fn the_groups_of_a_device_restored_are_encrypted() {
             &mls_message
         )
         .is_some());
+}
+
+/// What the Conversation Focus forwards of the Commit `commit` it accepted
+/// (RCC.16 section 7.9.3)
+fn focus_commit(commit_list: &[&[u8]]) -> Vec<u8> {
+    proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: encode_message_list(commit_list).unwrap(),
+                ..ServerCommitBundle::default()
+            },
+        )),
+    })
+}
+
+/// What the client of Alice receives of what Bob sends the group, decrypted
+fn received_from_bob(
+    device: &E2eeDevice,
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+) -> Result<Vec<u8>, MessageError> {
+    let (outer, mls_message) = from_bob(bob, bobs_group, "tel:+491707654321", "bob-1");
+    device
+        .decrypt_message(
+            CONVERSATION,
+            &cpim_message(&outer).get_info().unwrap(),
+            &mls_message,
+        )
+        .map(|plaintext| {
+            cpim_message(&plaintext)
+                .get_message_body()
+                .unwrap()
+                .1
+                .to_vec()
+        })
+}
+
+/// What Bob decrypts of the message `outer` the client of Alice sends
+fn received_by_bob(bob: &MlsClient, bobs_group: &mut MlsConversation, outer: &[u8]) -> Vec<u8> {
+    let outer = cpim_message(outer);
+    let (_, mls_message, _) = outer.get_message_body().unwrap();
+    bobs_group
+        .decrypt(bob, mls_message, outer.get_info().unwrap().imdn_message_id)
+        .unwrap()
+        .payload
+        .unwrap()
+}
+
+#[test]
+fn a_commit_of_another_member_is_applied_as_the_focus_forwards_it() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let output = bobs_group.update_keys(&bob).unwrap();
+
+    match device
+        .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit {
+            sender,
+            added,
+            removed,
+            self_removed: false,
+        }] => {
+            assert_eq!(sender, bob.credential());
+            assert!(added.is_empty() && removed.is_empty());
+        }
+        other => panic!("{} messages", other.len()),
+    }
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+
+    // the epoch both are in
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    assert_eq!(
+        received_from_bob(&device, &bob, &mut bobs_group),
+        Ok(b"hi Alice".to_vec())
+    );
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-11", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
+    );
+}
+
+#[test]
+fn a_bundle_of_commits_is_applied_whole_or_not_at_all() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, "tel:+491707654321", "bob-1");
+    let output = bobs_group.update_keys(&bob).unwrap();
+
+    // with a Commit of another group after it
+    let mut others = bob.create_conversation(Some(b"other"), 0).unwrap();
+    let other = others.update_keys(&bob).unwrap();
+    assert_eq!(
+        device
+            .on_server_message(
+                CONVERSATION,
+                &focus_commit(&[&output.commit, &other.commit])
+            )
+            .map(|_| ()),
+        Err(StoreError::Mls(ErrorKind::UnexpectedMessage))
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    // still in the epoch the message is of
+    assert!(device
+        .decrypt_message(
+            CONVERSATION,
+            &cpim_message(&outer).get_info().unwrap(),
+            &mls_message
+        )
+        .is_ok());
+
+    assert_eq!(
+        device
+            .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+            .map(|messages| messages.len()),
+        Ok(1)
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+}
+
+#[test]
+fn a_proposal_the_focus_forwards_is_kept_for_a_commit() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let proposal = bobs_group.leave(&bob).unwrap();
+    let proposal_list = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ProposalList(
+            encode_message_list(&[&proposal]).unwrap(),
+        )),
+    });
+
+    match device
+        .on_server_message(CONVERSATION, &proposal_list)
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Proposal { sender }] => assert_eq!(sender, bob.credential()),
+        other => panic!("{} messages", other.len()),
+    }
+    let pending = device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, _| {
+            Ok(conversation.mls_group().pending_proposals().count())
+        });
+    assert_eq!(pending, Ok(1));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+}
+
+#[test]
+fn the_commit_of_the_device_forwarded_back_is_applied() {
+    let (bob, bobs) = bob_with_key_package();
+    let (device, _) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let bundle = bundle_of(&cpim);
+    let mut bobs_group = joined(&bob, &bundle);
+
+    // as the Focus forwards it to all members, before it accepts it
+    let forwarded = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: bundle.commit_list.clone(),
+                welcome: bundle.welcome.clone(),
+                private_message: Vec::new(),
+                ratchet_tree: bundle.ratchet_tree.clone(),
+            },
+        )),
+    });
+    let previous = epoch_identifier(&device, CONVERSATION);
+    assert!(matches!(
+        device
+            .on_server_message(CONVERSATION, &forwarded)
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Commit { .. }]
+    ));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert!(device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .is_ok());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-12", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
+    );
+
+    // a refusal of what was applied is not taken
+    let message_id = String::from_utf8(
+        cpim_message(&cpim)
+            .get_info()
+            .unwrap()
+            .imdn_message_id
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&message_id, "transient-error")),
+        Ok(None)
+    );
+}
+
+#[test]
+fn a_commit_of_another_applied_first_voids_the_one_of_the_device() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, client| {
+            conversation.update_keys(client).map(|_| ())
+        })
+        .unwrap();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let waiting = rt.spawn(groups.encrypt(CONVERSATION, &plaintext("message-13", None)));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!waiting.is_finished(), "waits for the Commit");
+
+    let output = bobs_group.update_keys(&bob).unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit]));
+    let sent = rt
+        .block_on(waiting)
+        .unwrap()
+        .expect("sent in the epoch of the other Commit");
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
+    );
+}
+
+/// The IMDN of the Conversation Focus refusing the message `message_id`
+/// for `reason` (RCC.16 sections 6.2.5, 7.7.2.3)
+fn refusal(message_id: &str, reason: &str) -> Vec<u8> {
+    imdn(
+        message_id,
+        &format!(
+            "<failed><mls-server-failure-reason><{}/></mls-server-failure-reason></failed>",
+            reason
+        ),
+    )
+}
+
+fn imdn(message_id: &str, status: &str) -> Vec<u8> {
+    imdn_with(message_id, status, "")
+}
+
+/// An IMDN with `extension` in its delivery notification, after the status
+fn imdn_with(message_id: &str, status: &str, extension: &str) -> Vec<u8> {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<imdn xmlns=\"urn:ietf:params:xml:ns:imdn\">\
+<message-id>{}</message-id>\
+<datetime>2026-10-25T12:00:03.000+00:00</datetime>\
+<delivery-notification><status>{}</status>{}</delivery-notification>\
+</imdn>",
+        message_id, status, extension
+    )
+    .into_bytes()
+}
+
+const INVALID_COMMIT: &str =
+    "<mls-server-failure-reason><invalid-commit/></mls-server-failure-reason>";
+
+/// The device with a group it made, and the Message-ID of the control
+/// message of its Commit
+fn group_made() -> (Arc<E2eeDevice>, String) {
+    let (_, bobs) = bob_with_key_package();
+    let (device, _) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let message_id = cpim_message(&cpim)
+        .get_info()
+        .unwrap()
+        .imdn_message_id
+        .to_vec();
+    (device, String::from_utf8(message_id).unwrap())
+}
+
+#[test]
+fn a_commit_the_focus_refuses_is_discarded() {
+    let (device, message_id) = group_made();
+
+    // what is not its refusal
+    for (conversation_id, imdn) in [
+        (CONVERSATION, refusal("another", "transient-error")),
+        ("another", refusal(&message_id, "transient-error")),
+        (CONVERSATION, imdn(&message_id, "<delivered/>")),
+        (CONVERSATION, imdn(&message_id, "<failed/>")),
+        (
+            CONVERSATION,
+            imdn(
+                &message_id,
+                "<failed><mls-client-failure-reason><invalid-commit/></mls-client-failure-reason></failed>",
+            ),
+        ),
+        (
+            CONVERSATION,
+            imdn_with(&message_id, "<delivered/>", INVALID_COMMIT),
+        ),
+        (CONVERSATION, b"not an IMDN".to_vec()),
+    ] {
+        assert_eq!(
+            device.on_imdn(conversation_id, &imdn),
+            Ok(None),
+            "{}",
+            String::from_utf8_lossy(&imdn)
+        );
+    }
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, true)));
+    // nor is what the Focus sends that leaves it pending
+    assert!(device.on_server_message(CONVERSATION, b"\x0a\xff").is_err());
+
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&message_id, "transient-error")),
+        Ok(Some(ServerFailureReason::TransientError))
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
+    // the group is of the device alone
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, &plaintext("message-14", None)),
+        Err(MessageError::NotCreated)
+    );
+    // and refused once
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&message_id, "transient-error")),
+        Ok(None)
+    );
+}
+
+#[test]
+fn a_group_abandoned_takes_no_refusal() {
+    let (device, message_id) = group_made();
+    device.abandon(CONVERSATION).unwrap();
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")),
+        Ok(None)
+    );
+}
+
+#[test]
+fn messages_waiting_for_a_commit_the_focus_refuses_are_not_sent() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, message_id) = group_made();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let waiting = rt.spawn(groups.encrypt(CONVERSATION, &plaintext("message-15", None)));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!waiting.is_finished(), "waits for the Commit");
+
+    assert!(!groups.on_imdn(CONVERSATION, &refusal("another", "invalid-commit")));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!waiting.is_finished());
+
+    // the reason where section 6.2.5 places it
+    assert!(groups.on_imdn(
+        CONVERSATION,
+        &imdn_with(&message_id, "<failed/>", INVALID_COMMIT)
+    ));
+    assert_eq!(
+        rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiting).await
+        })
+        .map(|sent| sent.unwrap()),
+        Ok(None),
+        "not sent, at once"
+    );
+
+    drop(device);
+    assert!(!groups.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")));
 }

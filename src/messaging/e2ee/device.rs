@@ -15,6 +15,7 @@
 //! The E2EE of the device: its MLS state, its Home KDS, and its enrolment
 //! once provisioned (RCC.16 sections 4, 5.1)
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rust_rcs_core::mls::rcs::certificate::RcsCredentialValidator;
@@ -64,6 +65,9 @@ pub struct E2eeDevice {
     /// if ACS gave one
     provisioned: Mutex<Option<(String, Option<Vec<u8>>)>>,
     make_signer: MakeSigner,
+    /// By group, the Message-ID of the control message carrying the Commit
+    /// of the device last sent, for as long as the device runs
+    control_messages: Mutex<HashMap<String, String>>,
 }
 
 impl E2eeDevice {
@@ -91,11 +95,16 @@ impl E2eeDevice {
             home_kds,
             provisioned: Mutex::new(None),
             make_signer: Box::new(|| SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).ok()),
+            control_messages: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn store(&self) -> &MlsStore {
         &self.store
+    }
+
+    pub(super) fn control_messages(&self) -> &Mutex<HashMap<String, String>> {
+        &self.control_messages
     }
 
     pub(super) fn kds(&self) -> &dyn KeyDistribution {

@@ -2086,6 +2086,10 @@ struct ScriptedEncryption {
     /// The Conversation-ID and server message of each group to join
     joined: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    /// Whether the IMDNs it is given refuse a control message of the client
+    refusing: bool,
+    /// The Conversation-ID and IMDN of each IMDN received in its groups
+    imdns: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     abandoned: std::sync::Mutex<Vec<String>>,
     /// The groups it encrypts
     encrypting: Vec<String>,
@@ -2129,6 +2133,14 @@ impl GroupEncryption for ScriptedEncryption {
             .lock()
             .unwrap()
             .push((String::from(conversation_id), body.to_vec()));
+    }
+
+    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool {
+        self.imdns
+            .lock()
+            .unwrap()
+            .push((String::from(conversation_id), imdn.to_vec()));
+        self.refusing
     }
 
     fn abandon(&self, conversation_id: &str) {
@@ -2732,6 +2744,10 @@ impl GroupEncryption for EncryptingPrepared {
         self.0.on_server_message(conversation_id, body)
     }
 
+    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool {
+        self.0.on_imdn(conversation_id, imdn)
+    }
+
     fn abandon(&self, conversation_id: &str) {
         self.0.abandon(conversation_id)
     }
@@ -2931,6 +2947,121 @@ fn an_encrypted_message_in_a_group_not_encrypted_is_not_given_to_the_app() {
     );
     assert!(encryption.decrypted.lock().unwrap().is_empty());
     assert!(encryption.encrypted.lock().unwrap().is_empty());
+}
+
+/// A delivery notification from the focus of the message `message_id`,
+/// with `status`
+fn group_imdn_cpim(message_id: &str, status: &str) -> String {
+    format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: focus-imdn-1\r\n\
+\r\n\
+Content-Type: message/imdn+xml\r\n\
+Content-Disposition: notification\r\n\
+\r\n\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<imdn xmlns=\"urn:ietf:params:xml:ns:imdn\">\
+<message-id>{}</message-id>\
+<datetime>2026-10-25T11:59:59.000Z</datetime>\
+<delivery-notification><status>{}</status></delivery-notification>\
+</imdn>",
+        GROUP, ALICE, message_id, status
+    )
+}
+
+const REFUSED: &str =
+    "<failed><mls-server-failure-reason><invalid-commit/></mls-server-failure-reason></failed>";
+
+#[test]
+fn a_refusal_of_a_control_message_of_the_client_is_not_given_to_the_app() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        refusing: true,
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-refused");
+
+    let refusal = group_imdn_cpim("control-1", REFUSED);
+    connection.send_cpim(&rt, &focus_path, &our_path, &refusal);
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    // the next taken first
+    connection.send_cpim(&rt, &focus_path, &our_path, &group_cpim(ALICE, "", "plain"));
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| r.2),
+        Ok(String::from("plain"))
+    );
+    let imdns = encryption.imdns.lock().unwrap();
+    assert_eq!(imdns.len(), 1);
+    assert_eq!(imdns[0].0, "conversation-1");
+    assert!(refusal.ends_with(&*String::from_utf8_lossy(&imdns[0].1)));
+}
+
+#[test]
+fn a_notification_the_encryption_does_not_take_is_given_to_the_app() {
+    // in an encrypted group
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = encrypting_messages(&client, "conversation-1", Some(CIPHERTEXT), None);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-notified");
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &group_imdn_cpim("message-1", "<delivered/>"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let (_, content_type, content) = client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the notification given to the app");
+    assert!(content_type.starts_with("message/imdn+xml"));
+    assert_eq!(
+        Imdn::from_xml(content.as_bytes()).map(|imdn| imdn.message_id),
+        Some(String::from("message-1"))
+    );
+    assert_eq!(encryption.imdns.lock().unwrap().len(), 1);
+
+    // and in one that is not, without the encryption
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        refusing: true,
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, invite, _subscribe, focus_path) = new_group(&client, &mut peer);
+    let our_path = sdp_attribute(&String::from_utf8_lossy(&body_data(&invite)), "path").unwrap();
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &group_imdn_cpim("message-2", REFUSED),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let (_, content_type, _) = client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the notification given to the app");
+    assert!(content_type.starts_with("message/imdn+xml"));
+    assert!(encryption.imdns.lock().unwrap().is_empty());
 }
 
 #[test]

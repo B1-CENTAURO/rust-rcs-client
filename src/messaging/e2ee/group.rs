@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The encrypted group chats of the device: those it creates, and those it
-//! joins (RCC.16 section 8.1)
+//! The encrypted group chats of the device: those it creates, those it
+//! joins, and what their Conversation Focus sends of them (RCC.16 sections
+//! 6.2, 8.1)
 
 use std::io::Read;
 use std::sync::{Arc, Weak};
@@ -23,12 +24,16 @@ use chrono::{Local, SecondsFormat};
 use futures::future::{join_all, BoxFuture};
 use rust_rcs_core::cpim::{CPIMInfo, CPIMMessage};
 use rust_rcs_core::ffi::log::platform_log;
+use rust_rcs_core::imdn::notification::{Imdn, Status};
 use rust_rcs_core::internet::body::message_body::MessageBody;
 use rust_rcs_core::internet::parameter::ParameterParser;
 use rust_rcs_core::internet::{Body, Header};
 use rust_rcs_core::io::DynamicChain;
+use rust_rcs_core::mls::rcs::imdn::{failure_reason, FailureReason};
 use rust_rcs_core::mls::rcs::proto::{self, server_mls_rcs_message, ServerMlsRcsMessage};
-use rust_rcs_core::mls::rcs::{MlsCapability, CONTENT_TYPE_MLS_RCS_CLIENT, MLS_VERSION_V1};
+use rust_rcs_core::mls::rcs::{
+    MlsCapability, ServerFailureReason, CONTENT_TYPE_MLS_RCS_CLIENT, MLS_VERSION_V1,
+};
 use rust_rcs_core::mls::{ErrorKind, IncomingMessage};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -98,7 +103,8 @@ impl E2eeDevice {
     /// own, carrying the `message/mls-rcs-client` its INVITE is to carry
     /// (RCC.16 sections 7.9.2, 8.1, 8.1.2)
     ///
-    /// The Commit is applied once the Conversation Focus accepts it.
+    /// The Commit is applied once the Conversation Focus accepts it, or
+    /// discarded if it refuses it.
     pub async fn create_group(
         &self,
         conversation_id: &str,
@@ -145,7 +151,12 @@ impl E2eeDevice {
             })
             .map_err(GroupError::Store)?;
 
-        Ok(control_message(from, to, &client_message))
+        let (message_id, cpim) = control_message(from, to, &client_message);
+        self.control_messages()
+            .lock()
+            .unwrap()
+            .insert(String::from(conversation_id), message_id);
+        Ok(cpim)
     }
 
     /// Joins the MLS group of the group chat `conversation_id` with the
@@ -197,35 +208,80 @@ impl E2eeDevice {
     }
 
     /// Takes what the Conversation Focus of the group `conversation_id` sent
-    /// of its MLS group (RCC.16 sections 6.2.4, 7.9)
+    /// of its MLS group: its acceptance of the Commit of the device, the
+    /// Commits it accepted, own ones included, and the Proposals (RCC.16
+    /// sections 6.2.4, 7.9.3, 9.2)
+    ///
+    /// A bundle or list is applied as a whole once it is checked, else none
+    /// of it is (section 6.2.6). A Commit of another applied first voids the
+    /// one of the device. The GroupInfo only answers a request for it
+    /// (section 7.10.1).
     pub fn on_server_message(
         &self,
         conversation_id: &str,
         body: &[u8],
-    ) -> Result<IncomingMessage, StoreError> {
-        let message: ServerMlsRcsMessage = proto::decode(body).map_err(StoreError::Mls)?;
-        match message.payload {
-            Some(server_mls_rcs_message::Payload::AcceptedMlsRcsMessage(accepted)) => self
-                .store()
-                .with_conversation(conversation_id.as_bytes(), |conversation, client| {
-                    conversation.process_accepted(client, &accepted)
-                }),
-            // the Commits and Proposals of others, and the GroupInfo, are
-            // for the members of a group
-            _ => Err(StoreError::Mls(ErrorKind::UnexpectedMessage)),
+    ) -> Result<Vec<IncomingMessage>, StoreError> {
+        let (taken, pending) = self.store().with_conversation(
+            conversation_id.as_bytes(),
+            |conversation, client| {
+                let taken = conversation.process_server_message(client, body);
+                Ok((taken, conversation.has_pending_commit()))
+            },
+        )?;
+        if !pending {
+            self.control_messages()
+                .lock()
+                .unwrap()
+                .remove(conversation_id);
         }
+        taken.map_err(StoreError::Mls)
+    }
+
+    /// The reason the Conversation Focus of the group `conversation_id`
+    /// gives in the IMDN `imdn` for refusing the control message carrying
+    /// the pending Commit of the device, if it is that: the Commit is then
+    /// discarded, as the Focus does not apply it (RCC.16 sections 6.2.5,
+    /// 7.7.2.1)
+    pub fn on_imdn(
+        &self,
+        conversation_id: &str,
+        imdn: &[u8],
+    ) -> Result<Option<ServerFailureReason>, StoreError> {
+        // a failed status is of a delivery notification
+        let refused = Imdn::from_xml(imdn).filter(|imdn| imdn.status == Status::Failed);
+        let (Some(refused), Some(FailureReason::Server(reason))) = (refused, failure_reason(imdn))
+        else {
+            return Ok(None);
+        };
+        {
+            let mut control_messages = self.control_messages().lock().unwrap();
+            if control_messages.get(conversation_id) != Some(&refused.message_id) {
+                return Ok(None);
+            }
+            control_messages.remove(conversation_id);
+        }
+
+        self.store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                conversation.discard_pending_commit(client)
+            })?;
+        Ok(Some(reason))
     }
 
     /// Lets go of the MLS group `conversation_id`
     pub fn abandon(&self, conversation_id: &str) -> Result<(), StoreError> {
+        self.control_messages()
+            .lock()
+            .unwrap()
+            .remove(conversation_id);
         self.store().delete_conversation(conversation_id.as_bytes())
     }
 }
 
 /// A CPIM message carrying the `message/mls-rcs-client` `client_message`,
 /// with only the headers left unencrypted, asking to be told if it is
-/// refused (RCC.16 sections 6.2.5, 7.5.6, 7.5.7, 7.9)
-fn control_message(from: &str, to: &str, client_message: &[u8]) -> Vec<u8> {
+/// refused (RCC.16 sections 6.2.5, 7.5.6, 7.5.7, 7.9), and its Message-ID
+fn control_message(from: &str, to: &str, client_message: &[u8]) -> (String, Vec<u8>) {
     let message_id = Uuid::new_v4()
         .as_hyphenated()
         .encode_lower(&mut Uuid::encode_buffer())
@@ -239,7 +295,7 @@ fn control_message(from: &str, to: &str, client_message: &[u8]) -> Vec<u8> {
                 b"DateTime",
                 Local::now().to_rfc3339_opts(SecondsFormat::Millis, false),
             ),
-            Header::new(b"imdn.Message-ID", message_id),
+            Header::new(b"imdn.Message-ID", message_id.clone()),
             Header::new(b"imdn.Disposition-Notification", b"negative-delivery"),
         ],
         Body::Message(MessageBody {
@@ -256,7 +312,7 @@ fn control_message(from: &str, to: &str, client_message: &[u8]) -> Vec<u8> {
     if message.get_readers(&mut readers).is_ok() {
         let _ = DynamicChain::new(readers).read_to_end(&mut data);
     }
-    data
+    (message_id, data)
 }
 
 /// The group chats created encrypted by the device, for as long as it is kept
@@ -336,6 +392,21 @@ impl GroupEncryption for DeviceGroups {
             }
         }
         self.taken.notify_waiters();
+    }
+
+    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool {
+        let Some(device) = self.device.upgrade() else {
+            return false;
+        };
+        let refused = match device.on_imdn(conversation_id, imdn) {
+            Ok(None) => return false,
+            Ok(Some(reason)) => format!("Commit refused by the focus: {:?}", reason),
+            Err(e) => format!("Commit refused by the focus, not discarded: {:?}", e),
+        };
+        platform_log(LOG_TAG, refused);
+        // what waits for it is sent, or not, without it
+        self.taken.notify_waiters();
+        true
     }
 
     fn abandon(&self, conversation_id: &str) {

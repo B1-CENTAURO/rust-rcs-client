@@ -46,8 +46,16 @@ pub trait GroupEncryption: Send + Sync {
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool;
 
     /// Takes what the Conversation Focus of the group `conversation_id` sent
-    /// of its MLS group, as a `message/mls-rcs-server` (section 7.9)
+    /// of its MLS group, as a `message/mls-rcs-server`: its acceptance of a
+    /// Commit of this client, and the Commits and Proposals of others
+    /// (sections 6.2.4, 7.9)
     fn on_server_message(&self, conversation_id: &str, body: &[u8]);
+
+    /// Takes the `message/imdn+xml` `imdn` received in the group chat
+    /// `conversation_id`: true if it is the Conversation Focus refusing a
+    /// control message of this client, which is not for the app (RCC.16
+    /// sections 6.2.5, 7.7.2.1)
+    fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool;
 
     /// Lets go of the MLS group `conversation_id`, as its chat did not start
     /// or its invitation was not accepted
