@@ -2099,6 +2099,14 @@ struct ScriptedEncryption {
     encrypted: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     /// The CPIM message it decrypts the encrypted messages to, if it can
     plaintext: Option<String>,
+    /// What it signs the notifications of those as, if it can
+    signature: Option<String>,
+    /// The Conversation-ID and CPIM message of each notification to sign
+    signed: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    /// Whether the notifications received in its groups are for the app
+    verifying: bool,
+    /// The Conversation-ID, CPIM From and IMDN of each notification to check
+    verified: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
     /// The Conversation-ID, CPIM From and Message-ID, and content of each
     /// message to decrypt
     decrypted: std::sync::Mutex<Vec<(String, String, String, Vec<u8>)>>,
@@ -2161,6 +2169,24 @@ impl GroupEncryption for ScriptedEncryption {
             .push((String::from(conversation_id), cpim.to_vec()));
         let ciphertext = self.ciphertext.clone().map(String::into_bytes);
         Box::pin(async move { ciphertext })
+    }
+
+    fn sign(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.signed
+            .lock()
+            .unwrap()
+            .push((String::from(conversation_id), cpim.to_vec()));
+        let signature = self.signature.clone().map(String::into_bytes);
+        Box::pin(async move { signature })
+    }
+
+    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> bool {
+        self.verified.lock().unwrap().push((
+            String::from(conversation_id),
+            String::from_utf8_lossy(cpim_info.from).into_owned(),
+            imdn.to_vec(),
+        ));
+        self.verifying
     }
 
     fn decrypt(
@@ -2765,6 +2791,14 @@ impl GroupEncryption for EncryptingPrepared {
         self.0.encrypt(conversation_id, cpim)
     }
 
+    fn sign(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.sign(conversation_id, cpim)
+    }
+
+    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> bool {
+        self.0.verify(conversation_id, cpim_info, imdn)
+    }
+
     fn decrypt(
         &self,
         conversation_id: &str,
@@ -2891,6 +2925,11 @@ fn an_encrypted_message_is_given_to_the_app_decrypted() {
         encryption.encrypted.lock().unwrap().is_empty(),
         "the notification not encrypted"
     );
+    assert_eq!(
+        encryption.signed.lock().unwrap().len(),
+        1,
+        "and sent unsigned, as it could not be signed"
+    );
 }
 
 #[test]
@@ -3011,12 +3050,28 @@ fn a_refusal_of_a_control_message_of_the_client_is_not_given_to_the_app() {
     assert!(refusal.ends_with(&*String::from_utf8_lossy(&imdns[0].1)));
 }
 
+/// The client with the group `conversation-1` encrypted, the notifications
+/// received in it taken as signed by whom they are from if `verifying`
+fn verifying(client: &Client, verifying: bool) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        verifying,
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
 #[test]
 fn a_notification_the_encryption_does_not_take_is_given_to_the_app() {
-    // in an encrypted group
+    // in an encrypted group, signed by whom it is from
     let (client, mut peer) = start(true);
     let rt = Arc::clone(&client.rt);
-    let encryption = encrypting_messages(&client, "conversation-1", Some(CIPHERTEXT), None);
+    let encryption = verifying(&client, true);
     let (mut connection, focus_path, our_path) =
         joined_encrypted_group(&client, &mut peer, "group-notified");
     connection.send_cpim(
@@ -3036,6 +3091,14 @@ fn a_notification_the_encryption_does_not_take_is_given_to_the_app() {
         Some(String::from("message-1"))
     );
     assert_eq!(encryption.imdns.lock().unwrap().len(), 1);
+    let verified = encryption.verified.lock().unwrap();
+    assert_eq!(verified.len(), 1);
+    assert_eq!(
+        (verified[0].0.as_str(), verified[0].1.as_str()),
+        ("conversation-1", &*format!("<{}>", GROUP))
+    );
+    assert_eq!(verified[0].2, encryption.imdns.lock().unwrap()[0].1);
+    drop(verified);
 
     // and in one that is not, without the encryption
     let (client, mut peer) = start(true);
@@ -3062,6 +3125,146 @@ fn a_notification_the_encryption_does_not_take_is_given_to_the_app() {
         .expect("the notification given to the app");
     assert!(content_type.starts_with("message/imdn+xml"));
     assert!(encryption.imdns.lock().unwrap().is_empty());
+    assert!(encryption.verified.lock().unwrap().is_empty());
+
+    // its own sent unsigned
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &group_cpim(ALICE, ASKING, "tell me"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let _ = client.received.recv_timeout(Duration::from_secs(5));
+    let send = connection.next_message(&rt);
+    let (_, imdn) = group_notification(&send);
+    assert_eq!(imdn.message_id, "peer-message-1");
+    connection.respond(&rt, &send, "200 OK");
+    assert!(encryption.signed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_notification_not_signed_by_whom_it_is_from_is_not_given_to_the_app() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = verifying(&client, false);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-unverified");
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &group_imdn_cpim("message-1", "<displayed/>"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    // the next taken first
+    connection.send_cpim(&rt, &focus_path, &our_path, &group_cpim(ALICE, "", "plain"));
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| r.2),
+        Ok(String::from("plain"))
+    );
+    assert_eq!(encryption.verified.lock().unwrap().len(), 1);
+}
+
+/// What the scripted encryption makes of a notification it signs
+const SIGNED: &str = "From: <sip:+15551234@example.com>\r\nTo: <tel:+15550002>\r\nNS: mls <http://www.gsma.com/rcs/mls>\r\nmls.MLS-Derived-Content-Signature: c2lnbmVk\r\n\r\nContent-Type: message/imdn+xml\r\n\r\n<imdn/>";
+
+#[test]
+fn the_notifications_of_an_encrypted_group_are_sent_signed() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let plaintext = format!(
+        "From: <tel:+15550002>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: peer-message-1\r\n{}\r\nContent-Type: text/plain\r\n\r\nhi",
+        GROUP, ASKING
+    );
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        ciphertext: Some(String::from(CIPHERTEXT)),
+        plaintext: Some(plaintext),
+        signature: Some(String::from(SIGNED)),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-signing");
+
+    // its delivery
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &encrypted_group_cpim(ALICE, ASKING, "ciphertext"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let _ = client.received.recv_timeout(Duration::from_secs(5));
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    assert_eq!(String::from_utf8_lossy(&send.body), SIGNED);
+    connection.respond(&rt, &send, "200 OK");
+
+    // and its display
+    let notice = client
+        .received_messages
+        .displayed("peer-message-1")
+        .unwrap();
+    assert!(client.sessions.send_group_imdn(
+        GROUP,
+        &notice.xml,
+        &notice.sender_uri,
+        |_, _| {},
+        &rt
+    ));
+    let send = connection.next_message(&rt);
+    assert_eq!(String::from_utf8_lossy(&send.body), SIGNED);
+    connection.respond(&rt, &send, "200 OK");
+
+    // signed as they would have been sent
+    let signed = encryption.signed.lock().unwrap();
+    let told: Vec<(&str, Notification, Status, String)> = signed
+        .iter()
+        .map(|(conversation_id, cpim)| {
+            let cpim = CPIMMessage::try_from(&Body::construct_message(cpim).unwrap()).unwrap();
+            let (content_type, xml, _) = cpim.get_message_body().unwrap();
+            assert_eq!(content_type, Some(&b"message/imdn+xml"[..]));
+            let imdn = Imdn::from_xml(xml).unwrap();
+            (
+                conversation_id.as_str(),
+                imdn.notification,
+                imdn.status,
+                imdn.message_id,
+            )
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (
+                "conversation-1",
+                Notification::Delivery,
+                Status::Delivered,
+                String::from("peer-message-1")
+            ),
+            (
+                "conversation-1",
+                Notification::Display,
+                Status::Displayed,
+                String::from("peer-message-1")
+            ),
+        ]
+    );
+    assert!(
+        encryption.encrypted.lock().unwrap().is_empty(),
+        "nor encrypted"
+    );
 }
 
 #[test]

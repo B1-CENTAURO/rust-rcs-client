@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The messages of the encrypted group chats (RCC.16 sections 7.5, 9.1.1)
+//! The messages of the encrypted group chats, and their signed notifications
+//! (RCC.16 sections 7.5, 7.6, 9.1.1, 9.1.3, 9.1.4)
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -20,12 +21,19 @@ use std::io::Read;
 use base64::{engine::general_purpose, Engine as _};
 use rust_rcs_core::cpim::cpim_namespace::CPIMNamespace;
 use rust_rcs_core::cpim::{CPIMHeaders, CPIMInfo, CPIMMessage};
+use rust_rcs_core::imdn::notification::{Imdn, Notification, Status};
 use rust_rcs_core::internet::Body;
-use rust_rcs_core::mls::rcs::{
-    credential_tel_uris, is_unencrypted_cpim_header, same_tel_uri, SecretPayloadType,
-    CPIM_HEADER_EPOCH_AUTHENTICATOR, CPIM_HEADER_ERA_ID, CPIM_NAMESPACE, CPIM_NAMESPACE_PREFIX,
+use rust_rcs_core::mls::rcs::imdn::{failure_reason, FailureReason};
+use rust_rcs_core::mls::rcs::wire::{
+    self, AuthenticatedData, DeliveryNotificationStatus, DisplayNotificationStatus,
+    VerifiableDeliveryImdn, VerifiableDerivedContent, VerifiableDisplayImdn,
 };
-use rust_rcs_core::mls::ErrorKind;
+use rust_rcs_core::mls::rcs::{
+    credential_tel_uris, is_unencrypted_cpim_header, same_tel_uri, ClientFailureReason,
+    SecretPayloadType, CPIM_HEADER_DERIVED_CONTENT_SIGNATURE, CPIM_HEADER_EPOCH_AUTHENTICATOR,
+    CPIM_HEADER_ERA_ID, CPIM_NAMESPACE, CPIM_NAMESPACE_PREFIX,
+};
+use rust_rcs_core::mls::{Credential, ErrorKind};
 
 use super::device::{participant_tel_uri, E2eeDevice};
 use super::store::StoreError;
@@ -42,8 +50,15 @@ pub enum MessageError {
     /// The Conversation Focus refused the Commit that made the group, which
     /// is in no epoch the others are in
     NotCreated,
-    /// What was to be encrypted is not a CPIM message with an IMDN Message-ID
+    /// What was to be encrypted is not a CPIM message with an IMDN Message-ID,
+    /// or what was to be signed or checked not one carrying a delivery or
+    /// display notification
     NotCpim,
+    /// A notification not signed, that is to be (RCC.16 sections 9.1.3, 9.1.4)
+    NotSigned,
+    /// A notification signed by another member than the participant it is
+    /// from
+    NotFromSigner,
     Store(StoreError),
 }
 
@@ -78,6 +93,63 @@ fn with_negative_delivery(disposition: Option<&[u8]>) -> Vec<u8> {
         Some(disposition) => [disposition, b", negative-delivery"].concat(),
         None => b"negative-delivery".to_vec(),
     }
+}
+
+/// The tel URI of the participant the CPIM From of `cpim_info` gives, if any
+fn told_sender(cpim_info: &CPIMInfo) -> Option<String> {
+    let uri = cpim_info.from_uri.as_ref()?;
+    let uri = String::from_utf8_lossy(&uri.string_representation_without_query_and_fragment())
+        .into_owned();
+    participant_tel_uri(std::iter::once(uri.as_str()), None)
+}
+
+/// Whether `told`, the tel URI of a participant, is one of those of the
+/// credential `credential`
+fn is_of(credential: &Credential, told: &str) -> bool {
+    credential_tel_uris(credential)
+        .unwrap_or_default()
+        .iter()
+        .any(|uri| same_tel_uri(uri, told))
+}
+
+/// What the signature of the notification `imdn` covers, sent in the CPIM
+/// message of Message-ID `message_id` in Era `era` (RCC.16 sections 7.5.3.2,
+/// 7.6.3); None if it is no delivery or display notification
+///
+/// The Message-IDs of Original Messages are left empty, as Re-Sent Messages
+/// are not taken yet.
+fn signed_content(message_id: &[u8], era: u32, imdn: &[u8]) -> Option<Vec<u8>> {
+    let notification = Imdn::from_xml(imdn)?;
+    let told_of = notification.message_id.as_bytes();
+    let content = match (notification.notification, notification.status) {
+        (Notification::Delivery, status) => {
+            let status = match status {
+                Status::Delivered => DeliveryNotificationStatus::Delivered,
+                Status::Failed => DeliveryNotificationStatus::Failed,
+                Status::Forbidden => DeliveryNotificationStatus::Forbidden,
+                Status::Error => DeliveryNotificationStatus::Error,
+                _ => return None,
+            };
+            let reason = match failure_reason(imdn) {
+                Some(FailureReason::Client(reason)) => reason,
+                _ => ClientFailureReason::Unset,
+            };
+            VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+                status, told_of, b"", reason,
+            ))
+        }
+        (Notification::Display, status) => {
+            let status = match status {
+                Status::Displayed => DisplayNotificationStatus::Displayed,
+                Status::Forbidden => DisplayNotificationStatus::Forbidden,
+                Status::Error => DisplayNotificationStatus::Error,
+                _ => return None,
+            };
+            VerifiableDerivedContent::DisplayImdn(VerifiableDisplayImdn::new(status, told_of, b""))
+        }
+        (Notification::Processing, _) => return None,
+    };
+    wire::encode(&AuthenticatedData::new(message_id, b"", era, content)).ok()
 }
 
 impl E2eeDevice {
@@ -249,18 +321,8 @@ impl E2eeDevice {
 
         // the sender as the RCS sender identity tells, else as MLS does
         let tel_uris = credential_tel_uris(&decrypted.sender).unwrap_or_default();
-        let told = cpim_info
-            .from_uri
-            .as_ref()
-            .map(|uri| {
-                String::from_utf8_lossy(&uri.string_representation_without_query_and_fragment())
-                    .into_owned()
-            })
-            .and_then(|uri| participant_tel_uri(std::iter::once(uri.as_str()), None));
-        let from = match (told, tel_uris.first()) {
-            (Some(told), _) if tel_uris.iter().any(|uri| same_tel_uri(uri, &told)) => {
-                cpim_info.from.to_vec()
-            }
+        let from = match (told_sender(cpim_info), tel_uris.first()) {
+            (Some(told), _) if is_of(&decrypted.sender, &told) => cpim_info.from.to_vec(),
             (_, Some(sender)) => format!("<{}>", sender).into_bytes(),
             (_, None) => cpim_info.from.to_vec(),
         };
@@ -277,5 +339,110 @@ impl E2eeDevice {
         // the headers encrypted, then the MIME body
         data.extend_from_slice(&payload);
         Ok(data)
+    }
+
+    /// The CPIM message `cpim` carrying a delivery or display notification,
+    /// signed in the MLS group `conversation_id` over what it tells of, with
+    /// the Era-ID of the group (RCC.16 sections 7.5.3.3, 7.6.1, 9.1.3, 9.1.4)
+    ///
+    /// Not while a Commit of this client waits for the Conversation Focus to
+    /// accept it, nor once the Focus refused the Commit that made the group.
+    pub fn sign_notification(
+        &self,
+        conversation_id: &str,
+        cpim: &[u8],
+    ) -> Result<Vec<u8>, MessageError> {
+        let body = Body::construct_message(cpim).map_err(|_| MessageError::NotCpim)?;
+        let message = CPIMMessage::try_from(&body).map_err(|_| MessageError::NotCpim)?;
+        let info = message.get_info().map_err(|_| MessageError::NotCpim)?;
+        // as the client makes them, not Base64 encoded
+        let (_, imdn, _) = message.get_message_body().ok_or(MessageError::NotCpim)?;
+        // the end of the headers, after which the MIME body comes
+        let end = cpim
+            .windows(4)
+            .position(|crlfs| crlfs == b"\r\n\r\n")
+            .ok_or(MessageError::NotCpim)?
+            + 2;
+
+        let (pending, epoch, era) = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, _| {
+                Ok((
+                    conversation.has_pending_commit(),
+                    conversation.epoch(),
+                    conversation.era(),
+                ))
+            })
+            .map_err(MessageError::Store)?;
+        if pending {
+            return Err(MessageError::Pending);
+        }
+        if epoch == 0 {
+            return Err(MessageError::NotCreated);
+        }
+        let era = era.ok_or(MessageError::Store(StoreError::Mls(
+            ErrorKind::InvalidState,
+        )))?;
+        let content =
+            signed_content(info.imdn_message_id, era, imdn).ok_or(MessageError::NotCpim)?;
+        let signature = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                conversation.sign(client, &content)
+            })
+            .map_err(MessageError::Store)?;
+
+        let mut data = cpim[..end].to_vec();
+        header_line(&mut data, b"NS", b"mls <http://www.gsma.com/rcs/mls>");
+        header_line(
+            &mut data,
+            &[&b"mls."[..], CPIM_HEADER_DERIVED_CONTENT_SIGNATURE].concat(),
+            general_purpose::STANDARD.encode(signature).as_bytes(),
+        );
+        header_line(
+            &mut data,
+            &[&b"mls."[..], CPIM_HEADER_ERA_ID].concat(),
+            era.to_string().as_bytes(),
+        );
+        data.extend_from_slice(&cpim[end..]);
+        Ok(data)
+    }
+
+    /// Whether the notification `imdn` received in the MLS group
+    /// `conversation_id`, in the CPIM message `cpim_info` tells of, is signed
+    /// over what it tells of by the participant it is from (RCC.16 sections
+    /// 7.6.2, 9.1.3, 9.1.4)
+    ///
+    /// A negative delivery may come unsigned: the Conversation Focus sends
+    /// its own so, and a client that cannot sign one (section 7.7.2).
+    pub fn verify_notification(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        imdn: &[u8],
+    ) -> Result<(), MessageError> {
+        let Some(signature) = cpim_info.mls_derived_content_signature else {
+            return match Imdn::from_xml(imdn) {
+                Some(notification) if notification.status == Status::Failed => Ok(()),
+                _ => Err(MessageError::NotSigned),
+            };
+        };
+        let signature = general_purpose::STANDARD
+            .decode(signature)
+            .map_err(|_| MessageError::Store(StoreError::Mls(ErrorKind::BadFormat)))?;
+
+        let signer = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                let era = conversation.era().ok_or(ErrorKind::InvalidState)?;
+                let content = signed_content(cpim_info.imdn_message_id, era, imdn)
+                    .ok_or(ErrorKind::BadFormat)?;
+                conversation.verify_signature(client, &signature, &content)
+            })
+            .map_err(MessageError::Store)?;
+        match told_sender(cpim_info) {
+            Some(told) if is_of(&signer, &told) => Ok(()),
+            _ => Err(MessageError::NotFromSigner),
+        }
     }
 }

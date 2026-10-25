@@ -71,6 +71,19 @@ pub trait GroupEncryption: Send + Sync {
     /// accept is; None if it cannot be
     fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>>;
 
+    /// The CPIM message `cpim` carrying a notification of the group chat
+    /// `conversation_id`, signed over what it tells of (RCC.16 sections
+    /// 7.6.1, 9.1.3, 9.1.4), once a Commit of this client the Conversation
+    /// Focus is yet to accept is; None if it cannot be
+    fn sign(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>>;
+
+    /// Whether the `message/imdn+xml` `imdn` received in the group chat
+    /// `conversation_id`, delivered in the CPIM message `cpim_info` tells of,
+    /// is for the app: signed over what it tells of by the participant it is
+    /// from, or a negative delivery, which may come unsigned (RCC.16 sections
+    /// 7.6.2, 7.7)
+    fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> bool;
+
     /// The CPIM message the `message/mls` `mls_message` of the group chat
     /// `conversation_id` carried, delivered in the CPIM message `cpim_info`
     /// tells of; its From the MLS identity of the sender if that is another

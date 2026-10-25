@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose, Engine as _};
@@ -24,14 +25,20 @@ use rust_rcs_core::mls::rcs::proto::{
     ClientMlsRcsMessage, EpochIdentifier, MlsGroupInfo, ServerCommitBundle, ServerMlsRcsMessage,
     WelcomeCommitBundle,
 };
-use rust_rcs_core::mls::rcs::wire::encode_message_list;
+use rust_rcs_core::mls::rcs::wire::{
+    self, encode_message_list, AuthenticatedData, DeliveryNotificationStatus,
+    DisplayNotificationStatus, VerifiableDeliveryImdn, VerifiableDerivedContent,
+    VerifiableDisplayImdn,
+};
 use rust_rcs_core::mls::rcs::{
-    is_unencrypted_cpim_header, ServerFailureReason, CONTENT_TYPE_MLS_RCS_CLIENT,
+    is_unencrypted_cpim_header, ClientFailureReason, ServerFailureReason,
+    CONTENT_TYPE_MLS_RCS_CLIENT,
 };
 use rust_rcs_core::mls::{ErrorKind, IncomingMessage, MlsClient, MlsConfig, MlsConversation};
 
 use crate::capability::{Capabilities, CapabilityQuery};
 use crate::messaging::cpm::encryption::GroupEncryption;
+use crate::messaging::cpm::make_cpim_imdn_body;
 
 use super::device::{E2eeDevice, Enrolled, CIPHERSUITE};
 use super::device_tests::{alice, provision};
@@ -1641,4 +1648,356 @@ fn messages_waiting_for_a_commit_the_focus_refuses_are_not_sent() {
 
     drop(device);
     assert!(!groups.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")));
+}
+
+/// An IMDN document of `message_id`, its notification `notification` with
+/// `status`
+fn notification_xml(message_id: &str, notification: &str, status: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<imdn xmlns=\"urn:ietf:params:xml:ns:imdn\">\
+<message-id>{}</message-id>\
+<datetime>2026-10-25T12:00:00.000Z</datetime>\
+<{2}><status>{}</status></{2}>\
+</imdn>",
+        message_id, status, notification
+    )
+}
+
+/// The CPIM message of Message-ID `cpim_id` carrying the notification `xml`,
+/// from `from`, as the client sends one, with `extra` headers
+fn notification_cpim(from: &str, cpim_id: &str, extra: &str, xml: &str) -> Vec<u8> {
+    format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:04.000+00:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: {}\r\n\
+{}\
+\r\n\
+Content-Type: message/imdn+xml\r\n\
+Content-Disposition: notification\r\n\
+Content-Length: {}\r\n\
+\r\n\
+{}",
+        from,
+        BOB_TEL,
+        cpim_id,
+        extra,
+        xml.len(),
+        xml
+    )
+    .into_bytes()
+}
+
+/// What the signature of a notification of the CPIM message `cpim_id` in
+/// Era 0 covers, as Bob derives it
+fn derived(cpim_id: &str, content: VerifiableDerivedContent) -> Vec<u8> {
+    wire::encode(&AuthenticatedData::new(cpim_id.as_bytes(), b"", 0, content)).unwrap()
+}
+
+#[test]
+fn a_notification_is_signed_over_what_it_tells_of() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let alice = credential(&[ALICE, CA]);
+
+    for (xml, content) in [
+        (
+            notification_xml("bob-1", "delivery-notification", "<delivered/>"),
+            VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+                DeliveryNotificationStatus::Delivered,
+                b"bob-1",
+                b"",
+                ClientFailureReason::Unset,
+            )),
+        ),
+        (
+            notification_xml("bob-1", "display-notification", "<displayed/>"),
+            VerifiableDerivedContent::DisplayImdn(VerifiableDisplayImdn::new(
+                DisplayNotificationStatus::Displayed,
+                b"bob-1",
+                b"",
+            )),
+        ),
+        // a negative delivery with the reason of the client
+        (
+            notification_xml(
+                "bob-1",
+                "delivery-notification",
+                "<failed><mls-client-failure-reason><failed-to-decrypt/></mls-client-failure-reason></failed>",
+            ),
+            VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+                DeliveryNotificationStatus::Failed,
+                b"bob-1",
+                b"",
+                ClientFailureReason::FailureToDecrypt,
+            )),
+        ),
+    ] {
+        let cpim = notification_cpim(IMPU, "imdn-1", "", &xml);
+        let signed = device.sign_notification(CONVERSATION, &cpim).unwrap();
+
+        // the headers added after those it had, the notification as it was
+        let message = cpim_message(&signed);
+        assert_eq!(
+            header_names(&message),
+            [
+                "From",
+                "To",
+                "DateTime",
+                "<urn:ietf:params:imdn>.Message-ID",
+                "<http://www.gsma.com/rcs/mls>.MLS-Derived-Content-Signature",
+                "<http://www.gsma.com/rcs/mls>.Era-ID",
+            ]
+        );
+        assert_eq!(
+            message.get_message_body(),
+            Some((Some(&b"message/imdn+xml"[..]), xml.as_bytes(), false))
+        );
+        let text = String::from_utf8_lossy(&signed).into_owned();
+        assert!(text.contains("\r\nmls.Era-ID: 0\r\n\r\n"), "{}", text);
+
+        let signature = message
+            .get_info()
+            .unwrap()
+            .mls_derived_content_signature
+            .unwrap();
+        let signature = general_purpose::STANDARD.decode(signature).unwrap();
+        assert_eq!(
+            bobs_group
+                .verify_signature(&bob, &signature, &derived("imdn-1", content))
+                .unwrap(),
+            alice,
+            "{}",
+            xml
+        );
+    }
+}
+
+#[test]
+fn a_notification_is_not_signed_unless_it_can_be() {
+    let xml = notification_xml("bob-1", "delivery-notification", "<delivered/>");
+    let cpim = notification_cpim(IMPU, "imdn-2", "", &xml);
+
+    // while the Commit of the group waits, or once it is refused
+    let (device, message_id) = group_made();
+    assert_eq!(
+        device.sign_notification(CONVERSATION, &cpim),
+        Err(MessageError::Pending)
+    );
+    device
+        .on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit"))
+        .unwrap();
+    assert_eq!(
+        device.sign_notification(CONVERSATION, &cpim),
+        Err(MessageError::NotCreated)
+    );
+
+    // what is no delivery or display notification, or no CPIM message, or
+    // of no group
+    let (device, _, _) = alice_and_bob();
+    let processed = notification_cpim(
+        IMPU,
+        "imdn-3",
+        "",
+        &notification_xml("bob-1", "processing-notification", "<processed/>"),
+    );
+    for cpim in [
+        processed,
+        notification_cpim(IMPU, "imdn-4", "", "<not-an-imdn/>"),
+        b"not a CPIM message".to_vec(),
+    ] {
+        assert_eq!(
+            device.sign_notification(CONVERSATION, &cpim),
+            Err(MessageError::NotCpim)
+        );
+    }
+    assert_eq!(
+        device.sign_notification("another", &cpim),
+        Err(MessageError::Store(StoreError::Mls(
+            ErrorKind::UnknownGroup
+        )))
+    );
+}
+
+/// Bob's notification of `xml`, in the CPIM message `cpim_id` from `from`,
+/// signed over `content`
+fn signed_by_bob(
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+    from: &str,
+    cpim_id: &str,
+    xml: &str,
+    content: VerifiableDerivedContent,
+) -> Vec<u8> {
+    let signature = bobs_group.sign(bob, &derived(cpim_id, content)).unwrap();
+    let extra = format!(
+        "NS: mls <http://www.gsma.com/rcs/mls>\r\nmls.MLS-Derived-Content-Signature: {}\r\nmls.Era-ID: 0\r\n",
+        general_purpose::STANDARD.encode(signature)
+    );
+    notification_cpim(from, cpim_id, &extra, xml)
+}
+
+#[test]
+fn a_notification_received_is_taken_if_signed_by_whom_it_is_from() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let xml = notification_xml("message-1", "display-notification", "<displayed/>");
+    let displayed = || {
+        VerifiableDerivedContent::DisplayImdn(VerifiableDisplayImdn::new(
+            DisplayNotificationStatus::Displayed,
+            b"message-1",
+            b"",
+        ))
+    };
+    let verified = |cpim: &[u8], xml: &str| {
+        device.verify_notification(
+            CONVERSATION,
+            &cpim_message(cpim).get_info().unwrap(),
+            xml.as_bytes(),
+        )
+    };
+
+    // by him, from him, in a SIP URI or a tel URI
+    for from in ["sip:+491707654321@ims.example.com", BOB_TEL] {
+        let cpim = signed_by_bob(&bob, &mut bobs_group, from, "imdn-5", &xml, displayed());
+        assert_eq!(verified(&cpim, &xml), Ok(()), "{}", from);
+    }
+
+    // from another
+    let cpim = signed_by_bob(
+        &bob,
+        &mut bobs_group,
+        "sip:+491700000009@ims.example.com",
+        "imdn-6",
+        &xml,
+        displayed(),
+    );
+    assert_eq!(verified(&cpim, &xml), Err(MessageError::NotFromSigner));
+
+    // not over what it tells of: another notification, or another CPIM
+    // message
+    let cpim = signed_by_bob(&bob, &mut bobs_group, BOB_TEL, "imdn-7", &xml, displayed());
+    let delivered = notification_xml("message-1", "delivery-notification", "<delivered/>");
+    assert_eq!(
+        verified(&cpim, &delivered),
+        Err(MessageError::Store(StoreError::Mls(ErrorKind::Rejected)))
+    );
+    let moved = String::from_utf8(cpim)
+        .unwrap()
+        .replace("imdn.Message-ID: imdn-7", "imdn.Message-ID: imdn-8");
+    assert_eq!(
+        verified(moved.as_bytes(), &xml),
+        Err(MessageError::Store(StoreError::Mls(ErrorKind::Rejected)))
+    );
+
+    // a signature that is none
+    let cpim = notification_cpim(
+        BOB_TEL,
+        "imdn-9",
+        "NS: mls <http://www.gsma.com/rcs/mls>\r\nmls.MLS-Derived-Content-Signature: %%%\r\n",
+        &xml,
+    );
+    assert_eq!(
+        verified(&cpim, &xml),
+        Err(MessageError::Store(StoreError::Mls(ErrorKind::BadFormat)))
+    );
+
+    // unsigned, only a negative delivery
+    let cpim = notification_cpim(BOB_TEL, "imdn-10", "", &xml);
+    assert_eq!(verified(&cpim, &xml), Err(MessageError::NotSigned));
+    let failed = refusal("message-1", "transient-error");
+    let failed = String::from_utf8(failed).unwrap();
+    let cpim = notification_cpim(BOB_TEL, "imdn-11", "", &failed);
+    assert_eq!(verified(&cpim, &failed), Ok(()));
+}
+
+#[test]
+fn the_notifications_of_the_groups_of_the_device_are_signed_once_its_commit_is_accepted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (bob, bobs) = bob_with_key_package();
+    let (device, _) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    let xml = notification_xml("bob-1", "delivery-notification", "<delivered/>");
+    let waiting =
+        rt.spawn(groups.sign(CONVERSATION, &notification_cpim(IMPU, "imdn-12", "", &xml)));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!waiting.is_finished(), "waits for the Commit");
+    groups.on_server_message(
+        CONVERSATION,
+        &accepted(epoch_identifier(&device, CONVERSATION)),
+    );
+    let signed = rt.block_on(waiting).unwrap().expect("signed once accepted");
+    let signature = cpim_message(&signed)
+        .get_info()
+        .unwrap()
+        .mls_derived_content_signature
+        .map(|signature| general_purpose::STANDARD.decode(signature).unwrap())
+        .unwrap();
+    let content = VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+        DeliveryNotificationStatus::Delivered,
+        b"bob-1",
+        b"",
+        ClientFailureReason::Unset,
+    ));
+    assert!(bobs_group
+        .verify_signature(&bob, &signature, &derived("imdn-12", content))
+        .is_ok());
+
+    // and those received checked
+    let mine = notification_xml("message-1", "delivery-notification", "<delivered/>");
+    let content = VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+        DeliveryNotificationStatus::Delivered,
+        b"message-1",
+        b"",
+        ClientFailureReason::Unset,
+    ));
+    let cpim = signed_by_bob(&bob, &mut bobs_group, BOB_TEL, "imdn-13", &mine, content);
+    let info = cpim_message(&cpim);
+    assert!(groups.verify(CONVERSATION, &info.get_info().unwrap(), mine.as_bytes()));
+    let unsigned = cpim_message(&notification_cpim(BOB_TEL, "imdn-14", "", &mine));
+    assert!(!groups.verify(CONVERSATION, &unsigned.get_info().unwrap(), mine.as_bytes()));
+
+    // nor what cannot be, nor once the device is let go of
+    assert_eq!(rt.block_on(groups.sign(CONVERSATION, b"not CPIM")), None);
+    drop(device);
+    assert!(!groups.verify(CONVERSATION, &info.get_info().unwrap(), mine.as_bytes()));
+    assert_eq!(
+        rt.block_on(groups.sign(CONVERSATION, &notification_cpim(IMPU, "imdn-15", "", &xml))),
+        None
+    );
+}
+
+#[test]
+fn a_notification_as_the_client_makes_one_is_signed() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let xml = notification_xml("bob-1", "delivery-notification", "<delivered/>");
+    let body = make_cpim_imdn_body(&xml, BOB_TEL, IMPU);
+    let mut cpim = Vec::new();
+    body.reader().unwrap().read_to_end(&mut cpim).unwrap();
+
+    let signed = device.sign_notification(CONVERSATION, &cpim).unwrap();
+    let message = cpim_message(&signed);
+    assert_eq!(
+        message.get_message_body(),
+        Some((Some(&b"message/imdn+xml"[..]), xml.as_bytes(), false))
+    );
+    let info = message.get_info().unwrap();
+    let signature = general_purpose::STANDARD
+        .decode(info.mls_derived_content_signature.unwrap())
+        .unwrap();
+    let content = VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+        DeliveryNotificationStatus::Delivered,
+        b"bob-1",
+        b"",
+        ClientFailureReason::Unset,
+    ));
+    let cpim_id = String::from_utf8(info.imdn_message_id.to_vec()).unwrap();
+    assert!(bobs_group
+        .verify_signature(&bob, &signature, &derived(&cpim_id, content))
+        .is_ok());
 }

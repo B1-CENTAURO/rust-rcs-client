@@ -86,6 +86,9 @@ pub struct CPMMessageParam {
     message_id: String,
     /// Sent as it is, of the type `message_type`, not in a CPIM message
     raw: bool,
+    /// A CPIM message carrying a notification, signed in a group chat
+    /// encrypted end to end
+    signed: bool,
     recipient: String,
     recipient_type: RecipientType,
     recipient_uri: String,
@@ -110,6 +113,7 @@ impl CPMMessageParam {
             message_content,
             message_id,
             raw: false,
+            signed: false,
             recipient: String::from(recipient),
             recipient_type: RecipientType::from(recipient_type),
             recipient_uri: String::from(recipient_uri),
@@ -120,6 +124,15 @@ impl CPMMessageParam {
     /// The message sent as it is, not in a CPIM message
     pub fn raw(mut self) -> CPMMessageParam {
         self.raw = true;
+        self
+    }
+
+    /// The CPIM message carrying a notification, sent as it is, and signed
+    /// if the group chat it goes to is encrypted end to end (RCC.16 sections
+    /// 9.1.3, 9.1.4)
+    pub fn notification(mut self) -> CPMMessageParam {
+        self.raw = true;
+        self.signed = true;
         self
     }
 }
