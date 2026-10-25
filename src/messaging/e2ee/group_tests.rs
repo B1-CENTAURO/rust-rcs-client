@@ -43,9 +43,11 @@ use crate::messaging::cpm::make_cpim_imdn_body;
 use super::device::{E2eeDevice, Enrolled, CIPHERSUITE};
 use super::device_tests::{alice, provision};
 use super::group::{recipients, DeviceGroups, GroupError};
-use super::kds::{Fetched, KdsError, Recipient};
+use super::kds::{Fetched, KdsError, KeyDistribution, Recipient};
 use super::kds_tests::certificates::*;
-use super::kds_tests::{bob, credential, signer, validator, App, Kds, ALICE_TEL, BOB_TEL, TODAY};
+use super::kds_tests::{
+    bob, credential, signer, validator, App, Kds, ALICE_TEL, BOB_TEL, HOME_KDS, TODAY,
+};
 use super::message::MessageError;
 use super::store::StoreError;
 
@@ -2635,4 +2637,321 @@ fn the_groups_of_the_device_are_left_once_its_commit_is_accepted() {
         )),
         None
     );
+}
+
+/// What the Conversation Focus forwards of a leave: the ProposalList of the
+/// self_remove `proposal` (RCC.16 section 9.4)
+fn forwarded_leave(proposal: &[u8]) -> Vec<u8> {
+    proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ProposalList(
+            encode_message_list(&[proposal]).unwrap(),
+        )),
+    })
+}
+
+/// What the Conversation Focus forwards of the Commit the control message
+/// `cpim` carries, without Welcome
+fn forwarded_commit(cpim: &[u8]) -> Vec<u8> {
+    proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: commit_bundle_of(cpim).commit_list,
+                ..ServerCommitBundle::default()
+            },
+        )),
+    })
+}
+
+const BOB_IMPU: &str = "sip:+491707654321@ims.example.com";
+
+/// Bob's device as of LATER, in the group of the conversation with both
+/// phones of Alice, its Commit accepted: the device, and each phone of Alice
+/// with its group
+fn bob_with_both_phones_of_alice() -> (
+    Arc<E2eeDevice>,
+    (MlsClient, MlsConversation),
+    (MlsClient, MlsConversation),
+) {
+    let phone = client_later(ALICE, ALICE_KEY, ALICE_PUBLIC_KEY);
+    let other_phone = client_later(ALICE_RENEWED, ALICE_RENEWED_KEY, ALICE_RENEWED_PUBLIC_KEY);
+    let app = Arc::new(App::default());
+    let kds = Arc::new(Kds::issuing(&[BOB, CA], &app).knowing_too(vec![(
+        ALICE_TEL,
+        Fetched::KeyPackages(vec![
+            phone.generate_key_package(false).unwrap(),
+            other_phone.generate_key_package(false).unwrap(),
+        ]),
+    )]));
+    let device = E2eeDevice::new(
+        validator(LATER),
+        HOME_KDS,
+        kds as Arc<dyn KeyDistribution>,
+        Box::new(|_| true),
+        None,
+    )
+    .unwrap()
+    .with_signer(|| Some(signer(BOB_KEY, BOB_PUBLIC_KEY)));
+    provision(&device, &[BOB_TEL], None);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    let device = Arc::new(device);
+
+    let cpim =
+        block_on(device.create_group(CONVERSATION, BOB_IMPU, FACTORY, vec![recipient(ALICE_TEL)]))
+            .unwrap();
+    let phones_group = joined(&phone, &bundle_of(&cpim));
+    let other_phones_group = joined(&other_phone, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    (
+        device,
+        (phone, phones_group),
+        (other_phone, other_phones_group),
+    )
+}
+
+#[test]
+fn a_leave_the_focus_forwards_is_committed_with_the_other_clients_of_the_leaver() {
+    let (device, (phone, mut phones_group), (other_phone, mut other_phones_group)) =
+        bob_with_both_phones_of_alice();
+    assert_eq!(
+        device.commit_leaves(CONVERSATION, BOB_IMPU, GROUP_URI),
+        Ok(None),
+        "no one leaving"
+    );
+
+    // Alice leaves from one phone
+    let proposal = phones_group.leave(&phone).unwrap();
+    let forwarded = forwarded_leave(&proposal);
+    assert!(matches!(
+        device
+            .on_server_message(CONVERSATION, &forwarded)
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Proposal { .. }]
+    ));
+    other_phones_group
+        .process_server_message(&other_phone, &forwarded)
+        .unwrap();
+    let cpim = device
+        .commit_leaves(CONVERSATION, BOB_IMPU, GROUP_URI)
+        .unwrap()
+        .expect("a Commit of the leave");
+
+    // in a control message from Bob to the group (RCC.16 section 9.5.1)
+    let info = cpim_message(&cpim);
+    let info = info.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", BOB_IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"negative-delivery"[..])
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+
+    // removing both phones once forwarded back
+    match device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { removed, .. }] => {
+            assert_eq!(removed.len(), 2);
+            for phone in [&phone, &other_phone] {
+                assert!(removed.contains(phone.credential()));
+            }
+        }
+        other => panic!("{} messages", other.len()),
+    }
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    for (client, group) in [
+        (&phone, &mut phones_group),
+        (&other_phone, &mut other_phones_group),
+    ] {
+        assert!(matches!(
+            group
+                .process_server_message(client, &forwarded_commit(&cpim))
+                .unwrap()
+                .as_slice(),
+            [IncomingMessage::Commit {
+                self_removed: true,
+                ..
+            }]
+        ));
+    }
+
+    // its control message the one known
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")),
+        Ok(None),
+        "applied already"
+    );
+}
+
+#[test]
+fn the_leave_of_the_user_from_another_client_is_left_for_others_to_commit() {
+    let (device, phone, mut phones_group, _) = group_to_add_bob_to();
+    let proposal = phones_group.leave(&phone).unwrap();
+    device
+        .on_server_message(CONVERSATION, &forwarded_leave(&proposal))
+        .unwrap();
+    assert_eq!(
+        device.commit_leaves(CONVERSATION, IMPU, GROUP_URI),
+        Ok(None)
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+}
+
+#[test]
+fn a_leave_is_committed_once_the_commit_of_the_device_is_settled() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // a Commit of the device made before Bob's leave came
+    let removal = device
+        .remove_from_group(CONVERSATION, IMPU, GROUP_URI, BOB_TEL)
+        .unwrap();
+    let proposal = bobs_group.leave(&bob).unwrap();
+    assert!(groups.on_server_message(CONVERSATION, &forwarded_leave(&proposal)));
+    assert_eq!(
+        device.commit_leaves(CONVERSATION, IMPU, GROUP_URI),
+        Err(GroupError::Pending)
+    );
+
+    // which the Focus refuses for leaving the leave out
+    let committing = rt.spawn(groups.commit_leaves(
+        String::from(CONVERSATION),
+        String::from(IMPU),
+        String::from(GROUP_URI),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!committing.is_finished(), "waits for the Commit");
+    assert!(groups.on_imdn(
+        CONVERSATION,
+        &refusal(&control_id(&removal), "incorrect-epoch")
+    ));
+    let cpim = rt
+        .block_on(committing)
+        .unwrap()
+        .expect("committed once refused");
+    match device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { removed, .. }] => {
+            assert_eq!(removed, &vec![credential(&[BOB, CA])])
+        }
+        other => panic!("{} messages", other.len()),
+    }
+
+    // what is not a Proposal leaves nothing to commit, nor once the device
+    // is let go of
+    assert!(!groups.on_server_message(CONVERSATION, b"\x0a\xff"));
+    drop(device);
+    assert!(!groups.on_server_message(CONVERSATION, &forwarded_leave(&proposal)));
+    assert_eq!(
+        rt.block_on(groups.commit_leaves(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+        )),
+        None
+    );
+}
+
+#[test]
+fn a_participant_the_server_removed_is_committed_out_with_server_remove() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let cpim = device
+        .remove_for_server(CONVERSATION, IMPU, GROUP_URI, BOB_TEL)
+        .unwrap();
+    let info = cpim_message(&cpim);
+    let info = info.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+
+    // a server_remove Proposal (RCC.16 section 7.11.9) in the Commit
+    let commit_list = commit_bundle_of(&cpim).commit_list;
+    assert!(commit_list.windows(3).any(|w| w == [1, 0xF0, 0x04]));
+    match device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { removed, .. }] => {
+            assert_eq!(removed, &vec![credential(&[BOB, CA])])
+        }
+        other => panic!("{} messages", other.len()),
+    }
+    assert!(matches!(
+        bobs_group
+            .process_server_message(&bob, &forwarded_commit(&cpim))
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Commit {
+            self_removed: true,
+            ..
+        }]
+    ));
+
+    // none left once removed, as when another member's Commit came first
+    assert_eq!(
+        device.remove_for_server(CONVERSATION, IMPU, GROUP_URI, BOB_TEL),
+        Err(GroupError::NotMember(String::from(BOB_TEL)))
+    );
+    // nor is the user
+    assert_eq!(
+        device.remove_for_server(CONVERSATION, IMPU, GROUP_URI, ALICE_TEL),
+        Err(GroupError::NotMember(String::from(ALICE_TEL)))
+    );
+}
+
+#[test]
+fn the_participants_the_server_removed_from_groups_of_the_device_are_committed_out() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, _) = group_made();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // Bob, by the SIP URI of his number, once the Commit making the group is
+    // accepted
+    let removing = rt.spawn(groups.remove_for_server(
+        String::from(CONVERSATION),
+        String::from(IMPU),
+        String::from(GROUP_URI),
+        String::from("sip:+491707654321@ims.example.com"),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!removing.is_finished(), "waits for the Commit");
+    // which carries no Proposals
+    assert!(!groups.on_server_message(
+        CONVERSATION,
+        &accepted(epoch_identifier(&device, CONVERSATION)),
+    ));
+    let cpim = rt
+        .block_on(removing)
+        .unwrap()
+        .expect("removed once accepted");
+    assert!(!commit_bundle_of(&cpim).commit_list.is_empty());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+    groups.discard(CONVERSATION, false);
+
+    // nor one who is no member, nor by a URI of no number, at once
+    for participant in ["sip:+491700000001@ims.example.com", "sip:bob@example.com"] {
+        assert_eq!(
+            rt.block_on(groups.remove_for_server(
+                String::from(CONVERSATION),
+                String::from(IMPU),
+                String::from(GROUP_URI),
+                String::from(participant),
+            )),
+            None,
+            "{}",
+            participant
+        );
+    }
 }

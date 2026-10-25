@@ -135,6 +135,36 @@ pub trait GroupEncryption: Send + Sync {
         to: String,
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
+    /// The CPIM message carrying a `message/mls-rcs-client` with a Commit of
+    /// the leaves of other members of the group chat `conversation_id`, whose
+    /// self_remove Proposals the Conversation Focus forwarded, removing the
+    /// other Clients of their Participants too, to send to the Focus in the
+    /// session, `from` and `to` that of the CPIM message (RCC.16 sections
+    /// 9.4, 9.5.1), once a Commit of this client the Focus is yet to accept
+    /// is; None if there are none to commit
+    fn commit_leaves(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>>;
+
+    /// The CPIM message carrying a `message/mls-rcs-client` with a Commit
+    /// removing with server_remove Proposals the Clients of `participant`,
+    /// whom the Messaging Server removed from the group chat
+    /// `conversation_id`, to send to the Conversation Focus in the session,
+    /// `from` and `to` that of the CPIM message (RCC.16 sections 9.5.1, 9.6),
+    /// once a Commit of this client the Focus is yet to accept is; None if
+    /// none is left to remove, as when the Commit of another member removed
+    /// them first
+    fn remove_for_server(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participant: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>>;
+
     /// Lets go of the Commit or the leave of this client in the group chat
     /// `conversation_id`, as the Conversation Focus answered the request
     /// carrying it with an error, a refusal of it to follow if
@@ -150,8 +180,9 @@ pub trait GroupEncryption: Send + Sync {
     /// Takes what the Conversation Focus of the group `conversation_id` sent
     /// of its MLS group, as a `message/mls-rcs-server`: its acceptance of a
     /// Commit of this client, and the Commits and Proposals of others
-    /// (sections 6.2.4, 7.9)
-    fn on_server_message(&self, conversation_id: &str, body: &[u8]);
+    /// (sections 6.2.4, 7.9); true if it carried Proposals, as the leaves
+    /// commit_leaves() commits (section 9.4)
+    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> bool;
 
     /// Takes the `message/imdn+xml` `imdn` received in the group chat
     /// `conversation_id`: true if it is the Conversation Focus refusing a

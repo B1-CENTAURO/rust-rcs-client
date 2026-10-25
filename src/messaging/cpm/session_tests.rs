@@ -2100,6 +2100,17 @@ struct ScriptedEncryption {
     leaving: Option<Vec<u8>>,
     /// What it waits for before preparing it, if anything
     leave_held: Option<Arc<tokio::sync::Notify>>,
+    /// Whether what the focus sends carries Proposals
+    proposing: bool,
+    /// The CPIM message it prepares for committing leaves, if any
+    committing: Option<Vec<u8>>,
+    /// The Conversation-ID, from and to of each commit of leaves
+    committed: std::sync::Mutex<Vec<(String, String, String)>>,
+    /// The CPIM message it prepares for a removal by the server, if any
+    removing_for_server: Option<Vec<u8>>,
+    /// The Conversation-ID, from, to and participant of each removal by the
+    /// server
+    removed_for_server: std::sync::Mutex<Vec<(String, String, String, String)>>,
     /// The Conversation-ID, from and to of each leave
     left: std::sync::Mutex<Vec<(String, String, String)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
@@ -2192,6 +2203,35 @@ impl GroupEncryption for ScriptedEncryption {
         })
     }
 
+    fn commit_leaves(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.committed
+            .lock()
+            .unwrap()
+            .push((conversation_id, from, to));
+        let cpim = self.committing.clone();
+        Box::pin(async move { cpim })
+    }
+
+    fn remove_for_server(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participant: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.removed_for_server
+            .lock()
+            .unwrap()
+            .push((conversation_id, from, to, participant));
+        let cpim = self.removing_for_server.clone();
+        Box::pin(async move { cpim })
+    }
+
     fn discard(&self, conversation_id: &str, refusal_follows: bool) {
         self.discarded
             .lock()
@@ -2207,11 +2247,12 @@ impl GroupEncryption for ScriptedEncryption {
         self.joining
     }
 
-    fn on_server_message(&self, conversation_id: &str, body: &[u8]) {
+    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> bool {
         self.server_messages
             .lock()
             .unwrap()
             .push((String::from(conversation_id), body.to_vec()));
+        self.proposing
     }
 
     fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool {
@@ -2597,6 +2638,8 @@ fn an_encrypted_group_invitation_is_joined_before_it_is_told_of() {
         [(String::from("conversation-1"), b"from the focus".to_vec())]
     );
     assert!(encryption.abandoned.lock().unwrap().is_empty());
+    // nothing to commit, as it carried no Proposals
+    assert!(encryption.committed.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2863,6 +2906,26 @@ impl GroupEncryption for EncryptingPrepared {
         self.0.prepare_leave(conversation_id, from, to)
     }
 
+    fn commit_leaves(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.commit_leaves(conversation_id, from, to)
+    }
+
+    fn remove_for_server(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participant: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0
+            .remove_for_server(conversation_id, from, to, participant)
+    }
+
     fn discard(&self, conversation_id: &str, refusal_follows: bool) {
         self.0.discard(conversation_id, refusal_follows)
     }
@@ -2871,7 +2934,7 @@ impl GroupEncryption for EncryptingPrepared {
         self.0.join(conversation_id, server_message)
     }
 
-    fn on_server_message(&self, conversation_id: &str, body: &[u8]) {
+    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> bool {
         self.0.on_server_message(conversation_id, body)
     }
 
@@ -4871,4 +4934,169 @@ fn a_leave_whose_session_ends_while_it_is_made_is_let_go_of() {
     );
     assert!(encryption.abandoned.lock().unwrap().is_empty());
     peer.silence();
+}
+
+/// What the scripted encryption makes a Commit of the leaves of others, or
+/// of a removal by the server, carry
+const COMMITTING_CPIM: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x07\x08committing";
+
+/// The client with the group `conversation-1` encrypted, what the focus
+/// sends of it carrying Proposals, the leaves of others and removals by the
+/// server committed with COMMITTING_CPIM
+fn committing_in(client: &Client) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        proposing: true,
+        committing: Some(COMMITTING_CPIM.to_vec()),
+        removing_for_server: Some(COMMITTING_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+/// A CPIM message of the focus carrying the `message/mls-rcs-server`
+/// `content`
+fn from_the_focus(content: &str) -> String {
+    format!(
+        "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:01.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: focus-1\r\n\r\nContent-Type: message/mls-rcs-server\r\n\r\n{}",
+        GROUP, IMPU, content
+    )
+}
+
+#[test]
+fn a_leave_the_focus_forwards_is_committed_in_the_session() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = committing_in(&client);
+    let (mut connection, msrp_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-committing");
+
+    connection.send_content(
+        &rt,
+        &msrp_path,
+        &our_path,
+        "message/cpim",
+        &from_the_focus("a leave"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+
+    // the Commit, as it is, for the focus (RCC.16 sections 9.4, 9.5.1)
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    assert_eq!(send.body, COMMITTING_CPIM);
+    assert_eq!(
+        *encryption.committed.lock().unwrap(),
+        [(
+            String::from("conversation-1"),
+            String::from(IMPU),
+            String::from(GROUP)
+        )]
+    );
+    connection.respond(&rt, &send, "200 OK");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(encryption.discarded.lock().unwrap().is_empty());
+
+    // one the focus does not take is let go of, no refusal to follow
+    connection.send_content(
+        &rt,
+        &msrp_path,
+        &our_path,
+        "message/cpim",
+        &from_the_focus("another leave"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let send = connection.next_message(&rt);
+    connection.respond(&rt, &send, "403 Forbidden");
+    let discarded = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.discarded.lock().unwrap().is_empty()
+    });
+    assert!(discarded);
+    assert_eq!(
+        *encryption.discarded.lock().unwrap(),
+        [(String::from("conversation-1"), false)]
+    );
+}
+
+#[test]
+fn a_participant_the_server_removed_is_committed_out_in_the_session() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = committing_in(&client);
+    let msrp = encrypted_group_invitation(&client, &mut peer, "group-removed");
+    let ok = peer.next_response();
+    peer.send(&ack(&ok, "group-removed"));
+    let subscribe = peer.next_request("SUBSCRIBE");
+    let mut connection = msrp.accept(&rt);
+
+    let notify = |seq: u32, user: &str, reason: &str| {
+        conference_notify(
+            &subscribe,
+            seq,
+            &format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<conference-info xmlns=\"urn:ietf:params:xml:ns:conference-info\" entity=\"{}\" \
+state=\"partial\" version=\"{}\"><users><user entity=\"{}\"><endpoint entity=\"{}\">\
+<status>disconnected</status><disconnection-method>booted</disconnection-method>\
+<disconnection-info><reason>{}</reason></disconnection-info></endpoint></user></users>\
+</conference-info>",
+                GROUP, seq, user, user, reason
+            ),
+        )
+    };
+
+    // one removed by a participant, whose Commit came with the REFER
+    peer.send(&notify(1, ALICE, "SIP;cause=410;text=&quot;Kicked&quot;"));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    // one the Messaging Server removed (RCC.16 section 9.6)
+    peer.send(&notify(
+        2,
+        BOB,
+        "SIP;cause=410;text=&quot;Removed by server&quot;",
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    assert_eq!(send.body, COMMITTING_CPIM);
+    assert_eq!(
+        *encryption.removed_for_server.lock().unwrap(),
+        [(
+            String::from("conversation-1"),
+            String::from(IMPU),
+            String::from(GROUP),
+            String::from(BOB)
+        )]
+    );
+    connection.respond(&rt, &send, "200 OK");
+    assert!(encryption.committed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_participant_the_server_removed_from_a_group_not_encrypted_is_not_committed_out() {
+    let (client, mut peer) = start(true);
+    let (_connection, _invite, subscribe, _) = new_group(&client, &mut peer);
+    // set once the group is started without it
+    let encryption = committing_in(&client);
+    peer.send(&conference_notify(
+        &subscribe,
+        1,
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<conference-info xmlns=\"urn:ietf:params:xml:ns:conference-info\" entity=\"{}\" \
+state=\"partial\" version=\"1\"><users><user entity=\"{}\"><endpoint entity=\"{}\">\
+<status>disconnected</status><disconnection-method>booted</disconnection-method>\
+<disconnection-info><reason>SIP;cause=410;text=&quot;Removed by server&quot;</reason>\
+</disconnection-info></endpoint></user></users></conference-info>",
+            GROUP, BOB, BOB
+        ),
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(encryption.removed_for_server.lock().unwrap().is_empty());
 }

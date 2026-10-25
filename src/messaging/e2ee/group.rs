@@ -41,7 +41,7 @@ use uuid::Uuid;
 use crate::capability::CapabilityQuery;
 use crate::messaging::cpm::encryption::GroupEncryption;
 
-use super::device::{is_of, participant_tel_uri, E2eeDevice, CIPHERSUITE};
+use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice, CIPHERSUITE};
 use super::kds::{fetch_key_packages, Fetched, KdsError, Recipient};
 use super::message::MessageError;
 use super::store::StoreError;
@@ -138,12 +138,7 @@ impl E2eeDevice {
             })
             .map_err(GroupError::Store)?;
 
-        let (message_id, cpim) = control_message(from, to, &client_message);
-        self.control_messages()
-            .lock()
-            .unwrap()
-            .insert(String::from(conversation_id), message_id);
-        Ok(cpim)
+        Ok(self.sent_in(conversation_id, from, to, &client_message))
     }
 
     /// Adds the participants `recipients` to the MLS group `conversation_id`,
@@ -188,12 +183,7 @@ impl E2eeDevice {
             })
             .map_err(GroupError::Store)?;
 
-        let (message_id, cpim) = control_message(from, to, &client_message);
-        self.control_messages()
-            .lock()
-            .unwrap()
-            .insert(String::from(conversation_id), message_id);
-        Ok(cpim)
+        Ok(self.sent_in(conversation_id, from, to, &client_message))
     }
 
     /// Removes all the Clients of the participant at `tel_uri` from the MLS
@@ -210,6 +200,38 @@ impl E2eeDevice {
         from: &str,
         to: &str,
         tel_uri: &str,
+    ) -> Result<Vec<u8>, GroupError> {
+        self.commit_removal(conversation_id, from, to, tel_uri, false)
+    }
+
+    /// Removes all the Clients of the participant at `tel_uri`, whom the
+    /// Messaging Server removed from the group chat `conversation_id`, with
+    /// server_remove Proposals: the CPIM message, `from` and `to` its own,
+    /// carrying the `message/mls-rcs-client` to send to the Conversation
+    /// Focus over MSRP (RCC.16 sections 7.11.9, 9.5.1, 9.6)
+    ///
+    /// NotMember once none of its Clients is left, as when the Commit of
+    /// another member removed them first; otherwise as remove_from_group().
+    pub fn remove_for_server(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        tel_uri: &str,
+    ) -> Result<Vec<u8>, GroupError> {
+        self.commit_removal(conversation_id, from, to, tel_uri, true)
+    }
+
+    /// The control message of a Commit removing all the Clients of the
+    /// participant at `tel_uri`, with server_remove Proposals if
+    /// `for_server`
+    fn commit_removal(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        tel_uri: &str,
+        for_server: bool,
     ) -> Result<Vec<u8>, GroupError> {
         let client_message = self
             .store()
@@ -229,7 +251,10 @@ impl E2eeDevice {
                 if removed.is_empty() {
                     return Ok(Err(GroupError::NotMember(String::from(tel_uri))));
                 }
-                let output = conversation.remove_members(client, &removed)?;
+                let output = match for_server {
+                    true => conversation.remove_members_for_server(client, &removed)?,
+                    false => conversation.remove_members(client, &removed)?,
+                };
                 match output.to_client_message() {
                     Ok(client_message) => Ok(Ok(client_message)),
                     Err(e) => {
@@ -240,12 +265,87 @@ impl E2eeDevice {
             })
             .map_err(GroupError::Store)??;
 
-        let (message_id, cpim) = control_message(from, to, &client_message);
+        Ok(self.sent_in(conversation_id, from, to, &client_message))
+    }
+
+    /// Commits the leaves of other members the Conversation Focus forwarded
+    /// in the group chat `conversation_id`, their self_remove Proposals, with
+    /// the removal of the other Clients of their Participants: the CPIM
+    /// message, `from` and `to` its own, carrying the `message/mls-rcs-client`
+    /// to send to the Focus over MSRP (RCC.16 sections 6.2.2, 9.4, 9.5.1);
+    /// None if no other member is leaving
+    ///
+    /// The leave of the user itself, from another of its Clients, is left for
+    /// another member to commit, as the device cannot remove itself. Not
+    /// while a Commit of the device waits for the Focus to accept it, which
+    /// the Focus refuses for leaving the Proposals out (section 6.2.1); it
+    /// voids the one of the device if another member's Commit is applied
+    /// first.
+    pub fn commit_leaves(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<Vec<u8>>, GroupError> {
+        let client_message = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                let leaving = conversation.leaving_members();
+                if leaving.is_empty()
+                    || leaving
+                        .iter()
+                        .any(|member| same_participant(member, client.credential()))
+                {
+                    return Ok(Ok(None));
+                }
+                if conversation.has_pending_commit() {
+                    return Ok(Err(GroupError::Pending));
+                }
+                let others: Vec<_> = conversation
+                    .members()
+                    .into_iter()
+                    .filter(|member| {
+                        !leaving.contains(member)
+                            && leaving
+                                .iter()
+                                .any(|leaver| same_participant(leaver, member))
+                    })
+                    .collect();
+                let output = match others.is_empty() {
+                    true => conversation.commit_pending_proposals(client)?,
+                    // with the self_removes, as Commits take those pending
+                    false => conversation.remove_members(client, &others)?,
+                };
+                match output.to_client_message() {
+                    Ok(client_message) => Ok(Ok(Some(client_message))),
+                    Err(e) => {
+                        conversation.discard_pending_commit(client)?;
+                        Err(e)
+                    }
+                }
+            })
+            .map_err(GroupError::Store)??;
+
+        Ok(client_message
+            .map(|client_message| self.sent_in(conversation_id, from, to, &client_message)))
+    }
+
+    /// The control message carrying `client_message` in the group chat
+    /// `conversation_id`, its Message-ID kept for a refusal of it to be
+    /// recognised
+    fn sent_in(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        client_message: &[u8],
+    ) -> Vec<u8> {
+        let (message_id, cpim) = control_message(from, to, client_message);
         self.control_messages()
             .lock()
             .unwrap()
             .insert(String::from(conversation_id), message_id);
-        Ok(cpim)
+        cpim
     }
 
     /// The control message for the BYE of the user `from` leaving the group
@@ -274,12 +374,7 @@ impl E2eeDevice {
             })
             .map_err(GroupError::Store)??;
 
-        let (message_id, cpim) = control_message(from, to, &client_message);
-        self.control_messages()
-            .lock()
-            .unwrap()
-            .insert(String::from(conversation_id), message_id);
-        Ok(cpim)
+        Ok(self.sent_in(conversation_id, from, to, &client_message))
     }
 
     /// The KeyPackages of all the Clients of each of `recipients`, as their
@@ -558,6 +653,42 @@ impl DeviceGroups {
     }
 }
 
+impl DeviceGroups {
+    /// What `make` makes of the device, once a Commit of the device the
+    /// Conversation Focus is yet to accept is, waiting for it no longer than
+    /// the acceptance wait; `failed` tells of it not made
+    fn once_settled(
+        &self,
+        make: impl Fn(&E2eeDevice) -> Result<Option<Vec<u8>>, GroupError> + Send + 'static,
+        failed: &'static str,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let device = self.device.clone();
+        let taken = Arc::clone(&self.taken);
+        let deadline = tokio::time::Instant::now() + self.acceptance_wait;
+        Box::pin(async move {
+            loop {
+                // told of what is taken from now on
+                let notified = taken.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                match make(&*device.upgrade()?) {
+                    Ok(made) => return made,
+                    Err(GroupError::Pending) => {}
+                    Err(e) => {
+                        platform_log(LOG_TAG, format!("{}: {:?}", failed, e));
+                        return None;
+                    }
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    platform_log(LOG_TAG, format!("{}, the Commit not accepted", failed));
+                    return None;
+                }
+            }
+        })
+    }
+}
+
 impl GroupEncryption for DeviceGroups {
     fn prepare(
         &self,
@@ -633,34 +764,17 @@ impl GroupEncryption for DeviceGroups {
         to: String,
         participant: String,
     ) -> BoxFuture<'static, Option<Vec<u8>>> {
-        let device = self.device.clone();
-        let taken = Arc::clone(&self.taken);
-        let deadline = tokio::time::Instant::now() + self.acceptance_wait;
-        Box::pin(async move {
-            let tel_uri = participant_tel_uri(std::iter::once(participant.as_str()), None)?;
-            loop {
-                // told of what is taken from now on
-                let notified = taken.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-
-                match device
-                    .upgrade()?
+        let Some(tel_uri) = participant_tel_uri(std::iter::once(participant.as_str()), None) else {
+            return Box::pin(async { None });
+        };
+        self.once_settled(
+            move |device| {
+                device
                     .remove_from_group(&conversation_id, &from, &to, &tel_uri)
-                {
-                    Ok(cpim) => return Some(cpim),
-                    Err(GroupError::Pending) => {}
-                    Err(e) => {
-                        platform_log(LOG_TAG, format!("participant not removed: {:?}", e));
-                        return None;
-                    }
-                }
-                if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                    platform_log(LOG_TAG, "participant not removed, the Commit not accepted");
-                    return None;
-                }
-            }
-        })
+                    .map(Some)
+            },
+            "participant not removed",
+        )
     }
 
     fn prepare_leave(
@@ -669,30 +783,42 @@ impl GroupEncryption for DeviceGroups {
         from: String,
         to: String,
     ) -> BoxFuture<'static, Option<Vec<u8>>> {
-        let device = self.device.clone();
-        let taken = Arc::clone(&self.taken);
-        let deadline = tokio::time::Instant::now() + self.acceptance_wait;
-        Box::pin(async move {
-            loop {
-                // told of what is taken from now on
-                let notified = taken.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
+        self.once_settled(
+            move |device| device.leave_group(&conversation_id, &from, &to).map(Some),
+            "group not left",
+        )
+    }
 
-                match device.upgrade()?.leave_group(&conversation_id, &from, &to) {
-                    Ok(cpim) => return Some(cpim),
-                    Err(GroupError::Pending) => {}
-                    Err(e) => {
-                        platform_log(LOG_TAG, format!("group not left: {:?}", e));
-                        return None;
-                    }
-                }
-                if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                    platform_log(LOG_TAG, "group not left, the Commit not accepted");
-                    return None;
-                }
-            }
-        })
+    fn commit_leaves(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.once_settled(
+            move |device| device.commit_leaves(&conversation_id, &from, &to),
+            "leaves not committed",
+        )
+    }
+
+    fn remove_for_server(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participant: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let Some(tel_uri) = participant_tel_uri(std::iter::once(participant.as_str()), None) else {
+            return Box::pin(async { None });
+        };
+        self.once_settled(
+            move |device| {
+                device
+                    .remove_for_server(&conversation_id, &from, &to, &tel_uri)
+                    .map(Some)
+            },
+            "participant removed by the server not committed",
+        )
     }
 
     fn discard(&self, conversation_id: &str, refusal_follows: bool) {
@@ -718,13 +844,21 @@ impl GroupEncryption for DeviceGroups {
         }
     }
 
-    fn on_server_message(&self, conversation_id: &str, body: &[u8]) {
-        if let Some(device) = self.device.upgrade() {
-            if let Err(e) = device.on_server_message(conversation_id, body) {
-                platform_log(LOG_TAG, format!("message of the focus not taken: {:?}", e));
-            }
-        }
+    fn on_server_message(&self, conversation_id: &str, body: &[u8]) -> bool {
+        let proposed = match self.device.upgrade() {
+            Some(device) => match device.on_server_message(conversation_id, body) {
+                Ok(taken) => taken
+                    .iter()
+                    .any(|message| matches!(message, IncomingMessage::Proposal { .. })),
+                Err(e) => {
+                    platform_log(LOG_TAG, format!("message of the focus not taken: {:?}", e));
+                    false
+                }
+            },
+            None => false,
+        };
         self.taken.notify_waiters();
+        proposed
     }
 
     fn on_imdn(&self, conversation_id: &str, imdn: &[u8]) -> bool {

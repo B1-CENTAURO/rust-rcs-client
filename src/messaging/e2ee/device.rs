@@ -233,6 +233,15 @@ pub(super) fn is_of(credential: &Credential, told: &str) -> bool {
         .any(|uri| same_tel_uri(uri, told))
 }
 
+/// Whether the credentials `a` and `b` are of Clients of the same
+/// Participant, having a tel URI in common
+pub(super) fn same_participant(a: &Credential, b: &Credential) -> bool {
+    credential_tel_uris(a)
+        .unwrap_or_default()
+        .iter()
+        .any(|uri| is_of(b, uri))
+}
+
 /// The tel URI of the user: one of its public user identities, else the
 /// number of a SIP URI among them, else `msisdn`
 pub fn participant_tel_uri<'a>(
