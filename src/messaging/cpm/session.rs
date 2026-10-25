@@ -83,7 +83,8 @@ use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{GroupEncryption, CONTENT_TYPE_MLS, CONTENT_TYPE_MLS_RCS_SERVER};
 use super::group_chat::{
-    refer_participants, refer_removal, GroupChats, GroupIds, GroupInvitation, Participant,
+    focus_answer, refer_participants, refer_removal, GroupChats, GroupIds, GroupInvitation,
+    Participant,
 };
 use super::imdn::send_group_imdn;
 use super::session_invitation::{
@@ -92,7 +93,6 @@ use super::session_invitation::{
 };
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMContact, CPMServiceType};
-use super::standalone_messaging::OutgoingPagerModeContext;
 use super::{
     decode_base64, is_composing_document, is_media_type, make_cpim_message_content_body,
     new_message_id, understands_cpim_requirements, CPMMessageParam, IS_COMPOSING, LOG_TAG,
@@ -1081,36 +1081,88 @@ impl SessionEnd {
         self.hang_up();
     }
 
-    /// Leaves the group the session is with for good, where end() leaves it
-    /// only until the next session: with a BYE whose Reason is SIP cause 200
-    /// (RCC.07 section 3.2.4.11, by RCC.11), `callback` told how it was
-    /// answered, or else why it was not sent
-    pub(crate) fn leave<F>(&self, callback: F)
+    /// Leaves the group the session is with, `conference_uri`, for good,
+    /// where end() leaves it only until the next session: with a BYE whose
+    /// Reason is SIP cause 200 (RCC.07 section 3.2.4.11, by RCC.11),
+    /// `callback` told how it was answered, or else why it was not sent
+    ///
+    /// In an encrypted group, the BYE carries the self_remove Proposal of
+    /// this client, once a Commit of this client the Conversation Focus is
+    /// yet to accept is. The MLS group is let go of once the BYE is answered
+    /// with a 2xx, and the Proposal once it is answered otherwise (RCC.16
+    /// section 9.4). If the Proposal cannot be made, nothing is sent, the
+    /// session is left as it is, and `callback` is told 488.
+    pub(crate) fn leave<F>(&self, conference_uri: &str, callback: F)
     where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
+        let encrypted = {
+            let inner = self.sip_session.get_inner();
+            let session_info = inner.get_session_info();
+            session_info
+                .encryption
+                .clone()
+                .zip(session_info.conversation_id.clone())
+        };
+        let public_user_identity = self
+            .registered_public_identity
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, public_user_identity, _)| public_user_identity.clone());
+        let Some(((encryption, conversation_id), public_user_identity)) =
+            encrypted.zip(public_user_identity)
+        else {
+            self.send_leave(
+                None,
+                Box::new(move |status_code, reason_phrase, _| callback(status_code, reason_phrase)),
+            );
+            return;
+        };
+
+        let preparing = encryption.prepare_leave(
+            conversation_id.clone(),
+            public_user_identity,
+            String::from(conference_uri),
+        );
+        let session_end = self.clone();
+        self.rt.spawn(async move {
+            let Some(control_message) = preparing.await else {
+                callback(488, String::from("Not Acceptable Here"));
+                return;
+            };
+            session_end.send_leave(
+                Some(&control_message),
+                Box::new(move |status_code, reason_phrase, refusal_follows| {
+                    if (200..300).contains(&status_code) {
+                        encryption.abandon(&conversation_id);
+                    } else {
+                        encryption.discard(&conversation_id, refusal_follows);
+                    }
+                    callback(status_code, reason_phrase);
+                }),
+            );
+        });
+    }
+
+    /// Ends the session with the BYE of leave(), carrying the CPIM message
+    /// `control_message` if any, `answered` told how it was answered
+    fn send_leave(&self, control_message: Option<&[u8]>, answered: FocusAnswered) {
         if !self.close() {
-            callback(481, String::from("Call/Transaction Does Not Exist"));
+            answered(481, String::from("Call/Transaction Does Not Exist"), false);
             return;
         }
 
-        let (client_transaction_tx, mut client_transaction_rx) = mpsc::channel(1);
-        self.rt.spawn(async move {
-            match client_transaction_rx.recv().await {
-                Some((status_code, reason_phrase)) => callback(status_code, reason_phrase),
-                None => callback(500, String::from("Internal Error")),
-            }
-        });
-
+        let answer = focus_answer(&self.rt, answered);
         if let Ok(mut message) = self.dialog.make_request(b"BYE", None) {
             message.add_header(Header::new(b"Reason", LEAVING_REASON));
-            self.send(
-                message,
-                OutgoingPagerModeContext {
-                    client_transaction_tx,
-                    rt: Arc::clone(&self.rt),
-                },
-            );
+            // without, the transaction gives it its Content-Length
+            if let Some(cpim) = control_message {
+                message.add_header(Header::new(b"Content-Type", b"message/cpim"));
+                message.add_header(Header::new(b"Content-Length", format!("{}", cpim.len())));
+                message.set_body(Arc::new(Body::Raw(cpim.to_vec())));
+            }
+            self.send(message, answer);
         }
 
         self.hang_up();
@@ -1668,7 +1720,7 @@ impl CPMSessionService {
     ) -> bool
     where
         P: FnOnce(&dyn GroupEncryption, String, String) -> BoxFuture<'static, Option<Vec<u8>>>,
-        R: FnOnce(&SessionEnd, Option<&[u8]>, ReferAnswered) -> Result<(), ReferAnswered>
+        R: FnOnce(&SessionEnd, Option<&[u8]>, FocusAnswered) -> Result<(), FocusAnswered>
             + Send
             + 'static,
         F: FnOnce(u16, String) + Send + Sync + 'static,
@@ -1895,7 +1947,7 @@ impl CPMSessionService {
         let sessions = self.ongoing_sessions.lock().unwrap();
         if let Some(session_end) = group_session_end(&sessions, conference_uri) {
             drop(sessions);
-            session_end.leave(callback);
+            session_end.leave(conference_uri, callback);
             return;
         }
 
@@ -1936,7 +1988,7 @@ impl CPMSessionService {
                 }
                 let session_end = group_session_end(&ongoing_sessions.lock().unwrap(), &group);
                 match session_end {
-                    Some(session_end) => session_end.leave(callback),
+                    Some(session_end) => session_end.leave(&group, callback),
                     None => callback(481, String::from("Call/Transaction Does Not Exist")),
                 }
             })),
@@ -2854,9 +2906,9 @@ struct NewGroup<'a> {
 /// not
 type Started = Box<dyn FnOnce(u16, String, Option<String>) + Send + Sync>;
 
-/// Told how a REFER was answered, and whether an MLS refusal of what it
-/// carried may follow (RCC.16 section 7.2.6)
-type ReferAnswered = Box<dyn FnOnce(u16, String, bool) + Send + Sync>;
+/// Told how the focus answered a request, such as a REFER or a BYE, and
+/// whether an MLS refusal of what it carried may follow (RCC.16 section 7.2.6)
+type FocusAnswered = Box<dyn FnOnce(u16, String, bool) + Send + Sync>;
 
 /// The body of an INVITE starting a group, with its boundary: its SDP, the
 /// participants the focus is to invite (RFC 5366 section 4), and the CPIM

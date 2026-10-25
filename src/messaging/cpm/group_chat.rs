@@ -751,35 +751,46 @@ fn send_refer<F>(
 ) where
     F: FnOnce(u16, String, bool) + Send + Sync + 'static,
 {
-    let (client_transaction_tx, mut client_transaction_rx) = mpsc::channel(1);
-    session_end.rt.spawn(async move {
-        if let Some((status_code, reason_phrase, refusal_follows)) =
-            client_transaction_rx.recv().await
-        {
-            callback(status_code, reason_phrase, refusal_follows);
-        }
-    });
-
     session_end.tm.send_request(
         message,
         transport,
-        ReferAnswer {
-            client_transaction_tx,
-            rt: Arc::clone(&session_end.rt),
-        },
+        focus_answer(&session_end.rt, callback),
         &session_end.rt,
     );
 }
 
-/// Tells how a REFER was answered: its status code and reason phrase, and
-/// whether an MLS refusal of what it carried may follow (RCC.16 section
-/// 7.2.6), as none does when it did not reach the focus
-struct ReferAnswer {
+/// What tells `callback` how the focus answered a request of a session, as
+/// FocusAnswer does; 500 if the request was not sent
+pub(crate) fn focus_answer<F>(rt: &Arc<Runtime>, callback: F) -> FocusAnswer
+where
+    F: FnOnce(u16, String, bool) + Send + Sync + 'static,
+{
+    let (client_transaction_tx, mut client_transaction_rx) = mpsc::channel(1);
+    rt.spawn(async move {
+        match client_transaction_rx.recv().await {
+            Some((status_code, reason_phrase, refusal_follows)) => {
+                callback(status_code, reason_phrase, refusal_follows)
+            }
+            None => callback(500, String::from("Internal Error"), false),
+        }
+    });
+
+    FocusAnswer {
+        client_transaction_tx,
+        rt: Arc::clone(rt),
+    }
+}
+
+/// Tells how the focus answered a request, such as a REFER or a BYE: its
+/// status code and reason phrase, and whether an MLS refusal of what it
+/// carried may follow (RCC.16 section 7.2.6), as none does when it did not
+/// reach the focus
+pub(crate) struct FocusAnswer {
     client_transaction_tx: mpsc::Sender<(u16, String, bool)>,
     rt: Arc<Runtime>,
 }
 
-impl ClientTransactionCallbacks for ReferAnswer {
+impl ClientTransactionCallbacks for FocusAnswer {
     fn on_provisional_response(&self, _message: SipMessage) {}
 
     fn on_final_response(&self, message: SipMessage) {

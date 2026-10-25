@@ -2185,7 +2185,7 @@ fn a_commit_whose_request_the_focus_answers_with_an_error_is_discarded() {
     let cpim =
         block_on(device.add_to_group(CONVERSATION, IMPU, GROUP_URI, vec![recipient(BOB_TEL)]))
             .unwrap();
-    assert_eq!(device.discard_commit(CONVERSATION, true), Ok(()));
+    assert_eq!(device.discard_pending(CONVERSATION, true), Ok(()));
     assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
     assert_eq!(
         device.on_imdn(
@@ -2199,7 +2199,7 @@ fn a_commit_whose_request_the_focus_answers_with_an_error_is_discarded() {
     let cpim =
         block_on(device.add_to_group(CONVERSATION, IMPU, GROUP_URI, vec![recipient(BOB_TEL)]))
             .unwrap();
-    assert_eq!(device.discard_commit(CONVERSATION, false), Ok(()));
+    assert_eq!(device.discard_pending(CONVERSATION, false), Ok(()));
     assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
     assert_eq!(
         device.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")),
@@ -2455,6 +2455,183 @@ fn the_participants_of_the_groups_of_the_device_are_removed_once_its_commit_is_a
             String::from(IMPU),
             String::from(GROUP_URI),
             String::from(BOB_TEL),
+        )),
+        None
+    );
+}
+
+/// The Message-ID of the control message `cpim`
+fn control_id(cpim: &[u8]) -> String {
+    String::from_utf8(
+        cpim_message(cpim)
+            .get_info()
+            .unwrap()
+            .imdn_message_id
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_user_leaves_with_a_self_remove_of_the_device_another_member_commits() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let cpim = device.leave_group(CONVERSATION, IMPU, GROUP_URI).unwrap();
+
+    // a ProposalList (RCC.16 section 7.9.4), in a control message from the
+    // user to the group
+    let message = cpim_message(&cpim);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"negative-delivery"[..])
+    );
+    let (content_type, content, _) = message.get_message_body().unwrap();
+    assert_eq!(content_type, Some(CONTENT_TYPE_MLS_RCS_CLIENT));
+    let list = match proto::decode::<ClientMlsRcsMessage>(content)
+        .unwrap()
+        .payload
+    {
+        Some(client_mls_rcs_message::Payload::ProposalList(list)) => list,
+        _ => panic!("not a ProposalList"),
+    };
+    assert_eq!(wire::decode_message_list(&list).unwrap().len(), 1);
+    // the group kept until the Focus agrees to the leave
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    // Bob, the Focus forwarding it to him, commits it
+    let forwarded = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ProposalList(list)),
+    });
+    match bobs_group
+        .process_server_message(&bob, &forwarded)
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Proposal { sender }] => assert_eq!(sender, &credential(&[ALICE, CA])),
+        other => panic!("{} messages", other.len()),
+    }
+    let output = bobs_group.commit_pending_proposals(&bob).unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    assert_eq!(bobs_group.members(), [credential(&[BOB, CA])]);
+    match device
+        .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { self_removed, .. }] => assert!(*self_removed),
+        other => panic!("{} messages", other.len()),
+    }
+}
+
+#[test]
+fn a_leave_is_not_made_unless_it_can_be() {
+    let (device, _, _) = alice_and_bob();
+    assert_eq!(
+        device.leave_group("another", IMPU, GROUP_URI),
+        Err(GroupError::Store(StoreError::Mls(ErrorKind::UnknownGroup)))
+    );
+
+    // nor while a Commit of the device waits
+    let (device, message_id) = group_made();
+    assert_eq!(
+        device.leave_group(CONVERSATION, IMPU, GROUP_URI),
+        Err(GroupError::Pending)
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, true)));
+    // its control message still the one known
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")),
+        Ok(Some(ServerFailureReason::InvalidCommit))
+    );
+}
+
+#[test]
+fn a_leave_the_focus_refuses_is_withdrawn() {
+    let (device, _, _) = alice_and_bob();
+
+    // refused by an IMDN alone
+    let cpim = device.leave_group(CONVERSATION, IMPU, GROUP_URI).unwrap();
+    assert_eq!(
+        device.on_imdn(
+            CONVERSATION,
+            &refusal(&control_id(&cpim), "transient-error")
+        ),
+        Ok(Some(ServerFailureReason::TransientError))
+    );
+
+    // answered with an error, a refusal to follow, which is then taken
+    let cpim = device.leave_group(CONVERSATION, IMPU, GROUP_URI).unwrap();
+    assert_eq!(device.discard_pending(CONVERSATION, true), Ok(()));
+    assert_eq!(
+        device.on_imdn(
+            CONVERSATION,
+            &refusal(&control_id(&cpim), "incorrect-epoch")
+        ),
+        Ok(Some(ServerFailureReason::IncorrectEpoch))
+    );
+
+    // none to follow
+    let cpim = device.leave_group(CONVERSATION, IMPU, GROUP_URI).unwrap();
+    assert_eq!(device.discard_pending(CONVERSATION, false), Ok(()));
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")),
+        Ok(None)
+    );
+
+    // the device commits as before, its self_remove gone
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert!(device
+        .remove_from_group(CONVERSATION, IMPU, GROUP_URI, BOB_TEL)
+        .is_ok());
+}
+
+#[test]
+fn the_groups_of_the_device_are_left_once_its_commit_is_accepted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, message_id) = group_made();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    let leaving = rt.spawn(groups.prepare_leave(
+        String::from(CONVERSATION),
+        String::from(IMPU),
+        String::from(GROUP_URI),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!leaving.is_finished(), "waits for the Commit");
+    groups.on_server_message(
+        CONVERSATION,
+        &accepted(epoch_identifier(&device, CONVERSATION)),
+    );
+    let cpim = rt.block_on(leaving).unwrap().expect("left once accepted");
+    // its control message the one now known
+    assert!(!groups.on_imdn(CONVERSATION, &refusal(&message_id, "invalid-commit")));
+    assert!(groups.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")));
+
+    // let go of once the Focus agrees
+    groups.abandon(CONVERSATION);
+    assert!(!groups.encrypts(CONVERSATION));
+
+    // nor a group not kept, nor once the device is let go of
+    assert_eq!(
+        rt.block_on(groups.prepare_leave(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+        )),
+        None
+    );
+    let (device, _, _) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    drop(device);
+    assert_eq!(
+        rt.block_on(groups.prepare_leave(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
         )),
         None
     );
