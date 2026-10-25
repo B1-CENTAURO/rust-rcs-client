@@ -94,6 +94,14 @@ fn recipient(tel_uri: &str) -> Recipient {
 /// Alice's device enrolled with a Home KDS having `directory` for the
 /// Participants asked for, if it has one
 fn enrolled(directory: Option<Vec<(&str, Fetched)>>) -> (Arc<E2eeDevice>, Arc<Kds>) {
+    let (device, kds, _) = enrolled_with_app(directory);
+    (device, kds)
+}
+
+/// As enrolled(), with the app keeping its state
+fn enrolled_with_app(
+    directory: Option<Vec<(&str, Fetched)>>,
+) -> (Arc<E2eeDevice>, Arc<Kds>, Arc<App>) {
     let app = Arc::new(App::default());
     let kds = Kds::issuing(&[ALICE, CA], &app);
     let kds = Arc::new(match directory {
@@ -103,7 +111,7 @@ fn enrolled(directory: Option<Vec<(&str, Fetched)>>) -> (Arc<E2eeDevice>, Arc<Kd
     let device = alice(&app, &kds, TODAY, None);
     provision(&device, &[ALICE_TEL], None);
     assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
-    (Arc::new(device), kds)
+    (Arc::new(device), kds, app)
 }
 
 /// Bob, and a KeyPackage of his
@@ -1166,4 +1174,87 @@ fn the_messages_of_the_groups_of_the_device_are_decrypted_while_it_is_kept() {
         groups.decrypt(CONVERSATION, &info.get_info().unwrap(), &mls_message),
         None
     );
+}
+
+#[test]
+fn a_message_with_no_rcs_header_declares_no_rcs_namespace() {
+    let (device, _, _) = alice_and_bob();
+    let without = String::from_utf8(plaintext("message-10", None))
+        .unwrap()
+        .replace(
+            "NS: rcs <http://www.gsma.com/rcs>\r\nrcs.advised-action: none\r\n",
+            "",
+        );
+    let outer = device
+        .encrypt_message(CONVERSATION, without.as_bytes())
+        .unwrap();
+    let text = String::from_utf8_lossy(&outer).into_owned();
+    let namespaces: Vec<&str> = text.lines().filter(|l| l.starts_with("NS:")).collect();
+    assert_eq!(
+        namespaces,
+        [
+            "NS: imdn <urn:ietf:params:imdn>",
+            "NS: mls <http://www.gsma.com/rcs/mls>",
+        ]
+    );
+}
+
+#[test]
+fn a_message_re_sent_is_not_taken_yet() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let resent = bobs_group
+        .encrypt_resent(
+            &bob,
+            b"\r\nContent-Type: text/plain\r\n\r\nagain",
+            &credential(&[ALICE, CA]),
+            b"bob-2",
+            b"bob-1",
+        )
+        .unwrap();
+    let mut outer = format!(
+        "From: <tel:+491707654321>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:02.000+00:00\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: bob-2\r\n\r\nContent-Type: message/mls\r\n\r\n",
+        GROUP_URI
+    )
+    .into_bytes();
+    outer.extend_from_slice(&resent);
+    assert_eq!(
+        device.decrypt_message(
+            CONVERSATION,
+            &cpim_message(&outer).get_info().unwrap(),
+            &resent
+        ),
+        Err(MessageError::Store(StoreError::Mls(
+            ErrorKind::UnexpectedMessage
+        )))
+    );
+}
+
+#[test]
+fn the_groups_of_a_device_restored_are_encrypted() {
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+
+    let restored = Arc::new(alice(&app, &kds, TODAY, Some(&app.last().unwrap())));
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&restored, query);
+    assert!(groups.encrypts(CONVERSATION));
+    assert!(!groups.encrypts("another"));
+
+    // and its messages decrypted
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, "tel:+491707654321", "bob-1");
+    assert!(groups
+        .decrypt(
+            CONVERSATION,
+            &cpim_message(&outer).get_info().unwrap(),
+            &mls_message
+        )
+        .is_some());
 }
