@@ -24,6 +24,8 @@ use quick_xml::reader::Reader;
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::internet::body::message_body::MessageBody;
 use rust_rcs_core::internet::body::multipart_body::MultipartBody;
+use rust_rcs_core::internet::parameter::ParameterParser;
+use rust_rcs_core::internet::syntax;
 use rust_rcs_core::internet::{Body, Header};
 use rust_rcs_core::io::Serializable;
 use rust_rcs_core::sip::sip_session::SipSession;
@@ -54,6 +56,39 @@ pub struct Participant {
     /// pending and so on, or how it was disconnected (section 5.7.5):
     /// departed, booted, failed or busy, or disconnected if not told
     pub status: String,
+    /// Why its endpoint was disconnected, if the focus tells in
+    /// `<disconnection-info>` (section 5.7.6): a SIP Reason, such as
+    /// `SIP;cause=410;text="Removed by server"` (RCC.16 sections 9.3, 9.4,
+    /// 9.6)
+    pub disconnection_reason: Option<String>,
+}
+
+impl Participant {
+    /// Whether the Messaging Server removed it from the group, as it does a
+    /// user who lost RCS, saying so with cause 410 and the text "Removed by
+    /// server" (RCC.16 section 9.6)
+    pub fn removed_by_server(&self) -> bool {
+        let Some(reason) = &self.disconnection_reason else {
+            return false;
+        };
+        let mut parameters = ParameterParser::new(reason.as_bytes(), b';', true);
+        if !parameters
+            .next()
+            .is_some_and(|protocol| protocol.name.eq_ignore_ascii_case(b"SIP"))
+        {
+            return false;
+        }
+        let (mut cause, mut text) = (None, None);
+        for parameter in parameters {
+            if parameter.name.eq_ignore_ascii_case(b"cause") {
+                cause = parameter.value;
+            } else if parameter.name.eq_ignore_ascii_case(b"text") {
+                text = parameter.value.map(syntax::unquote);
+            }
+        }
+        cause == Some(b"410")
+            && text.is_some_and(|text| text.eq_ignore_ascii_case(b"Removed by server"))
+    }
 }
 
 /// An invitation to a group chat not known before (RCC.07 section 3.2.4.4)
@@ -95,6 +130,7 @@ struct User {
     deleted: bool,
     display_text: Option<String>,
     status: Option<String>,
+    disconnection_reason: Option<String>,
 }
 
 /// A conference-info document (RFC 4575 section 5), as far as its users go
@@ -122,8 +158,9 @@ fn parse_conference_info(xml: &[u8]) -> Option<ConferenceInfo> {
 
     let mut info: Option<ConferenceInfo> = None;
     let mut user: Option<User> = None;
-    // the status and disconnection method of the endpoint being read
-    let mut endpoint: Option<(Option<String>, Option<String>)> = None;
+    // the status, disconnection method and disconnection reason of the
+    // endpoint being read
+    let mut endpoint: Option<(Option<String>, Option<String>, Option<String>)> = None;
     // the elements open, by local name
     let mut path: Vec<Vec<u8>> = Vec::new();
 
@@ -156,7 +193,7 @@ fn parse_conference_info(xml: &[u8]) -> Option<ConferenceInfo> {
                         });
                     }
                     b"endpoint" if user.is_some() => {
-                        endpoint = Some((None, None));
+                        endpoint = Some((None, None, None));
                     }
                     _ => {}
                 }
@@ -199,6 +236,11 @@ fn parse_conference_info(xml: &[u8]) -> Option<ConferenceInfo> {
                             endpoint.1 = Some(text);
                         }
                     }
+                    (Some(b"disconnection-info"), Some(b"reason")) => {
+                        if let Some(endpoint) = &mut endpoint {
+                            endpoint.2 = Some(text);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -207,11 +249,14 @@ fn parse_conference_info(xml: &[u8]) -> Option<ConferenceInfo> {
                 path.pop();
                 match e.local_name().as_ref() {
                     b"endpoint" => {
-                        if let (Some(user), Some((status, method))) = (&mut user, endpoint.take()) {
+                        if let (Some(user), Some((status, method, reason))) =
+                            (&mut user, endpoint.take())
+                        {
                             let status = endpoint_status(status, method);
                             // a connected endpoint makes the user so
                             if user.status.as_deref() != Some("connected") {
                                 user.status = Some(status);
+                                user.disconnection_reason = reason;
                             }
                         }
                     }
@@ -283,12 +328,14 @@ impl Roster {
             let known = self.participants.iter().position(|p| p.uri == user.entity);
             let previous = known.map(|i| self.participants[i].clone());
 
-            let status = match (user.deleted, user.status) {
-                (true, _) => String::from("disconnected"),
-                (false, Some(status)) => status,
+            let (status, disconnection_reason) = match (user.deleted, user.status) {
+                (true, _) => (String::from("disconnected"), user.disconnection_reason),
+                (false, Some(status)) => (status, user.disconnection_reason),
                 (false, None) => previous
                     .as_ref()
-                    .map_or(String::from("connected"), |p| p.status.clone()),
+                    .map_or((String::from("connected"), None), |p| {
+                        (p.status.clone(), p.disconnection_reason.clone())
+                    }),
             };
             let participant = Participant {
                 display_name: user
@@ -296,6 +343,7 @@ impl Roster {
                     .or_else(|| previous.as_ref().and_then(|p| p.display_name.clone())),
                 uri: user.entity,
                 status,
+                disconnection_reason,
             };
 
             if previous.as_ref() != Some(&participant) {
@@ -436,6 +484,21 @@ impl GroupChats {
 
         (self.listener)(CPMGroupEvent::Joined(conference_uri.clone()));
 
+        // a participant the Messaging Server removed is committed out of
+        // the MLS group by the members (RCC.16 section 9.6)
+        let removing = Arc::downgrade(sip_session);
+        let removed_by_server = move |participant: &str| {
+            let session_end = removing
+                .upgrade()
+                .and_then(|sip_session| sip_session.get_inner().session_end());
+            if let Some(session_end) = session_end {
+                let participant = String::from(participant);
+                session_end.commit(move |encryption, conversation_id, from, to| {
+                    encryption.remove_for_server(conversation_id, from, to, participant)
+                });
+            }
+        };
+
         let core = self.core.lock().unwrap().as_ref().and_then(Weak::upgrade);
         let registered = self.registered_public_identity.lock().unwrap().clone();
         let subscriber = match (core, registered) {
@@ -447,6 +510,7 @@ impl GroupChats {
                 &instance_id,
                 session.mls_opaque_token(),
                 &self.listener,
+                removed_by_server,
                 rt,
             )
             .map(|subscriber| (subscriber, core, transport)),
@@ -477,7 +541,8 @@ impl GroupChats {
 }
 
 /// Subscribes to the conference events of the group at `conference_uri`,
-/// telling `listener` of each participant that changes
+/// telling `listener` of each participant that changes, and
+/// `removed_by_server` of each the Messaging Server removed
 fn subscribe(
     conference_uri: &str,
     core: &Arc<SipCore>,
@@ -486,6 +551,7 @@ fn subscribe(
     instance_id: &str,
     mls_opaque_token: Arc<Mutex<Option<String>>>,
     listener: &Arc<dyn Fn(CPMGroupEvent) + Send + Sync>,
+    removed_by_server: impl Fn(&str) + Send + Sync + 'static,
     rt: &Arc<Runtime>,
 ) -> Option<Arc<Subscriber>> {
     let roster = Mutex::new(Roster::default());
@@ -505,6 +571,9 @@ fn subscribe(
                 if let Body::Raw(xml) = body.as_ref() {
                     let changed = roster.lock().unwrap().take_in(xml);
                     for participant in changed {
+                        if participant.removed_by_server() {
+                            removed_by_server(&participant.uri);
+                        }
                         listener(CPMGroupEvent::Participant(
                             conference_uri_.clone(),
                             participant,
@@ -861,6 +930,7 @@ entity=\"sip:conf1@conf.example.com\" state=\"{}\" version=\"{}\">\
             uri: String::from(uri),
             display_name: display_name.map(String::from),
             status: String::from(status),
+            disconnection_reason: None,
         }
     }
 
@@ -965,5 +1035,88 @@ entity=\"sip:conf1@conf.example.com\" state=\"{}\" version=\"{}\">\
             )),
             vec![participant(A, None, "connected")]
         );
+    }
+
+    /// An endpoint disconnected by `method`, the focus telling why as
+    /// `reason`, a SIP Reason
+    fn disconnected(method: &str, reason: &str) -> String {
+        format!(
+            "<endpoint entity=\"sip:x@example.com\"><status>disconnected</status>\
+<disconnection-method>{}</disconnection-method>\
+<disconnection-info><when>2026-10-25T12:00:00Z</when><reason>{}</reason>\
+<by>sip:conf1@conf.example.com</by></disconnection-info></endpoint>",
+            method, reason
+        )
+    }
+
+    #[test]
+    fn why_a_participant_was_disconnected_is_told() {
+        let mut roster = Roster::default();
+        roster.take_in(&document(
+            "full",
+            1,
+            &(user(A, Some("Alice"), &endpoint("connected", None))
+                + &user(B, None, &endpoint("connected", None))),
+        ));
+
+        // removed by the Messaging Server (RCC.16 section 9.6)
+        let changed = roster.take_in(&document(
+            "partial",
+            2,
+            &user(
+                B,
+                None,
+                &disconnected("booted", "SIP;cause=410;text=&quot;Removed by server&quot;"),
+            ),
+        ));
+        assert_eq!(
+            changed,
+            vec![Participant {
+                disconnection_reason: Some(String::from(
+                    "SIP;cause=410;text=\"Removed by server\""
+                )),
+                ..participant(B, None, "booted")
+            }]
+        );
+        assert!(changed[0].removed_by_server());
+
+        // a connected endpoint tells no reason, whatever another tells
+        let changed = roster.take_in(&document(
+            "partial",
+            3,
+            &user(
+                A,
+                None,
+                &(disconnected("departed", "SIP;cause=200;text=&quot;Call completed&quot;")
+                    + &endpoint("connected", None)),
+            ),
+        ));
+        assert!(changed.is_empty(), "{:?}", changed);
+    }
+
+    #[test]
+    fn only_the_server_removing_a_participant_is_a_removal_by_the_server() {
+        let removed = |reason: Option<&str>| Participant {
+            disconnection_reason: reason.map(String::from),
+            ..participant(B, None, "booted")
+        };
+        for reason in [
+            "SIP;cause=410;text=\"Removed by server\"",
+            "sip ; Cause=410 ; TEXT=\"removed by server\"",
+        ] {
+            assert!(removed(Some(reason)).removed_by_server(), "{}", reason);
+        }
+        for reason in [
+            // removed by a participant (section 9.3), or left (section 9.4)
+            "SIP;cause=410;text=\"Kicked\"",
+            "SIP;cause=200;text=\"Call completed\"",
+            "SIP;cause=480;text=\"Removed by server\"",
+            "Q.850;cause=410;text=\"Removed by server\"",
+            "SIP;cause=410",
+            "",
+        ] {
+            assert!(!removed(Some(reason)).removed_by_server(), "{}", reason);
+        }
+        assert!(!removed(None).removed_by_server());
     }
 }

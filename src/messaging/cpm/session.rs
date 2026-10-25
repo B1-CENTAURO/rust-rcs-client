@@ -581,6 +581,11 @@ impl CPMSession {
         self.session_end.lock().unwrap().replace(session_end);
     }
 
+    /// What ending the session takes, while it goes on
+    pub(crate) fn session_end(&self) -> Option<SessionEnd> {
+        self.session_end.lock().unwrap().clone()
+    }
+
     /// Told once when the session ends, to whoever waits first
     pub fn ended(&self) -> Arc<Notify> {
         Arc::clone(&self.ended)
@@ -898,8 +903,8 @@ impl CPMSession {
                             );
 
                             while let Some(message) = message_rx.recv().await {
-                                let (content_type, data) = if message.raw {
-                                    let mut data = message.message_content.as_bytes().to_vec();
+                                let (content_type, data) = if let Some(data) = &message.raw {
+                                    let mut data = data.clone();
                                     // a notification signed in an encrypted
                                     // one, else sent unsigned as RCC.16 lets
                                     // it be (sections 7.7.2.2, 9.1.3, 9.1.4)
@@ -1142,6 +1147,75 @@ impl SessionEnd {
                     callback(status_code, reason_phrase);
                 }),
             );
+        });
+    }
+
+    /// Sends in the session the control message `prepare` makes with the
+    /// encryption of the session, given the Conversation-ID, the user and the
+    /// group, for the Conversation Focus to accept and forward (RCC.16
+    /// section 9.5.1); nothing if the session is not with an encrypted group,
+    /// or if no control message is made. The Commit it carries is let go of
+    /// if the message is not sent.
+    pub(crate) fn commit<P>(&self, prepare: P)
+    where
+        P: FnOnce(
+            &dyn GroupEncryption,
+            String,
+            String,
+            String,
+        ) -> BoxFuture<'static, Option<Vec<u8>>>,
+    {
+        let (encrypted, conference_uri) = {
+            let inner = self.sip_session.get_inner();
+            let session_info = inner.get_session_info();
+            (
+                session_info
+                    .encryption
+                    .clone()
+                    .zip(session_info.conversation_id.clone()),
+                String::from_utf8_lossy(&session_info.cpm_contact.service_uri).into_owned(),
+            )
+        };
+        let public_user_identity = self
+            .registered_public_identity
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, public_user_identity, _)| public_user_identity.clone());
+        let Some(((encryption, conversation_id), public_user_identity)) =
+            encrypted.zip(public_user_identity)
+        else {
+            return;
+        };
+
+        let preparing = prepare(
+            &*encryption,
+            conversation_id.clone(),
+            public_user_identity,
+            conference_uri.clone(),
+        );
+        let sip_session = Arc::clone(&self.sip_session);
+        let rt = Arc::clone(&self.rt);
+        self.rt.spawn(async move {
+            let Some(cpim) = preparing.await else {
+                return;
+            };
+            let message = CPMMessageParam::new(
+                String::from("message/cpim"),
+                String::new(),
+                new_message_id(),
+                &conference_uri,
+                &RecipientType::Group,
+                &conference_uri,
+                move |status_code, _| {
+                    // not reaching the focus, it is not refused either
+                    if !(200..300).contains(&status_code) {
+                        encryption.discard(&conversation_id, false);
+                    }
+                },
+            )
+            .raw_data(cpim);
+            sip_session.get_inner().send_message(message, &rt);
         });
     }
 
@@ -1592,7 +1666,15 @@ impl CPMSessionService {
                     .conversation_id
                     .clone();
                 if let (Some(encryption), Some(conversation_id)) = (encryption, conversation_id) {
-                    encryption.on_server_message(&conversation_id, content_body);
+                    // a member's leave for this client to commit (RCC.16
+                    // section 9.4)
+                    if encryption.on_server_message(&conversation_id, content_body) {
+                        if let Some(session_end) = session.get_inner().session_end() {
+                            session_end.commit(|encryption, conversation_id, from, to| {
+                                encryption.commit_leaves(conversation_id, from, to)
+                            });
+                        }
+                    }
                 }
             };
 
@@ -2878,7 +2960,7 @@ fn group_session_end(
     conference_uri: &str,
 ) -> Option<SessionEnd> {
     group_session(sessions, conference_uri)
-        .and_then(|sip_session| sip_session.get_inner().session_end.lock().unwrap().clone())
+        .and_then(|sip_session| sip_session.get_inner().session_end())
 }
 
 /// Whom an outgoing session is with

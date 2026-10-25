@@ -85,7 +85,7 @@ pub struct CPMMessageParam {
     /// The imdn.Message-ID it is sent with, which notifications of it give
     message_id: String,
     /// Sent as it is, of the type `message_type`, not in a CPIM message
-    raw: bool,
+    raw: Option<Vec<u8>>,
     /// A CPIM message carrying a notification, signed in a group chat
     /// encrypted end to end
     signed: bool,
@@ -112,7 +112,7 @@ impl CPMMessageParam {
             message_type,
             message_content,
             message_id,
-            raw: false,
+            raw: None,
             signed: false,
             recipient: String::from(recipient),
             recipient_type: RecipientType::from(recipient_type),
@@ -123,17 +123,25 @@ impl CPMMessageParam {
 
     /// The message sent as it is, not in a CPIM message
     pub fn raw(mut self) -> CPMMessageParam {
-        self.raw = true;
+        self.raw = Some(self.message_content.as_bytes().to_vec());
+        self
+    }
+
+    /// `data` sent as it is instead, which unlike the message's content need
+    /// not be text, such as the CPIM message carrying a Commit (RCC.16
+    /// section 9.5.1)
+    pub(crate) fn raw_data(mut self, data: Vec<u8>) -> CPMMessageParam {
+        self.raw = Some(data);
         self
     }
 
     /// The CPIM message carrying a notification, sent as it is, and signed
     /// if the group chat it goes to is encrypted end to end (RCC.16 sections
     /// 9.1.3, 9.1.4)
-    pub fn notification(mut self) -> CPMMessageParam {
-        self.raw = true;
-        self.signed = true;
-        self
+    pub fn notification(self) -> CPMMessageParam {
+        let mut message = self.raw();
+        message.signed = true;
+        message
     }
 }
 
