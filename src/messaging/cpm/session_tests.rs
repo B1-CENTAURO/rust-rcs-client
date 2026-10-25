@@ -2098,6 +2098,8 @@ struct ScriptedEncryption {
     removed: std::sync::Mutex<Vec<(String, String, String, String)>>,
     /// The CPIM message it prepares for leaving, if any
     leaving: Option<Vec<u8>>,
+    /// What it waits for before preparing it, if anything
+    leave_held: Option<Arc<tokio::sync::Notify>>,
     /// The Conversation-ID, from and to of each leave
     left: std::sync::Mutex<Vec<(String, String, String)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
@@ -2181,7 +2183,13 @@ impl GroupEncryption for ScriptedEncryption {
     ) -> BoxFuture<'static, Option<Vec<u8>>> {
         self.left.lock().unwrap().push((conversation_id, from, to));
         let cpim = self.leaving.clone();
-        Box::pin(async move { cpim })
+        let held = self.leave_held.clone();
+        Box::pin(async move {
+            if let Some(held) = held {
+                held.notified().await;
+            }
+            cpim
+        })
     }
 
     fn discard(&self, conversation_id: &str, refusal_follows: bool) {
@@ -4827,4 +4835,40 @@ fn an_encrypted_group_that_cannot_be_left_is_not_sent_a_bye() {
     assert!(client.sessions.has_session_with(GROUP));
     assert!(encryption.discarded.lock().unwrap().is_empty());
     assert!(encryption.abandoned.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_leave_whose_session_ends_while_it_is_made_is_let_go_of() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let held = Arc::new(tokio::sync::Notify::new());
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        leaving: Some(LEAVING_CPIM.to_vec()),
+        leave_held: Some(Arc::clone(&held)),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-ending");
+
+    let result = leave(&client, GROUP);
+    // the session ended meanwhile, for the time being only
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    assert_eq!(header_value(&bye, "Reason"), "", "not leaving the group");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+
+    held.notify_one();
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(481));
+    assert_eq!(
+        *encryption.discarded.lock().unwrap(),
+        [(String::from("conversation-1"), false)]
+    );
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+    peer.silence();
 }
