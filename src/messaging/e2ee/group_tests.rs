@@ -14,6 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use base64::{engine::general_purpose, Engine as _};
 use futures::executor::block_on;
 use rust_rcs_core::cpim::{CPIMHeaders, CPIMMessage};
 use rust_rcs_core::internet::Body;
@@ -36,6 +37,7 @@ use super::group::{recipients, DeviceGroups, GroupError};
 use super::kds::{Fetched, KdsError, Recipient};
 use super::kds_tests::certificates::*;
 use super::kds_tests::{bob, credential, signer, validator, App, Kds, ALICE_TEL, BOB_TEL, TODAY};
+use super::message::MessageError;
 use super::store::StoreError;
 
 const CONVERSATION: &str = "4f0e8b9c-3a71-4d2e-9b6a-2c5d8e1f7a30";
@@ -92,6 +94,14 @@ fn recipient(tel_uri: &str) -> Recipient {
 /// Alice's device enrolled with a Home KDS having `directory` for the
 /// Participants asked for, if it has one
 fn enrolled(directory: Option<Vec<(&str, Fetched)>>) -> (Arc<E2eeDevice>, Arc<Kds>) {
+    let (device, kds, _) = enrolled_with_app(directory);
+    (device, kds)
+}
+
+/// As enrolled(), with the app keeping its state
+fn enrolled_with_app(
+    directory: Option<Vec<(&str, Fetched)>>,
+) -> (Arc<E2eeDevice>, Arc<Kds>, Arc<App>) {
     let app = Arc::new(App::default());
     let kds = Kds::issuing(&[ALICE, CA], &app);
     let kds = Arc::new(match directory {
@@ -101,7 +111,7 @@ fn enrolled(directory: Option<Vec<(&str, Fetched)>>) -> (Arc<E2eeDevice>, Arc<Kd
     let device = alice(&app, &kds, TODAY, None);
     provision(&device, &[ALICE_TEL], None);
     assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
-    (Arc::new(device), kds)
+    (Arc::new(device), kds, app)
 }
 
 /// Bob, and a KeyPackage of his
@@ -751,4 +761,500 @@ fn the_groups_of_the_device_are_joined_while_it_is_kept() {
         });
     drop(device);
     assert!(!groups.join("group-2", &server_message));
+}
+
+/// Alice's device and Bob in the group of the conversation, the Commit
+/// making it accepted, both in epoch 1
+fn alice_and_bob() -> (Arc<E2eeDevice>, MlsClient, MlsConversation) {
+    let (bob, bobs) = bob_with_key_package();
+    let (device, _) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let bobs_group = joined(&bob, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    (device, bob, bobs_group)
+}
+
+const GROUP_URI: &str = "sip:conf1@conf.example.com";
+
+/// A CPIM message from Alice to the group as the client sends one, asking
+/// to be told of `disposition`
+fn plaintext(message_id: &str, disposition: Option<&str>) -> Vec<u8> {
+    format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:00.000+00:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: {}\r\n\
+{}\
+NS: cpm <http://www.openmobilealliance.org/cpm/>\r\n\
+cpm.Payload-Type: text/plain\r\n\
+NS: rcs <http://www.gsma.com/rcs>\r\n\
+rcs.advised-action: none\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: 9\r\n\
+\r\n\
+hello Bob",
+        IMPU,
+        GROUP_URI,
+        message_id,
+        disposition
+            .map(|d| format!("imdn.Disposition-Notification: {}\r\n", d))
+            .unwrap_or_default()
+    )
+    .into_bytes()
+}
+
+fn header_names(message: &CPIMMessage) -> Vec<String> {
+    let CPIMHeaders::Inflated(headers) = &message.headers else {
+        panic!("headers not inflated");
+    };
+    headers
+        .iter()
+        .map(|header| String::from_utf8_lossy(header.get_name()).into_owned())
+        .collect()
+}
+
+fn cpim_message(data: &[u8]) -> CPIMMessage {
+    CPIMMessage::try_from(&Body::construct_message(data).unwrap()).unwrap()
+}
+
+#[test]
+fn a_message_is_sent_encrypted_with_only_the_headers_left_unencrypted() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let outer = device
+        .encrypt_message(
+            CONVERSATION,
+            &plaintext("message-1", Some("positive-delivery, display")),
+        )
+        .unwrap();
+
+    let message = cpim_message(&outer);
+    assert_eq!(
+        header_names(&message),
+        [
+            "From",
+            "To",
+            "DateTime",
+            "<urn:ietf:params:imdn>.Message-ID",
+            "<http://www.gsma.com/rcs>.advised-action",
+            "<urn:ietf:params:imdn>.Disposition-Notification",
+            "<http://www.gsma.com/rcs/mls>.Epoch-Authenticator",
+            "<http://www.gsma.com/rcs/mls>.Era-ID",
+        ]
+    );
+    let info = message.get_info().unwrap();
+    assert_eq!(info.imdn_message_id, b"message-1");
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"positive-delivery, display, negative-delivery"[..])
+    );
+    let value = |name: &str| {
+        message
+            .get_values(name.as_bytes())
+            .first()
+            .map(|value| String::from_utf8_lossy(value.value).into_owned())
+    };
+    assert_eq!(
+        value("<http://www.gsma.com/rcs/mls>.Epoch-Authenticator"),
+        Some(general_purpose::STANDARD.encode(bobs_group.epoch_authenticator()))
+    );
+    assert_eq!(
+        value("<http://www.gsma.com/rcs/mls>.Era-ID"),
+        Some(String::from("0"))
+    );
+    let text = String::from_utf8_lossy(&outer).into_owned();
+    let namespaces: Vec<&str> = text.lines().filter(|l| l.starts_with("NS:")).collect();
+    assert_eq!(
+        namespaces,
+        [
+            "NS: imdn <urn:ietf:params:imdn>",
+            "NS: rcs <http://www.gsma.com/rcs>",
+            "NS: mls <http://www.gsma.com/rcs/mls>",
+        ]
+    );
+
+    // what Bob decrypts the rest of
+    let (content_type, mls_message, base64) = message.get_message_body().unwrap();
+    assert_eq!(content_type, Some(&b"message/mls"[..]));
+    assert!(!base64);
+    let decrypted = bobs_group.decrypt(&bob, mls_message, b"message-1").unwrap();
+    assert_eq!(decrypted.sender, credential(&[ALICE, CA]));
+    assert_eq!(
+        String::from_utf8_lossy(&decrypted.payload.unwrap()),
+        "NS: cpm <http://www.openmobilealliance.org/cpm/>\r\n\
+cpm.Payload-Type: text/plain\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: 9\r\n\
+\r\n\
+hello Bob"
+    );
+}
+
+#[test]
+fn a_message_asks_to_be_told_of_a_negative_delivery_once() {
+    let (device, _, _) = alice_and_bob();
+    for (asked, told) in [
+        (None, "negative-delivery"),
+        (Some("negative-delivery"), "negative-delivery"),
+        (
+            Some("display, Negative-Delivery"),
+            "display, Negative-Delivery",
+        ),
+        (
+            Some("positive-delivery"),
+            "positive-delivery, negative-delivery",
+        ),
+    ] {
+        let outer = device
+            .encrypt_message(CONVERSATION, &plaintext("message-2", asked))
+            .unwrap();
+        assert_eq!(
+            cpim_message(&outer)
+                .get_info()
+                .unwrap()
+                .disposition_notification,
+            Some(told.as_bytes()),
+            "{:?}",
+            asked
+        );
+    }
+}
+
+#[test]
+fn a_message_is_not_encrypted_unless_it_can_be() {
+    // the Commit of the group not yet accepted
+    let (_, bobs) = bob_with_key_package();
+    let (device, _) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, &plaintext("message-3", None)),
+        Err(MessageError::Pending)
+    );
+
+    // in no group, or not a CPIM message with an ID
+    let (device, _, _) = alice_and_bob();
+    assert_eq!(
+        device.encrypt_message("another", &plaintext("message-4", None)),
+        Err(MessageError::Store(StoreError::Mls(
+            ErrorKind::UnknownGroup
+        )))
+    );
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, b"not a CPIM message"),
+        Err(MessageError::NotCpim)
+    );
+    let without_id = String::from_utf8(plaintext("message-5", None))
+        .unwrap()
+        .replace("imdn.Message-ID: message-5\r\n", "");
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, without_id.as_bytes()),
+        Err(MessageError::NotCpim)
+    );
+}
+
+/// What Bob sends the group as the client of Alice receives it, from
+/// `from`: the CPIM message carrying it and the encrypted message
+fn from_bob(
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+    from: &str,
+    message_id: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    let mls_message = bobs_group
+        .encrypt_cpim(
+            bob,
+            b"NS: cpm <http://www.openmobilealliance.org/cpm/>\r\ncpm.Payload-Type: text/plain\r\n\r\nContent-Type: text/plain\r\n\r\nhi Alice",
+            b"bob-1",
+            b"",
+        )
+        .unwrap();
+    let mut outer = format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:01.000+00:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: {}\r\n\
+imdn.Disposition-Notification: positive-delivery, negative-delivery\r\n\
+\r\n\
+Content-Type: message/mls\r\n\
+\r\n",
+        from, GROUP_URI, message_id
+    )
+    .into_bytes();
+    outer.extend_from_slice(&mls_message);
+    (outer, mls_message)
+}
+
+#[test]
+fn a_message_received_is_decrypted_with_the_headers_it_came_with() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (outer, mls_message) = from_bob(
+        &bob,
+        &mut bobs_group,
+        "sip:+491707654321@ims.example.com",
+        "bob-1",
+    );
+    let outer = cpim_message(&outer);
+    let plaintext = device
+        .decrypt_message(CONVERSATION, &outer.get_info().unwrap(), &mls_message)
+        .unwrap();
+
+    let message = cpim_message(&plaintext);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, b"<sip:+491707654321@ims.example.com>");
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    assert_eq!(info.date, b"2026-10-25T12:00:01.000+00:00");
+    assert_eq!(info.imdn_message_id, b"bob-1");
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"positive-delivery, negative-delivery"[..])
+    );
+    assert_eq!(info.payload_type, Some(&b"text/plain"[..]));
+    assert_eq!(
+        message.get_message_body(),
+        Some((Some(&b"text/plain"[..]), &b"hi Alice"[..], false))
+    );
+}
+
+#[test]
+fn a_message_from_another_than_its_mls_sender_is_from_the_mls_sender() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    for told in ["sip:+491700000009@ims.example.com", "sip:bob@example.com"] {
+        let (outer, mls_message) = from_bob(&bob, &mut bobs_group, told, "bob-1");
+        let plaintext = device
+            .decrypt_message(
+                CONVERSATION,
+                &cpim_message(&outer).get_info().unwrap(),
+                &mls_message,
+            )
+            .unwrap();
+        assert_eq!(
+            cpim_message(&plaintext).get_info().unwrap().from,
+            b"<tel:+491707654321>",
+            "{}",
+            told
+        );
+    }
+}
+
+#[test]
+fn a_message_not_for_the_group_as_it_came_is_not_decrypted() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+
+    // bound to another Message-ID
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, "tel:+491707654321", "another-id");
+    assert_eq!(
+        device.decrypt_message(
+            CONVERSATION,
+            &cpim_message(&outer).get_info().unwrap(),
+            &mls_message
+        ),
+        Err(MessageError::Store(StoreError::Mls(ErrorKind::Rejected)))
+    );
+
+    // of another group, or none
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, "tel:+491707654321", "bob-1");
+    let info = cpim_message(&outer);
+    assert_eq!(
+        device.decrypt_message("another", &info.get_info().unwrap(), &mls_message),
+        Err(MessageError::Store(StoreError::Mls(
+            ErrorKind::UnknownGroup
+        )))
+    );
+    assert!(device
+        .decrypt_message(CONVERSATION, &info.get_info().unwrap(), b"not MLS")
+        .is_err());
+
+    // its own coming back
+    let own = device
+        .encrypt_message(CONVERSATION, &plaintext("message-6", None))
+        .unwrap();
+    let own = cpim_message(&own);
+    let (_, mls_message, _) = own.get_message_body().unwrap();
+    assert!(device
+        .decrypt_message(CONVERSATION, &own.get_info().unwrap(), mls_message)
+        .is_err());
+}
+
+#[test]
+fn messages_wait_for_the_focus_to_accept_the_commit_of_the_group() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_, bobs) = bob_with_key_package();
+    let (device, _) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    assert!(groups.encrypts(CONVERSATION));
+    assert!(!groups.encrypts("another"));
+
+    let waiting = rt.spawn(groups.encrypt(CONVERSATION, &plaintext("message-7", None)));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !waiting.is_finished(),
+        "waits for the Commit to be accepted"
+    );
+    // what is not the acceptance leaves it waiting
+    groups.on_server_message(CONVERSATION, b"\x0a\xff");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!waiting.is_finished());
+
+    groups.on_server_message(
+        CONVERSATION,
+        &accepted(epoch_identifier(&device, CONVERSATION)),
+    );
+    let encrypted = rt.block_on(waiting).unwrap().expect("sent once accepted");
+    assert_eq!(
+        cpim_message(&encrypted).get_info().unwrap().imdn_message_id,
+        b"message-7"
+    );
+}
+
+#[test]
+fn messages_are_not_sent_in_a_group_whose_commit_is_not_accepted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_, bobs) = bob_with_key_package();
+    let (device, _) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query)
+        .with_acceptance_wait(std::time::Duration::from_millis(300));
+    assert_eq!(
+        rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                groups.encrypt(CONVERSATION, &plaintext("message-8", None)),
+            )
+            .await
+        }),
+        Ok(None),
+        "given up after the wait"
+    );
+
+    // nor what cannot be, nor once the device is let go of
+    assert_eq!(rt.block_on(groups.encrypt(CONVERSATION, b"not CPIM")), None);
+    drop(device);
+    assert!(!groups.encrypts(CONVERSATION));
+    assert_eq!(
+        rt.block_on(groups.encrypt(CONVERSATION, &plaintext("message-9", None))),
+        None
+    );
+}
+
+#[test]
+fn the_messages_of_the_groups_of_the_device_are_decrypted_while_it_is_kept() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, "tel:+491707654321", "bob-1");
+    let info = cpim_message(&outer);
+    let plaintext = groups
+        .decrypt(CONVERSATION, &info.get_info().unwrap(), &mls_message)
+        .expect("decrypted");
+    assert_eq!(
+        cpim_message(&plaintext)
+            .get_message_body()
+            .map(|b| b.1.to_vec()),
+        Some(b"hi Alice".to_vec())
+    );
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, "tel:+491707654321", "bob-2");
+    let info = cpim_message(&outer);
+    assert_eq!(
+        groups.decrypt("another", &info.get_info().unwrap(), &mls_message),
+        None
+    );
+    drop(device);
+    assert_eq!(
+        groups.decrypt(CONVERSATION, &info.get_info().unwrap(), &mls_message),
+        None
+    );
+}
+
+#[test]
+fn a_message_with_no_rcs_header_declares_no_rcs_namespace() {
+    let (device, _, _) = alice_and_bob();
+    let without = String::from_utf8(plaintext("message-10", None))
+        .unwrap()
+        .replace(
+            "NS: rcs <http://www.gsma.com/rcs>\r\nrcs.advised-action: none\r\n",
+            "",
+        );
+    let outer = device
+        .encrypt_message(CONVERSATION, without.as_bytes())
+        .unwrap();
+    let text = String::from_utf8_lossy(&outer).into_owned();
+    let namespaces: Vec<&str> = text.lines().filter(|l| l.starts_with("NS:")).collect();
+    assert_eq!(
+        namespaces,
+        [
+            "NS: imdn <urn:ietf:params:imdn>",
+            "NS: mls <http://www.gsma.com/rcs/mls>",
+        ]
+    );
+}
+
+#[test]
+fn a_message_re_sent_is_not_taken_yet() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let resent = bobs_group
+        .encrypt_resent(
+            &bob,
+            b"\r\nContent-Type: text/plain\r\n\r\nagain",
+            &credential(&[ALICE, CA]),
+            b"bob-2",
+            b"bob-1",
+        )
+        .unwrap();
+    let mut outer = format!(
+        "From: <tel:+491707654321>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:02.000+00:00\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: bob-2\r\n\r\nContent-Type: message/mls\r\n\r\n",
+        GROUP_URI
+    )
+    .into_bytes();
+    outer.extend_from_slice(&resent);
+    assert_eq!(
+        device.decrypt_message(
+            CONVERSATION,
+            &cpim_message(&outer).get_info().unwrap(),
+            &resent
+        ),
+        Err(MessageError::Store(StoreError::Mls(
+            ErrorKind::UnexpectedMessage
+        )))
+    );
+}
+
+#[test]
+fn the_groups_of_a_device_restored_are_encrypted() {
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+
+    let restored = Arc::new(alice(&app, &kds, TODAY, Some(&app.last().unwrap())));
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&restored, query);
+    assert!(groups.encrypts(CONVERSATION));
+    assert!(!groups.encrypts("another"));
+
+    // and its messages decrypted
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, "tel:+491707654321", "bob-1");
+    assert!(groups
+        .decrypt(
+            CONVERSATION,
+            &cpim_message(&outer).get_info().unwrap(),
+            &mls_message
+        )
+        .is_some());
 }

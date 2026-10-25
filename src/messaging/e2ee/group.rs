@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The group chats this client creates encrypted (RCC.16 section 8.1)
+//! The encrypted group chats of the device: those it creates, and those it
+//! joins (RCC.16 section 8.1)
 
 use std::io::Read;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use chrono::{Local, SecondsFormat};
 use futures::future::{join_all, BoxFuture};
-use rust_rcs_core::cpim::CPIMMessage;
+use rust_rcs_core::cpim::{CPIMInfo, CPIMMessage};
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::internet::body::message_body::MessageBody;
 use rust_rcs_core::internet::parameter::ParameterParser;
@@ -28,6 +30,7 @@ use rust_rcs_core::io::DynamicChain;
 use rust_rcs_core::mls::rcs::proto::{self, server_mls_rcs_message, ServerMlsRcsMessage};
 use rust_rcs_core::mls::rcs::{MlsCapability, CONTENT_TYPE_MLS_RCS_CLIENT, MLS_VERSION_V1};
 use rust_rcs_core::mls::{ErrorKind, IncomingMessage};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::capability::CapabilityQuery;
@@ -35,9 +38,14 @@ use crate::messaging::cpm::encryption::GroupEncryption;
 
 use super::device::{participant_tel_uri, E2eeDevice, CIPHERSUITE};
 use super::kds::{fetch_key_packages, Fetched, KdsError, Recipient};
+use super::message::MessageError;
 use super::store::StoreError;
 
 const LOG_TAG: &str = "e2ee";
+
+/// How long a message waits for a Commit of this client to be accepted by
+/// the Conversation Focus before it is not sent
+const ACCEPTANCE_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GroupError {
@@ -255,6 +263,9 @@ fn control_message(from: &str, to: &str, client_message: &[u8]) -> Vec<u8> {
 pub struct DeviceGroups {
     device: Weak<E2eeDevice>,
     capabilities: CapabilityQuery,
+    /// Told once what the Conversation Focus sent is taken
+    taken: Arc<Notify>,
+    acceptance_wait: Duration,
 }
 
 impl DeviceGroups {
@@ -264,7 +275,16 @@ impl DeviceGroups {
         DeviceGroups {
             device: Arc::downgrade(device),
             capabilities,
+            taken: Arc::new(Notify::new()),
+            acceptance_wait: ACCEPTANCE_WAIT,
         }
+    }
+
+    /// Has messages wait `acceptance_wait` for a Commit to be accepted
+    #[cfg(test)]
+    pub fn with_acceptance_wait(mut self, acceptance_wait: Duration) -> DeviceGroups {
+        self.acceptance_wait = acceptance_wait;
+        self
     }
 }
 
@@ -315,11 +335,63 @@ impl GroupEncryption for DeviceGroups {
                 platform_log(LOG_TAG, format!("message of the focus not taken: {:?}", e));
             }
         }
+        self.taken.notify_waiters();
     }
 
     fn abandon(&self, conversation_id: &str) {
         if let Some(device) = self.device.upgrade() {
             let _ = device.abandon(conversation_id);
+        }
+    }
+
+    fn encrypts(&self, conversation_id: &str) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.store().has_conversation(conversation_id.as_bytes()))
+    }
+
+    fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let device = self.device.clone();
+        let taken = Arc::clone(&self.taken);
+        let deadline = tokio::time::Instant::now() + self.acceptance_wait;
+        let conversation_id = String::from(conversation_id);
+        let cpim = cpim.to_vec();
+        Box::pin(async move {
+            loop {
+                // told of what is taken from now on
+                let notified = taken.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                match device.upgrade()?.encrypt_message(&conversation_id, &cpim) {
+                    Ok(encrypted) => return Some(encrypted),
+                    Err(MessageError::Pending) => {}
+                    Err(e) => {
+                        platform_log(LOG_TAG, format!("message not encrypted: {:?}", e));
+                        return None;
+                    }
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    platform_log(LOG_TAG, "message not sent, the Commit not accepted");
+                    return None;
+                }
+            }
+        })
+    }
+
+    fn decrypt(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        mls_message: &[u8],
+    ) -> Option<Vec<u8>> {
+        let device = self.device.upgrade()?;
+        match device.decrypt_message(conversation_id, cpim_info, mls_message) {
+            Ok(cpim) => Some(cpim),
+            Err(e) => {
+                platform_log(LOG_TAG, format!("message not decrypted: {:?}", e));
+                None
+            }
         }
     }
 }
