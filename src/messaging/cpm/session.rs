@@ -83,8 +83,8 @@ use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{GroupEncryption, CONTENT_TYPE_MLS, CONTENT_TYPE_MLS_RCS_SERVER};
 use super::group_chat::{
-    focus_answer, refer_participants, refer_removal, GroupChats, GroupIds, GroupInvitation,
-    Participant,
+    focus_answer, group_info_pull, refer_participants, refer_removal, GroupChats, GroupIds,
+    GroupInvitation, Participant,
 };
 use super::imdn::send_group_imdn;
 use super::session_invitation::{
@@ -1219,6 +1219,31 @@ impl SessionEnd {
         });
     }
 
+    /// Self-heals the MLS group of the session if it fell out of step with
+    /// that of the Conversation Focus, asking the focus with INFO requests in
+    /// the session's dialog, and sending it the External Commit that may come
+    /// of it (RCC.16 sections 6.3, 9.5.1, 10.1)
+    pub(crate) fn heal_if_needed(&self) {
+        let encrypted = {
+            let inner = self.sip_session.get_inner();
+            let session_info = inner.get_session_info();
+            session_info
+                .encryption
+                .clone()
+                .zip(session_info.conversation_id.clone())
+        };
+        let Some((encryption, conversation_id)) = encrypted else {
+            return;
+        };
+        if !encryption.needs_healing(&conversation_id) {
+            return;
+        }
+        let pull = group_info_pull(self);
+        self.commit(move |encryption, conversation_id, from, to| {
+            encryption.heal(conversation_id, from, to, pull)
+        });
+    }
+
     /// Ends the session with the BYE of leave(), carrying the CPIM message
     /// `control_message` if any, `answered` told how it was answered
     fn send_leave(&self, control_message: Option<&[u8]>, answered: FocusAnswered) {
@@ -1625,6 +1650,9 @@ impl CPMSessionService {
                             platform_log(LOG_TAG, "message decrypted not a CPIM message");
                         }
                     }
+                    // the group healed if it could not be decrypted (RCC.16
+                    // section 10.1)
+                    heal_if_needed(session);
                     return;
                 }
                 if is_media_type(content_type, "message/imdn+xml") {
@@ -1637,8 +1665,11 @@ impl CPMSessionService {
                     {
                         // the Conversation Focus refusing a control message
                         // of this client tells the encryption, not the app
-                        // (RCC.16 section 6.2.5)
-                        if encryption.on_imdn(conversation_id, content_body) {
+                        // (RCC.16 section 6.2.5), and the group healed if
+                        // the refusal tells it is out of step
+                        let refused = encryption.on_imdn(conversation_id, content_body);
+                        heal_if_needed(session);
+                        if refused {
                             return;
                         }
                         // nor is one not signed by whom it is from (section
@@ -1675,6 +1706,8 @@ impl CPMSessionService {
                             });
                         }
                     }
+                    // or the group healed, if it could not be applied
+                    heal_if_needed(session);
                 }
             };
 
@@ -2951,6 +2984,14 @@ fn group_session<'s>(
                 )
         })
         .map(|(_, sip_session)| sip_session)
+}
+
+/// Self-heals the MLS group of `session` if it needs to be, as
+/// SessionEnd::heal_if_needed() does
+fn heal_if_needed(session: &Arc<SipSession<CPMSession>>) {
+    if let Some(session_end) = session.get_inner().session_end() {
+        session_end.heal_if_needed();
+    }
 }
 
 /// What ending the session with the group at `conference_uri` takes, if

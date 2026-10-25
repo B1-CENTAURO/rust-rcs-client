@@ -39,9 +39,10 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::capability::CapabilityQuery;
-use crate::messaging::cpm::encryption::GroupEncryption;
+use crate::messaging::cpm::encryption::{GroupEncryption, GroupInfoPull};
 
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice, CIPHERSUITE};
+use super::heal::heal_once;
 use super::kds::{fetch_key_packages, Fetched, KdsError, Recipient};
 use super::message::MessageError;
 use super::store::StoreError;
@@ -333,7 +334,7 @@ impl E2eeDevice {
     /// The control message carrying `client_message` in the group chat
     /// `conversation_id`, its Message-ID kept for a refusal of it to be
     /// recognised
-    fn sent_in(
+    pub(super) fn sent_in(
         &self,
         conversation_id: &str,
         from: &str,
@@ -477,6 +478,11 @@ impl E2eeDevice {
                 .unwrap()
                 .remove(conversation_id);
         }
+        // one that cannot be applied puts the group out of step (RCC.16
+        // sections 6.2.6, 10.1)
+        if taken.is_err() {
+            self.heals().want(conversation_id);
+        }
         taken.map_err(StoreError::Mls)
     }
 
@@ -496,6 +502,15 @@ impl E2eeDevice {
         else {
             return Ok(None);
         };
+        // of any message, the group then to be self-healed (RCC.16 section
+        // 6.2.5)
+        if matches!(
+            reason,
+            ServerFailureReason::IncorrectEpochAuthenticator
+                | ServerFailureReason::MismatchedConfirmationTag
+        ) {
+            self.heals().want(conversation_id);
+        }
         {
             let mut control_messages = self.control_messages().lock().unwrap();
             if control_messages.get(conversation_id) != Some(&refused.message_id) {
@@ -880,6 +895,31 @@ impl GroupEncryption for DeviceGroups {
         if let Some(device) = self.device.upgrade() {
             let _ = device.abandon(conversation_id);
         }
+    }
+
+    fn needs_healing(&self, conversation_id: &str) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.needs_healing(conversation_id))
+    }
+
+    fn heal(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        pull: GroupInfoPull,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let taken = Arc::clone(&self.taken);
+        Box::pin(heal_once(
+            self.device.clone(),
+            conversation_id,
+            from,
+            to,
+            pull,
+            // what waited for it is sent, or not, once it is over
+            move || taken.notify_waiters(),
+        ))
     }
 
     fn encrypts(&self, conversation_id: &str) -> bool {

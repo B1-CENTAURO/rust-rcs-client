@@ -22,8 +22,8 @@ use rust_rcs_core::internet::Body;
 use rust_rcs_core::mls::rcs::certificate::CertificateError;
 use rust_rcs_core::mls::rcs::proto::{
     self, client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage,
-    ClientMlsRcsMessage, CommitBundle, EpochIdentifier, MlsGroupInfo, ServerCommitBundle,
-    ServerMlsRcsMessage, WelcomeCommitBundle,
+    ClientMlsRcsMessage, CommitBundle, EpochControlMessages, EpochIdentifier, MlsEnhancedGroupInfo,
+    MlsGroupInfo, ServerCommitBundle, ServerMlsRcsMessage, WelcomeCommitBundle,
 };
 use rust_rcs_core::mls::rcs::wire::{
     self, encode_message_list, AuthenticatedData, DeliveryNotificationStatus,
@@ -32,12 +32,13 @@ use rust_rcs_core::mls::rcs::wire::{
 };
 use rust_rcs_core::mls::rcs::{
     is_unencrypted_cpim_header, ClientFailureReason, ServerFailureReason,
-    CONTENT_TYPE_MLS_RCS_CLIENT,
+    CONTENT_TYPE_MLS_RCS_CLIENT, INFO_PACKAGE_MLS_ENHANCED_GROUP_INFO_PULL,
+    INFO_PACKAGE_MLS_GROUP_INFO_PULL,
 };
 use rust_rcs_core::mls::{ErrorKind, IncomingMessage, MlsClient, MlsConfig, MlsConversation};
 
 use crate::capability::{Capabilities, CapabilityQuery};
-use crate::messaging::cpm::encryption::GroupEncryption;
+use crate::messaging::cpm::encryption::{GroupEncryption, GroupInfoPull};
 use crate::messaging::cpm::make_cpim_imdn_body;
 
 use super::device::{E2eeDevice, Enrolled, CIPHERSUITE};
@@ -2954,4 +2955,427 @@ fn the_participants_the_server_removed_from_groups_of_the_device_are_committed_o
             participant
         );
     }
+}
+
+/// A Conversation Focus answering the INFO requests asking for GroupInfo
+/// with `answers` in turn, keeping each request: its Info-Package and body
+fn focus_answering(
+    answers: Vec<Option<(u16, Vec<u8>)>>,
+) -> (GroupInfoPull, Arc<Mutex<Vec<(Vec<u8>, Option<Vec<u8>>)>>>) {
+    let answers = Arc::new(Mutex::new(answers.into_iter()));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let asked_ = Arc::clone(&asked);
+    let pull: GroupInfoPull = Arc::new(move |package, body| {
+        asked_.lock().unwrap().push((package.to_vec(), body));
+        let answer = answers.lock().unwrap().next().flatten();
+        Box::pin(async move { answer })
+    });
+    (pull, asked)
+}
+
+/// Bob's Commit of a key update, which the Focus accepted and the device
+/// missed, and the GroupInfo the Focus keeps since
+fn missed_by_the_device(
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+) -> (Vec<u8>, MlsGroupInfo) {
+    let output = bobs_group.update_keys(bob).unwrap();
+    bobs_group.merge_pending_commit(bob).unwrap();
+    let group_info = MlsGroupInfo {
+        group_info: output.group_info.clone(),
+        ratchet_tree: bobs_group.ratchet_tree().unwrap(),
+        pending_proposals: Vec::new(),
+    };
+    (output.commit, group_info)
+}
+
+#[test]
+fn a_group_that_missed_a_commit_is_healed_with_the_control_messages_the_focus_kept() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let device_epoch = epoch_identifier(&device, CONVERSATION);
+    let (commit, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+
+    // not to be healed until something fails
+    assert!(!groups.needs_healing(CONVERSATION));
+    // Bob's message of the epoch the device missed
+    assert!(received_from_bob(&device, &bob, &mut bobs_group).is_err());
+    assert!(groups.needs_healing(CONVERSATION));
+
+    // the Focus giving the Commit since the epoch the device asked from
+    // (RCC.16 sections 7.10.3, 10.1.2)
+    let latest = bobs_group.epoch_identifier();
+    let enhanced = proto::encode(&MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(latest.clone()),
+        mls_group_info: Some(group_info),
+        committed_control_messages: vec![EpochControlMessages {
+            rcs_message_id: String::from("focus-commit-1"),
+            server_mls_rcs_message: Some(ServerMlsRcsMessage {
+                payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+                    ServerCommitBundle {
+                        commit_list: encode_message_list(&[&commit]).unwrap(),
+                        ..ServerCommitBundle::default()
+                    },
+                )),
+            }),
+        }],
+        paginated_epoch_identifier: Some(latest),
+    });
+    let (pull, asked) = focus_answering(vec![Some((200, enhanced))]);
+    assert_eq!(
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        )),
+        None,
+        "no External Commit"
+    );
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [(
+            INFO_PACKAGE_MLS_ENHANCED_GROUP_INFO_PULL.to_vec(),
+            Some(proto::encode(&device_epoch))
+        )]
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    assert!(!groups.needs_healing(CONVERSATION));
+    assert!(received_from_bob(&device, &bob, &mut bobs_group).is_ok());
+}
+
+#[test]
+fn a_group_the_focus_cannot_catch_up_is_rejoined_with_an_external_commit() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    assert!(received_from_bob(&device, &bob, &mut bobs_group).is_err());
+
+    // the epoch of the device unknown to the Focus: only its GroupInfo given
+    let enhanced = proto::encode(&MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(bobs_group.epoch_identifier()),
+        mls_group_info: Some(group_info),
+        ..MlsEnhancedGroupInfo::default()
+    });
+    let (pull, asked) = focus_answering(vec![Some((200, enhanced))]);
+    let cpim = rt
+        .block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        ))
+        .expect("an External Commit");
+    assert_eq!(asked.lock().unwrap().len(), 1);
+
+    // in a control message from the user to the group, applied already
+    let info = cpim_message(&cpim);
+    let info = info.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((3, false)));
+
+    // which Bob takes, the device then back in step with him
+    bobs_group
+        .process_server_message(&bob, &forwarded_commit(&cpim))
+        .unwrap();
+    assert_eq!(bobs_group.members().len(), 2);
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-21", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
+    );
+    assert!(received_from_bob(&device, &bob, &mut bobs_group).is_ok());
+    // forwarded back, it is the device's own
+    assert!(device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .is_ok());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((3, false)));
+}
+
+#[test]
+fn the_group_info_is_pulled_when_the_enhanced_one_is_not_given() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+
+    // pages that bring nothing new are not asked for again
+    assert!(received_from_bob(&device, &bob, &mut bobs_group).is_err());
+    let stuck = proto::encode(&MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(bobs_group.epoch_identifier()),
+        paginated_epoch_identifier: Some(epoch_identifier(&device, CONVERSATION)),
+        ..MlsEnhancedGroupInfo::default()
+    });
+    let (pull, asked) = focus_answering(vec![
+        Some((200, stuck)),
+        Some((469, Vec::new())),
+        Some((469, Vec::new())),
+    ]);
+    assert_eq!(
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        )),
+        None
+    );
+    let packages: Vec<_> = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(package, _)| package.clone())
+        .collect();
+    assert_eq!(
+        packages,
+        [
+            INFO_PACKAGE_MLS_ENHANCED_GROUP_INFO_PULL.to_vec(),
+            INFO_PACKAGE_MLS_GROUP_INFO_PULL.to_vec()
+        ]
+    );
+
+    // no MLS group with the Focus, its enhanced GroupInfo not even read:
+    // nothing comes of it (RCC.16 section 6.3.1)
+    assert!(received_from_bob(&device, &bob, &mut bobs_group).is_err());
+    let (pull, asked) = focus_answering(vec![
+        Some((200, b"not an MlsEnhancedGroupInfo".to_vec())),
+        Some((469, Vec::new())),
+    ]);
+    assert_eq!(
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        )),
+        None
+    );
+    let packages: Vec<_> = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(package, body)| (package.clone(), body.is_some()))
+        .collect();
+    assert_eq!(
+        packages,
+        [
+            (INFO_PACKAGE_MLS_ENHANCED_GROUP_INFO_PULL.to_vec(), true),
+            (INFO_PACKAGE_MLS_GROUP_INFO_PULL.to_vec(), false)
+        ]
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    // the GroupInfo given, the group is rejoined from it
+    assert!(received_from_bob(&device, &bob, &mut bobs_group).is_err());
+    let pulled = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::MlsGroupInfo(group_info)),
+    });
+    let (pull, _) = focus_answering(vec![None, Some((200, pulled))]);
+    let cpim = rt
+        .block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        ))
+        .expect("an External Commit");
+    bobs_group
+        .process_server_message(&bob, &forwarded_commit(&cpim))
+        .unwrap();
+    assert!(received_from_bob(&device, &bob, &mut bobs_group).is_ok());
+}
+
+#[test]
+fn a_group_is_self_healed_once_at_a_time_and_not_too_often() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, _, _) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let up_to_date = || {
+        proto::encode(&MlsEnhancedGroupInfo {
+            latest_epoch_identifier: Some(epoch_identifier(&device, CONVERSATION)),
+            ..MlsEnhancedGroupInfo::default()
+        })
+    };
+    let heal = |pull: GroupInfoPull| {
+        groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        )
+    };
+
+    // not unless it is to be
+    let (pull, asked) = focus_answering(vec![Some((200, up_to_date()))]);
+    assert_eq!(rt.block_on(heal(pull)), None);
+    assert!(asked.lock().unwrap().is_empty());
+
+    // while it is, messages wait, and it is not healed again
+    let released = Arc::new(tokio::sync::Notify::new());
+    let released_ = Arc::clone(&released);
+    let answer = up_to_date();
+    let held: GroupInfoPull = Arc::new(move |_, _| {
+        let released = Arc::clone(&released_);
+        let answer = answer.clone();
+        Box::pin(async move {
+            released.notified().await;
+            Some((200, answer))
+        })
+    });
+    device.heals().want(CONVERSATION);
+    let healing = rt.spawn(heal(held));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!groups.needs_healing(CONVERSATION));
+    // what fails meanwhile is not healed again
+    device.heals().want(CONVERSATION);
+    let (pull, asked) = focus_answering(vec![Some((200, up_to_date()))]);
+    assert_eq!(rt.block_on(heal(pull)), None);
+    assert!(asked.lock().unwrap().is_empty());
+    let waiting = rt.spawn(groups.encrypt(CONVERSATION, &plaintext("message-22", None)));
+    let xml = notification_xml("bob-1", "delivery-notification", "<delivered/>");
+    let signing =
+        rt.spawn(groups.sign(CONVERSATION, &notification_cpim(IMPU, "imdn-22", "", &xml)));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!waiting.is_finished(), "waits for the group to be healed");
+    assert!(!signing.is_finished(), "waits for the group to be healed");
+    released.notify_one();
+    assert_eq!(rt.block_on(healing).unwrap(), None);
+    assert!(rt.block_on(waiting).unwrap().is_some(), "sent once healed");
+    assert!(
+        rt.block_on(signing).unwrap().is_some(),
+        "signed once healed"
+    );
+    assert!(!groups.needs_healing(CONVERSATION));
+    // nor again until something fails again
+    let (pull, asked) = focus_answering(vec![Some((200, up_to_date()))]);
+    assert_eq!(rt.block_on(heal(pull)), None);
+    assert!(asked.lock().unwrap().is_empty());
+
+    // four more times in a day, and no more (RCC.16 section 10.1)
+    for _ in 0..4 {
+        device.heals().want(CONVERSATION);
+        let (pull, asked) = focus_answering(vec![Some((200, up_to_date()))]);
+        rt.block_on(heal(pull));
+        assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+    device.heals().want(CONVERSATION);
+    let (pull, asked) = focus_answering(vec![Some((200, up_to_date()))]);
+    assert_eq!(rt.block_on(heal(pull)), None);
+    assert!(asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_group_is_to_be_healed_once_out_of_step_with_its_focus() {
+    let (device, _, _) = alice_and_bob();
+
+    // a refusal saying so, of a message or a control message (RCC.16
+    // section 6.2.5)
+    for reason in [
+        "incorrect-epoch-authenticator",
+        "mismatched-confirmation-tag",
+    ] {
+        let (device, _, _) = alice_and_bob();
+        assert_eq!(
+            device.on_imdn(CONVERSATION, &refusal("message-23", reason)),
+            Ok(None)
+        );
+        assert!(device.needs_healing(CONVERSATION), "{}", reason);
+    }
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal("message-23", "transient-error")),
+        Ok(None)
+    );
+    assert!(!device.needs_healing(CONVERSATION));
+
+    // what is not even an MLS message is not
+    let garbage = cpim_message(&plaintext("message-24", None));
+    assert!(device
+        .decrypt_message(CONVERSATION, &garbage.get_info().unwrap(), b"not MLS")
+        .is_err());
+    assert!(!device.needs_healing(CONVERSATION));
+
+    // a control message of the Focus that cannot be applied (section 6.2.6)
+    assert!(device.on_server_message(CONVERSATION, b"\x0a\xff").is_err());
+    assert!(device.needs_healing(CONVERSATION));
+}
+
+#[test]
+fn a_commit_of_the_device_the_focus_kept_is_applied_by_healing() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, _, _) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let cpim = device
+        .remove_from_group(CONVERSATION, IMPU, GROUP_URI, BOB_TEL)
+        .unwrap();
+
+    // the Focus accepted it, which the device was not told
+    let bundle = commit_bundle_of(&cpim);
+    let latest = EpochIdentifier {
+        epoch_id: 2,
+        epoch_authenticator: bundle.epoch_authenticator.clone(),
+        ..epoch_identifier(&device, CONVERSATION)
+    };
+    let enhanced = proto::encode(&MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(latest.clone()),
+        committed_control_messages: vec![EpochControlMessages {
+            rcs_message_id: control_id(&cpim),
+            server_mls_rcs_message: Some(ServerMlsRcsMessage {
+                payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+                    ServerCommitBundle {
+                        commit_list: bundle.commit_list,
+                        ..ServerCommitBundle::default()
+                    },
+                )),
+            }),
+        }],
+        paginated_epoch_identifier: Some(latest),
+        ..MlsEnhancedGroupInfo::default()
+    });
+    device.heals().want(CONVERSATION);
+    let (pull, _) = focus_answering(vec![Some((200, enhanced))]);
+    assert_eq!(
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        )),
+        None
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    // its control message no longer waits for a refusal
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")),
+        Ok(None)
+    );
+}
+
+#[test]
+fn the_group_info_of_another_group_is_not_rejoined_in_its_stead() {
+    let (device, bob, _) = alice_and_bob();
+    let mut bobs_other = bob.create_conversation(Some(b"another group"), 0).unwrap();
+    let output = bobs_other.update_keys(&bob).unwrap();
+    bobs_other.merge_pending_commit(&bob).unwrap();
+    let group_info = MlsGroupInfo {
+        group_info: output.group_info,
+        ratchet_tree: bobs_other.ratchet_tree().unwrap(),
+        pending_proposals: Vec::new(),
+    };
+    assert_eq!(
+        device.rejoin_group(CONVERSATION, IMPU, GROUP_URI, &group_info),
+        Err(GroupError::Store(StoreError::Mls(
+            ErrorKind::UnexpectedMessage
+        )))
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
 }

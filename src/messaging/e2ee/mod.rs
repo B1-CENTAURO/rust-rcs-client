@@ -17,6 +17,7 @@
 pub mod device;
 pub mod ffi;
 pub mod group;
+pub mod heal;
 pub mod kds;
 pub mod message;
 pub mod provisioning;

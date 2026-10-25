@@ -15,6 +15,8 @@
 //! End-to-end encryption of the group chats this client takes part in, when
 //! it has it (RCC.16 sections 8.1, 9.1.1)
 
+use std::sync::Arc;
+
 use futures::future::BoxFuture;
 use rust_rcs_core::cpim::CPIMInfo;
 use rust_rcs_core::sip::SipMessage;
@@ -25,6 +27,26 @@ pub const CONTENT_TYPE_MLS_RCS_SERVER: &[u8] = b"message/mls-rcs-server";
 
 /// Content-Type of an encrypted message (RCC.16 section 7.5.6)
 pub const CONTENT_TYPE_MLS: &[u8] = b"message/mls";
+
+/// Content-Type of the EpochIdentifier an MLS-Enhanced-Group-Info-Pull
+/// request carries (RCC.16 section 7.10.2)
+pub const CONTENT_TYPE_MLS_RCS: &[u8] = b"message/mls-rcs";
+
+/// The Info-Packages of the INFO requests asking the Conversation Focus for
+/// the GroupInfo of the MLS group of a conversation (RCC.16 sections 6.3.1,
+/// 6.3.2)
+pub const INFO_PACKAGE_GROUP_INFO_PULL: &[u8] = b"MLS-Group-Info-Pull";
+pub const INFO_PACKAGE_ENHANCED_GROUP_INFO_PULL: &[u8] = b"MLS-Enhanced-Group-Info-Pull";
+
+/// Sends the Conversation Focus of a session an INFO request of the
+/// Info-Package it is given, carrying the body given if any, giving the status
+/// code and body of its final response, or None if none came (RCC.16 sections
+/// 6.3.1, 6.3.2)
+pub type GroupInfoPull = Arc<
+    dyn Fn(&'static [u8], Option<Vec<u8>>) -> BoxFuture<'static, Option<(u16, Vec<u8>)>>
+        + Send
+        + Sync,
+>;
 
 /// Text of the Warning by which a server tells that no Negative-Delivery
 /// IMDN follows its error response (RCC.16 section 7.2.6)
@@ -193,6 +215,26 @@ pub trait GroupEncryption: Send + Sync {
     /// Lets go of the MLS group `conversation_id`, as its chat did not start,
     /// its invitation was not accepted, or the user left it
     fn abandon(&self, conversation_id: &str);
+
+    /// Whether the MLS group `conversation_id` fell out of step with that of
+    /// its Conversation Focus and is to be self-healed, as when a message could
+    /// not be decrypted (RCC.16 section 10.1); false while it is being
+    fn needs_healing(&self, conversation_id: &str) -> bool;
+
+    /// Self-heals the MLS group `conversation_id`, if it is to be and is not
+    /// being already, asking the Conversation Focus with `pull` for what it
+    /// missed or for its GroupInfo (RCC.16 sections 6.3, 10.1): the CPIM
+    /// message carrying a `message/mls-rcs-client` with the External Commit
+    /// rejoining the group, if it comes to that, to send to the Focus in the
+    /// session, `from` and `to` that of the CPIM message. Messages to send in
+    /// the group wait for it to end.
+    fn heal(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        pull: GroupInfoPull,
+    ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
     /// Whether the group chat `conversation_id` is encrypted, its MLS group
     /// kept
