@@ -2085,6 +2085,13 @@ struct ScriptedEncryption {
     prepared: std::sync::Mutex<Vec<(String, String, String, Vec<String>)>>,
     /// The Conversation-ID and server message of each group to join
     joined: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    /// The CPIM message it prepares for each addition, if any
+    adding: Option<Vec<u8>>,
+    /// The Conversation-ID, from, to and participants of each addition
+    added: std::sync::Mutex<Vec<(String, String, String, Vec<String>)>>,
+    /// The Conversation-ID of each Commit let go of, and whether a refusal
+    /// of it was to follow
+    discarded: std::sync::Mutex<Vec<(String, bool)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     /// Whether the IMDNs it is given refuse a control message of the client
     refusing: bool,
@@ -2126,6 +2133,28 @@ impl GroupEncryption for ScriptedEncryption {
             .push((conversation_id, from, to, participants));
         let cpim = self.cpim.clone();
         Box::pin(async move { cpim })
+    }
+
+    fn prepare_add(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participants: Vec<String>,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.added
+            .lock()
+            .unwrap()
+            .push((conversation_id, from, to, participants));
+        let cpim = self.adding.clone();
+        Box::pin(async move { cpim })
+    }
+
+    fn discard(&self, conversation_id: &str, refusal_follows: bool) {
+        self.discarded
+            .lock()
+            .unwrap()
+            .push((String::from(conversation_id), refusal_follows));
     }
 
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
@@ -2760,6 +2789,20 @@ impl GroupEncryption for EncryptingPrepared {
         participants: Vec<String>,
     ) -> BoxFuture<'static, Option<Vec<u8>>> {
         self.0.prepare(conversation_id, from, to, participants)
+    }
+
+    fn prepare_add(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participants: Vec<String>,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.prepare_add(conversation_id, from, to, participants)
+    }
+
+    fn discard(&self, conversation_id: &str, refusal_follows: bool) {
+        self.0.discard(conversation_id, refusal_follows)
     }
 
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
@@ -4349,4 +4392,157 @@ fn a_restart_by_the_focus_of_a_group_being_left_is_declined() {
     // no longer being left, an invitation is answered as any other
     let _msrp = group_invitation(&client, &mut peer, "group-later");
     assert_eq!(status_code(&peer.next_response()), 200);
+}
+
+/// What the scripted encryption makes a REFER adding participants carry
+const ADDING_CPIM: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x01\x02adding";
+
+/// The client with the group `conversation-1` encrypted, participants added
+/// to it with ADDING_CPIM if `adding`
+fn adding_to(client: &Client, adding: bool) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        adding: adding.then(|| ADDING_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+/// Adds the participants Carol and Dave to the group, what the client is
+/// told of how the focus answered given to `result`
+fn add_carol_and_dave(client: &Client) -> mpsc::Receiver<u16> {
+    let (result_tx, result) = mpsc::channel();
+    let result_tx = std::sync::Mutex::new(result_tx);
+    assert!(client.sessions.add_participants(
+        GROUP,
+        &[
+            String::from("sip:+15550003@example.com"),
+            String::from("tel:+15550004")
+        ],
+        move |status_code, _| {
+            let _ = result_tx.lock().unwrap().send(status_code);
+        },
+    ));
+    result
+}
+
+#[test]
+fn participants_are_added_to_an_encrypted_group_with_the_commit_in_the_refer() {
+    let (client, mut peer) = start(true);
+    let encryption = adding_to(&client, true);
+    let (_connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-adding");
+    let result = add_carol_and_dave(&client);
+
+    let refer = peer.next_request("REFER");
+    assert_eq!(request_uri(&refer), GROUP);
+    assert_eq!(header_value(&refer, "Require"), "multiple-refer");
+    assert!(header_value(&refer, "Content-Type").starts_with("multipart/mixed; boundary="));
+
+    // the list, then the control message (RCC.16 section 9.2)
+    let parts = parts_of(&refer);
+    let content_types: Vec<&str> = parts.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(
+        content_types,
+        ["application/resource-lists+xml", "message/cpim"]
+    );
+    let list = String::from_utf8_lossy(&parts[0].1).into_owned();
+    for entry in [
+        "<entry uri=\"sip:+15550003@example.com\" cp:copyControl=\"to\"/>",
+        "<entry uri=\"tel:+15550004\" cp:copyControl=\"to\"/>",
+    ] {
+        assert!(list.contains(entry), "{} in {}", entry, list);
+    }
+    assert_eq!(parts[1].1, ADDING_CPIM);
+    let refer_to = header_value(&refer, "Refer-To");
+    let content_id = refer_to.trim_start_matches("<cid:").trim_end_matches('>');
+    let body = String::from_utf8_lossy(&body_data(&refer)).into_owned();
+    assert!(
+        body.contains(&format!(
+            "Content-Disposition: recipient-list\r\nContent-ID: <{}>",
+            content_id
+        )),
+        "the list by its Content-ID in {}",
+        body
+    );
+
+    // made for the participants, in the group's MLS group
+    assert_eq!(
+        *encryption.added.lock().unwrap(),
+        [(
+            String::from("conversation-1"),
+            String::from(IMPU),
+            String::from(GROUP),
+            vec![
+                String::from("sip:+15550003@example.com"),
+                String::from("tel:+15550004")
+            ]
+        )]
+    );
+    peer.send(&answer(&refer, "202 Accepted", None));
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(202));
+    assert!(encryption.discarded.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_commit_of_a_refer_the_focus_answers_with_an_error_is_let_go_of() {
+    let (client, mut peer) = start(true);
+    let encryption = adding_to(&client, true);
+    let (_connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-conflict");
+
+    for (status, warning, refusal_follows) in [
+        // a refusal saying why to follow (RCC.16 section 9.2)
+        ("409 Conflict", None, true),
+        // or another warning only
+        (
+            "400 Bad Request",
+            Some("399 operator.com \"122 Function not allowed\""),
+            true,
+        ),
+        // none (section 7.2.6)
+        (
+            "400 Bad Request",
+            Some("399 operator.com \"451 Non-MLS error\", 399 google.com \"122 Function not allowed\""),
+            false,
+        ),
+    ] {
+        let result = add_carol_and_dave(&client);
+        let refer = peer.next_request("REFER");
+        let mut response = answer(&refer, status, None);
+        if let Some(warning) = warning {
+            response = response.replacen(
+                "Content-Length: 0",
+                &format!("Warning: {}\r\nContent-Length: 0", warning),
+                1,
+            );
+        }
+        peer.send(&response);
+        let status_code: u16 = status[..3].parse().unwrap();
+        assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(status_code));
+        assert_eq!(
+            encryption.discarded.lock().unwrap().last(),
+            Some(&(String::from("conversation-1"), refusal_follows)),
+            "{} {:?}",
+            status,
+            warning
+        );
+    }
+    assert_eq!(encryption.discarded.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn participants_that_cannot_be_added_to_an_encrypted_group_are_not_referred() {
+    let (client, mut peer) = start(true);
+    let encryption = adding_to(&client, false);
+    let (_connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-refusing");
+
+    let result = add_carol_and_dave(&client);
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(488));
+    assert_eq!(encryption.added.lock().unwrap().len(), 1);
+    peer.silence();
+    assert!(encryption.discarded.lock().unwrap().is_empty());
 }

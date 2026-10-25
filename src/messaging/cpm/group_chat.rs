@@ -22,22 +22,27 @@ use std::sync::{Arc, Mutex, Weak};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rust_rcs_core::ffi::log::platform_log;
+use rust_rcs_core::internet::body::message_body::MessageBody;
+use rust_rcs_core::internet::body::multipart_body::MultipartBody;
 use rust_rcs_core::internet::{Body, Header};
+use rust_rcs_core::io::Serializable;
 use rust_rcs_core::sip::sip_session::SipSession;
 use rust_rcs_core::sip::sip_subscription::subscribe_request::SubscribeRequest;
 use rust_rcs_core::sip::sip_subscription::subscriber::{Subscriber, SubscriberEvent};
 use rust_rcs_core::sip::sip_subscription::InitialSubscribeContext;
-use rust_rcs_core::sip::{SipCore, SipDialog, SipMessage, SipTransport, SUBSCRIBE};
+use rust_rcs_core::sip::{
+    ClientTransactionCallbacks, SipCore, SipDialog, SipMessage, SipTransport, SUBSCRIBE,
+};
 use rust_rcs_core::util::rand::create_raw_alpha_numeric_string;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use super::encryption::says_no_refusal_follows;
 use super::session::{
     add_mls_opaque_token, mls_opaque_token_value, CPMGroupEvent, CPMSession, SessionEnd,
 };
 use super::sip::cpm_contact::CPMServiceType;
-use super::standalone_messaging::OutgoingPagerModeContext;
 use super::{is_media_type, LOG_TAG};
 
 /// A participant of a group chat, as its focus tells
@@ -609,24 +614,28 @@ xmlns:cp=\"urn:ietf:params:xml:ns:copycontrol\"><list>",
 }
 
 /// Asks the focus of the session `session_end` ends to invite
-/// `participants` (RFC 5368), `callback` told how it answered; false, and
-/// nothing asked, if the session is not up to it
+/// `participants` (RFC 5368), with the CPIM message `control_message` of
+/// the Commit adding them to its MLS group if it is encrypted (RCC.16
+/// section 9.2), `callback` told how it answered and whether an MLS refusal
+/// may follow (section 7.2.6); `callback` given back, and nothing asked, if
+/// the session is not up to it
 pub(crate) fn refer_participants<F>(
     session_end: &SessionEnd,
     participants: &[String],
+    control_message: Option<&[u8]>,
     callback: F,
-) -> bool
+) -> Result<(), F>
 where
-    F: FnOnce(u16, String) + Send + Sync + 'static,
+    F: FnOnce(u16, String, bool) + Send + Sync + 'static,
 {
     let transport = match &*session_end.registered_public_identity.lock().unwrap() {
         Some((transport, _, _)) => Arc::clone(transport),
-        None => return false,
+        None => return Err(callback),
     };
 
     let mut message = match session_end.dialog.make_request(b"REFER", None) {
         Ok(message) => message,
-        Err(_) => return false,
+        Err(_) => return Err(callback),
     };
     let mls_opaque_token = session_end.sip_session.get_inner().mls_opaque_token();
     add_mls_opaque_token(&mut message, mls_opaque_token.lock().unwrap().clone());
@@ -640,33 +649,108 @@ where
     message.add_header(Header::new(b"Refer-To", format!("<cid:{}>", content_id)));
     message.add_header(Header::new(b"Refer-Sub", b"false"));
     message.add_header(Header::new(b"Require", b"multiple-refer"));
-    message.add_header(Header::new(
-        b"Content-Type",
-        b"application/resource-lists+xml",
-    ));
-    message.add_header(Header::new(b"Content-Disposition", b"recipient-list"));
-    message.add_header(Header::new(b"Content-ID", format!("<{}>", content_id)));
-    message.add_header(Header::new(b"Content-Length", format!("{}", list.len())));
-    message.set_body(Arc::new(Body::Raw(list)));
+    match control_message {
+        // the list, then the control message (RCC.16 section 9.2)
+        Some(cpim) => {
+            let boundary = create_raw_alpha_numeric_string(16);
+            let parts = vec![
+                Arc::new(Body::Message(MessageBody {
+                    headers: vec![
+                        Header::new(b"Content-Type", b"application/resource-lists+xml"),
+                        Header::new(b"Content-Disposition", b"recipient-list"),
+                        Header::new(b"Content-ID", format!("<{}>", content_id)),
+                        Header::new(b"Content-Length", format!("{}", list.len())),
+                    ],
+                    body: Arc::new(Body::Raw(list)),
+                })),
+                Arc::new(Body::Message(MessageBody {
+                    headers: vec![
+                        Header::new(b"Content-Type", b"message/cpim"),
+                        Header::new(b"Content-Length", format!("{}", cpim.len())),
+                    ],
+                    body: Arc::new(Body::Raw(cpim.to_vec())),
+                })),
+            ];
+            message.add_header(Header::new(
+                b"Content-Type",
+                format!(
+                    "multipart/mixed; boundary={}",
+                    String::from_utf8_lossy(&boundary)
+                ),
+            ));
+            let body = Body::Multipart(MultipartBody { boundary, parts });
+            message.add_header(Header::new(
+                b"Content-Length",
+                format!("{}", body.estimated_size()),
+            ));
+            message.set_body(Arc::new(body));
+        }
+        None => {
+            message.add_header(Header::new(
+                b"Content-Type",
+                b"application/resource-lists+xml",
+            ));
+            message.add_header(Header::new(b"Content-Disposition", b"recipient-list"));
+            message.add_header(Header::new(b"Content-ID", format!("<{}>", content_id)));
+            message.add_header(Header::new(b"Content-Length", format!("{}", list.len())));
+            message.set_body(Arc::new(Body::Raw(list)));
+        }
+    }
 
     let (client_transaction_tx, mut client_transaction_rx) = mpsc::channel(1);
     session_end.rt.spawn(async move {
-        if let Some((status_code, reason_phrase)) = client_transaction_rx.recv().await {
-            callback(status_code, reason_phrase);
+        if let Some((status_code, reason_phrase, refusal_follows)) =
+            client_transaction_rx.recv().await
+        {
+            callback(status_code, reason_phrase, refusal_follows);
         }
     });
 
     session_end.tm.send_request(
         message,
         &transport,
-        OutgoingPagerModeContext {
+        ReferAnswer {
             client_transaction_tx,
             rt: Arc::clone(&session_end.rt),
         },
         &session_end.rt,
     );
 
-    true
+    Ok(())
+}
+
+/// Tells how a REFER was answered: its status code and reason phrase, and
+/// whether an MLS refusal of what it carried may follow (RCC.16 section
+/// 7.2.6), as none does when it did not reach the focus
+struct ReferAnswer {
+    client_transaction_tx: mpsc::Sender<(u16, String, bool)>,
+    rt: Arc<Runtime>,
+}
+
+impl ClientTransactionCallbacks for ReferAnswer {
+    fn on_provisional_response(&self, _message: SipMessage) {}
+
+    fn on_final_response(&self, message: SipMessage) {
+        let refusal_follows = !says_no_refusal_follows(&message);
+        if let SipMessage::Response(l, _, _) = message {
+            let answer = (
+                l.status_code,
+                String::from_utf8_lossy(&l.reason_phrase).into_owned(),
+                refusal_follows,
+            );
+            let tx = self.client_transaction_tx.clone();
+            self.rt.spawn(async move {
+                let _ = tx.send(answer).await;
+            });
+        }
+    }
+
+    fn on_transport_error(&self) {
+        let tx = self.client_transaction_tx.clone();
+        self.rt.spawn(async move {
+            let _ = tx.send((0, String::from("Transport Error"), false)).await;
+        });
+    }
 }
 
 #[cfg(test)]

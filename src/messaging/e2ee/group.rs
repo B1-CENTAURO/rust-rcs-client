@@ -58,6 +58,8 @@ pub enum GroupError {
     /// The Home KDS has no KeyPackages to add the Participant with, by its
     /// tel URI, for what it said instead
     NotEncryptable(String, Fetched),
+    /// A Commit of the device waits for the Conversation Focus to accept it
+    Pending,
     Store(StoreError),
 }
 
@@ -112,25 +114,7 @@ impl E2eeDevice {
         to: &str,
         recipients: Vec<Recipient>,
     ) -> Result<Vec<u8>, GroupError> {
-        let asked: Vec<String> = recipients.iter().map(|r| r.tel_uri.clone()).collect();
-        let fetched =
-            fetch_key_packages(self.kds(), self.validator(), vec![CIPHERSUITE], recipients)
-                .await
-                .map_err(GroupError::Kds)?;
-
-        let mut key_packages = Vec::new();
-        for tel_uri in asked {
-            match fetched
-                .iter()
-                .find(|(fetched_for, _)| *fetched_for == tel_uri)
-            {
-                Some((_, Fetched::KeyPackages(of_participant))) => {
-                    key_packages.extend(of_participant.iter().cloned())
-                }
-                Some((_, other)) => return Err(GroupError::NotEncryptable(tel_uri, other.clone())),
-                None => return Err(GroupError::NotEncryptable(tel_uri, Fetched::NotFound)),
-            }
-        }
+        let key_packages = self.key_packages(recipients).await?;
 
         let (_, client_message) = self
             .store()
@@ -157,6 +141,81 @@ impl E2eeDevice {
             .unwrap()
             .insert(String::from(conversation_id), message_id);
         Ok(cpim)
+    }
+
+    /// Adds the participants `recipients` to the MLS group `conversation_id`,
+    /// each with all of their Clients: the CPIM message, `from` and `to` its
+    /// own, carrying the `message/mls-rcs-client` the REFER inviting them is
+    /// to carry (RCC.16 sections 7.9.2, 9.2)
+    ///
+    /// Not while a Commit of the device waits for the Conversation Focus to
+    /// accept it. The Commit is applied once the Focus accepts it or forwards
+    /// it back, or discarded if it refuses it.
+    pub async fn add_to_group(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        recipients: Vec<Recipient>,
+    ) -> Result<Vec<u8>, GroupError> {
+        let pending = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, _| {
+                Ok(conversation.has_pending_commit())
+            })
+            .map_err(GroupError::Store)?;
+        if pending {
+            return Err(GroupError::Pending);
+        }
+        let key_packages = self.key_packages(recipients).await?;
+
+        let client_message = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                // one made meanwhile
+                if conversation.has_pending_commit() {
+                    return Err(ErrorKind::InvalidState);
+                }
+                let key_packages: Vec<&[u8]> = key_packages.iter().map(|kp| &kp[..]).collect();
+                let output = conversation.add_members(client, &key_packages)?;
+                output.to_client_message().or_else(|e| {
+                    conversation.discard_pending_commit(client)?;
+                    Err(e)
+                })
+            })
+            .map_err(GroupError::Store)?;
+
+        let (message_id, cpim) = control_message(from, to, &client_message);
+        self.control_messages()
+            .lock()
+            .unwrap()
+            .insert(String::from(conversation_id), message_id);
+        Ok(cpim)
+    }
+
+    /// The KeyPackages of all the Clients of each of `recipients`, as their
+    /// Home KDS gives them (RCC.16 section 5.3)
+    async fn key_packages(&self, recipients: Vec<Recipient>) -> Result<Vec<Vec<u8>>, GroupError> {
+        let asked: Vec<String> = recipients.iter().map(|r| r.tel_uri.clone()).collect();
+        let fetched =
+            fetch_key_packages(self.kds(), self.validator(), vec![CIPHERSUITE], recipients)
+                .await
+                .map_err(GroupError::Kds)?;
+
+        let mut key_packages = Vec::new();
+        for tel_uri in asked {
+            match fetched
+                .iter()
+                .find(|(fetched_for, _)| *fetched_for == tel_uri)
+            {
+                Some((_, Fetched::KeyPackages(of_participant))) => {
+                    key_packages.extend(of_participant.iter().cloned())
+                }
+                Some((_, other)) => return Err(GroupError::NotEncryptable(tel_uri, other.clone())),
+                None => return Err(GroupError::NotEncryptable(tel_uri, Fetched::NotFound)),
+            }
+        }
+        Ok(key_packages)
     }
 
     /// Joins the MLS group of the group chat `conversation_id` with the
@@ -266,6 +325,27 @@ impl E2eeDevice {
                 conversation.discard_pending_commit(client)
             })?;
         Ok(Some(reason))
+    }
+
+    /// Discards the pending Commit of the device in the group
+    /// `conversation_id`, the request carrying it answered with an error by
+    /// the Conversation Focus; its control message is forgotten unless a
+    /// refusal of it is to follow (RCC.16 sections 6.2.5, 7.2.6)
+    pub fn discard_commit(
+        &self,
+        conversation_id: &str,
+        refusal_follows: bool,
+    ) -> Result<(), StoreError> {
+        if !refusal_follows {
+            self.control_messages()
+                .lock()
+                .unwrap()
+                .remove(conversation_id);
+        }
+        self.store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                conversation.discard_pending_commit(client)
+            })
     }
 
     /// Lets go of the MLS group `conversation_id`
@@ -409,6 +489,56 @@ impl GroupEncryption for DeviceGroups {
                 }
             }
         })
+    }
+
+    fn prepare_add(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participants: Vec<String>,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let device = self.device.clone();
+        let capabilities = Arc::clone(&self.capabilities);
+        let taken = Arc::clone(&self.taken);
+        let deadline = tokio::time::Instant::now() + self.acceptance_wait;
+        Box::pin(async move {
+            let recipients = recipients(&participants, &capabilities).await?;
+            loop {
+                // told of what is taken from now on
+                let notified = taken.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                let device = device.upgrade()?;
+                match device
+                    .add_to_group(&conversation_id, &from, &to, recipients.clone())
+                    .await
+                {
+                    Ok(cpim) => return Some(cpim),
+                    Err(GroupError::Pending) => {}
+                    Err(e) => {
+                        platform_log(LOG_TAG, format!("participants not added: {:?}", e));
+                        return None;
+                    }
+                }
+                drop(device);
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    platform_log(LOG_TAG, "participants not added, the Commit not accepted");
+                    return None;
+                }
+            }
+        })
+    }
+
+    fn discard(&self, conversation_id: &str, refusal_follows: bool) {
+        if let Some(device) = self.device.upgrade() {
+            if let Err(e) = device.discard_commit(conversation_id, refusal_follows) {
+                platform_log(LOG_TAG, format!("Commit not discarded: {:?}", e));
+            }
+        }
+        // what waits for it is sent, or not, without it
+        self.taken.notify_waiters();
     }
 
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
