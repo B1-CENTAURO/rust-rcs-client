@@ -3310,6 +3310,8 @@ fn a_refusal_of_a_control_message_of_the_client_is_not_given_to_the_app() {
         joining: true,
         encrypting: vec![String::from("conversation-1")],
         refusing: true,
+        // which the app would be given, were it not a refusal
+        verifying: true,
         ..ScriptedEncryption::default()
     });
     client
@@ -3335,6 +3337,7 @@ fn a_refusal_of_a_control_message_of_the_client_is_not_given_to_the_app() {
     assert_eq!(imdns.len(), 1);
     assert_eq!(imdns[0].0, "conversation-1");
     assert!(refusal.ends_with(&*String::from_utf8_lossy(&imdns[0].1)));
+    assert!(encryption.verified.lock().unwrap().is_empty());
 }
 
 /// The client with the group `conversation-1` encrypted, the notifications
