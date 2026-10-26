@@ -197,6 +197,60 @@ fn a_device_restored_enrols_again_only_when_its_certificate_would_not_do() {
 }
 
 #[test]
+fn a_certificate_with_less_than_60_days_left_is_renewed_keeping_the_groups() {
+    let app = Arc::new(App::default());
+    let kds = Arc::new(Kds::issuing(&[ALICE, CA], &app));
+    let device = alice(&app, &kds, TODAY, None);
+    provision(&device, &["tel:+491701234567"], None);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    let (group_id, ()) = device
+        .store()
+        .add_conversation(|client| Ok((client.create_conversation(None, 0)?, ())))
+        .unwrap();
+
+    // 47 days left (RCC.16 section 9.5.3)
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    assert_eq!(kds.enrolments.lock().unwrap().len(), 2);
+    assert_eq!(kds.uploads().len(), 2);
+    assert!(device.store().has_conversation(&group_id));
+
+    // its KeyPackages to be uploaded again, if they were refused
+    kds.taking.store(false, Ordering::SeqCst);
+    assert_eq!(
+        block_on(device.enrol()),
+        Err(DeviceError::Enrolment(EnrolmentError::Kds(
+            KdsError::Refused(String::from("quota"))
+        )))
+    );
+    assert!(!device.store().key_packages_uploaded());
+    assert_eq!(device.mls_feature_tags(), None);
+    assert!(device.store().has_conversation(&group_id));
+}
+
+#[test]
+fn a_device_provisioned_for_another_number_enrols_anew() {
+    let app = Arc::new(App::default());
+    let kds = Arc::new(Kds::issuing(&[ALICE, CA], &app));
+    let device = alice(&app, &kds, TODAY, None);
+    provision(&device, &["tel:+491701234567"], None);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    let (group_id, ()) = device
+        .store()
+        .add_conversation(|client| Ok((client.create_conversation(None, 0)?, ())))
+        .unwrap();
+
+    // a client of the other Participant in place of the one of the first,
+    // whose groups go
+    let bobs = Arc::new(Kds::issuing(&[BOB, CA], &app));
+    let device = alice(&app, &bobs, TODAY, Some(&app.last().unwrap()))
+        .with_signer(|| Some(signer(BOB_KEY, BOB_PUBLIC_KEY)));
+    provision(&device, &["tel:+491707654321"], None);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    assert_eq!(device.store().credential(), Some(credential(&[BOB, CA])));
+    assert!(!device.store().has_conversation(&group_id));
+}
+
+#[test]
 fn a_device_gives_acs_its_participant_key_and_home_kds() {
     let app = Arc::new(App::default());
     let kds = Arc::new(Kds::issuing(&[ALICE, CA], &app));
