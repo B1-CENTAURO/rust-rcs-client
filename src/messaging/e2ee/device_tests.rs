@@ -27,7 +27,7 @@ use super::device::{participant_tel_uri, DeviceError, E2eeDevice, Enrolled, CIPH
 use super::kds::{EnrolmentError, KdsError, KeyDistribution};
 use super::kds_tests::certificates::*;
 use super::kds_tests::{
-    credential, signer, validator, App, Kds, ALICE_TEL, HOME_KDS, LATER, TODAY,
+    credential, signer, validator, App, Kds, ALICE_TEL, EARLY, HOME_KDS, LATER, TODAY,
 };
 use super::store::StoreError;
 
@@ -134,7 +134,7 @@ fn the_participant_is_known_by_a_tel_uri_of_the_user() {
 fn a_device_enrols_once_provisioned_and_only_once() {
     let app = Arc::new(App::default());
     let kds = Arc::new(Kds::issuing(&[ALICE, CA], &app));
-    let device = alice(&app, &kds, TODAY, None);
+    let device = alice(&app, &kds, EARLY, None);
 
     assert_eq!(block_on(device.enrol()), Err(DeviceError::NotProvisioned));
     assert!(kds.enrolments.lock().unwrap().is_empty());
@@ -152,7 +152,7 @@ fn a_device_enrols_once_provisioned_and_only_once() {
     assert_eq!(device.store().credential(), Some(credential(&[ALICE, CA])));
     assert_eq!(kds.uploads()[0].0.len(), 11, "10, and one of last resort");
 
-    // with a certificate others would still add it with
+    // with a certificate others would still add it with, for long enough
     assert_eq!(block_on(device.enrol()), Ok(Enrolled::Already));
     assert_eq!(kds.enrolments.lock().unwrap().len(), 1);
     assert_eq!(kds.uploads().len(), 1);
@@ -162,13 +162,13 @@ fn a_device_enrols_once_provisioned_and_only_once() {
 fn a_device_restored_enrols_again_only_when_its_certificate_would_not_do() {
     let app = Arc::new(App::default());
     let kds = Arc::new(Kds::issuing(&[ALICE, CA], &app));
-    let device = alice(&app, &kds, TODAY, None);
+    let device = alice(&app, &kds, EARLY, None);
     provision(&device, &["tel:+491701234567"], None);
     assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
     let saved = app.last().unwrap();
 
     let again = Arc::new(Kds::issuing(&[ALICE, CA], &app));
-    let restored = alice(&app, &again, TODAY, Some(&saved));
+    let restored = alice(&app, &again, EARLY, Some(&saved));
     provision(&restored, &["tel:+491701234567"], None);
     assert_eq!(block_on(restored.enrol()), Ok(Enrolled::Already));
     assert!(again.enrolments.lock().unwrap().is_empty());
@@ -231,7 +231,7 @@ fn a_saved_state_that_is_not_one_is_refused() {
 fn e2ee_is_told_while_the_kds_holds_key_packages_of_the_device() {
     let app = Arc::new(App::default());
     let kds = Arc::new(Kds::issuing(&[ALICE, CA], &app));
-    let device = alice(&app, &kds, TODAY, None);
+    let device = alice(&app, &kds, EARLY, None);
     assert_eq!(device.mls_feature_tags(), None, "not enrolled");
 
     // certified, but none of its KeyPackages taken

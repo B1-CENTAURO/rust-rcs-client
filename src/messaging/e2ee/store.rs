@@ -29,6 +29,7 @@ use std::time::SystemTime;
 use rust_rcs_core::mls::rcs::{ClientIdentity, ParticipantKey};
 use rust_rcs_core::mls::{
     self, Clock, Credential, CredentialValidator, ErrorKind, MlsClient, MlsConfig, MlsConversation,
+    SignatureKeyPair,
 };
 
 /// Starts the state kept: the Participant Key, whether the KeyPackages of the
@@ -134,6 +135,21 @@ impl MlsStore {
         state.saved = saved;
         state.conversations.clear();
         Ok(())
+    }
+
+    /// Has the client take on `credential`, a certificate renewed for the
+    /// key of `signer`, its groups kept (RCC.16 section 9.5.3): its
+    /// KeyPackages are to be uploaded again
+    pub fn renew(
+        &self,
+        credential: Credential,
+        signer: SignatureKeyPair,
+    ) -> Result<(), StoreError> {
+        let mut state = self.state.lock().unwrap();
+        let client = state.client.as_mut().ok_or(StoreError::NoClient)?;
+        client.renew(credential, signer).map_err(StoreError::Mls)?;
+        state.uploaded = false;
+        self.save(&mut state)
     }
 
     /// Takes on the Participant Key and the client in `saved`, a state the app

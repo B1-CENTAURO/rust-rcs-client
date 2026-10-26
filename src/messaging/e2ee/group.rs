@@ -36,7 +36,7 @@ use rust_rcs_core::mls::rcs::proto::{
 use rust_rcs_core::mls::rcs::{
     MlsCapability, ServerFailureReason, CONTENT_TYPE_MLS_RCS_CLIENT, MLS_VERSION_V1,
 };
-use rust_rcs_core::mls::{ErrorKind, IncomingMessage};
+use rust_rcs_core::mls::{CredentialValidator, ErrorKind, IncomingMessage};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -567,18 +567,36 @@ impl E2eeDevice {
             .unwrap_or(false)
     }
 
+    /// Whether the certificate of the device has 30 days left at least, as
+    /// one a key update brings into a group has to (RCC.16 Annex A.4.1.5)
+    fn certificate_lasting(&self) -> bool {
+        self.store()
+            .credential()
+            .zip(self.store().signature_key())
+            .is_some_and(|(credential, signature_key)| {
+                CredentialValidator::validate_addition(
+                    self.validator(),
+                    &credential,
+                    &signature_key,
+                )
+            })
+    }
+
     /// Whether the device is to update its keys in the group chat
     /// `conversation_id` (RCC.16 section 9.5.2), as update_keys() does: by
     /// the days passed and the messages sent since it last did, or since it
-    /// joined; not while a Commit of the device waits for the Conversation
-    /// Focus to accept it
+    /// joined, or as its certificate was renewed (section 9.5.3); not while
+    /// a Commit of the device waits for the Conversation Focus to accept it,
+    /// nor while its certificate has less than 30 days left (Annex A.4.1.5)
     pub fn key_update_due(&self, conversation_id: &str) -> bool {
-        self.store()
-            .peek_conversation(conversation_id.as_bytes(), |conversation, client| {
-                !conversation.has_pending_commit()
-                    && conversation.key_update_due(client).unwrap_or(false)
-            })
-            .unwrap_or(false)
+        self.certificate_lasting()
+            && self
+                .store()
+                .peek_conversation(conversation_id.as_bytes(), |conversation, client| {
+                    !conversation.has_pending_commit()
+                        && conversation.key_update_due(client).unwrap_or(false)
+                })
+                .unwrap_or(false)
     }
 
     /// Updates the keys of the device in the group chat `conversation_id`
@@ -594,6 +612,9 @@ impl E2eeDevice {
         from: &str,
         to: &str,
     ) -> Result<Option<Vec<u8>>, GroupError> {
+        if !self.certificate_lasting() {
+            return Ok(None);
+        }
         let client_message = self
             .store()
             .with_conversation(conversation_id.as_bytes(), |conversation, client| {

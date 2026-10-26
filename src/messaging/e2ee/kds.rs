@@ -28,7 +28,9 @@ use rust_rcs_core::mls::rcs::certificate::{
     x509_credential, CertificateError, RcsCredentialValidator,
 };
 use rust_rcs_core::mls::rcs::ClientIdentity;
-use rust_rcs_core::mls::{self, key_package_info, Ciphersuite, MlsClient, SignatureKeyPair};
+use rust_rcs_core::mls::{
+    self, key_package_info, Ciphersuite, Credential, MlsClient, SignatureKeyPair,
+};
 use uuid::Uuid;
 
 use super::store::{MlsStore, StoreError};
@@ -137,6 +139,71 @@ pub async fn enrol(
     signer: SignatureKeyPair,
     key_packages: usize,
 ) -> Result<(), EnrolmentError> {
+    let credential = issue(
+        store,
+        kds,
+        validator,
+        home_kds,
+        tel_uri,
+        identity_proof,
+        ciphersuite,
+        &signer,
+    )
+    .await?;
+    store
+        .create(|config, validator| {
+            MlsClient::with_credential(credential, signer, ciphersuite, config, validator)
+        })
+        .map_err(EnrolmentError::Store)?;
+
+    upload_key_packages(store, kds, key_packages, true).await
+}
+
+/// Renews the certificate of the client in `store` as enrol() enrols it, for
+/// the key of `signer`, the client taking on both while keeping its groups,
+/// and uploads `key_packages` of its KeyPackages again (RCC.16 section 9.5.3)
+pub async fn renew(
+    store: &MlsStore,
+    kds: &dyn KeyDistribution,
+    validator: &RcsCredentialValidator,
+    home_kds: u32,
+    tel_uri: &str,
+    identity_proof: Option<Vec<u8>>,
+    ciphersuite: Ciphersuite,
+    signer: SignatureKeyPair,
+    key_packages: usize,
+) -> Result<(), EnrolmentError> {
+    let credential = issue(
+        store,
+        kds,
+        validator,
+        home_kds,
+        tel_uri,
+        identity_proof,
+        ciphersuite,
+        &signer,
+    )
+    .await?;
+    store
+        .renew(credential, signer)
+        .map_err(EnrolmentError::Store)?;
+
+    upload_key_packages(store, kds, key_packages, true).await
+}
+
+/// The credential the Home KDS issues for a new Client ID and the key of
+/// `signer`, the ParticipantInformation signed by the Participant Key in
+/// `store`, once checked as others will check it
+async fn issue(
+    store: &MlsStore,
+    kds: &dyn KeyDistribution,
+    validator: &RcsCredentialValidator,
+    home_kds: u32,
+    tel_uri: &str,
+    identity_proof: Option<Vec<u8>>,
+    ciphersuite: Ciphersuite,
+    signer: &SignatureKeyPair,
+) -> Result<Credential, EnrolmentError> {
     let client_id = Uuid::new_v4().to_string();
     let participant_information = store
         .participant_information(
@@ -168,13 +235,7 @@ pub async fn enrol(
     validator
         .validate_query(&credential, signer.public(), tel_uri)
         .map_err(EnrolmentError::Certificate)?;
-    store
-        .create(|config, validator| {
-            MlsClient::with_credential(credential, signer, ciphersuite, config, validator)
-        })
-        .map_err(EnrolmentError::Store)?;
-
-    upload_key_packages(store, kds, key_packages, true).await
+    Ok(credential)
 }
 
 /// Uploads `count` new KeyPackages of the client in `store`, and one of last

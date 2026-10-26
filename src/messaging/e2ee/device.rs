@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use rust_rcs_core::mls::rcs::certificate::RcsCredentialValidator;
 use rust_rcs_core::mls::rcs::{credential_tel_uris, same_tel_uri, MlsCapability, MLS_VERSION_V1};
@@ -40,6 +40,10 @@ pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SH
 
 /// KeyPackages uploaded at enrolment, besides the one of last resort
 const KEY_PACKAGES: usize = 10;
+
+/// How long a certificate has left at least for the device to keep it,
+/// rather than have it renewed (RCC.16 section 9.5.3)
+const RENEWAL_LEAD: Duration = Duration::from_secs(60 * 24 * 60 * 60);
 
 type MakeSigner = Box<dyn Fn() -> Option<SignatureKeyPair> + Send + Sync>;
 
@@ -142,8 +146,13 @@ impl E2eeDevice {
     }
 
     /// Enrols the device with its Home KDS, unless it holds a certificate
-    /// others would still add it with, for the tel URI provisioned (RCC.16
-    /// sections 4.2, 5.1, Annex A.4.1.2)
+    /// others would still add it with, for the tel URI provisioned, with 60
+    /// days left at least (RCC.16 sections 4.2, 5.1, 9.5.3, Annex A.4.1.2)
+    ///
+    /// A certificate with less left, or expired, of the same Participant is
+    /// renewed, for a new signature key: the client takes on both, keeping
+    /// its groups, which take them on with their next key update. One of
+    /// another Participant is replaced, and its groups dropped.
     pub async fn enrol(&self) -> Result<Enrolled, DeviceError> {
         let (tel_uri, identity_proof) = self
             .provisioned
@@ -152,14 +161,16 @@ impl E2eeDevice {
             .clone()
             .ok_or(DeviceError::NotProvisioned)?;
 
-        if let (Some(credential), Some(signature_key)) =
+        let renewing = if let (Some(credential), Some(signature_key)) =
             (self.store.credential(), self.store.signature_key())
         {
-            if self
+            let lasting = self
                 .validator
                 .validate_query(&credential, &signature_key, &tel_uri)
-                .is_ok()
-            {
+                .is_ok_and(|certificate| {
+                    certificate.not_after >= self.validator.now() + RENEWAL_LEAD
+                });
+            if lasting {
                 if self.store.key_packages_uploaded() {
                     return Ok(Enrolled::Already);
                 }
@@ -169,11 +180,32 @@ impl E2eeDevice {
                     .map(|()| Enrolled::Now)
                     .map_err(DeviceError::Enrolment);
             }
-        }
+            // renewed while the Participant is the same, its groups kept
+            credential_tel_uris(&credential)
+                .is_ok_and(|tel_uris| tel_uris.iter().any(|uri| same_tel_uri(uri, &tel_uri)))
+        } else {
+            false
+        };
 
         let signer = (self.make_signer)().ok_or(DeviceError::Enrolment(EnrolmentError::Store(
             StoreError::Mls(ErrorKind::Crypto),
         )))?;
+        if renewing {
+            return kds::renew(
+                &self.store,
+                &*self.kds,
+                &self.validator,
+                self.home_kds,
+                &tel_uri,
+                identity_proof,
+                CIPHERSUITE,
+                signer,
+                KEY_PACKAGES,
+            )
+            .await
+            .map(|()| Enrolled::Now)
+            .map_err(DeviceError::Enrolment);
+        }
         kds::enrol(
             &self.store,
             &*self.kds,
