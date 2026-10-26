@@ -434,3 +434,44 @@ fn a_state_of_another_layout_is_refused() {
     }
     assert!(store(&app).restore(&kept).is_ok());
 }
+
+#[test]
+fn every_client_the_store_takes_on_tells_the_time_of_its_clock() {
+    use std::time::{Duration, SystemTime};
+
+    let app = Arc::new(App::default());
+    let device = device(&app, "alice");
+    let now = Arc::new(Mutex::new(SystemTime::now()));
+    let clock: rust_rcs_core::mls::Clock = {
+        let now = Arc::clone(&now);
+        Arc::new(move || *now.lock().unwrap())
+    };
+    device.set_clock(Arc::clone(&clock));
+    let bob = member("bob");
+    let (group_id, _) = group_with(&device, &bob);
+    let due = |device: &MlsStore| {
+        device
+            .peek_conversation(&group_id, |conversation, client| {
+                conversation.key_update_due(client).unwrap()
+            })
+            .unwrap()
+    };
+    assert!(!due(&device));
+    *now.lock().unwrap() += Duration::from_secs(31 * 24 * 60 * 60);
+    assert!(due(&device));
+
+    // the client taken again from the state kept, as a change is undone
+    app.refuse(true);
+    assert_eq!(
+        encrypt(&device, &group_id, "not kept"),
+        Err(StoreError::NotSaved)
+    );
+    app.refuse(false);
+    assert!(due(&device));
+
+    // or as a state is restored
+    let restored = store(&app);
+    restored.set_clock(clock);
+    restored.restore(&app.last()).unwrap();
+    assert!(due(&restored));
+}
