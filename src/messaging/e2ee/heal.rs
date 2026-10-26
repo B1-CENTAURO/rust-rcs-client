@@ -116,24 +116,24 @@ impl Heals {
     }
 
     /// Whether self-healing the group `conversation_id` failed, which a new
-    /// Era of it is to follow (RCC.16 section 10.1), and none is being made
+    /// Era of it is to follow (RCC.16 section 10.1)
     pub(super) fn failed(&self, conversation_id: &str) -> bool {
         self.0
             .lock()
             .unwrap()
             .get(conversation_id)
-            .is_some_and(|heal| heal.failed && !heal.ongoing)
+            .is_some_and(|heal| heal.failed)
     }
 
     /// Starts making a new Era of the group `conversation_id`, self-healing
-    /// it having failed, during which it is not self-healed; false if none is
-    /// due, or one is being made already
+    /// it having failed, during which it is not self-healed and no other is
+    /// due; false if none is due, as when one is being made already
     pub(super) fn begin_new_era(&self, conversation_id: &str) -> bool {
         let mut heals = self.0.lock().unwrap();
         let Some(heal) = heals.get_mut(conversation_id) else {
             return false;
         };
-        if !heal.failed || heal.ongoing {
+        if !heal.failed {
             return false;
         }
         heal.failed = false;

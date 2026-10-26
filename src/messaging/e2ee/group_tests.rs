@@ -5062,7 +5062,9 @@ fn a_new_era_waits_for_the_group_info_and_is_not_made_twice_at_once() {
     assert!(groups.new_era_due(CONVERSATION));
     assert_eq!(era(&device, CONVERSATION), Some(0));
 
-    // one made at a time, the group not self-healed meanwhile
+    // one made at a time, the group not self-healed meanwhile, though it
+    // was to be
+    device.heals().want(CONVERSATION);
     let (answer_tx, answer_rx) = std::sync::mpsc::channel::<Option<(u16, Vec<u8>)>>();
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let waiting: GroupInfoPull = Arc::new(move |_, _| {
@@ -5111,4 +5113,29 @@ fn no_new_era_is_made_for_a_participant_not_e2ee_capable_and_healing_starts_over
     assert!(!groups.new_era_due(CONVERSATION));
     device.heals().want(CONVERSATION);
     assert!(groups.needs_healing(CONVERSATION));
+}
+
+#[test]
+fn the_participants_of_a_new_era_are_asked_for_once_for_all_their_clients() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, (phone, _), (other_phone, _)) =
+        bob_with_both_phones_of_alice_on(OCTOBER, None);
+    let (query, asked) = answering(&[(ALICE_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    healing_failed(&device, &groups, &rt);
+    kds.now_knowing(vec![(
+        ALICE_TEL,
+        Fetched::KeyPackages(vec![
+            phone.generate_key_package(false).unwrap(),
+            other_phone.generate_key_package(false).unwrap(),
+        ]),
+    )]);
+
+    let (pull, _) = focus_answering(vec![Some((469, Vec::new()))]);
+    assert!(prepare_next_era(&groups, &rt, pull).is_some());
+    assert_eq!(*asked.lock().unwrap(), [ALICE_TEL]);
+    assert_eq!(
+        kds.queries.lock().unwrap().last().unwrap().1,
+        [recipient(ALICE_TEL)]
+    );
 }
