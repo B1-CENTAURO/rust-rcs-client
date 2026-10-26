@@ -4887,3 +4887,32 @@ fn the_device_joins_a_new_era_another_member_makes_in_place_of_its_group() {
         String::from_utf8_lossy(&received_by_bob(&bob, &mut next, &sent)).ends_with("hello Bob")
     );
 }
+
+#[test]
+fn a_new_era_with_a_participant_not_in_the_group_renews_the_continuity_token() {
+    let (device, kds, bob, _, _) = alice_and_bob_in_time_with_kds();
+    let token = continuity_token(&device);
+    let cpim = device
+        .remove_from_group(CONVERSATION, IMPU, GROUP_URI, BOB_TEL)
+        .unwrap();
+    device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap();
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+
+    // Bob a Participant, not a member of the group of the device (RCC.16
+    // section 8.3.1.2)
+    block_on(device.create_next_era(
+        CONVERSATION,
+        IMPU,
+        GROUP_URI,
+        vec![recipient(BOB_TEL)],
+        None,
+    ))
+    .unwrap();
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+    assert_ne!(continuity_token(&device), token);
+}
