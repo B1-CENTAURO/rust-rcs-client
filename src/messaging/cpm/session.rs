@@ -1084,16 +1084,18 @@ pub(crate) struct SessionEnd {
     pub(crate) dialog: Arc<SipDialog>,
     pub(crate) tm: Arc<SipTransactionManager>,
     pub(crate) registered_public_identity: Arc<Mutex<Option<(Arc<SipTransport>, String, String)>>>,
+    pub(crate) restarter: Arc<Mutex<Option<Restarter>>>,
     pub(crate) rt: Arc<Runtime>,
 }
 
 impl SessionEnd {
     /// Ends the session, unless it ended already: a message sent from now on
     /// starts another, its MSRP connection closes, and its dialog goes,
-    /// ended with a BYE if `send_bye`, as when its MSRP connection is lost
-    pub(crate) fn end(&self, send_bye: bool) {
+    /// ended with a BYE if `send_bye`, as when its MSRP connection is lost;
+    /// false if it ended already
+    pub(crate) fn end(&self, send_bye: bool) -> bool {
         if !self.close() {
-            return;
+            return false;
         }
 
         if send_bye {
@@ -1103,6 +1105,7 @@ impl SessionEnd {
         }
 
         self.hang_up();
+        true
     }
 
     /// Leaves the group the session is with, `conference_uri`, for good,
@@ -1263,12 +1266,72 @@ impl SessionEnd {
         let Some((encryption, conversation_id)) = encrypted else {
             return;
         };
+        if encryption.new_era_due(&conversation_id) {
+            self.restart_in_new_era(&*encryption, conversation_id);
+            return;
+        }
         if !encryption.needs_healing(&conversation_id) {
             return;
         }
         let pull = group_info_pull(self);
         self.commit(move |encryption, conversation_id, from, to| {
             encryption.heal(conversation_id, from, to, pull)
+        });
+    }
+
+    /// Makes the next Era of the MLS group of the session, as self-healing
+    /// it failed, from the GroupInfo the Conversation Focus gives in the
+    /// session, and restarts the group with it: the session ended, another
+    /// started with an INVITE carrying it (RCC.16 sections 8.3, 10.1)
+    fn restart_in_new_era(&self, encryption: &dyn GroupEncryption, conversation_id: String) {
+        let conference_uri = String::from_utf8_lossy(
+            &self
+                .sip_session
+                .get_inner()
+                .get_session_info()
+                .cpm_contact
+                .service_uri,
+        )
+        .into_owned();
+        let Some(public_user_identity) = self
+            .registered_public_identity
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, public_user_identity, _)| public_user_identity.clone())
+        else {
+            return;
+        };
+
+        let preparing = encryption.prepare_next_era(
+            conversation_id.clone(),
+            public_user_identity,
+            conference_uri.clone(),
+            group_info_pull(self),
+        );
+        let encryption = self
+            .sip_session
+            .get_inner()
+            .get_session_info()
+            .encryption
+            .clone();
+        let session_end = self.clone();
+        self.rt.spawn(async move {
+            let Some(cpim) = preparing.await else {
+                return;
+            };
+            // not once the session ended otherwise, as when the group was
+            // left: its Commit then not sent
+            if !session_end.end(true) {
+                if let Some(encryption) = encryption {
+                    encryption.discard(&conversation_id, false);
+                }
+                return;
+            }
+            let restarter = session_end.restarter.lock().unwrap().clone();
+            if let Some(restarter) = restarter {
+                restarter(conference_uri, cpim);
+            }
         });
     }
 
@@ -1587,6 +1650,9 @@ pub struct CPMSessionService {
     /// The end-to-end encryption of the group chats created, if the client
     /// has it
     group_encryption: Arc<Mutex<Option<Arc<dyn GroupEncryption>>>>,
+    /// What a session restarts its group in a new Era of its MLS group with,
+    /// once the core is attached
+    restarter: Arc<Mutex<Option<Restarter>>>,
 }
 
 impl CPMSessionService {
@@ -1807,6 +1873,7 @@ impl CPMSessionService {
             group_invite_handler_function: Box::new(group_invite_handler_function),
             group_chats,
             group_encryption,
+            restarter: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1832,8 +1899,60 @@ impl CPMSessionService {
     }
 
     /// The core the conference events of groups are subscribed to with
-    pub fn attach_core(&self, core: &Arc<SipCore>) {
+    pub fn attach_core(self: &Arc<Self>, core: &Arc<SipCore>, rt: &Arc<Runtime>) {
         self.group_chats.attach_core(core);
+
+        // for sessions to restart their group in a new Era of its MLS group
+        let service = Arc::downgrade(self);
+        let core = Arc::downgrade(core);
+        let rt = Arc::clone(rt);
+        *self.restarter.lock().unwrap() = Some(Arc::new(move |conference_uri, cpim| {
+            if let (Some(service), Some(core)) = (service.upgrade(), core.upgrade()) {
+                service.restart_in_new_era(&conference_uri, &cpim, &core, &rt);
+            }
+        }));
+    }
+
+    /// Restarts the group at `conference_uri` with an INVITE carrying `cpim`,
+    /// the CPIM message of the next Era of its MLS group, whose Commit is
+    /// discarded if the group does not start (RCC.16 sections 8.1, 8.3.1)
+    fn restart_in_new_era(
+        &self,
+        conference_uri: &str,
+        cpim: &[u8],
+        core: &Arc<SipCore>,
+        rt: &Arc<Runtime>,
+    ) {
+        let encryption = self.group_encryption.lock().unwrap().clone();
+        let conversation_id = self
+            .group_chats
+            .ids_of(conference_uri)
+            .map(|ids| ids.conversation_id);
+        let sessions = self.ongoing_sessions.lock().unwrap();
+        let invitations = self.ongoing_outgoing_invitations.lock().unwrap();
+        self.invite(
+            sessions,
+            invitations,
+            Invitee {
+                uri: conference_uri,
+                to_uri: conference_uri,
+                recipient_type: &RecipientType::Group,
+                known_as: Some(conference_uri),
+                new_group: None,
+                new_era: Some(cpim),
+            },
+            None,
+            Some(Box::new(move |status_code, _, _| {
+                if status_code != 200 {
+                    platform_log(LOG_TAG, format!("new Era refused: {}", status_code));
+                    if let Some((encryption, conversation_id)) = encryption.zip(conversation_id) {
+                        encryption.discard(&conversation_id, false);
+                    }
+                }
+            })),
+            core,
+            rt,
+        );
     }
 
     /// Asks the focus of the group at `conference_uri`, in the session there
@@ -2177,6 +2296,7 @@ impl CPMSessionService {
                 recipient_type: &RecipientType::Group,
                 known_as: Some(conference_uri),
                 new_group: None,
+                new_era: None,
             },
             None,
             Some(Box::new(move |status_code, reason_phrase, _| {
@@ -2320,6 +2440,7 @@ impl CPMSessionService {
                 recipient_type,
                 known_as: Some(recipient),
                 new_group: None,
+                new_era: None,
             },
             Some(message),
             None,
@@ -2441,6 +2562,7 @@ impl CPMSessionService {
                     subject,
                     encrypted,
                 }),
+                new_era: None,
             },
             None,
             Some(started),
@@ -2668,14 +2790,31 @@ impl CPMSessionService {
                         invite_message.set_body(Arc::new(body));
                     }
 
-                    None => {
-                        invite_message.add_header(Header::new(b"Content-Type", "application/sdp"));
-                        invite_message.add_header(Header::new(
-                            b"Content-Length",
-                            format!("{}", sdp.estimated_size()),
-                        ));
-                        invite_message.set_body(sdp);
-                    }
+                    None => match invitee.new_era {
+                        // with the next Era of its MLS group (RCC.16 section
+                        // 8.3.1), the focus knowing its participants
+                        Some(cpim) => {
+                            let (boundary, body) = era_restart_body(&sdp, cpim);
+                            invite_message.add_header(Header::new(
+                                b"Content-Type",
+                                format!("multipart/mixed; boundary={}", boundary),
+                            ));
+                            invite_message.add_header(Header::new(
+                                b"Content-Length",
+                                format!("{}", body.estimated_size()),
+                            ));
+                            invite_message.set_body(Arc::new(body));
+                        }
+                        None => {
+                            invite_message
+                                .add_header(Header::new(b"Content-Type", "application/sdp"));
+                            invite_message.add_header(Header::new(
+                                b"Content-Length",
+                                format!("{}", sdp.estimated_size()),
+                            ));
+                            invite_message.set_body(sdp);
+                        }
+                    },
                 }
 
                 let req_headers = invite_message.copy_headers();
@@ -2707,6 +2846,7 @@ impl CPMSessionService {
                 let group_chats = Arc::clone(&self.group_chats);
 
                 let registered_public_identity = Arc::clone(&self.registered_public_identity);
+                let restarter = Arc::clone(&self.restarter);
 
                 let tm = core.get_transaction_manager();
                 let tm_ = Arc::clone(&tm);
@@ -2822,6 +2962,7 @@ impl CPMSessionService {
                                                                 dialog: Arc::clone(&dialog),
                                                                 tm: Arc::clone(&tm_),
                                                                 registered_public_identity: Arc::clone(&registered_public_identity),
+                                                                restarter: Arc::clone(&restarter),
                                                                 rt: Arc::clone(&rt_),
                                                             };
                                                             cpm_session.keep_session_end(session_end.clone());
@@ -2936,7 +3077,7 @@ impl CPMSessionService {
                                                                     }, &connect_function, move || {
                                                                         // the MSRP connection lost, the
                                                                         // session is ended
-                                                                        session_end.end(true)
+                                                                        session_end.end(true);
                                                                     }, &rt) {
 
                                                                         // the session takes the messages
@@ -3136,6 +3277,9 @@ struct Invitee<'a> {
     /// What the messages sent before the session starts are sent to, if known
     known_as: Option<&'a str>,
     new_group: Option<NewGroup<'a>>,
+    /// The CPIM message of the next Era of the MLS group of the group
+    /// restarted (RCC.16 section 8.3.1)
+    new_era: Option<&'a [u8]>,
 }
 
 /// A group to start
@@ -3154,6 +3298,11 @@ type Started = Box<dyn FnOnce(u16, String, Option<String>) + Send + Sync>;
 /// Told how the focus answered a request, such as a REFER or a BYE, and
 /// whether an MLS refusal of what it carried may follow (RCC.16 section 7.2.6)
 type FocusAnswered = Box<dyn FnOnce(u16, String, bool) + Send + Sync>;
+
+/// Restarts the group at the URI with an INVITE carrying the CPIM message of
+/// the next Era of its MLS group, its session ended first (RCC.16 section
+/// 8.3.1)
+pub(crate) type Restarter = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
 
 /// The body of an INVITE starting a group, with its boundary: its SDP, the
 /// participants the focus is to invite (RFC 5366 section 4), and the CPIM
@@ -3207,6 +3356,34 @@ xmlns:cp=\"urn:ietf:params:xml:ns:copycontrol\"><list>",
         })));
     }
 
+    (
+        boundary_,
+        Body::Multipart(MultipartBody { boundary, parts }),
+    )
+}
+
+/// The body of an INVITE restarting a group in the next Era of its MLS
+/// group, with its boundary: its SDP and the CPIM message of that Era
+/// (RCC.16 section 8.3.1)
+fn era_restart_body(sdp: &Arc<Body>, cpim: &[u8]) -> (String, Body) {
+    let boundary = create_raw_alpha_numeric_string(16);
+    let boundary_ = String::from_utf8_lossy(&boundary).into_owned();
+    let parts = vec![
+        Arc::new(Body::Message(MessageBody {
+            headers: vec![
+                Header::new(b"Content-Type", b"application/sdp"),
+                Header::new(b"Content-Length", format!("{}", sdp.estimated_size())),
+            ],
+            body: Arc::clone(sdp),
+        })),
+        Arc::new(Body::Message(MessageBody {
+            headers: vec![
+                Header::new(b"Content-Type", b"message/cpim"),
+                Header::new(b"Content-Length", format!("{}", cpim.len())),
+            ],
+            body: Arc::new(Body::Raw(cpim.to_vec())),
+        })),
+    ];
     (
         boundary_,
         Body::Multipart(MultipartBody { boundary, parts }),
@@ -3436,7 +3613,9 @@ impl SipDialogEventCallbacks for CPMSessionDialogEventReceiver {
             },
             &self.msrp_socket_connect_function,
             // the MSRP connection lost, the session is ended
-            move || session_end.end(true),
+            move || {
+                session_end.end(true);
+            },
             &self.rt,
         ) {
             Ok(_) => {}
@@ -3895,6 +4074,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                             ongoing_dialogs,
                                             &self.service.ongoing_sessions,
                                             &self.service.group_chats,
+                                            &self.service.restarter,
                                             &self.tm,
                                             rt,
                                         );
@@ -4013,6 +4193,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                     Arc::clone(&self.service.ongoing_sessions);
                                                 let group_chats =
                                                     Arc::clone(&self.service.group_chats);
+                                                let restarter = Arc::clone(&self.service.restarter);
 
                                                 let ongoing_incoming_invitations_ = Arc::clone(
                                                     &self.service.ongoing_incoming_invitations,
@@ -4052,6 +4233,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                                 &ongoing_dialogs,
                                                                 &ongoing_sessions,
                                                                 &group_chats,
+                                                                &restarter,
                                                                 &tm_,
                                                                 &rt_,
                                                             );

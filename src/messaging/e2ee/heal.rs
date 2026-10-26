@@ -51,6 +51,9 @@ struct Heal {
     ongoing: bool,
     /// When it was self-healed, within HEAL_PERIOD
     attempts: Vec<Instant>,
+    /// Self-healing it failed, tried too often lately: it is to be made
+    /// anew in its next Era (RCC.16 sections 8.3, 10.1)
+    failed: bool,
 }
 
 /// The groups to self-heal and those being self-healed, by Conversation-ID
@@ -104,11 +107,54 @@ impl Heals {
             .retain(|attempt| now.duration_since(*attempt) < HEAL_PERIOD);
         if heal.attempts.len() >= HEAL_ATTEMPTS {
             platform_log(LOG_TAG, "self-healing failed, tried too often");
+            heal.failed = true;
             return false;
         }
         heal.attempts.push(now);
         heal.ongoing = true;
         true
+    }
+
+    /// Whether self-healing the group `conversation_id` failed, which a new
+    /// Era of it is to follow (RCC.16 section 10.1), and none is being made
+    pub(super) fn failed(&self, conversation_id: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .is_some_and(|heal| heal.failed && !heal.ongoing)
+    }
+
+    /// Starts making a new Era of the group `conversation_id`, self-healing
+    /// it having failed, during which it is not self-healed; false if none is
+    /// due, or one is being made already
+    pub(super) fn begin_new_era(&self, conversation_id: &str) -> bool {
+        let mut heals = self.0.lock().unwrap();
+        let Some(heal) = heals.get_mut(conversation_id) else {
+            return false;
+        };
+        if !heal.failed || heal.ongoing {
+            return false;
+        }
+        heal.failed = false;
+        heal.wanted = false;
+        heal.ongoing = true;
+        true
+    }
+
+    /// Takes note of a new Era of the group `conversation_id` that could not
+    /// be begun for now, to be tried again
+    pub(super) fn put_off_new_era(&self, conversation_id: &str) {
+        if let Some(heal) = self.0.lock().unwrap().get_mut(conversation_id) {
+            heal.failed = true;
+            heal.ongoing = false;
+        }
+    }
+
+    /// Self-heals the group `conversation_id` from scratch from now on, as
+    /// once a new Era of it was tried
+    pub(super) fn start_over(&self, conversation_id: &str) {
+        self.0.lock().unwrap().remove(conversation_id);
     }
 
     fn end(&self, conversation_id: &str) {
@@ -204,7 +250,7 @@ impl E2eeDevice {
 
 /// The MlsGroupInfo of the `message/mls-rcs-server` `body` of the 200 OK to an
 /// MLS-Group-Info-Pull INFO request (RCC.16 section 7.10.1)
-fn pulled_group_info(body: &[u8]) -> Option<MlsGroupInfo> {
+pub(super) fn pulled_group_info(body: &[u8]) -> Option<MlsGroupInfo> {
     match proto::decode::<ServerMlsRcsMessage>(body).ok()?.payload {
         Some(server_mls_rcs_message::Payload::MlsGroupInfo(group_info)) => Some(group_info),
         _ => None,

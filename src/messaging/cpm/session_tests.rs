@@ -399,7 +399,7 @@ pub fn start(registered: bool) -> (Client, Peer) {
         handlers,
         &rt,
     ));
-    sessions.attach_core(&core);
+    sessions.attach_core(&core, &rt);
 
     let transport = Arc::new(SipTransport::new::<DuplexStream>(
         String::from(TRANSPORT_ADDRESS),
@@ -2126,6 +2126,13 @@ struct ScriptedEncryption {
     /// The Conversation-ID, from and to of each self-healing, and the
     /// answers of the focus
     healed: Arc<std::sync::Mutex<Vec<(String, String, String, Vec<Option<(u16, Vec<u8>)>>)>>>,
+    /// Whether a new Era of its groups is due, until one is prepared
+    era_due: std::sync::atomic::AtomicBool,
+    /// The CPIM message it prepares for a new Era, if any
+    next_era: Option<Vec<u8>>,
+    /// The Conversation-ID, from and to of each new Era prepared, and how
+    /// the focus answered the GroupInfo pull
+    eras: Arc<std::sync::Mutex<Vec<(String, String, String, Option<(u16, Vec<u8>)>)>>>,
     /// The Conversation-ID, from and to of each leave
     left: std::sync::Mutex<Vec<(String, String, String)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
@@ -2367,6 +2374,29 @@ impl GroupEncryption for ScriptedEncryption {
                 .lock()
                 .unwrap()
                 .push((conversation_id, from, to, answers));
+            cpim
+        })
+    }
+
+    fn new_era_due(&self, _conversation_id: &str) -> bool {
+        self.era_due.load(Ordering::SeqCst)
+    }
+
+    fn prepare_next_era(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        pull: GroupInfoPull,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.era_due.store(false, Ordering::SeqCst);
+        let cpim = self.next_era.clone();
+        let eras = Arc::clone(&self.eras);
+        Box::pin(async move {
+            let answer = pull(b"MLS-Group-Info-Pull", None).await;
+            eras.lock()
+                .unwrap()
+                .push((conversation_id, from, to, answer));
             cpim
         })
     }
@@ -3096,6 +3126,20 @@ impl GroupEncryption for EncryptingPrepared {
         pull: GroupInfoPull,
     ) -> BoxFuture<'static, Option<Vec<u8>>> {
         self.0.heal(conversation_id, from, to, pull)
+    }
+
+    fn new_era_due(&self, conversation_id: &str) -> bool {
+        self.0.new_era_due(conversation_id)
+    }
+
+    fn prepare_next_era(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        pull: GroupInfoPull,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.prepare_next_era(conversation_id, from, to, pull)
     }
 
     fn encrypts(&self, conversation_id: &str) -> bool {
@@ -5893,4 +5937,187 @@ fn a_group_restarted_with_an_mls_group_it_cannot_join_is_taken_part_in_still() {
     peer.next_request("SUBSCRIBE");
     let _connection = msrp.accept(&client.rt);
     assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+}
+
+/// What the scripted encryption makes the INVITE of a new Era carry
+const NEXT_ERA_CPIM: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x0a\x08next era";
+
+/// The client with the group `conversation-1` encrypted, a new Era of it
+/// due as self-healing it failed, which is made as NEXT_ERA_CPIM if
+/// `made`; the session with the group, its MSRP connection, once a message
+/// it cannot decrypt came, and the INFO asking the focus for the GroupInfo
+/// in its dialog, unanswered
+fn new_era_asked_for(
+    client: &Client,
+    peer: &mut Peer,
+    made: bool,
+) -> (Arc<ScriptedEncryption>, MsrpConnection, SipMessage) {
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        era_due: std::sync::atomic::AtomicBool::new(true),
+        next_era: made.then(|| NEXT_ERA_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, msrp_path, our_path) =
+        joined_encrypted_group(client, peer, "group-old-era");
+    connection.send_content(
+        &rt,
+        &msrp_path,
+        &our_path,
+        "message/cpim",
+        &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+
+    // the GroupInfo asked for in the session's dialog (RCC.16 section 6.3.1)
+    let info = peer.next_request("INFO");
+    assert_eq!(header_value(&info, "Call-ID"), "group-old-era");
+    assert_eq!(header_value(&info, "Info-Package"), "MLS-Group-Info-Pull");
+    (encryption, connection, info)
+}
+
+/// The GroupInfo the focus gives for `info`
+fn group_info_given(peer: &mut Peer, info: &SipMessage) {
+    peer.send(
+        &answer(info, "200 OK", Some("the group info"))
+            .replace("application/sdp", "message/mls-rcs-server"),
+    );
+}
+
+/// As new_era_asked_for(), the GroupInfo given
+fn new_era_due(
+    client: &Client,
+    peer: &mut Peer,
+    made: bool,
+) -> (Arc<ScriptedEncryption>, MsrpConnection) {
+    let (encryption, connection, info) = new_era_asked_for(client, peer, made);
+    group_info_given(peer, &info);
+    (encryption, connection)
+}
+
+/// The INVITE restarting the group, once its session ended, answered with
+/// `status`
+fn restart_in_new_era(
+    client: &Client,
+    peer: &mut Peer,
+    mut connection: MsrpConnection,
+    status: &str,
+) -> SipMessage {
+    let rt = Arc::clone(&client.rt);
+    let bye = peer.next_request("BYE");
+    assert_eq!(header_value(&bye, "Call-ID"), "group-old-era");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+
+    let restart = peer.next_request("INVITE");
+    assert_eq!(request_uri(&restart), GROUP);
+    assert_eq!(header_value(&restart, "Conversation-ID"), "conversation-1");
+    match status {
+        "200 OK" => {
+            let msrp = MsrpPeer::listen(&rt);
+            peer.send(&answer_from(
+                &restart,
+                status,
+                &focus_contact(),
+                Some(&msrp.sdp("sendrecv")),
+            ));
+            next_requests(peer, &["ACK", "SUBSCRIBE"]);
+            let _connection = msrp.accept(&rt);
+        }
+        _ => {
+            peer.send(&answer(&restart, status, None));
+            peer.next_request("ACK");
+        }
+    }
+    restart
+}
+
+#[test]
+fn a_group_whose_healing_failed_is_restarted_in_a_new_era() {
+    let (client, mut peer) = start(true);
+    let (encryption, connection) = new_era_due(&client, &mut peer, true);
+    let restart = restart_in_new_era(&client, &mut peer, connection, "200 OK");
+
+    // the INVITE carries the SDP and the new Era of its MLS group (RCC.16
+    // sections 8.1, 8.3.1)
+    let parts = parts_of(&restart);
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].0, "application/sdp");
+    assert_eq!(
+        parts[1],
+        (String::from("message/cpim"), NEXT_ERA_CPIM.to_vec())
+    );
+    assert_eq!(
+        *encryption.eras.lock().unwrap(),
+        [(
+            String::from("conversation-1"),
+            String::from(IMPU),
+            String::from(GROUP),
+            Some((200, b"the group info".to_vec()))
+        )]
+    );
+    assert!(encryption.discarded.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_new_era_the_focus_refuses_is_discarded() {
+    let (client, mut peer) = start(true);
+    let (encryption, connection) = new_era_due(&client, &mut peer, true);
+    restart_in_new_era(&client, &mut peer, connection, "409 Conflict");
+    let discarded = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.discarded.lock().unwrap().is_empty()
+    });
+    assert!(discarded);
+    assert_eq!(
+        *encryption.discarded.lock().unwrap(),
+        [(String::from("conversation-1"), false)]
+    );
+}
+
+#[test]
+fn a_session_whose_new_era_is_not_made_goes_on() {
+    let (client, mut peer) = start(true);
+    let (encryption, _connection) = new_era_due(&client, &mut peer, false);
+    let made = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.eras.lock().unwrap().is_empty()
+    });
+    assert!(made);
+
+    // the session not ended, nor the group restarted
+    peer.silence();
+    assert!(client.sessions.has_session_with(GROUP));
+}
+
+#[test]
+fn a_new_era_made_once_the_session_ended_otherwise_is_discarded() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (encryption, mut connection, info) = new_era_asked_for(&client, &mut peer, true);
+
+    // the session ended meanwhile, as when the user leaves
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+    group_info_given(&mut peer, &info);
+
+    let discarded = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.discarded.lock().unwrap().is_empty()
+    });
+    assert!(discarded);
+    assert_eq!(
+        *encryption.discarded.lock().unwrap(),
+        [(String::from("conversation-1"), false)]
+    );
+    // the group not restarted
+    peer.silence();
 }
