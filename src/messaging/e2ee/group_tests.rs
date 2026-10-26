@@ -5324,7 +5324,7 @@ fn a_group_its_focus_moved_to_unencrypted_is_healed_into_rather_than_made_anew()
     assert!(!groups.new_era_due(CONVERSATION));
     // but the group self-healed into it
     assert!(groups.needs_healing(CONVERSATION));
-    let (pull, _) = focus_answering(vec![None, group_info_answer(group_info)]);
+    let (pull, _) = focus_answering(vec![None, group_info_answer(group_info.clone())]);
     let cpim = rt
         .block_on(groups.heal(
             String::from(CONVERSATION),
@@ -5335,7 +5335,9 @@ fn a_group_its_focus_moved_to_unencrypted_is_healed_into_rather_than_made_anew()
         .expect("an External Commit");
     assert!(groups.encryption_ended(CONVERSATION));
 
-    // which the app is told of once, as the Focus forwards it back
+    // which the app is told of once, as the Focus forwards it back, also
+    // after self-healing started over
+    device.heals().start_over(CONVERSATION);
     let ended = Taken {
         proposals: false,
         encryption_ended: true,
@@ -5344,6 +5346,22 @@ fn a_group_its_focus_moved_to_unencrypted_is_healed_into_rather_than_made_anew()
         groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
         ended
     );
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
+        Taken::default()
+    );
+
+    // not again for self-healing the group unencrypted already
+    device.heals().want(CONVERSATION);
+    let (pull, _) = focus_answering(vec![None, group_info_answer(group_info)]);
+    let cpim = rt
+        .block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        ))
+        .expect("an External Commit");
     assert_eq!(
         groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
         Taken::default()
