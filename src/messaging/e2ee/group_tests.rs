@@ -14,6 +14,7 @@
 
 use std::io::Read;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use base64::{engine::general_purpose, Engine as _};
 use futures::executor::block_on;
@@ -117,17 +118,49 @@ fn enrolled(directory: Option<Vec<(&str, Fetched)>>) -> (Arc<E2eeDevice>, Arc<Kd
 fn enrolled_with_app(
     directory: Option<Vec<(&str, Fetched)>>,
 ) -> (Arc<E2eeDevice>, Arc<Kds>, Arc<App>) {
+    enrolled_in_time(directory, None)
+}
+
+/// As enrolled_with_app(), the device telling the time of `clock` if given
+fn enrolled_in_time(
+    directory: Option<Vec<(&str, Fetched)>>,
+    clock: Option<&Clock>,
+) -> (Arc<E2eeDevice>, Arc<Kds>, Arc<App>) {
     let app = Arc::new(App::default());
     let kds = Kds::issuing(&[ALICE, CA], &app);
     let kds = Arc::new(match directory {
         Some(directory) => kds.knowing_too(directory),
         None => kds,
     });
-    let device = alice(&app, &kds, TODAY, None);
+    let mut device = alice(&app, &kds, TODAY, None);
+    if let Some(clock) = clock {
+        let clock = clock.clone();
+        device = device.with_clock(move || clock.now());
+    }
     provision(&device, &[ALICE_TEL], None);
     assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
     (Arc::new(device), kds, app)
 }
+
+/// The time a device of the tests tells, which they move on
+#[derive(Clone)]
+struct Clock(Arc<Mutex<SystemTime>>);
+
+impl Clock {
+    fn new() -> Clock {
+        Clock(Arc::new(Mutex::new(SystemTime::now())))
+    }
+
+    fn now(&self) -> SystemTime {
+        *self.0.lock().unwrap()
+    }
+
+    fn advance(&self, by: Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+}
+
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Bob, and a KeyPackage of his
 fn bob_with_key_package() -> (MlsClient, Vec<u8>) {
@@ -3449,7 +3482,7 @@ fn the_group_info_of_another_group_is_not_rejoined_in_its_stead() {
 fn encryption_ended_reason(device: &E2eeDevice, conversation_id: &str) -> Option<EndMlsReason> {
     device
         .store()
-        .peek_conversation(conversation_id.as_bytes(), |conversation| {
+        .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
             conversation.encryption_ended_reason()
         })
         .unwrap()
@@ -3792,4 +3825,165 @@ fn a_recipient_unable_to_decrypt_is_told_apart_from_other_failures() {
         ImdnTold::Refusal
     );
     assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
+}
+
+/// As alice_and_bob(), the device telling the time of the clock given back
+fn alice_and_bob_in_time() -> (Arc<E2eeDevice>, MlsClient, MlsConversation, Clock) {
+    let clock = Clock::new();
+    let (bob, bobs) = bob_with_key_package();
+    let (device, _, _) = enrolled_in_time(
+        Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]),
+        Some(&clock),
+    );
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let bobs_group = joined(&bob, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    (device, bob, bobs_group, clock)
+}
+
+#[test]
+fn the_keys_of_the_device_are_updated_once_due() {
+    let (device, bob, mut bobs_group, clock) = alice_and_bob_in_time();
+    assert!(!device.key_update_due(CONVERSATION));
+    assert_eq!(device.update_keys(CONVERSATION, IMPU, GROUP_URI), Ok(None));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    // after 30 days (RCC.16 section 9.5.2), with a Commit (section 9.5.1) in
+    // a control message from the user to the group
+    clock.advance(31 * DAY);
+    assert!(device.key_update_due(CONVERSATION));
+    let cpim = device
+        .update_keys(CONVERSATION, IMPU, GROUP_URI)
+        .unwrap()
+        .expect("a control message");
+    let message = cpim_message(&cpim);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"negative-delivery"[..])
+    );
+    let bundle = commit_bundle_of(&cpim);
+    assert!(!bundle.group_info.is_empty());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+
+    // not again while it waits for the Focus
+    assert!(!device.key_update_due(CONVERSATION));
+    assert_eq!(
+        device.update_keys(CONVERSATION, IMPU, GROUP_URI),
+        Err(GroupError::Pending)
+    );
+
+    // applied once forwarded back, and by Bob
+    device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap();
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    assert!(!device.key_update_due(CONVERSATION));
+    match bobs_group
+        .process_commit_bundle(
+            &bob,
+            &ServerCommitBundle {
+                commit_list: bundle.commit_list,
+                ..ServerCommitBundle::default()
+            },
+        )
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { added, removed, .. }] => {
+            assert!(added.is_empty() && removed.is_empty())
+        }
+        other => panic!("{} messages", other.len()),
+    }
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-70", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
+    );
+}
+
+#[test]
+fn the_keys_of_the_device_are_updated_after_50_messages() {
+    let (device, _, _, clock) = alice_and_bob_in_time();
+    for n in 0..49 {
+        device
+            .encrypt_message(CONVERSATION, &plaintext(&format!("message-{}", n), None))
+            .unwrap();
+    }
+    clock.advance(8 * DAY);
+    assert!(!device.key_update_due(CONVERSATION));
+    device
+        .encrypt_message(CONVERSATION, &plaintext("message-49", None))
+        .unwrap();
+    assert!(device.key_update_due(CONVERSATION));
+}
+
+#[test]
+fn the_keys_of_the_groups_of_the_device_are_updated_once_its_commit_is_accepted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let clock = Clock::new();
+    let (_, bobs) = bob_with_key_package();
+    let (device, _, _) = enrolled_in_time(
+        Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]),
+        Some(&clock),
+    );
+    block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let update = || {
+        groups.update_keys(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+        )
+    };
+
+    clock.advance(31 * DAY);
+    assert!(
+        !groups.key_update_due(CONVERSATION),
+        "not while the Commit waits"
+    );
+    let updating = rt.spawn(update());
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!updating.is_finished(), "waits for the Commit");
+    groups.on_server_message(
+        CONVERSATION,
+        &accepted(epoch_identifier(&device, CONVERSATION)),
+    );
+    let cpim = rt
+        .block_on(updating)
+        .unwrap()
+        .expect("updated once accepted");
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+
+    // its control message known, and withdrawn if the Focus refuses it
+    assert_eq!(
+        groups.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")),
+        ImdnTold::Refusal
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert!(groups.key_update_due(CONVERSATION));
+
+    // none once updated
+    let cpim = rt.block_on(update()).expect("updated again");
+    groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    assert!(!groups.key_update_due(CONVERSATION));
+    assert_eq!(rt.block_on(update()), None);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+
+    // nor once the device is let go of
+    clock.advance(31 * DAY);
+    assert!(groups.key_update_due(CONVERSATION));
+    drop(device);
+    assert!(!groups.key_update_due(CONVERSATION));
+    assert_eq!(rt.block_on(update()), None);
 }

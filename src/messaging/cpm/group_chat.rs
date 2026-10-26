@@ -484,6 +484,12 @@ impl GroupChats {
 
         (self.listener)(CPMGroupEvent::Joined(conference_uri.clone()));
 
+        // the keys of this client updated, if that is due (RCC.16 section
+        // 9.5.2)
+        if let Some(session_end) = session.session_end() {
+            session_end.update_keys();
+        }
+
         // a participant the Messaging Server removed is committed out of
         // the MLS group by the members (RCC.16 section 9.6)
         let removing = Arc::downgrade(sip_session);
