@@ -17,16 +17,16 @@
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::mls::rcs::credential_tel_uris;
 use rust_rcs_core::mls::rcs::era::EraBase;
-use rust_rcs_core::mls::rcs::proto::MlsGroupInfo;
+use rust_rcs_core::mls::rcs::proto::{EndMlsReason, MlsGroupInfo};
 use rust_rcs_core::mls::rcs::INFO_PACKAGE_MLS_GROUP_INFO_PULL;
-use rust_rcs_core::mls::ErrorKind;
+use rust_rcs_core::mls::{self, CommitOutput, ErrorKind, MlsClient, MlsConversation};
 
 use crate::capability::CapabilityQuery;
 use crate::messaging::cpm::encryption::GroupInfoPull;
 
 use super::device::{is_of, E2eeDevice};
 use super::group::{recipients, GroupError};
-use super::heal::pulled_group_info;
+use super::heal::{pulled_group_info, NextEra};
 use super::kds::Recipient;
 use super::store::StoreError;
 
@@ -35,6 +35,10 @@ const LOG_TAG: &str = "e2ee";
 /// What the Conversation Focus answers an MLS-Group-Info-Pull with when the
 /// conversation has no MLS group (RCC.16 section 6.3.1)
 const NO_MLS_GROUP: u16 = 469;
+
+/// What the Conversation Focus answers the INVITE carrying a new Era with
+/// when it is not the Era after the latest (RCC.16 section 8.3.1)
+const CONFLICT: u16 = 409;
 
 impl E2eeDevice {
     /// Makes the next Era of the MLS group of the group chat
@@ -60,6 +64,39 @@ impl E2eeDevice {
         recipients: Vec<Recipient>,
         group_info: Option<&MlsGroupInfo>,
     ) -> Result<Vec<u8>, GroupError> {
+        let base = self.era_base(conversation_id, group_info)?;
+        self.next_era(conversation_id, from, to, recipients, &base)
+            .await
+    }
+
+    /// Makes the next Era of the MLS group of the group chat
+    /// `conversation_id` an Unencrypted Singleton Era, moved to unencrypted
+    /// for `reason`, the device its only member: the CPIM message, `from` and
+    /// `to` its own, carrying the `message/mls-rcs-client` the INVITE
+    /// restarting the group is to carry (RCC.16 sections 8.3.1, 11.2.1)
+    ///
+    /// The Era follows that of `group_info`, or else that of the group the
+    /// device has, as with create_next_era(), without KeyPackages. The
+    /// Commit, adding end_mls, is applied once the Focus accepts it.
+    pub fn create_singleton_era(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        group_info: Option<&MlsGroupInfo>,
+        reason: EndMlsReason,
+    ) -> Result<Vec<u8>, GroupError> {
+        let base = self.era_base(conversation_id, group_info)?;
+        self.singleton_era(conversation_id, from, to, &base, reason)
+    }
+
+    /// What the next Era of the group `conversation_id` follows: the group
+    /// as `group_info` tells it, or else as the device has it
+    fn era_base(
+        &self,
+        conversation_id: &str,
+        group_info: Option<&MlsGroupInfo>,
+    ) -> Result<EraBase, GroupError> {
         let base = match group_info {
             Some(group_info) => EraBase::of_group_info(group_info)
                 .map_err(|e| GroupError::Store(StoreError::Mls(e)))?,
@@ -75,17 +112,77 @@ impl E2eeDevice {
                 ErrorKind::UnexpectedMessage,
             )));
         }
+        Ok(base)
+    }
 
-        // the Participants of the RCS conversation, the user among them
-        let mut participants: Vec<String> = self
-            .store()
-            .credential()
-            .and_then(|credential| credential_tel_uris(&credential).ok())
-            .and_then(|tel_uris| tel_uris.into_iter().next())
-            .into_iter()
+    /// The next Era after `base` with all the Clients of `recipients`, as
+    /// create_next_era() makes it
+    async fn next_era(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        recipients: Vec<Recipient>,
+        base: &EraBase,
+    ) -> Result<Vec<u8>, GroupError> {
+        let participants = recipients
+            .iter()
+            .map(|recipient| recipient.tel_uri.clone())
             .collect();
-        participants.extend(recipients.iter().map(|recipient| recipient.tel_uri.clone()));
         let key_packages = self.key_packages(recipients).await?;
+        self.era_after(
+            conversation_id,
+            from,
+            to,
+            base,
+            participants,
+            |conversation, client| {
+                let key_packages: Vec<&[u8]> = key_packages.iter().map(|kp| &kp[..]).collect();
+                conversation.add_members(client, &key_packages)
+            },
+        )
+    }
+
+    /// The Unencrypted Singleton Era after `base`, as create_singleton_era()
+    /// makes it
+    fn singleton_era(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        base: &EraBase,
+        reason: EndMlsReason,
+    ) -> Result<Vec<u8>, GroupError> {
+        self.era_after(
+            conversation_id,
+            from,
+            to,
+            base,
+            Vec::new(),
+            |conversation, client| conversation.set_encryption_ended(client, Some(reason)),
+        )
+    }
+
+    /// The Era after `base`, `participants` its Participants besides the
+    /// user, made with the Commit `commit` makes, in place of the group of the
+    /// Era before: the CPIM message, `from` and `to` its own, carrying it
+    /// (RCC.16 sections 7.9.2, 8.3.1)
+    fn era_after(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        base: &EraBase,
+        mut participants: Vec<String>,
+        commit: impl FnOnce(&mut MlsConversation, &MlsClient) -> mls::Result<CommitOutput>,
+    ) -> Result<Vec<u8>, GroupError> {
+        // the Participants of the RCS conversation, the user among them
+        participants.extend(
+            self.store()
+                .credential()
+                .and_then(|credential| credential_tel_uris(&credential).ok())
+                .and_then(|tel_uris| tel_uris.into_iter().next()),
+        );
 
         let (_, client_message) = self
             .store()
@@ -95,11 +192,9 @@ impl E2eeDevice {
                 let renew = !base.continuity_holds(kept.as_ref(), &participants);
                 drop(kept);
 
-                let mut conversation = client.create_next_era(&base, renew)?;
-                let key_packages: Vec<&[u8]> = key_packages.iter().map(|kp| &kp[..]).collect();
-                let made = conversation
-                    .add_members(client, &key_packages)
-                    .and_then(|output| output.to_client_message());
+                let mut conversation = client.create_next_era(base, renew)?;
+                let made =
+                    commit(&mut conversation, client).and_then(|output| output.to_client_message());
                 match made {
                     Ok(client_message) => Ok((conversation, client_message)),
                     Err(e) => {
@@ -114,29 +209,35 @@ impl E2eeDevice {
     }
 
     /// Whether the MLS group of the group chat `conversation_id` is to be
-    /// made anew in its next Era, self-healing it having failed (RCC.16
-    /// sections 8.3, 10.1)
+    /// made anew in its next Era, self-healing it having failed, or to move
+    /// to an Unencrypted Singleton Era (RCC.16 sections 8.3, 10.1, 11.2.1)
     pub fn new_era_due(&self, conversation_id: &str) -> bool {
-        self.heals().failed(conversation_id)
+        self.heals().era_due(conversation_id)
     }
 
     /// Makes the next Era of the MLS group of the group chat
     /// `conversation_id`, if one is due as new_era_due() tells: the CPIM
     /// message, `from` and `to` its own, that the INVITE restarting the group
-    /// is to carry, as create_next_era() makes it (RCC.16 sections 8.3, 10.1)
+    /// is to carry, as create_next_era() or create_singleton_era() makes it
+    /// (RCC.16 sections 8.3, 10.1, 11.2.1)
     ///
     /// The Era follows that of the GroupInfo asked of the Conversation Focus
     /// with `pull`, or that of the group of the device if the Focus has none.
     /// Its Participants are the members of that group besides the user, as
     /// the Focus keeps its MLS group to the membership of the conversation;
     /// each is asked for its capabilities with `capabilities` (section 5.2).
+    /// It is an Unencrypted Singleton Era if one is due, if 30 Eras were made
+    /// in the day (section 11.2.3), or if the Era of all the Participants
+    /// cannot be made: when one no longer advertises E2EE, or when their
+    /// KeyPackages cannot be had (section 10.1).
     ///
     /// The group is not self-healed while the Era is made, nor is another
     /// made at the same time. Self-healing starts over once the GroupInfo is
     /// had, whether the Era can be made or not. None if no new Era is due, if
-    /// the Focus gives no GroupInfo for now, which leaves it due, or if a
-    /// Participant no longer advertises E2EE.
-    pub async fn make_era_after_failed_heal(
+    /// the Focus gives no GroupInfo for now, which leaves it due, or if its
+    /// group was moved to unencrypted already: the group is then self-healed
+    /// into it (section 10.1).
+    pub async fn make_due_era(
         &self,
         conversation_id: &str,
         from: &str,
@@ -144,15 +245,13 @@ impl E2eeDevice {
         capabilities: &CapabilityQuery,
         pull: &GroupInfoPull,
     ) -> Option<Vec<u8>> {
-        if !self.heals().begin_new_era(conversation_id) {
-            return None;
-        }
+        let next = self.heals().begin_new_era(conversation_id)?;
         let group_info = match pull(INFO_PACKAGE_MLS_GROUP_INFO_PULL, None).await {
             Some((200, body)) => match pulled_group_info(&body) {
                 Some(group_info) => Some(group_info),
                 None => {
                     platform_log(LOG_TAG, "new Era not made, its GroupInfo not read");
-                    self.heals().put_off_new_era(conversation_id);
+                    self.heals().put_off_new_era(conversation_id, next);
                     return None;
                 }
             },
@@ -165,39 +264,75 @@ impl E2eeDevice {
                         answer.map(|(status_code, _)| status_code)
                     ),
                 );
-                self.heals().put_off_new_era(conversation_id);
+                self.heals().put_off_new_era(conversation_id, next);
                 return None;
             }
         };
-        let members = match &group_info {
-            Some(group_info) => EraBase::of_group_info(group_info)
-                .map(|base| base.members().to_vec())
-                .map_err(StoreError::Mls),
-            None => self
-                .store()
-                .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
-                    conversation.members()
-                }),
-        };
+        let base = self.era_base(conversation_id, group_info.as_ref());
         self.heals().start_over(conversation_id);
-        let members = match members {
-            Ok(members) => members,
+        let base = match base {
+            Ok(base) => base,
             Err(e) => {
                 platform_log(LOG_TAG, format!("new Era not made: {:?}", e));
                 return None;
             }
         };
+        if base.is_encryption_ended() {
+            platform_log(LOG_TAG, "new Era not made, the group unencrypted already");
+            if group_info.is_some() {
+                self.heals().want(conversation_id);
+            }
+            return None;
+        }
 
+        let reason = match next {
+            NextEra::Singleton(reason) => reason,
+            NextEra::Encrypted => {
+                match self
+                    .era_of_participants(conversation_id, from, to, &base, capabilities)
+                    .await
+                {
+                    Ok(cpim) => {
+                        self.heals().era_made(conversation_id);
+                        return Some(cpim);
+                    }
+                    Err(reason) => reason,
+                }
+            }
+        };
+        match self.singleton_era(conversation_id, from, to, &base, reason) {
+            Ok(cpim) => Some(cpim),
+            Err(e) => {
+                platform_log(
+                    LOG_TAG,
+                    format!("Unencrypted Singleton Era not made: {:?}", e),
+                );
+                None
+            }
+        }
+    }
+
+    /// The next Era after `base` of its members besides the user, each asked
+    /// for its capabilities with `capabilities`, as make_due_era() makes it;
+    /// or the reason the group moves to unencrypted instead
+    async fn era_of_participants(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        base: &EraBase,
+        capabilities: &CapabilityQuery,
+    ) -> Result<Vec<u8>, EndMlsReason> {
         let own = self.store().credential();
         let mut participants: Vec<String> = Vec::new();
-        for member in members {
-            let Some(tel_uri) = credential_tel_uris(&member)
+        for member in base.members() {
+            let Some(tel_uri) = credential_tel_uris(member)
                 .ok()
                 .and_then(|tel_uris| tel_uris.into_iter().next())
             else {
                 continue;
             };
-            let known = participants.iter().any(|known| is_of(&member, known));
+            let known = participants.iter().any(|known| is_of(member, known));
             let user = own
                 .as_ref()
                 .is_some_and(|credential| is_of(credential, &tel_uri));
@@ -207,18 +342,48 @@ impl E2eeDevice {
         }
         let Some(recipients) = recipients(&participants, capabilities).await else {
             platform_log(LOG_TAG, "new Era not made, a Participant not E2EE capable");
-            return None;
+            return Err(EndMlsReason::GroupMemberFailsCapabilitiesCheck);
         };
 
-        match self
-            .create_next_era(conversation_id, from, to, recipients, group_info.as_ref())
+        self.next_era(conversation_id, from, to, recipients, base)
             .await
-        {
-            Ok(cpim) => Some(cpim),
-            Err(e) => {
+            .map_err(|e| {
                 platform_log(LOG_TAG, format!("new Era not made: {:?}", e));
-                None
-            }
+                match e {
+                    GroupError::Kds(_) | GroupError::NotEncryptable(..) => {
+                        EndMlsReason::CannotFetchKeypackages
+                    }
+                    _ => EndMlsReason::InternalClientError,
+                }
+            })
+    }
+
+    /// Takes note of the Conversation Focus refusing with `status_code` the
+    /// INVITE restarting the group chat `conversation_id` in the Era the
+    /// device made of it last, whose Commit is discarded (RCC.16 sections
+    /// 8.3.1, 10.1, 11.2.1)
+    ///
+    /// Another Era is then due: with 409, the Era did not follow the latest
+    /// and is made again from the latest GroupInfo; otherwise the group moves
+    /// to an Unencrypted Singleton Era, made again if that is what the Focus
+    /// refused.
+    pub fn era_refused(&self, conversation_id: &str, status_code: u16) {
+        let ending = self
+            .store()
+            .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
+                conversation.pending_encryption_end()
+            })
+            .ok()
+            .flatten();
+        if let Err(e) = self.discard_pending(conversation_id, false) {
+            platform_log(LOG_TAG, format!("refused Era not discarded: {:?}", e));
+        }
+        match (ending, status_code) {
+            (Some(reason), _) => self.heals().want_singleton(conversation_id, reason),
+            (None, CONFLICT) => self.heals().want_new_era(conversation_id),
+            (None, _) => self
+                .heals()
+                .want_singleton(conversation_id, EndMlsReason::InternalClientError),
         }
     }
 }
