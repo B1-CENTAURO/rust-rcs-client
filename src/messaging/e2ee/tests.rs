@@ -475,3 +475,30 @@ fn every_client_the_store_takes_on_tells_the_time_of_its_clock() {
     restored.restore(&app.last()).unwrap();
     assert!(due(&restored));
 }
+
+#[test]
+fn a_renewal_is_kept_at_once_or_undone() {
+    use rust_rcs_core::mls::SignatureKeyPair;
+
+    let app = Arc::new(App::default());
+    let device = device(&app, "alice");
+    // a basic credential, as one of another client
+    let renewed = |name: &str| -> Credential { member(name).credential().clone() };
+    let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap();
+    let public_key = signer.public().to_vec();
+    device.renew(renewed("alice 2"), signer).unwrap();
+    let restored = store(&app);
+    restored.restore(&app.last()).unwrap();
+    assert_eq!(restored.credential(), Some(renewed("alice 2")));
+    assert_eq!(restored.signature_key(), Some(public_key.clone()));
+
+    app.refuse(true);
+    let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap();
+    assert_eq!(
+        device.renew(renewed("alice 3"), signer),
+        Err(StoreError::NotSaved)
+    );
+    app.refuse(false);
+    assert_eq!(device.credential(), Some(renewed("alice 2")));
+    assert_eq!(device.signature_key(), Some(public_key));
+}

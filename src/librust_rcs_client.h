@@ -153,13 +153,14 @@ extern int32_t rcs_client_set_e2ee(struct rcs_client *client, uint32_t home_kds,
                                 rcs_e2ee_save_state_function save, rcs_kds_enrol_function enrol, rcs_kds_upload_function upload,
                                 rcs_kds_fetch_function fetch, void *context);
 
-// told how enrolling went: 0 enrolled, 1 already was, -1 E2EE not set or no tel URI configured, -2 the Home KDS could not
+// told how enrolling went: 0 enrolled, or its certificate renewed, 1 already was, -1 E2EE not set or no tel URI configured, -2 the Home KDS could not
 // be reached, -3 it refused, -4 the certificate it issued is not one others would add the device with, -5 the MLS state
 // could not be made or kept
 typedef void (*rcs_e2ee_enrol_result_callback) (int32_t status, void *context);
 
 // enrols the device with its Home KDS for the identity it was configured with, unless it holds a certificate others
-// would still add it with; once configured, before connecting
+// would still add it with, with more than 60 days left; one with less is renewed, the device keeping its groups
+// (RCC.16 section 9.5.3); once configured, before connecting, and again from time to time for the renewal
 extern void rcs_client_e2ee_enrol(struct rcs_runtime *runtime, struct rcs_client *client, rcs_e2ee_enrol_result_callback cb,
                                 void *context);
 

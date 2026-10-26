@@ -37,7 +37,9 @@ use rust_rcs_core::mls::rcs::{
     CONTENT_TYPE_MLS_RCS_CLIENT, INFO_PACKAGE_MLS_ENHANCED_GROUP_INFO_PULL,
     INFO_PACKAGE_MLS_GROUP_INFO_PULL,
 };
-use rust_rcs_core::mls::{ErrorKind, IncomingMessage, MlsClient, MlsConfig, MlsConversation};
+use rust_rcs_core::mls::{
+    key_package_info, ErrorKind, IncomingMessage, MlsClient, MlsConfig, MlsConversation,
+};
 
 use crate::capability::{Capabilities, CapabilityQuery};
 use crate::messaging::cpm::encryption::{
@@ -51,7 +53,7 @@ use super::group::{recipients, DeviceGroups, GroupError};
 use super::kds::{Fetched, KdsError, KeyDistribution, Recipient};
 use super::kds_tests::certificates::*;
 use super::kds_tests::{
-    bob, credential, signer, validator, App, Kds, ALICE_TEL, BOB_TEL, HOME_KDS, TODAY,
+    bob, bytes, credential, signer, validator, App, Kds, ALICE_TEL, BOB_TEL, HOME_KDS, TODAY,
 };
 use super::message::MessageError;
 use super::store::StoreError;
@@ -4014,4 +4016,166 @@ fn a_device_restored_tells_the_time_it_is_given() {
     assert!(!restored.key_update_due(CONVERSATION));
     clock.advance(31 * DAY);
     assert!(restored.key_update_due(CONVERSATION));
+}
+
+/// When Alice's certificate has less than 30 days left, and the one renewed
+/// for her is valid
+const RENEWING: &str = "2026-10-05";
+
+/// What Bob reads of the message `outer` the client of Alice sends: who sent
+/// it, and what
+fn read_by_bob(
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+    outer: &[u8],
+) -> (rust_rcs_core::mls::Credential, Vec<u8>) {
+    let outer = cpim_message(outer);
+    let (_, mls_message, _) = outer.get_message_body().unwrap();
+    let decrypted = bobs_group
+        .decrypt(bob, mls_message, outer.get_info().unwrap().imdn_message_id)
+        .unwrap();
+    (decrypted.sender, decrypted.payload.unwrap())
+}
+
+#[test]
+fn a_certificate_renewed_is_brought_into_the_groups_of_the_device() {
+    let bob = MlsClient::with_credential(
+        credential(&[BOB, CA]),
+        signer(BOB_KEY, BOB_PUBLIC_KEY),
+        CIPHERSUITE,
+        MlsConfig::default(),
+        Box::new(validator(RENEWING)),
+    )
+    .unwrap();
+    let bobs = bob.generate_key_package(false).unwrap();
+    let (device, _, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+
+    // less than 60 days left: renewed by the Home KDS for a new key (RCC.16
+    // section 9.5.3)
+    let renewing = Arc::new(Kds::issuing(&[ALICE_RENEWED, CA], &app));
+    let device = alice(&app, &renewing, RENEWING, Some(&app.last().unwrap()))
+        .with_signer(|| Some(signer(ALICE_RENEWED_KEY, ALICE_RENEWED_PUBLIC_KEY)));
+    provision(&device, &[ALICE_TEL], None);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    let enrolments = renewing.enrolments.lock().unwrap().clone();
+    assert_eq!(enrolments.len(), 1);
+    assert_eq!(enrolments[0].signature_key, bytes(ALICE_RENEWED_PUBLIC_KEY));
+    assert_eq!(
+        device.store().credential(),
+        Some(credential(&[ALICE_RENEWED, CA]))
+    );
+    // KeyPackages of it uploaded in place of the former ones
+    let uploads = renewing.uploads();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(
+        key_package_info(&uploads[0].0[0]).unwrap().credential,
+        credential(&[ALICE_RENEWED, CA])
+    );
+
+    // the group kept, the former certificate in it until the key update,
+    // due at once
+    let device = Arc::new(device);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert!(device.key_update_due(CONVERSATION));
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-80", None))
+        .unwrap();
+    assert_eq!(
+        read_by_bob(&bob, &mut bobs_group, &sent).0,
+        credential(&[ALICE, CA])
+    );
+    let cpim = device
+        .update_keys(CONVERSATION, IMPU, GROUP_URI)
+        .unwrap()
+        .expect("a control message");
+    let bundle = commit_bundle_of(&cpim);
+    assert!(matches!(
+        bobs_group
+            .process_commit_bundle(
+                &bob,
+                &ServerCommitBundle {
+                    commit_list: bundle.commit_list,
+                    ..ServerCommitBundle::default()
+                },
+            )
+            .unwrap()
+            .as_slice(),
+        [IncomingMessage::Commit { .. }]
+    ));
+    device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap();
+    assert!(!device.key_update_due(CONVERSATION));
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-81", None))
+        .unwrap();
+    let (sender, payload) = read_by_bob(&bob, &mut bobs_group, &sent);
+    assert_eq!(sender, credential(&[ALICE_RENEWED, CA]));
+    assert!(String::from_utf8_lossy(&payload).ends_with("hello Bob"));
+}
+
+#[test]
+fn no_key_update_is_made_with_a_certificate_about_to_expire() {
+    let (_, bobs) = bob_with_key_package();
+    let (device, kds, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+
+    // 31 days on by the device, its certificate with less than 30 days
+    // left, not renewed (RCC.16 Annex A.4.1.5)
+    let clock = Clock::new();
+    clock.advance(31 * DAY);
+    let later = {
+        let clock = clock.clone();
+        alice(
+            &app,
+            &kds,
+            super::kds_tests::LATER,
+            Some(&app.last().unwrap()),
+        )
+        .with_clock(move || clock.now())
+    };
+    assert!(!later.key_update_due(CONVERSATION));
+    assert_eq!(later.update_keys(CONVERSATION, IMPU, GROUP_URI), Ok(None));
+    assert_eq!(epoch(&later, CONVERSATION), Ok((1, false)));
+
+    // which with 30 days left it would be
+    let today =
+        alice(&app, &kds, TODAY, Some(&app.last().unwrap())).with_clock(move || clock.now());
+    assert!(today.key_update_due(CONVERSATION));
+}
+
+#[test]
+fn a_certificate_renewed_is_kept_though_its_key_packages_are_refused() {
+    let (device, _, app) = enrolled_with_app(None);
+    drop(device);
+
+    let renewing = Arc::new(Kds::issuing(&[ALICE_RENEWED, CA], &app));
+    renewing
+        .taking
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let device = alice(&app, &renewing, RENEWING, Some(&app.last().unwrap()))
+        .with_signer(|| Some(signer(ALICE_RENEWED_KEY, ALICE_RENEWED_PUBLIC_KEY)));
+    provision(&device, &[ALICE_TEL], None);
+    assert!(block_on(device.enrol()).is_err());
+
+    // as the app keeps it, its KeyPackages to be uploaded again
+    let restored = alice(&app, &renewing, RENEWING, Some(&app.last().unwrap()));
+    assert_eq!(
+        restored.store().credential(),
+        Some(credential(&[ALICE_RENEWED, CA]))
+    );
+    assert!(!restored.store().key_packages_uploaded());
 }

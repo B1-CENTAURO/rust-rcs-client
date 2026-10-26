@@ -51,6 +51,9 @@ pub(super) const ALICE_TEL: &str = "tel:+491701234567";
 pub(super) const HOME_KDS: u32 = 42;
 pub(super) const BOB_TEL: &str = "tel:+491707654321";
 
+/// When the certificates have more than 60 days left, as a device keeps
+/// its own without having it renewed (RCC.16 section 9.5.3)
+pub(super) const EARLY: &str = "2026-09-01";
 /// When the certificates have 30 days left at least
 pub(super) const TODAY: &str = "2026-09-15";
 /// When they have less
