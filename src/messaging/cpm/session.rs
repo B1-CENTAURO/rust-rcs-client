@@ -3643,6 +3643,34 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                             if let MsrpDirection::SendReceive = msrp_info.direction
                                             {
                                                 if self.service.group_chats.knows(conversation_id) {
+                                                    // with a new Era of its MLS
+                                                    // group, joined in place
+                                                    // of the one kept (RCC.16
+                                                    // section 8.3)
+                                                    if let Some(server_message) = &mls_group {
+                                                        let encryption = self
+                                                            .service
+                                                            .group_encryption
+                                                            .lock()
+                                                            .unwrap()
+                                                            .clone()
+                                                            .filter(|encryption| {
+                                                                encryption.join(
+                                                                    conversation_id,
+                                                                    server_message,
+                                                                )
+                                                            });
+                                                        match encryption {
+                                                            Some(encryption) => {
+                                                                session_info.encryption =
+                                                                    Some(encryption)
+                                                            }
+                                                            None => platform_log(
+                                                                LOG_TAG,
+                                                                "MLS group of the restart not joined",
+                                                            ),
+                                                        }
+                                                    }
                                                     auto_accept_response_code = 200;
                                                     break;
                                                 }

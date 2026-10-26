@@ -4689,3 +4689,201 @@ fn what_changes_while_key_packages_are_fetched_is_minded() {
     assert_eq!(replaced, Ok(None));
     assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
 }
+
+/// The Era of the group `conversation_id` of `device`
+fn era(device: &E2eeDevice, conversation_id: &str) -> Option<u32> {
+    device
+        .store()
+        .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
+            conversation.era()
+        })
+        .unwrap()
+}
+
+/// The continuity token the device keeps for the group of the conversation
+fn continuity_token(device: &E2eeDevice) -> Vec<u8> {
+    device
+        .store()
+        .with_client(|client| client.group_metadata(CONVERSATION.as_bytes()))
+        .unwrap()
+        .continuity_token
+}
+
+#[test]
+fn a_new_era_is_made_after_that_of_the_focus_with_the_clients_of_each_participant() {
+    let (device, kds, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let token = continuity_token(&device);
+    // the Focus a Commit ahead of the device
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+
+    let cpim = block_on(device.create_next_era(
+        CONVERSATION,
+        IMPU,
+        GROUP_URI,
+        vec![recipient(BOB_TEL)],
+        Some(&group_info),
+    ))
+    .unwrap();
+
+    // a control message from the user to the group with a Welcome, and the
+    // ratchet tree of the first Commit of an Era (RCC.16 sections 7.9.2,
+    // 8.3.1)
+    let message = cpim_message(&cpim);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    let bundle = bundle_of(&cpim);
+    assert!(!bundle.welcome.is_empty());
+    assert!(!bundle.ratchet_tree.is_empty());
+    assert_eq!(
+        kds.queries.lock().unwrap().last().unwrap().1,
+        [recipient(BOB_TEL)]
+    );
+    // in the Era after that of the Focus, the continuity token kept
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, true)));
+    assert_eq!(continuity_token(&device), token);
+
+    // Bob joins it in place of his group
+    let mut bobs_group = joined(&bob, &bundle);
+    assert_eq!(bobs_group.era(), Some(1));
+
+    // applied once the Focus accepts it
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-80", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
+    );
+}
+
+#[test]
+fn a_new_era_is_made_after_that_of_the_group_of_the_device_without_group_info() {
+    let (device, kds, bob, _, _) = alice_and_bob_in_time_with_kds();
+    let token = continuity_token(&device);
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+
+    let cpim = block_on(device.create_next_era(
+        CONVERSATION,
+        IMPU,
+        GROUP_URI,
+        vec![recipient(BOB_TEL)],
+        None,
+    ))
+    .unwrap();
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+    assert_eq!(continuity_token(&device), token);
+    assert_eq!(joined(&bob, &bundle_of(&cpim)).era(), Some(1));
+}
+
+#[test]
+fn a_new_era_renews_the_continuity_token_when_it_cannot_carry_over() {
+    let (device, kds, bob, _, _) = alice_and_bob_in_time_with_kds();
+    let token = continuity_token(&device);
+    // the GroupInfo of a group of the conversation the user is not in
+    let other_bob = super::kds_tests::bob();
+    let mut alone = other_bob
+        .create_conversation(Some(CONVERSATION.as_bytes()), 4)
+        .unwrap();
+    let (_, group_info) = missed_by_the_device(&other_bob, &mut alone);
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+
+    block_on(device.create_next_era(
+        CONVERSATION,
+        IMPU,
+        GROUP_URI,
+        vec![recipient(BOB_TEL)],
+        Some(&group_info),
+    ))
+    .unwrap();
+    assert_eq!(era(&device, CONVERSATION), Some(5));
+    assert_ne!(continuity_token(&device), token);
+}
+
+#[test]
+fn no_new_era_is_made_without_the_key_packages_of_each_participant_nor_of_another_group() {
+    let (device, kds, bob, _, _) = alice_and_bob_in_time_with_kds();
+    let next_era = |group_info: Option<&MlsGroupInfo>| {
+        block_on(device.create_next_era(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            vec![recipient(BOB_TEL)],
+            group_info,
+        ))
+    };
+
+    // the group of the device kept
+    kds.now_knowing(vec![(BOB_TEL, Fetched::NotFound)]);
+    assert_eq!(
+        next_era(None),
+        Err(GroupError::NotEncryptable(
+            String::from(BOB_TEL),
+            Fetched::NotFound
+        ))
+    );
+    assert_eq!(era(&device, CONVERSATION), Some(0));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    let mut other = bob.create_conversation(Some(b"another"), 0).unwrap();
+    let (_, group_info) = missed_by_the_device(&bob, &mut other);
+    assert_eq!(
+        next_era(Some(&group_info)),
+        Err(GroupError::Store(StoreError::Mls(
+            ErrorKind::UnexpectedMessage
+        )))
+    );
+    assert_eq!(era(&device, CONVERSATION), Some(0));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+}
+
+#[test]
+fn the_device_joins_a_new_era_another_member_makes_in_place_of_its_group() {
+    let (device, kds, bob, bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let base = rust_rcs_core::mls::rcs::era::EraBase::of_conversation(&bobs_group);
+    let mut next = bob.create_next_era(&base, false).unwrap();
+    let output = next
+        .add_members(&bob, &[&uploaded_key_package(&kds, 0)])
+        .unwrap();
+    next.merge_pending_commit(&bob).unwrap();
+    let server_message = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: encode_message_list(&[&output.commit]).unwrap(),
+                welcome: output.welcome.unwrap(),
+                private_message: Vec::new(),
+                ratchet_tree: output.ratchet_tree.unwrap(),
+            },
+        )),
+    });
+
+    // the group still active given way to (RCC.16 section 8.3)
+    device.join_group(CONVERSATION, &server_message).unwrap();
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-81", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut next, &sent)).ends_with("hello Bob")
+    );
+}

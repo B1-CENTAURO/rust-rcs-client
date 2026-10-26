@@ -5811,3 +5811,86 @@ fn the_keys_are_updated_after_a_message_received_once_due() {
         );
     }
 }
+
+/// The group the client joined with `invitation`, accepted, its session
+/// ended since
+fn group_left_for_now(
+    client: &Client,
+    peer: &mut Peer,
+    invitation: fn(&Client, &mut Peer, &str) -> MsrpPeer,
+) {
+    let rt = Arc::clone(&client.rt);
+    let msrp = invitation(client, peer, "group-first");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "group-first"));
+    peer.next_request("SUBSCRIBE");
+    let mut connection = msrp.accept(&rt);
+    assert!(client
+        .group_invites
+        .recv_timeout(Duration::from_secs(5))
+        .is_ok());
+    assert!(next_group_event(client).contains(" accepted"));
+    assert_eq!(next_group_event(client), format!("joined {}", GROUP));
+    assert!(client.sessions.end_session(GROUP));
+    let bye = peer.next_request("BYE");
+    connection.closed(&rt);
+    peer.send(&answer(&bye, "200 OK", None));
+    assert_eq!(next_group_event(client), format!("left {}", GROUP));
+}
+
+#[test]
+fn a_group_its_focus_restarts_with_a_new_era_joins_it_at_once() {
+    let (client, mut peer) = start(true);
+    let encryption = joining(&client, true);
+    group_left_for_now(&client, &mut peer, encrypted_group_invitation);
+
+    // restarted by its focus with a new Era of its MLS group (RCC.16
+    // section 8.3), taken at once, though the user answers invitations
+    client.group_answer.store(180, Ordering::SeqCst);
+    let msrp = encrypted_group_invitation(&client, &mut peer, "group-new-era");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert!(
+        client.group_invites.try_recv().is_err(),
+        "the user not asked"
+    );
+    assert_eq!(
+        *encryption.joined.lock().unwrap(),
+        [
+            (String::from("conversation-1"), WELCOME.to_vec()),
+            (String::from("conversation-1"), WELCOME.to_vec())
+        ]
+    );
+    // its session taking what the focus sends of the MLS group
+    assert!(sdp_attribute(&body(&ok), "accept-wrapped-types")
+        .unwrap()
+        .ends_with(" message/mls message/mls-rcs-server"));
+    peer.send(&ack(&ok, "group-new-era"));
+    peer.next_request("SUBSCRIBE");
+    let _connection = msrp.accept(&client.rt);
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+}
+
+#[test]
+fn a_group_restarted_with_an_mls_group_it_cannot_join_is_taken_part_in_still() {
+    let (client, mut peer) = start(true);
+    let encryption = joining(&client, false);
+    group_left_for_now(&client, &mut peer, group_invitation);
+
+    let msrp = encrypted_group_invitation(&client, &mut peer, "group-new-era");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert_eq!(
+        *encryption.joined.lock().unwrap(),
+        [(String::from("conversation-1"), WELCOME.to_vec())]
+    );
+    // unencrypted
+    assert!(!sdp_attribute(&body(&ok), "accept-wrapped-types")
+        .unwrap()
+        .contains("message/mls"));
+    peer.send(&ack(&ok, "group-new-era"));
+    peer.next_request("SUBSCRIBE");
+    let _connection = msrp.accept(&client.rt);
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+}
