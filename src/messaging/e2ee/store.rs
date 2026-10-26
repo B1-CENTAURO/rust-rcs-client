@@ -28,7 +28,7 @@ use std::time::SystemTime;
 
 use rust_rcs_core::mls::rcs::{ClientIdentity, ParticipantKey};
 use rust_rcs_core::mls::{
-    self, Credential, CredentialValidator, ErrorKind, MlsClient, MlsConfig, MlsConversation,
+    self, Clock, Credential, CredentialValidator, ErrorKind, MlsClient, MlsConfig, MlsConversation,
 };
 
 /// Starts the state kept: the Participant Key, whether the KeyPackages of the
@@ -56,6 +56,8 @@ pub struct MlsStore {
     validator: Arc<dyn CredentialValidator>,
     save: SaveState,
     state: Mutex<State>,
+    /// What the clients tell the time by, if not the system clock
+    clock: Mutex<Option<Clock>>,
 }
 
 struct State {
@@ -90,7 +92,26 @@ impl MlsStore {
                 saved: Vec::new(),
                 conversations: HashMap::new(),
             }),
+            clock: Mutex::new(None),
         }
+    }
+
+    /// Has the client, and those taken on from now on, tell the time by
+    /// `clock` rather than the system clock
+    pub fn set_clock(&self, clock: Clock) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(client) = state.client.as_mut() {
+            client.set_clock(clock.clone());
+        }
+        *self.clock.lock().unwrap() = Some(clock);
+    }
+
+    /// `client`, telling the time by the clock of the store if it has one
+    fn timed(&self, mut client: MlsClient) -> MlsClient {
+        if let Some(clock) = self.clock.lock().unwrap().clone() {
+            client.set_clock(clock);
+        }
+        client
     }
 
     /// Takes on the client `make` makes with the store's configuration and
@@ -102,6 +123,7 @@ impl MlsStore {
         // locked while kept, as the states are kept in the order they come
         let mut state = self.state.lock().unwrap();
         let client = make(self.config, self.shared_validator()).map_err(StoreError::Mls)?;
+        let client = self.timed(client);
         let saved = pack(state.participant.as_ref(), Some(&client), false)?;
         if !(self.save)(&saved) {
             return Err(StoreError::NotSaved);
@@ -242,11 +264,11 @@ impl MlsStore {
         result.map_err(StoreError::Mls)
     }
 
-    /// What `f` reads of the group `group_id`, which it does not change, so
-    /// that nothing is saved
+    /// What `f` reads of the group `group_id`, given the client, which it
+    /// does not change, so that nothing is saved
     pub fn peek_conversation<R, F>(&self, group_id: &[u8], f: F) -> Result<R, StoreError>
     where
-        F: FnOnce(&MlsConversation) -> R,
+        F: FnOnce(&MlsConversation, &MlsClient) -> R,
     {
         let mut state = self.state.lock().unwrap();
         let State {
@@ -262,7 +284,7 @@ impl MlsStore {
                 .map_err(StoreError::Mls)?;
             conversations.insert(group_id.to_vec(), conversation);
         }
-        Ok(f(conversations.get(group_id).unwrap()))
+        Ok(f(conversations.get(group_id).unwrap(), client))
     }
 
     /// Whether the group `group_id` is kept, as with_conversation() would
@@ -364,8 +386,10 @@ impl MlsStore {
         let client = match client {
             [] => None,
             snapshot => Some(
-                MlsClient::restore(snapshot, self.config, self.shared_validator())
-                    .map_err(StoreError::Mls)?,
+                self.timed(
+                    MlsClient::restore(snapshot, self.config, self.shared_validator())
+                        .map_err(StoreError::Mls)?,
+                ),
             ),
         };
         Ok((participant, client, uploaded == 1))

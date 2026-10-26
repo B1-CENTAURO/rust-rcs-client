@@ -561,10 +561,61 @@ impl E2eeDevice {
     /// its MLS group having the end_mls extension (RCC.16 section 11.2)
     pub fn encryption_ended(&self, conversation_id: &str) -> bool {
         self.store()
-            .peek_conversation(conversation_id.as_bytes(), |conversation| {
+            .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
                 conversation.is_encryption_ended()
             })
             .unwrap_or(false)
+    }
+
+    /// Whether the device is to update its keys in the group chat
+    /// `conversation_id` (RCC.16 section 9.5.2), as update_keys() does: by
+    /// the days passed and the messages sent since it last did, or since it
+    /// joined; not while a Commit of the device waits for the Conversation
+    /// Focus to accept it
+    pub fn key_update_due(&self, conversation_id: &str) -> bool {
+        self.store()
+            .peek_conversation(conversation_id.as_bytes(), |conversation, client| {
+                !conversation.has_pending_commit()
+                    && conversation.key_update_due(client).unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Updates the keys of the device in the group chat `conversation_id`
+    /// with an empty Commit with an UpdatePath, if it is due as
+    /// key_update_due() tells: the CPIM message, `from` and `to` its own,
+    /// carrying the `message/mls-rcs-client` to send to the Conversation
+    /// Focus over MSRP (RCC.16 sections 9.5.1, 9.5.2); None if it is not due
+    ///
+    /// Not while a Commit of the device waits for the Focus to accept it.
+    pub fn update_keys(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<Vec<u8>>, GroupError> {
+        let client_message = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                if conversation.has_pending_commit() {
+                    return Ok(Err(GroupError::Pending));
+                }
+                if !conversation.key_update_due(client)? {
+                    return Ok(Ok(None));
+                }
+                let output = conversation.update_keys(client)?;
+                match output.to_client_message() {
+                    Ok(client_message) => Ok(Ok(Some(client_message))),
+                    Err(e) => {
+                        conversation.discard_pending_commit(client)?;
+                        Err(e)
+                    }
+                }
+            })
+            .map_err(GroupError::Store)??;
+
+        Ok(client_message
+            .map(|client_message| self.sent_in(conversation_id, from, to, &client_message)))
     }
 
     /// Moves the group chat `conversation_id` to unencrypted for `reason`,
@@ -986,6 +1037,24 @@ impl GroupEncryption for DeviceGroups {
         self.once_settled(
             move |device| device.end_encryption(&conversation_id, &from, &to, reason),
             "encryption not ended",
+        )
+    }
+
+    fn key_update_due(&self, conversation_id: &str) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.key_update_due(conversation_id))
+    }
+
+    fn update_keys(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.once_settled(
+            move |device| device.update_keys(&conversation_id, &from, &to),
+            "keys not updated",
         )
     }
 

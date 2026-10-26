@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use rust_rcs_core::mls::rcs::certificate::RcsCredentialValidator;
 use rust_rcs_core::mls::rcs::{credential_tel_uris, same_tel_uri, MlsCapability, MLS_VERSION_V1};
@@ -228,6 +229,13 @@ impl E2eeDevice {
         make_signer: impl Fn() -> Option<SignatureKeyPair> + Send + Sync + 'static,
     ) -> E2eeDevice {
         self.make_signer = Box::new(make_signer);
+        self
+    }
+
+    /// The device telling the time with `clock` rather than the system
+    /// clock, as for when key updates are due
+    pub fn with_clock(self, clock: impl Fn() -> SystemTime + Send + Sync + 'static) -> E2eeDevice {
+        self.store.set_clock(Arc::new(clock));
         self
     }
 }

@@ -544,7 +544,7 @@ pub struct CPMSession {
     msrp_writer: Arc<Mutex<Option<mpsc::Sender<Option<Vec<u8>>>>>>,
     /// What ending the session takes, once its dialog is confirmed, taken
     /// when it ends
-    session_end: Mutex<Option<SessionEnd>>,
+    session_end: Arc<Mutex<Option<SessionEnd>>>,
     /// Set when the session ends, for any number to watch
     ended_watch: watch::Sender<bool>,
     /// The MLS-Opaque-Token the requests of the conversation carry, as it
@@ -563,7 +563,7 @@ impl CPMSession {
             pending_messages: Mutex::new(Vec::new()),
             ended: Arc::new(Notify::new()),
             msrp_writer: Arc::new(Mutex::new(None)),
-            session_end: Mutex::new(None),
+            session_end: Arc::new(Mutex::new(None)),
             ended_watch: watch::channel(false).0,
         }
     }
@@ -809,6 +809,7 @@ impl CPMSession {
                         .encryption
                         .clone()
                         .zip(self.session_info.conversation_id.clone());
+                    let session_end = Arc::clone(&self.session_end);
 
                     let rt_ = Arc::clone(rt);
 
@@ -949,7 +950,19 @@ impl CPMSession {
                                     // (section 11.2)
                                     if let Some((encryption, conversation_id)) = &encryption {
                                         match encryption.encrypt(conversation_id, &data).await {
-                                            Sealed::Encrypted(encrypted) => data = encrypted,
+                                            Sealed::Encrypted(encrypted) => {
+                                                data = encrypted;
+                                                // and the keys of this client
+                                                // updated once due (section
+                                                // 9.5.2)
+                                                if encryption.key_update_due(conversation_id) {
+                                                    let session_end =
+                                                        session_end.lock().unwrap().clone();
+                                                    if let Some(session_end) = session_end {
+                                                        session_end.update_keys();
+                                                    }
+                                                }
+                                            }
                                             Sealed::Unencrypted => {}
                                             Sealed::Failed => {
                                                 (message.message_result_callback)(
@@ -1222,6 +1235,15 @@ impl SessionEnd {
             )
             .raw_data(cpim);
             sip_session.get_inner().send_message(message, &rt);
+        });
+    }
+
+    /// Updates the keys of this client in the MLS group of the session, if
+    /// that is due, with a Commit sent in the session (RCC.16 sections 9.5.1,
+    /// 9.5.2)
+    pub(crate) fn update_keys(&self) {
+        self.commit(|encryption, conversation_id, from, to| {
+            encryption.update_keys(conversation_id, from, to)
         });
     }
 
@@ -1664,6 +1686,9 @@ impl CPMSessionService {
                     // the group healed if it could not be decrypted (RCC.16
                     // section 10.1)
                     heal_if_needed(session);
+                    // and the keys of this client updated once due, the
+                    // group being active (section 9.5.2)
+                    update_keys_if_due(session);
                     return;
                 }
                 if is_media_type(content_type, "message/imdn+xml") {
@@ -3050,6 +3075,25 @@ fn group_session<'s>(
 fn heal_if_needed(session: &Arc<SipSession<CPMSession>>) {
     if let Some(session_end) = session.get_inner().session_end() {
         session_end.heal_if_needed();
+    }
+}
+
+/// Updates the keys of this client in the MLS group of `session` if that is
+/// due, as SessionEnd::update_keys() does
+fn update_keys_if_due(session: &Arc<SipSession<CPMSession>>) {
+    let due = {
+        let inner = session.get_inner();
+        let session_info = inner.get_session_info();
+        session_info
+            .encryption
+            .as_ref()
+            .zip(session_info.conversation_id.as_ref())
+            .is_some_and(|(encryption, conversation_id)| encryption.key_update_due(conversation_id))
+    };
+    if due {
+        if let Some(session_end) = session.get_inner().session_end() {
+            session_end.update_keys();
+        }
     }
 }
 
