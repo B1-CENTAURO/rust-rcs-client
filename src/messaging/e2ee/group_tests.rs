@@ -3987,3 +3987,24 @@ fn the_keys_of_the_groups_of_the_device_are_updated_once_its_commit_is_accepted(
     assert!(!groups.key_update_due(CONVERSATION));
     assert_eq!(rt.block_on(update()), None);
 }
+
+#[test]
+fn a_device_restored_tells_the_time_it_is_given() {
+    let (_, bobs) = bob_with_key_package();
+    let (device, kds, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+
+    let clock = Clock::new();
+    let restored = {
+        let clock = clock.clone();
+        alice(&app, &kds, TODAY, Some(&app.last().unwrap())).with_clock(move || clock.now())
+    };
+    assert!(!restored.key_update_due(CONVERSATION));
+    clock.advance(31 * DAY);
+    assert!(restored.key_update_due(CONVERSATION));
+}
