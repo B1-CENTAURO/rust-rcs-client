@@ -1686,6 +1686,9 @@ impl CPMSessionService {
                     // the group healed if it could not be decrypted (RCC.16
                     // section 10.1)
                     heal_if_needed(session);
+                    // and the keys of this client updated once due, the
+                    // group being active (section 9.5.2)
+                    update_keys_if_due(session);
                     return;
                 }
                 if is_media_type(content_type, "message/imdn+xml") {
@@ -3072,6 +3075,25 @@ fn group_session<'s>(
 fn heal_if_needed(session: &Arc<SipSession<CPMSession>>) {
     if let Some(session_end) = session.get_inner().session_end() {
         session_end.heal_if_needed();
+    }
+}
+
+/// Updates the keys of this client in the MLS group of `session` if that is
+/// due, as SessionEnd::update_keys() does
+fn update_keys_if_due(session: &Arc<SipSession<CPMSession>>) {
+    let due = {
+        let inner = session.get_inner();
+        let session_info = inner.get_session_info();
+        session_info
+            .encryption
+            .as_ref()
+            .zip(session_info.conversation_id.as_ref())
+            .is_some_and(|(encryption, conversation_id)| encryption.key_update_due(conversation_id))
+    };
+    if due {
+        if let Some(session_end) = session.get_inner().session_end() {
+            session_end.update_keys();
+        }
     }
 }
 

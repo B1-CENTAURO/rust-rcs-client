@@ -5726,13 +5726,76 @@ fn the_keys_are_updated_after_a_message_once_due() {
         assert_eq!(send.body, UPDATING_CPIM);
         connection.respond(&rt, &send, "200 OK");
 
+        // the message and, once due, the Commit, which each go out in a task
+        // of their own, the Commit maybe first
         let result = client.send(GROUP, RecipientType::Group, "hello all");
-        let send = connection.next_message(&rt);
-        assert_eq!(String::from_utf8_lossy(&send.body), CIPHERTEXT);
-        connection.respond(&rt, &send, "200 OK");
+        let mut sent = Vec::new();
+        for _ in 0..if due { 2 } else { 1 } {
+            let send = connection.next_message(&rt);
+            sent.push(send.body.clone());
+            connection.respond(&rt, &send, "200 OK");
+        }
         assert_eq!(
             result.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
             Ok(200)
+        );
+        sent.sort();
+        let mut expected = vec![CIPHERTEXT.as_bytes().to_vec()];
+        if due {
+            expected.push(UPDATING_CPIM.to_vec());
+        }
+        expected.sort();
+        assert_eq!(sent, expected, "due {}", due);
+        connection.quiet(&rt);
+        assert_eq!(
+            encryption.updated.lock().unwrap().len(),
+            if due { 2 } else { 1 },
+            "due {}",
+            due
+        );
+    }
+}
+
+#[test]
+fn the_keys_are_updated_after_a_message_received_once_due() {
+    for due in [true, false] {
+        let (client, mut peer) = start(true);
+        let rt = Arc::clone(&client.rt);
+        let encryption = Arc::new(ScriptedEncryption {
+            cpim: Some(MLS_GROUP_CPIM.to_vec()),
+            joining: true,
+            encrypting: vec![String::from("conversation-1")],
+            plaintext: Some(encrypted_group_cpim(ALICE, "", "unused").replace(
+                "Content-Type: message/mls\r\n\r\nunused",
+                "Content-Type: text/plain\r\n\r\nhello",
+            )),
+            keys_due: due,
+            updating: Some(UPDATING_CPIM.to_vec()),
+            ..ScriptedEncryption::default()
+        });
+        client
+            .sessions
+            .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+        let (mut connection, msrp_path, our_path) =
+            joined_encrypted_group(&client, &mut peer, "group-updating-on-receipt");
+        let send = connection.next_message(&rt);
+        assert_eq!(send.body, UPDATING_CPIM);
+        connection.respond(&rt, &send, "200 OK");
+
+        connection.send_content(
+            &rt,
+            &msrp_path,
+            &our_path,
+            "message/cpim",
+            &encrypted_group_cpim(ALICE, "", "ciphertext"),
+        );
+        assert!(connection.next_response(&rt).first_line.contains(" 200"));
+        assert_eq!(
+            client
+                .received
+                .recv_timeout(Duration::from_secs(5))
+                .map(|r| r.2),
+            Ok(String::from("hello"))
         );
         if due {
             let send = connection.next_message(&rt);
