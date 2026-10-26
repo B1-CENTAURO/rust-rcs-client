@@ -5061,6 +5061,10 @@ fn a_new_era_waits_for_the_group_info_and_is_not_made_twice_at_once() {
     assert_eq!(prepare_next_era(&groups, &rt, pull), None);
     assert!(groups.new_era_due(CONVERSATION));
     assert_eq!(era(&device, CONVERSATION), Some(0));
+    // messages encrypted meanwhile, as once self-healing failed
+    assert!(device
+        .encrypt_message(CONVERSATION, &plaintext("message-82", None))
+        .is_ok());
 
     // one made at a time, the group not self-healed meanwhile, though it
     // was to be
@@ -5083,6 +5087,11 @@ fn a_new_era_waits_for_the_group_info_and_is_not_made_twice_at_once() {
     ));
     std::thread::sleep(Duration::from_millis(100));
     assert!(!groups.new_era_due(CONVERSATION));
+    // nothing sent while it is made (RCC.16 section 10.1.1)
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, &plaintext("message-83", None)),
+        Err(MessageError::Pending)
+    );
     let (pull, pulled) = focus_answering(vec![group_info_answer(group_info.clone())]);
     assert_eq!(prepare_next_era(&groups, &rt, pull), None);
     assert!(pulled.lock().unwrap().is_empty());
