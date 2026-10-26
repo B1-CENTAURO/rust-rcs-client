@@ -764,7 +764,7 @@ impl RcsEngine {
             &rt,
         ));
 
-        cpm_session_service.attach_core(&core);
+        cpm_session_service.attach_core(&core, &rt);
 
         let connector = Arc::new_cyclic(|connector: &Weak<Connector>| {
             let connector = Weak::clone(connector);

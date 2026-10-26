@@ -4916,3 +4916,235 @@ fn a_new_era_with_a_participant_not_in_the_group_renews_the_continuity_token() {
     assert_eq!(era(&device, CONVERSATION), Some(1));
     assert_ne!(continuity_token(&device), token);
 }
+
+/// Self-heals the group of the conversation as often as it takes to fail,
+/// the Conversation Focus answering nothing
+fn healing_failed(device: &E2eeDevice, groups: &DeviceGroups, rt: &tokio::runtime::Runtime) {
+    let (pull, _) = focus_answering(Vec::new());
+    for _ in 0..6 {
+        device.heals().want(CONVERSATION);
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            Arc::clone(&pull),
+        ));
+    }
+}
+
+/// What the Conversation Focus answers an MLS-Group-Info-Pull with
+fn group_info_answer(group_info: MlsGroupInfo) -> Option<(u16, Vec<u8>)> {
+    Some((
+        200,
+        proto::encode(&ServerMlsRcsMessage {
+            payload: Some(server_mls_rcs_message::Payload::MlsGroupInfo(group_info)),
+        }),
+    ))
+}
+
+fn prepare_next_era(
+    groups: &DeviceGroups,
+    rt: &tokio::runtime::Runtime,
+    pull: GroupInfoPull,
+) -> Option<Vec<u8>> {
+    rt.block_on(groups.prepare_next_era(
+        String::from(CONVERSATION),
+        String::from(IMPU),
+        String::from(GROUP_URI),
+        pull,
+    ))
+}
+
+#[test]
+fn a_new_era_is_due_once_self_healing_failed() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, _, _, _, _) = alice_and_bob_in_time_with_kds();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let (pull, _) = focus_answering(Vec::new());
+    let heal = || {
+        device.heals().want(CONVERSATION);
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            Arc::clone(&pull),
+        ));
+    };
+
+    // not after 5 attempts (RCC.16 section 10.1)
+    for _ in 0..5 {
+        heal();
+        assert!(!groups.new_era_due(CONVERSATION));
+    }
+    // but once another is to be made
+    heal();
+    assert!(groups.new_era_due(CONVERSATION));
+    assert!(!groups.needs_healing(CONVERSATION));
+    // and not without a reason to
+    let (pull, asked) = focus_answering(Vec::new());
+    assert_eq!(prepare_next_era(&groups, &rt, pull), None);
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    assert!(groups.new_era_due(CONVERSATION));
+    assert!(!groups.new_era_due("another"));
+}
+
+#[test]
+fn a_new_era_is_made_after_that_of_the_focus_once_self_healing_failed() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // none made while none is due
+    let (pull, pulled) = focus_answering(vec![group_info_answer(group_info.clone())]);
+    assert_eq!(prepare_next_era(&groups, &rt, Arc::clone(&pull)), None);
+    assert!(pulled.lock().unwrap().is_empty());
+
+    healing_failed(&device, &groups, &rt);
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    let cpim = prepare_next_era(&groups, &rt, pull).expect("a new Era");
+
+    // from the GroupInfo asked of the Focus (RCC.16 sections 6.3.1, 8.3.1),
+    // with the members of its group besides the user
+    assert_eq!(
+        *pulled.lock().unwrap(),
+        [(b"MLS-Group-Info-Pull".to_vec(), None)]
+    );
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+    let bundle = bundle_of(&cpim);
+    assert_eq!(joined(&bob, &bundle).era(), Some(1));
+    // self-healing starting over
+    assert!(!groups.new_era_due(CONVERSATION));
+    device.heals().want(CONVERSATION);
+    assert!(groups.needs_healing(CONVERSATION));
+}
+
+#[test]
+fn a_new_era_is_made_after_that_of_the_device_when_the_focus_has_no_group() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, _, _) = alice_and_bob_in_time_with_kds();
+    let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    healing_failed(&device, &groups, &rt);
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+
+    let (pull, _) = focus_answering(vec![Some((469, Vec::new()))]);
+    let cpim = prepare_next_era(&groups, &rt, pull).expect("a new Era");
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+    assert_eq!(joined(&bob, &bundle_of(&cpim)).era(), Some(1));
+}
+
+#[test]
+fn a_new_era_waits_for_the_group_info_and_is_not_made_twice_at_once() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    healing_failed(&device, &groups, &rt);
+
+    // no GroupInfo for now: still due
+    let (pull, _) = focus_answering(vec![None]);
+    assert_eq!(prepare_next_era(&groups, &rt, pull), None);
+    assert!(groups.new_era_due(CONVERSATION));
+    let (pull, _) = focus_answering(vec![Some((200, b"not a GroupInfo".to_vec()))]);
+    assert_eq!(prepare_next_era(&groups, &rt, pull), None);
+    assert!(groups.new_era_due(CONVERSATION));
+    assert_eq!(era(&device, CONVERSATION), Some(0));
+    // messages encrypted meanwhile, as once self-healing failed
+    assert!(device
+        .encrypt_message(CONVERSATION, &plaintext("message-82", None))
+        .is_ok());
+
+    // one made at a time, the group not self-healed meanwhile, though it
+    // was to be
+    device.heals().want(CONVERSATION);
+    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<Option<(u16, Vec<u8>)>>();
+    let answer_rx = Arc::new(Mutex::new(answer_rx));
+    let waiting: GroupInfoPull = Arc::new(move |_, _| {
+        let answer_rx = Arc::clone(&answer_rx);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || answer_rx.lock().unwrap().recv().unwrap())
+                .await
+                .unwrap()
+        })
+    });
+    let first = rt.spawn(groups.prepare_next_era(
+        String::from(CONVERSATION),
+        String::from(IMPU),
+        String::from(GROUP_URI),
+        waiting,
+    ));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!groups.new_era_due(CONVERSATION));
+    // nothing sent while it is made (RCC.16 section 10.1.1)
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, &plaintext("message-83", None)),
+        Err(MessageError::Pending)
+    );
+    let (pull, pulled) = focus_answering(vec![group_info_answer(group_info.clone())]);
+    assert_eq!(prepare_next_era(&groups, &rt, pull), None);
+    assert!(pulled.lock().unwrap().is_empty());
+    device.heals().want(CONVERSATION);
+    assert!(!groups.needs_healing(CONVERSATION));
+
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    answer_tx.send(group_info_answer(group_info)).unwrap();
+    assert!(rt.block_on(first).unwrap().is_some());
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+}
+
+#[test]
+fn no_new_era_is_made_for_a_participant_not_e2ee_capable_and_healing_starts_over() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, _, _, _, _) = alice_and_bob_in_time_with_kds();
+    let (query, asked) = answering(&[(BOB_TEL, answered(200, ""))]);
+    let groups = DeviceGroups::new(&device, query);
+    healing_failed(&device, &groups, &rt);
+
+    let (pull, _) = focus_answering(vec![Some((469, Vec::new()))]);
+    assert_eq!(prepare_next_era(&groups, &rt, pull), None);
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    assert_eq!(era(&device, CONVERSATION), Some(0));
+    assert!(!groups.new_era_due(CONVERSATION));
+    device.heals().want(CONVERSATION);
+    assert!(groups.needs_healing(CONVERSATION));
+}
+
+#[test]
+fn the_participants_of_a_new_era_are_asked_for_once_for_all_their_clients() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, (phone, _), (other_phone, _)) =
+        bob_with_both_phones_of_alice_on(OCTOBER, None);
+    let (query, asked) = answering(&[(ALICE_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    healing_failed(&device, &groups, &rt);
+    kds.now_knowing(vec![(
+        ALICE_TEL,
+        Fetched::KeyPackages(vec![
+            phone.generate_key_package(false).unwrap(),
+            other_phone.generate_key_package(false).unwrap(),
+        ]),
+    )]);
+
+    let (pull, _) = focus_answering(vec![Some((469, Vec::new()))]);
+    assert!(prepare_next_era(&groups, &rt, pull).is_some());
+    assert_eq!(*asked.lock().unwrap(), [ALICE_TEL]);
+    assert_eq!(
+        kds.queries.lock().unwrap().last().unwrap().1,
+        [recipient(ALICE_TEL)]
+    );
+}

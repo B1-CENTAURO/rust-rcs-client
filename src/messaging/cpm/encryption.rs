@@ -331,6 +331,26 @@ pub trait GroupEncryption: Send + Sync {
         pull: GroupInfoPull,
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
+    /// Whether the MLS group `conversation_id` is to be made anew in its next
+    /// Era, as self-healing it failed (RCC.16 sections 8.3, 10.1)
+    fn new_era_due(&self, conversation_id: &str) -> bool;
+
+    /// Makes the next Era of the MLS group `conversation_id`, if one is due,
+    /// after that of the GroupInfo asked of the Conversation Focus with
+    /// `pull`, with the Clients of its Participants (RCC.16 sections 8.3.1,
+    /// 10.1): the CPIM message carrying a `message/mls-rcs-client` with its
+    /// Welcome and Commit, for the INVITE restarting the group to carry,
+    /// `from` and `to` that of the CPIM message. The Commit is applied once
+    /// the Focus accepts it, and is to be discarded if the group does not
+    /// start.
+    fn prepare_next_era(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        pull: GroupInfoPull,
+    ) -> BoxFuture<'static, Option<Vec<u8>>>;
+
     /// Whether the group chat `conversation_id` is encrypted, its MLS group
     /// kept
     fn encrypts(&self, conversation_id: &str) -> bool;

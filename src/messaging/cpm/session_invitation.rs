@@ -53,7 +53,7 @@ use crate::contact::ContactKnownIdentities;
 use super::{
     group_chat::GroupChats,
     session::{
-        CPMSession, CPMSessionDialogEventReceiver, CPMSessionInfo, SessionEnd,
+        CPMSession, CPMSessionDialogEventReceiver, CPMSessionInfo, Restarter, SessionEnd,
         UpdateMessageCallbacks,
     },
     sip::cpm_contact::CPMServiceType,
@@ -160,6 +160,7 @@ pub fn try_accept_hanging_invitation(
     ongoing_dialogs: &Arc<Mutex<Vec<Arc<SipDialog>>>>,
     ongoing_sessions: &Arc<Mutex<Vec<(ContactKnownIdentities, Arc<SipSession<CPMSession>>)>>>,
     group_chats: &Arc<GroupChats>,
+    restarter: &Arc<Mutex<Option<Restarter>>>,
     tm: &Arc<SipTransactionManager>,
     rt: &Arc<Runtime>,
 ) {
@@ -194,6 +195,7 @@ pub fn try_accept_hanging_invitation(
                     ongoing_dialogs,
                     ongoing_sessions,
                     group_chats,
+                    restarter,
                     tm,
                     rt,
                 );
@@ -254,6 +256,7 @@ pub fn try_accept_invitation<'a, 'b>(
     ongoing_dialogs: &Arc<Mutex<Vec<Arc<SipDialog>>>>,
     ongoing_sessions: &Arc<Mutex<Vec<(ContactKnownIdentities, Arc<SipSession<CPMSession>>)>>>,
     group_chats: &Arc<GroupChats>,
+    restarter: &Arc<Mutex<Option<Restarter>>>,
     tm: &Arc<SipTransactionManager>,
     rt: &Arc<Runtime>,
 ) {
@@ -449,6 +452,7 @@ pub fn try_accept_invitation<'a, 'b>(
                                 dialog: Arc::clone(&dialog),
                                 tm: Arc::clone(tm),
                                 registered_public_identity: Arc::clone(registered_public_identity),
+                                restarter: Arc::clone(restarter),
                                 rt: Arc::clone(rt),
                             };
                             sip_session

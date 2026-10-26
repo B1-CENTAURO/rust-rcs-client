@@ -1162,6 +1162,29 @@ impl GroupEncryption for DeviceGroups {
         ))
     }
 
+    fn new_era_due(&self, conversation_id: &str) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.new_era_due(conversation_id))
+    }
+
+    fn prepare_next_era(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        pull: GroupInfoPull,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let device = self.device.clone();
+        let capabilities = Arc::clone(&self.capabilities);
+        Box::pin(async move {
+            device
+                .upgrade()?
+                .make_era_after_failed_heal(&conversation_id, &from, &to, &capabilities, &pull)
+                .await
+        })
+    }
+
     fn encrypts(&self, conversation_id: &str) -> bool {
         self.device
             .upgrade()
