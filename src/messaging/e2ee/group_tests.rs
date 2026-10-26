@@ -21,6 +21,7 @@ use futures::executor::block_on;
 use rust_rcs_core::cpim::{CPIMHeaders, CPIMMessage};
 use rust_rcs_core::internet::Body;
 use rust_rcs_core::mls::rcs::certificate::CertificateError;
+use rust_rcs_core::mls::rcs::era::EraBase;
 use rust_rcs_core::mls::rcs::proto::{
     self, client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage,
     ClientMlsRcsMessage, CommitBundle, EndMlsReason, EpochControlMessages, EpochIdentifier,
@@ -50,6 +51,7 @@ use crate::messaging::cpm::make_cpim_imdn_body;
 use super::device::{E2eeDevice, Enrolled, CIPHERSUITE};
 use super::device_tests::{alice, provision};
 use super::group::{recipients, DeviceGroups, GroupError};
+use super::heal::NextEra;
 use super::kds::{Fetched, KdsError, KeyDistribution, Recipient};
 use super::kds_tests::certificates::*;
 use super::kds_tests::{
@@ -5107,21 +5109,452 @@ fn a_new_era_waits_for_the_group_info_and_is_not_made_twice_at_once() {
     assert_eq!(era(&device, CONVERSATION), Some(1));
 }
 
+/// The reason the pending Commit of the device in the group of the
+/// conversation moves it to unencrypted, if it does
+fn pending_end(device: &E2eeDevice) -> Option<EndMlsReason> {
+    device
+        .store()
+        .peek_conversation(CONVERSATION.as_bytes(), |conversation, _| {
+            conversation.pending_encryption_end()
+        })
+        .unwrap()
+}
+
+/// What the WelcomeCommitBundle of an Unencrypted Singleton Era of the
+/// device, in the CPIM message `cpim`, tells of it: its Era, and that it is
+/// of the device alone, moved to unencrypted (RCC.16 section 11.2.1)
+fn singleton_era_of(device: &E2eeDevice, cpim: &[u8]) -> u32 {
+    let bundle = bundle_of(cpim);
+    assert!(bundle.welcome.is_empty());
+    assert!(!bundle.ratchet_tree.is_empty());
+    let base = EraBase::of_group_info(&MlsGroupInfo {
+        group_info: bundle.group_info,
+        ratchet_tree: bundle.ratchet_tree,
+        pending_proposals: Vec::new(),
+    })
+    .unwrap();
+    assert!(base.is_encryption_ended());
+    assert_eq!(base.group_id(), CONVERSATION.as_bytes());
+    assert_eq!(base.members(), [device.store().credential().unwrap()]);
+    base.era()
+}
+
 #[test]
-fn no_new_era_is_made_for_a_participant_not_e2ee_capable_and_healing_starts_over() {
+fn an_unencrypted_singleton_era_is_made_for_a_participant_not_e2ee_capable() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (device, _, _, _, _) = alice_and_bob_in_time_with_kds();
+    let (device, kds, _, _, _) = alice_and_bob_in_time_with_kds();
     let (query, asked) = answering(&[(BOB_TEL, answered(200, ""))]);
     let groups = DeviceGroups::new(&device, query);
+    healing_failed(&device, &groups, &rt);
+    let queries = kds.queries.lock().unwrap().len();
+
+    // the Era of all the Participants not made, the group moves to
+    // unencrypted (RCC.16 sections 10.1, 11.2.1)
+    let (pull, _) = focus_answering(vec![Some((469, Vec::new()))]);
+    let cpim = prepare_next_era(&groups, &rt, pull).expect("an Unencrypted Singleton Era");
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    assert_eq!(kds.queries.lock().unwrap().len(), queries);
+    assert_eq!(singleton_era_of(&device, &cpim), 1);
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+    assert_eq!(
+        pending_end(&device),
+        Some(EndMlsReason::GroupMemberFailsCapabilitiesCheck)
+    );
+    assert!(!groups.encryption_ended(CONVERSATION));
+    // self-healing starting over
+    assert!(!groups.new_era_due(CONVERSATION));
+    device.heals().want(CONVERSATION);
+    assert!(groups.needs_healing(CONVERSATION));
+
+    // unencrypted once the Focus accepts it, which the app is told of
+    assert_eq!(
+        groups.on_server_message(
+            CONVERSATION,
+            &accepted(epoch_identifier(&device, CONVERSATION)),
+        ),
+        Taken {
+            proposals: false,
+            encryption_ended: true,
+        }
+    );
+    assert_eq!(
+        encryption_ended_reason(&device, CONVERSATION),
+        Some(EndMlsReason::GroupMemberFailsCapabilitiesCheck)
+    );
+    assert_eq!(
+        rt.block_on(groups.encrypt(CONVERSATION, &plaintext("message-84", None))),
+        Sealed::Unencrypted
+    );
+}
+
+#[test]
+fn an_unencrypted_singleton_era_is_made_without_the_key_packages_of_a_participant() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    healing_failed(&device, &groups, &rt);
+    kds.now_knowing(vec![(BOB_TEL, Fetched::Unavailable)]);
+
+    // after the Era of the Focus
+    let (pull, _) = focus_answering(vec![group_info_answer(group_info)]);
+    let cpim = prepare_next_era(&groups, &rt, pull).expect("an Unencrypted Singleton Era");
+    assert_eq!(
+        kds.queries.lock().unwrap().last().unwrap().1,
+        [recipient(BOB_TEL)]
+    );
+    assert_eq!(singleton_era_of(&device, &cpim), 1);
+    assert_eq!(
+        pending_end(&device),
+        Some(EndMlsReason::CannotFetchKeypackages)
+    );
+}
+
+#[test]
+fn an_unencrypted_singleton_era_is_made_once_30_eras_were_made_in_the_day() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, _, _) = alice_and_bob_in_time_with_kds();
+    let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    let heals = device.heals();
+
+    // the 30th Era made (RCC.16 section 11.2.3), and counted
+    for _ in 0..29 {
+        heals.era_made(CONVERSATION);
+    }
+    healing_failed(&device, &groups, &rt);
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    let (pull, _) = focus_answering(vec![Some((469, Vec::new()))]);
+    let cpim = prepare_next_era(&groups, &rt, pull).expect("a new Era");
+    assert_eq!(joined(&bob, &bundle_of(&cpim)).era(), Some(1));
+    assert_eq!(pending_end(&device), None);
+    groups.discard(CONVERSATION, false);
+
+    // not another: an Unencrypted Singleton Era instead, without asking
+    // anyone
+    heals.want_new_era(CONVERSATION);
+    let queries = kds.queries.lock().unwrap().len();
+    let (pull, _) = focus_answering(vec![Some((469, Vec::new()))]);
+    let cpim = prepare_next_era(&groups, &rt, pull).expect("an Unencrypted Singleton Era");
+    assert_eq!(singleton_era_of(&device, &cpim), 2);
+    assert_eq!(
+        pending_end(&device),
+        Some(EndMlsReason::ServerFailureEraAdvancementQuotaReached)
+    );
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    assert_eq!(kds.queries.lock().unwrap().len(), queries);
+
+    // which is not counted, nor is starting over
+    groups.discard(CONVERSATION, false);
+    heals.start_over(CONVERSATION);
+    heals.want_new_era(CONVERSATION);
+    assert_eq!(
+        heals.begin_new_era(CONVERSATION),
+        Some(NextEra::Singleton(
+            EndMlsReason::ServerFailureEraAdvancementQuotaReached
+        ))
+    );
+    // nor in another group
+    heals.want_new_era("another");
+    assert_eq!(heals.begin_new_era("another"), Some(NextEra::Encrypted));
+}
+
+#[test]
+fn a_new_era_is_begun_once_at_a_time_an_unencrypted_singleton_one_first() {
+    let (device, _, _, _, _) = alice_and_bob_in_time_with_kds();
+    let heals = device.heals();
+    assert_eq!(heals.begin_new_era(CONVERSATION), None);
+
+    heals.want_new_era(CONVERSATION);
+    heals.want_singleton(CONVERSATION, EndMlsReason::OutgoingCommitFailed);
+    assert!(device.new_era_due(CONVERSATION));
+    assert_eq!(
+        heals.begin_new_era(CONVERSATION),
+        Some(NextEra::Singleton(EndMlsReason::OutgoingCommitFailed))
+    );
+    assert!(!device.new_era_due(CONVERSATION));
+    // nor another while it is made, nor self-healing
+    heals.want_singleton(CONVERSATION, EndMlsReason::InternalClientError);
+    heals.want(CONVERSATION);
+    assert_eq!(heals.begin_new_era(CONVERSATION), None);
+    assert!(!device.needs_healing(CONVERSATION));
+
+    // put off, it is due again as it was
+    heals.put_off_new_era(
+        CONVERSATION,
+        NextEra::Singleton(EndMlsReason::OutgoingCommitFailed),
+    );
+    assert_eq!(
+        heals.begin_new_era(CONVERSATION),
+        Some(NextEra::Singleton(EndMlsReason::OutgoingCommitFailed))
+    );
+    heals.put_off_new_era(CONVERSATION, NextEra::Encrypted);
+    assert_eq!(heals.begin_new_era(CONVERSATION), Some(NextEra::Encrypted));
+}
+
+#[test]
+fn a_group_its_focus_moved_to_unencrypted_is_healed_into_rather_than_made_anew() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    // Bob moved the group to unencrypted, which the device missed
+    let output = bobs_group
+        .set_encryption_ended(&bob, Some(EndMlsReason::OutgoingCommitFailed))
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    let group_info = MlsGroupInfo {
+        group_info: output.group_info,
+        ratchet_tree: bobs_group.ratchet_tree().unwrap(),
+        pending_proposals: Vec::new(),
+    };
+    healing_failed(&device, &groups, &rt);
+    let queries = kds.queries.lock().unwrap().len();
+
+    // no Era made (RCC.16 section 10.1)
+    let (pull, _) = focus_answering(vec![group_info_answer(group_info.clone())]);
+    assert_eq!(prepare_next_era(&groups, &rt, pull), None);
+    assert!(asked.lock().unwrap().is_empty());
+    assert_eq!(kds.queries.lock().unwrap().len(), queries);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert!(!groups.new_era_due(CONVERSATION));
+    // but the group self-healed into it
+    assert!(groups.needs_healing(CONVERSATION));
+    let (pull, _) = focus_answering(vec![None, group_info_answer(group_info)]);
+    let cpim = rt
+        .block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        ))
+        .expect("an External Commit");
+    assert!(groups.encryption_ended(CONVERSATION));
+
+    // which the app is told of once, as the Focus forwards it back
+    let ended = Taken {
+        proposals: false,
+        encryption_ended: true,
+    };
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
+        ended
+    );
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
+        Taken::default()
+    );
+}
+
+#[test]
+fn a_group_without_mls_group_at_its_focus_unencrypted_already_is_left_so() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, _, _, _, _) = alice_and_bob_in_time_with_kds();
+    let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    let cpim = device
+        .end_encryption(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            EndMlsReason::ClientFailureEncryptionNotAvailable,
+        )
+        .unwrap()
+        .unwrap();
+    device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap();
     healing_failed(&device, &groups, &rt);
 
     let (pull, _) = focus_answering(vec![Some((469, Vec::new()))]);
     assert_eq!(prepare_next_era(&groups, &rt, pull), None);
-    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
-    assert_eq!(era(&device, CONVERSATION), Some(0));
+    assert!(asked.lock().unwrap().is_empty());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    assert!(groups.encryption_ended(CONVERSATION));
     assert!(!groups.new_era_due(CONVERSATION));
-    device.heals().want(CONVERSATION);
+    assert!(!groups.needs_healing(CONVERSATION));
+}
+
+#[test]
+fn a_commit_moving_the_group_to_unencrypted_the_focus_refuses_makes_an_unencrypted_singleton_era_due(
+) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, _, _, _, _) = alice_and_bob_in_time_with_kds();
+    let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    let end = || {
+        device
+            .end_encryption(
+                CONVERSATION,
+                IMPU,
+                GROUP_URI,
+                EndMlsReason::ClientFailureEncryptionNotAvailable,
+            )
+            .unwrap()
+            .unwrap()
+    };
+
+    // not when the Focus moved it already: the group is self-healed instead
+    // (RCC.16 section 6.2.5)
+    let cpim = end();
+    assert_eq!(
+        groups.on_imdn(
+            CONVERSATION,
+            &refusal(&control_id(&cpim), "mls-group-has-end-mls")
+        ),
+        ImdnTold::Refusal
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert!(!groups.new_era_due(CONVERSATION));
     assert!(groups.needs_healing(CONVERSATION));
+
+    // refused otherwise (section 11.2)
+    let cpim = end();
+    assert_eq!(
+        groups.on_imdn(
+            CONVERSATION,
+            &refusal(&control_id(&cpim), "transient-error")
+        ),
+        ImdnTold::Refusal
+    );
+    assert_eq!(pending_end(&device), None);
+    assert!(groups.new_era_due(CONVERSATION));
+    let (pull, _) = focus_answering(vec![Some((469, Vec::new()))]);
+    let cpim = prepare_next_era(&groups, &rt, pull).expect("an Unencrypted Singleton Era");
+    assert_eq!(singleton_era_of(&device, &cpim), 1);
+    assert_eq!(
+        pending_end(&device),
+        Some(EndMlsReason::OutgoingCommitFailed)
+    );
+}
+
+#[test]
+fn a_commit_not_moving_the_group_to_unencrypted_the_focus_refuses_makes_no_era_due() {
+    let (device, message_id) = group_made();
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&message_id, "transient-error")),
+        Ok(Some(ServerFailureReason::TransientError))
+    );
+    assert!(!device.new_era_due(CONVERSATION));
+}
+
+#[test]
+fn the_focus_refusing_a_message_for_its_quotas_makes_a_new_era_due() {
+    let (device, _, _, _, _) = alice_and_bob_in_time_with_kds();
+    let heals = device.heals();
+
+    // the epochs of the group moved on too often (RCC.16 section 11.2.2)
+    assert_eq!(
+        device.on_imdn(
+            CONVERSATION,
+            &refusal("message-1", "epoch-advancement-quota-reached")
+        ),
+        Ok(None)
+    );
+    assert!(device.new_era_due(CONVERSATION));
+    assert_eq!(heals.begin_new_era(CONVERSATION), Some(NextEra::Encrypted));
+    heals.start_over(CONVERSATION);
+
+    // its Eras made too often (section 11.2.3)
+    assert_eq!(
+        device.on_imdn(
+            CONVERSATION,
+            &refusal("message-2", "era-advancement-quota-reached")
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        heals.begin_new_era(CONVERSATION),
+        Some(NextEra::Singleton(
+            EndMlsReason::ServerFailureEraAdvancementQuotaReached
+        ))
+    );
+    heals.start_over(CONVERSATION);
+
+    // nor for another reason
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal("message-3", "transient-error")),
+        Ok(None)
+    );
+    assert!(!device.new_era_due(CONVERSATION));
+    assert!(!device.needs_healing(CONVERSATION));
+    // or once the group moved to unencrypted, which it is self-healed into
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal("message-4", "mls-group-has-end-mls")),
+        Ok(None)
+    );
+    assert!(!device.new_era_due(CONVERSATION));
+    assert!(device.needs_healing(CONVERSATION));
+}
+
+#[test]
+fn an_era_the_focus_refuses_is_discarded_and_another_made() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    let heals = device.heals();
+    let next_era = || {
+        kds.now_knowing(vec![(
+            BOB_TEL,
+            Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+        )]);
+        block_on(device.create_next_era(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            vec![recipient(BOB_TEL)],
+            Some(&group_info),
+        ))
+        .unwrap()
+    };
+
+    // not the Era after the latest: made again (RCC.16 section 8.3.1)
+    next_era();
+    groups.era_refused(CONVERSATION, 409);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
+    assert_eq!(heals.begin_new_era(CONVERSATION), Some(NextEra::Encrypted));
+    heals.start_over(CONVERSATION);
+
+    // refused otherwise: the group moves to an Unencrypted Singleton Era
+    // (section 10.1)
+    next_era();
+    groups.era_refused(CONVERSATION, 403);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
+    assert_eq!(
+        heals.begin_new_era(CONVERSATION),
+        Some(NextEra::Singleton(EndMlsReason::InternalClientError))
+    );
+    heals.start_over(CONVERSATION);
+
+    // which is made again from the latest Era if refused, whatever the
+    // status (section 11.2.1)
+    for status_code in [409, 403] {
+        device
+            .create_singleton_era(
+                CONVERSATION,
+                IMPU,
+                GROUP_URI,
+                Some(&group_info),
+                EndMlsReason::CannotFetchKeypackages,
+            )
+            .unwrap();
+        groups.era_refused(CONVERSATION, status_code);
+        assert_eq!(pending_end(&device), None);
+        let (pull, _) = focus_answering(vec![group_info_answer(group_info.clone())]);
+        let cpim = prepare_next_era(&groups, &rt, pull).expect("an Unencrypted Singleton Era");
+        assert_eq!(singleton_era_of(&device, &cpim), 1);
+        assert_eq!(
+            pending_end(&device),
+            Some(EndMlsReason::CannotFetchKeypackages)
+        );
+        groups.discard(CONVERSATION, false);
+    }
 }
 
 #[test]

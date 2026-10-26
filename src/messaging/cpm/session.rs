@@ -1915,7 +1915,8 @@ impl CPMSessionService {
 
     /// Restarts the group at `conference_uri` with an INVITE carrying `cpim`,
     /// the CPIM message of the next Era of its MLS group, whose Commit is
-    /// discarded if the group does not start (RCC.16 sections 8.1, 8.3.1)
+    /// discarded if the group does not start, another Era then due (RCC.16
+    /// sections 8.1, 8.3.1, 10.1, 11.2.1)
     fn restart_in_new_era(
         &self,
         conference_uri: &str,
@@ -1946,7 +1947,7 @@ impl CPMSessionService {
                 if status_code != 200 {
                     platform_log(LOG_TAG, format!("new Era refused: {}", status_code));
                     if let Some((encryption, conversation_id)) = encryption.zip(conversation_id) {
-                        encryption.discard(&conversation_id, false);
+                        encryption.era_refused(&conversation_id, status_code);
                     }
                 }
             })),

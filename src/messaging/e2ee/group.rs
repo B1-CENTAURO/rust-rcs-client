@@ -522,14 +522,21 @@ impl E2eeDevice {
         else {
             return Ok(None);
         };
-        // of any message, the group then to be self-healed (RCC.16 section
-        // 6.2.5)
-        if matches!(
-            reason,
+        // of any message, the group then to be self-healed, as when it was
+        // moved to unencrypted meanwhile, or made anew in its next Era
+        // (RCC.16 sections 6.2.5, 11.2.2, 11.2.3)
+        match reason {
             ServerFailureReason::IncorrectEpochAuthenticator
-                | ServerFailureReason::MismatchedConfirmationTag
-        ) {
-            self.heals().want(conversation_id);
+            | ServerFailureReason::MismatchedConfirmationTag
+            | ServerFailureReason::MlsGroupHasEndMls => self.heals().want(conversation_id),
+            ServerFailureReason::EpochAdvancementQuotaReached => {
+                self.heals().want_new_era(conversation_id)
+            }
+            ServerFailureReason::EraAdvancementQuotaReached => self.heals().want_singleton(
+                conversation_id,
+                EndMlsReason::ServerFailureEraAdvancementQuotaReached,
+            ),
+            _ => {}
         }
         {
             let mut control_messages = self.control_messages().lock().unwrap();
@@ -539,7 +546,19 @@ impl E2eeDevice {
             control_messages.remove(conversation_id);
         }
 
+        let ending = self
+            .store()
+            .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
+                conversation.pending_encryption_end()
+            })?;
         self.drop_pending(conversation_id)?;
+        // the Commit moving the group to unencrypted refused, it moves to an
+        // Unencrypted Singleton Era instead, unless it was moved already
+        // (sections 11.2, 11.2.1)
+        if ending.is_some() && reason != ServerFailureReason::MlsGroupHasEndMls {
+            self.heals()
+                .want_singleton(conversation_id, EndMlsReason::OutgoingCommitFailed);
+        }
         Ok(Some(reason))
     }
 
@@ -1019,9 +1038,13 @@ impl GroupEncryption for DeviceGroups {
                         false
                     }
                 };
+                // or self-healing it did, as into an Unencrypted Singleton
+                // Era (RCC.16 sections 10.1, 11.2.1)
+                let healed_into = device.heals().take_ended_untold(conversation_id);
+                let ended_now = device.encryption_ended(conversation_id);
                 Taken {
                     proposals,
-                    encryption_ended: !ended && device.encryption_ended(conversation_id),
+                    encryption_ended: ended_now && (!ended || healed_into),
                 }
             }
             None => Taken::default(),
@@ -1180,9 +1203,15 @@ impl GroupEncryption for DeviceGroups {
         Box::pin(async move {
             device
                 .upgrade()?
-                .make_era_after_failed_heal(&conversation_id, &from, &to, &capabilities, &pull)
+                .make_due_era(&conversation_id, &from, &to, &capabilities, &pull)
                 .await
         })
+    }
+
+    fn era_refused(&self, conversation_id: &str, status_code: u16) {
+        if let Some(device) = self.device.upgrade() {
+            device.era_refused(conversation_id, status_code);
+        }
     }
 
     fn encrypts(&self, conversation_id: &str) -> bool {

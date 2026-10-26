@@ -332,17 +332,19 @@ pub trait GroupEncryption: Send + Sync {
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
     /// Whether the MLS group `conversation_id` is to be made anew in its next
-    /// Era, as self-healing it failed (RCC.16 sections 8.3, 10.1)
+    /// Era, as self-healing it failed, or to move to an Unencrypted Singleton
+    /// Era (RCC.16 sections 8.3, 10.1, 11.2.1)
     fn new_era_due(&self, conversation_id: &str) -> bool;
 
     /// Makes the next Era of the MLS group `conversation_id`, if one is due,
     /// after that of the GroupInfo asked of the Conversation Focus with
-    /// `pull`, with the Clients of its Participants (RCC.16 sections 8.3.1,
-    /// 10.1): the CPIM message carrying a `message/mls-rcs-client` with its
-    /// Welcome and Commit, for the INVITE restarting the group to carry,
-    /// `from` and `to` that of the CPIM message. The Commit is applied once
-    /// the Focus accepts it, and is to be discarded if the group does not
-    /// start.
+    /// `pull`, with the Clients of its Participants, or else an Unencrypted
+    /// Singleton Era (RCC.16 sections 8.3.1, 10.1, 11.2.1): the CPIM message
+    /// carrying a `message/mls-rcs-client` with its Commit, for the INVITE
+    /// restarting the group to carry, `from` and `to` that of the CPIM
+    /// message. The Commit is applied once the Focus accepts it, and is to be
+    /// discarded if the group does not start otherwise than by the Focus
+    /// refusing it, which era_refused() is for.
     fn prepare_next_era(
         &self,
         conversation_id: String,
@@ -350,6 +352,12 @@ pub trait GroupEncryption: Send + Sync {
         to: String,
         pull: GroupInfoPull,
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
+
+    /// Takes note of the Conversation Focus refusing with `status_code` the
+    /// INVITE restarting the group `conversation_id` in the Era
+    /// prepare_next_era() made, whose Commit is discarded, another Era then
+    /// due (RCC.16 sections 8.3.1, 10.1, 11.2.1)
+    fn era_refused(&self, conversation_id: &str, status_code: u16);
 
     /// Whether the group chat `conversation_id` is encrypted, its MLS group
     /// kept

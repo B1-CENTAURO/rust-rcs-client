@@ -2133,6 +2133,8 @@ struct ScriptedEncryption {
     /// The Conversation-ID, from and to of each new Era prepared, and how
     /// the focus answered the GroupInfo pull
     eras: Arc<std::sync::Mutex<Vec<(String, String, String, Option<(u16, Vec<u8>)>)>>>,
+    /// The Conversation-ID of each new Era the focus refused, and how
+    refused_eras: std::sync::Mutex<Vec<(String, u16)>>,
     /// The Conversation-ID, from and to of each leave
     left: std::sync::Mutex<Vec<(String, String, String)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
@@ -2399,6 +2401,13 @@ impl GroupEncryption for ScriptedEncryption {
                 .push((conversation_id, from, to, answer));
             cpim
         })
+    }
+
+    fn era_refused(&self, conversation_id: &str, status_code: u16) {
+        self.refused_eras
+            .lock()
+            .unwrap()
+            .push((String::from(conversation_id), status_code));
     }
 
     fn encrypts(&self, conversation_id: &str) -> bool {
@@ -3140,6 +3149,10 @@ impl GroupEncryption for EncryptingPrepared {
         pull: GroupInfoPull,
     ) -> BoxFuture<'static, Option<Vec<u8>>> {
         self.0.prepare_next_era(conversation_id, from, to, pull)
+    }
+
+    fn era_refused(&self, conversation_id: &str, status_code: u16) {
+        self.0.era_refused(conversation_id, status_code)
     }
 
     fn encrypts(&self, conversation_id: &str) -> bool {
@@ -6066,19 +6079,24 @@ fn a_group_whose_healing_failed_is_restarted_in_a_new_era() {
 }
 
 #[test]
-fn a_new_era_the_focus_refuses_is_discarded() {
-    let (client, mut peer) = start(true);
-    let (encryption, connection) = new_era_due(&client, &mut peer, true);
-    restart_in_new_era(&client, &mut peer, connection, "409 Conflict");
-    let discarded = (0..50).any(|_| {
-        std::thread::sleep(Duration::from_millis(20));
-        !encryption.discarded.lock().unwrap().is_empty()
-    });
-    assert!(discarded);
-    assert_eq!(
-        *encryption.discarded.lock().unwrap(),
-        [(String::from("conversation-1"), false)]
-    );
+fn a_new_era_the_focus_refuses_is_told_how_it_was() {
+    for (status, status_code) in [("409 Conflict", 409), ("403 Forbidden", 403)] {
+        let (client, mut peer) = start(true);
+        let (encryption, connection) = new_era_due(&client, &mut peer, true);
+        restart_in_new_era(&client, &mut peer, connection, status);
+        let refused = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            !encryption.refused_eras.lock().unwrap().is_empty()
+        });
+        assert!(refused);
+        // for its Commit to be discarded, and another Era made (RCC.16
+        // sections 8.3.1, 10.1)
+        assert_eq!(
+            *encryption.refused_eras.lock().unwrap(),
+            [(String::from("conversation-1"), status_code)]
+        );
+        assert!(encryption.discarded.lock().unwrap().is_empty());
+    }
 }
 
 #[test]
