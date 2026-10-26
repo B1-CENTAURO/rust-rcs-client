@@ -717,9 +717,11 @@ pub unsafe extern "C" fn rcs_client_set_e2ee(
 }
 
 /// Enrols the device with its Home KDS for the identity it was configured
-/// with, unless it holds a certificate others would still add it with; to be
-/// called once configured, before connecting (RCC.16 section 4.2). `cb` is
-/// told 0 if enrolled, 1 if it already was, -1 if E2EE is not set or the
+/// with, unless it holds a certificate others would still add it with, with
+/// more than 60 days left; one with less is renewed, the device keeping its
+/// groups (RCC.16 sections 4.2, 9.5.3). To be called once configured, before
+/// connecting, and again from time to time for the renewal. `cb` is told 0 if
+/// enrolled or renewed, 1 if it already was, -1 if E2EE is not set or the
 /// device was not configured with a tel URI, -2 if the Home KDS could not be
 /// reached, -3 if it refused, -4 if the certificate it issued is not one
 /// others would add the device with, -5 if the MLS state could not be made
