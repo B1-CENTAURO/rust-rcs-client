@@ -3879,6 +3879,13 @@ fn the_keys_of_the_device_are_updated_once_due() {
         Err(GroupError::Pending)
     );
 
+    // nor in a group not kept
+    assert!(!device.key_update_due("another"));
+    assert_eq!(
+        device.update_keys("another", IMPU, GROUP_URI),
+        Err(GroupError::Store(StoreError::Mls(ErrorKind::UnknownGroup)))
+    );
+
     // applied once forwarded back, and by Bob
     device
         .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
