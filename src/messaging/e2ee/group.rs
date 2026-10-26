@@ -384,7 +384,10 @@ impl E2eeDevice {
 
     /// The KeyPackages of all the Clients of each of `recipients`, as their
     /// Home KDS gives them (RCC.16 section 5.3)
-    async fn key_packages(&self, recipients: Vec<Recipient>) -> Result<Vec<Vec<u8>>, GroupError> {
+    pub(super) async fn key_packages(
+        &self,
+        recipients: Vec<Recipient>,
+    ) -> Result<Vec<Vec<u8>>, GroupError> {
         let asked: Vec<String> = recipients.iter().map(|r| r.tel_uri.clone()).collect();
         let fetched =
             fetch_key_packages(self.kds(), self.validator(), vec![CIPHERSUITE], recipients)
