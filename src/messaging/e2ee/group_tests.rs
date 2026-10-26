@@ -4156,3 +4156,26 @@ fn no_key_update_is_made_with_a_certificate_about_to_expire() {
         alice(&app, &kds, TODAY, Some(&app.last().unwrap())).with_clock(move || clock.now());
     assert!(today.key_update_due(CONVERSATION));
 }
+
+#[test]
+fn a_certificate_renewed_is_kept_though_its_key_packages_are_refused() {
+    let (device, _, app) = enrolled_with_app(None);
+    drop(device);
+
+    let renewing = Arc::new(Kds::issuing(&[ALICE_RENEWED, CA], &app));
+    renewing
+        .taking
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let device = alice(&app, &renewing, RENEWING, Some(&app.last().unwrap()))
+        .with_signer(|| Some(signer(ALICE_RENEWED_KEY, ALICE_RENEWED_PUBLIC_KEY)));
+    provision(&device, &[ALICE_TEL], None);
+    assert!(block_on(device.enrol()).is_err());
+
+    // as the app keeps it, its KeyPackages to be uploaded again
+    let restored = alice(&app, &renewing, RENEWING, Some(&app.last().unwrap()));
+    assert_eq!(
+        restored.store().credential(),
+        Some(credential(&[ALICE_RENEWED, CA]))
+    );
+    assert!(!restored.store().key_packages_uploaded());
+}
