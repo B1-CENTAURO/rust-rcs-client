@@ -32,6 +32,7 @@ use crate::rcs_engine::RcsEngine;
 use super::heal::Heals;
 use super::kds::{self, EnrolmentError, KeyDistribution};
 use super::provisioning;
+use super::replace::Replacements;
 use super::store::{MlsStore, SaveState, StoreError};
 
 /// The Cipher Suite the device enrols in: Client Certificates are ECDSA
@@ -76,6 +77,8 @@ pub struct E2eeDevice {
     control_messages: Mutex<HashMap<String, String>>,
     /// The groups to self-heal and being self-healed
     heals: Heals,
+    /// The groups whose KeyPackage Update is put off for now
+    replacements: Replacements,
 }
 
 impl E2eeDevice {
@@ -105,6 +108,7 @@ impl E2eeDevice {
             make_signer: Box::new(|| SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).ok()),
             control_messages: Mutex::new(HashMap::new()),
             heals: Heals::default(),
+            replacements: Replacements::default(),
         })
     }
 
@@ -118,6 +122,14 @@ impl E2eeDevice {
 
     pub(super) fn heals(&self) -> &Heals {
         &self.heals
+    }
+
+    pub(super) fn replacements(&self) -> &Replacements {
+        &self.replacements
+    }
+
+    pub(super) fn home_kds(&self) -> u32 {
+        self.home_kds
     }
 
     pub(super) fn kds(&self) -> &dyn KeyDistribution {

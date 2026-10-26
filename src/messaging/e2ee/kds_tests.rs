@@ -130,7 +130,7 @@ pub(super) struct Kds {
     /// Whether it takes KeyPackages
     pub(super) taking: AtomicBool,
     /// What it has for the Participants asked for; unavailable without
-    directory: Option<Vec<(String, Fetched)>>,
+    pub(super) directory: Mutex<Option<Vec<(String, Fetched)>>>,
     /// The app, to tell what it had kept by an upload
     app: Option<Arc<App>>,
     pub(super) enrolments: Mutex<Vec<Enrolment>>,
@@ -155,15 +155,19 @@ impl Kds {
 
     /// The KDS, having `directory` for the Participants asked for too
     pub(super) fn knowing_too(self, directory: Vec<(&str, Fetched)>) -> Kds {
-        Kds {
-            directory: Some(
-                directory
-                    .into_iter()
-                    .map(|(tel_uri, fetched)| (String::from(tel_uri), fetched))
-                    .collect(),
-            ),
-            ..self
-        }
+        self.now_knowing(directory);
+        self
+    }
+
+    /// Has the KDS have `directory` for the Participants asked for from now
+    /// on
+    pub(super) fn now_knowing(&self, directory: Vec<(&str, Fetched)>) {
+        *self.directory.lock().unwrap() = Some(
+            directory
+                .into_iter()
+                .map(|(tel_uri, fetched)| (String::from(tel_uri), fetched))
+                .collect(),
+        );
     }
 
     pub(super) fn uploads(&self) -> Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
@@ -202,7 +206,7 @@ impl KeyDistribution for Kds {
             .lock()
             .unwrap()
             .push((ciphersuites, recipients));
-        let directory = self.directory.clone();
+        let directory = self.directory.lock().unwrap().clone();
         Box::pin(async move { directory.ok_or(KdsError::Unavailable) })
     }
 }
