@@ -463,17 +463,23 @@ impl E2eeDevice {
     /// A bundle or list is applied as a whole once it is checked, else none
     /// of it is (section 6.2.6). A Commit of another applied first voids the
     /// one of the device. The GroupInfo only answers a request for it
-    /// (section 7.10.1).
+    /// (section 7.10.1). A Commit removing the device, as a KeyPackage Update
+    /// replacing its leaf does, has it join the group again with the Welcome
+    /// along, if there is one for it (section 9.5.4).
     pub fn on_server_message(
         &self,
         conversation_id: &str,
         body: &[u8],
     ) -> Result<Vec<IncomingMessage>, StoreError> {
-        let (taken, pending) = self.store().with_conversation(
+        let (taken, pending, active) = self.store().with_conversation(
             conversation_id.as_bytes(),
             |conversation, client| {
                 let taken = conversation.process_server_message(client, body);
-                Ok((taken, conversation.has_pending_commit()))
+                Ok((
+                    taken,
+                    conversation.has_pending_commit(),
+                    conversation.is_active(),
+                ))
             },
         )?;
         if !pending {
@@ -486,6 +492,13 @@ impl E2eeDevice {
         // sections 6.2.6, 10.1)
         if taken.is_err() {
             self.heals().want(conversation_id);
+        }
+        // the leaf of the device replaced by a KeyPackage Update, it joins
+        // again with the Welcome along (section 9.5.4)
+        if !active {
+            if let Err(e) = self.join_group(conversation_id, body) {
+                platform_log(LOG_TAG, format!("group not joined again: {:?}", e));
+            }
         }
         taken.map_err(StoreError::Mls)
     }
@@ -569,7 +582,7 @@ impl E2eeDevice {
 
     /// Whether the certificate of the device has 30 days left at least, as
     /// one a key update brings into a group has to (RCC.16 Annex A.4.1.5)
-    fn certificate_lasting(&self) -> bool {
+    pub(super) fn certificate_lasting(&self) -> bool {
         self.store()
             .credential()
             .zip(self.store().signature_key())
@@ -1062,9 +1075,9 @@ impl GroupEncryption for DeviceGroups {
     }
 
     fn key_update_due(&self, conversation_id: &str) -> bool {
-        self.device
-            .upgrade()
-            .is_some_and(|device| device.key_update_due(conversation_id))
+        self.device.upgrade().is_some_and(|device| {
+            device.replacement_due(conversation_id) || device.key_update_due(conversation_id)
+        })
     }
 
     fn update_keys(
@@ -1073,10 +1086,46 @@ impl GroupEncryption for DeviceGroups {
         from: String,
         to: String,
     ) -> BoxFuture<'static, Option<Vec<u8>>> {
-        self.once_settled(
-            move |device| device.update_keys(&conversation_id, &from, &to),
-            "keys not updated",
-        )
+        let device = self.device.clone();
+        let capabilities = Arc::clone(&self.capabilities);
+        let taken = Arc::clone(&self.taken);
+        let deadline = tokio::time::Instant::now() + self.acceptance_wait;
+        Box::pin(async move {
+            loop {
+                // told of what is taken from now on
+                let notified = taken.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                let device = device.upgrade()?;
+                // its Commit updates the keys of the device as well
+                let replaced = match device.replacement_due(&conversation_id) {
+                    true => {
+                        device
+                            .replace_members(&conversation_id, &from, &to, &capabilities)
+                            .await
+                    }
+                    false => Ok(None),
+                };
+                let made = match replaced {
+                    Ok(None) => device.update_keys(&conversation_id, &from, &to),
+                    replaced => replaced,
+                };
+                match made {
+                    Ok(made) => return made,
+                    Err(GroupError::Pending) => {}
+                    Err(e) => {
+                        platform_log(LOG_TAG, format!("keys not updated: {:?}", e));
+                        return None;
+                    }
+                }
+                drop(device);
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    platform_log(LOG_TAG, "keys not updated, the Commit not accepted");
+                    return None;
+                }
+            }
+        })
     }
 
     fn abandon(&self, conversation_id: &str) {

@@ -107,6 +107,15 @@ impl MlsStore {
         *self.clock.lock().unwrap() = Some(clock);
     }
 
+    /// The time the client tells: by the clock of the store if it has one,
+    /// else by the system clock
+    pub fn now(&self) -> SystemTime {
+        match self.clock.lock().unwrap().as_ref() {
+            Some(clock) => clock(),
+            None => SystemTime::now(),
+        }
+    }
+
     /// `client`, telling the time by the clock of the store if it has one
     fn timed(&self, mut client: MlsClient) -> MlsClient {
         if let Some(clock) = self.clock.lock().unwrap().clone() {

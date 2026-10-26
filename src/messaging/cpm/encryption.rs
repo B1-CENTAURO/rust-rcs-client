@@ -283,17 +283,23 @@ pub trait GroupEncryption: Send + Sync {
         reason: EndReason,
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
-    /// Whether this client is to update its keys in the group chat
-    /// `conversation_id`, by the days passed and the messages sent since it
-    /// last did (RCC.16 section 9.5.2)
+    /// Whether this client is to update keys in the group chat
+    /// `conversation_id`: its own, by the days passed and the messages sent
+    /// since it last did (RCC.16 section 9.5.2), or those of other members,
+    /// whose certificate expired or who did not update theirs in over 30
+    /// days, with a KeyPackage Update (section 9.5.4)
     fn key_update_due(&self, conversation_id: &str) -> bool;
 
     /// The CPIM message carrying a `message/mls-rcs-client` with a Commit
-    /// updating the keys of this client in the group chat `conversation_id`,
-    /// to send to the Conversation Focus in the session, `from` and `to` that
-    /// of the CPIM message (RCC.16 sections 9.5.1, 9.5.2), once a Commit of
-    /// this client the Focus is yet to accept is; None if no key update is
-    /// due then, or it cannot be made
+    /// updating keys in the group chat `conversation_id` as key_update_due()
+    /// tells, to send to the Conversation Focus in the session, `from` and
+    /// `to` that of the CPIM message (RCC.16 sections 9.5.1, 9.5.2, 9.5.4),
+    /// once a Commit of this client the Focus is yet to accept is; None if
+    /// no key update is due then, or it cannot be made
+    ///
+    /// A KeyPackage Update updates the keys of this client as well. One that
+    /// cannot be made, as no KeyPackages can be had of another member, moves
+    /// the group chat to unencrypted instead (section 11.2).
     fn update_keys(
         &self,
         conversation_id: String,

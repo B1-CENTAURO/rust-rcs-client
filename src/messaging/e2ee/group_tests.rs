@@ -2753,6 +2753,21 @@ fn bob_with_both_phones_of_alice() -> (
     (MlsClient, MlsConversation),
     (MlsClient, MlsConversation),
 ) {
+    let (device, _, phone, other_phone) = bob_with_both_phones_of_alice_on(LATER, None);
+    (device, phone, other_phone)
+}
+
+/// As bob_with_both_phones_of_alice(), the device as of `date`, telling the
+/// time of `clock` if given, with its Home KDS
+fn bob_with_both_phones_of_alice_on(
+    date: &str,
+    clock: Option<&Clock>,
+) -> (
+    Arc<E2eeDevice>,
+    Arc<Kds>,
+    (MlsClient, MlsConversation),
+    (MlsClient, MlsConversation),
+) {
     let phone = client_later(ALICE, ALICE_KEY, ALICE_PUBLIC_KEY);
     let other_phone = client_later(ALICE_RENEWED, ALICE_RENEWED_KEY, ALICE_RENEWED_PUBLIC_KEY);
     let app = Arc::new(App::default());
@@ -2763,15 +2778,19 @@ fn bob_with_both_phones_of_alice() -> (
             other_phone.generate_key_package(false).unwrap(),
         ]),
     )]));
-    let device = E2eeDevice::new(
-        validator(LATER),
+    let mut device = E2eeDevice::new(
+        validator(date),
         HOME_KDS,
-        kds as Arc<dyn KeyDistribution>,
+        Arc::clone(&kds) as Arc<dyn KeyDistribution>,
         Box::new(|_| true),
         None,
     )
     .unwrap()
     .with_signer(|| Some(signer(BOB_KEY, BOB_PUBLIC_KEY)));
+    if let Some(clock) = clock {
+        let clock = clock.clone();
+        device = device.with_clock(move || clock.now());
+    }
     provision(&device, &[BOB_TEL], None);
     assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
     let device = Arc::new(device);
@@ -2787,6 +2806,7 @@ fn bob_with_both_phones_of_alice() -> (
         .unwrap();
     (
         device,
+        kds,
         (phone, phones_group),
         (other_phone, other_phones_group),
     )
@@ -3831,9 +3851,16 @@ fn a_recipient_unable_to_decrypt_is_told_apart_from_other_failures() {
 
 /// As alice_and_bob(), the device telling the time of the clock given back
 fn alice_and_bob_in_time() -> (Arc<E2eeDevice>, MlsClient, MlsConversation, Clock) {
+    let (device, _, bob, bobs_group, clock) = alice_and_bob_in_time_with_kds();
+    (device, bob, bobs_group, clock)
+}
+
+/// As alice_and_bob_in_time(), with the Home KDS of the device
+fn alice_and_bob_in_time_with_kds() -> (Arc<E2eeDevice>, Arc<Kds>, MlsClient, MlsConversation, Clock)
+{
     let clock = Clock::new();
     let (bob, bobs) = bob_with_key_package();
-    let (device, _, _) = enrolled_in_time(
+    let (device, kds, _) = enrolled_in_time(
         Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]),
         Some(&clock),
     );
@@ -3844,7 +3871,7 @@ fn alice_and_bob_in_time() -> (Arc<E2eeDevice>, MlsClient, MlsConversation, Cloc
     device
         .on_server_message(CONVERSATION, &accepted(previous))
         .unwrap();
-    (device, bob, bobs_group, clock)
+    (device, kds, bob, bobs_group, clock)
 }
 
 #[test]
@@ -4150,11 +4177,14 @@ fn no_key_update_is_made_with_a_certificate_about_to_expire() {
     assert!(!later.key_update_due(CONVERSATION));
     assert_eq!(later.update_keys(CONVERSATION, IMPU, GROUP_URI), Ok(None));
     assert_eq!(epoch(&later, CONVERSATION), Ok((1, false)));
+    // nor a KeyPackage Update, which updates the leaf of the device too
+    assert!(!later.replacement_due(CONVERSATION));
 
     // which with 30 days left it would be
     let today =
         alice(&app, &kds, TODAY, Some(&app.last().unwrap())).with_clock(move || clock.now());
     assert!(today.key_update_due(CONVERSATION));
+    assert!(today.replacement_due(CONVERSATION));
 }
 
 #[test]
@@ -4178,4 +4208,484 @@ fn a_certificate_renewed_is_kept_though_its_key_packages_are_refused() {
         Some(credential(&[ALICE_RENEWED, CA]))
     );
     assert!(!restored.store().key_packages_uploaded());
+}
+
+const MINUTE: Duration = Duration::from_secs(60);
+
+/// The ratchet tree of the group `conversation_id` of `device`, as the
+/// Conversation Focus sends it along with a Welcome
+fn ratchet_tree(device: &E2eeDevice, conversation_id: &str) -> Vec<u8> {
+    device
+        .store()
+        .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
+            conversation.ratchet_tree()
+        })
+        .unwrap()
+        .unwrap()
+}
+
+/// What the Conversation Focus sends a Client replaced by the Commit and
+/// Welcome of `bundle`, with the ratchet tree `ratchet_tree`
+fn replaced_by(bundle: &WelcomeCommitBundle, ratchet_tree: Vec<u8>) -> ServerCommitBundle {
+    ServerCommitBundle {
+        commit_list: bundle.commit_list.clone(),
+        welcome: bundle.welcome.clone(),
+        private_message: Vec::new(),
+        ratchet_tree,
+    }
+}
+
+#[test]
+fn the_clients_of_others_not_updating_their_keys_are_replaced_with_their_key_packages() {
+    let (device, kds, bob, mut bobs_group, clock) = alice_and_bob_in_time_with_kds();
+    let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
+    let replace = || block_on(device.replace_members(CONVERSATION, IMPU, GROUP_URI, &query));
+
+    // not before 30 days
+    clock.advance(30 * DAY - MINUTE);
+    assert!(!device.replacement_due(CONVERSATION));
+    assert_eq!(replace(), Ok(None));
+    assert!(asked.lock().unwrap().is_empty());
+
+    // with the KeyPackages of his Participant, from the Home KDS he
+    // advertises (RCC.16 sections 5.3, 9.5.4)
+    clock.advance(2 * MINUTE);
+    assert!(device.replacement_due(CONVERSATION));
+    let bobs = bob.generate_key_package(false).unwrap();
+    kds.now_knowing(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]);
+    let cpim = replace().unwrap().expect("a control message");
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    assert_eq!(
+        kds.queries.lock().unwrap().last().unwrap().1,
+        [recipient(BOB_TEL)]
+    );
+    // a control message from the user to the group, with a Welcome and no
+    // ratchet tree (section 7.9.2)
+    let message = cpim_message(&cpim);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    let bundle = bundle_of(&cpim);
+    assert!(!bundle.welcome.is_empty());
+    assert!(bundle.ratchet_tree.is_empty());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+
+    // not again while it waits for the Focus
+    assert!(!device.replacement_due(CONVERSATION));
+    assert_eq!(replace(), Err(GroupError::Pending));
+
+    // applied once forwarded back, the keys of the device updated too
+    device
+        .on_server_message(CONVERSATION, &forwarded(&bundle))
+        .unwrap();
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    assert!(!device.replacement_due(CONVERSATION));
+    assert!(!device.key_update_due(CONVERSATION));
+    assert_eq!(replace(), Ok(None));
+
+    // Bob's Client, removed, joins again with the Welcome
+    let replaced = replaced_by(&bundle, ratchet_tree(&device, CONVERSATION));
+    bobs_group.process_commit_bundle(&bob, &replaced).unwrap();
+    assert!(!bobs_group.is_active());
+    let mut bobs_group = bob
+        .join_conversation(&replaced.welcome, &replaced.ratchet_tree)
+        .unwrap();
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-71", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
+    );
+}
+
+#[test]
+fn the_other_clients_of_the_user_are_replaced_with_key_packages_of_its_home_kds() {
+    const OCTOBER: &str = "2026-10-01";
+    let clock = Clock::new();
+    let phone = MlsClient::with_credential(
+        credential(&[ALICE, CA]),
+        signer(ALICE_KEY, ALICE_PUBLIC_KEY),
+        CIPHERSUITE,
+        MlsConfig::default(),
+        Box::new(validator(OCTOBER)),
+    )
+    .unwrap();
+    let app = Arc::new(App::default());
+    let kds = Arc::new(Kds::issuing(&[ALICE_RENEWED, CA], &app).knowing_too(vec![(
+        ALICE_TEL,
+        Fetched::KeyPackages(vec![phone.generate_key_package(false).unwrap()]),
+    )]));
+    let ticking = clock.clone();
+    let device = alice(&app, &kds, OCTOBER, None)
+        .with_signer(|| Some(signer(ALICE_RENEWED_KEY, ALICE_RENEWED_PUBLIC_KEY)))
+        .with_clock(move || ticking.now());
+    provision(&device, &[ALICE_TEL], None);
+    assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
+    let cpim =
+        block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(ALICE_TEL)]))
+            .unwrap();
+    let mut phones_group = joined(&phone, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+
+    // the Home KDS gives KeyPackages of the phone and of the device
+    clock.advance(31 * DAY);
+    kds.now_knowing(vec![(
+        ALICE_TEL,
+        Fetched::KeyPackages(vec![
+            phone.generate_key_package(false).unwrap(),
+            uploaded_key_package(&kds, 0),
+        ]),
+    )]);
+    let (query, asked) = answering(&[]);
+    let cpim = block_on(device.replace_members(CONVERSATION, IMPU, GROUP_URI, &query))
+        .unwrap()
+        .expect("a control message");
+    assert!(asked.lock().unwrap().is_empty());
+    assert_eq!(
+        kds.queries.lock().unwrap().last().unwrap().1,
+        [Recipient {
+            tel_uri: String::from(ALICE_TEL),
+            home_kds: HOME_KDS.to_string(),
+        }]
+    );
+
+    // the phone alone is replaced
+    let bundle = bundle_of(&cpim);
+    device
+        .on_server_message(CONVERSATION, &forwarded(&bundle))
+        .unwrap();
+    let replaced = replaced_by(&bundle, ratchet_tree(&device, CONVERSATION));
+    phones_group
+        .process_commit_bundle(&phone, &replaced)
+        .unwrap();
+    let phones_group = phone
+        .join_conversation(&replaced.welcome, &replaced.ratchet_tree)
+        .unwrap();
+    assert_eq!(phones_group.members().len(), 2);
+}
+
+#[test]
+fn the_device_replaced_by_another_member_joins_again_with_the_welcome() {
+    let (device, kds, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+
+    // Bob replaces the leaf of the device with a KeyPackage of it
+    let output = bobs_group
+        .replace_members(
+            &bob,
+            &[device.store().credential().unwrap()],
+            &[&uploaded_key_package(&kds, 0)],
+        )
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    let server_message = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: encode_message_list(&[&output.commit]).unwrap(),
+                welcome: output.welcome.unwrap(),
+                private_message: Vec::new(),
+                ratchet_tree: bobs_group.ratchet_tree().unwrap(),
+            },
+        )),
+    });
+    match device
+        .on_server_message(CONVERSATION, &server_message)
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { removed, .. }] => {
+            assert_eq!(removed, &[device.store().credential().unwrap()])
+        }
+        other => panic!("{} messages", other.len()),
+    }
+
+    // and goes on in the group
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-72", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
+    );
+}
+
+#[test]
+fn the_device_removed_without_a_welcome_is_not_in_the_group_any_more() {
+    let (device, _, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let output = bobs_group
+        .remove_members(&bob, &[device.store().credential().unwrap()])
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    device
+        .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+        .unwrap();
+    assert_eq!(
+        device
+            .store()
+            .peek_conversation(CONVERSATION.as_bytes(), |conversation, _| {
+                conversation.is_active()
+            }),
+        Ok(false)
+    );
+}
+
+#[test]
+fn a_key_package_update_not_possible_for_now_is_put_off_for_an_hour() {
+    let (device, kds, _, _, clock) = alice_and_bob_in_time_with_kds();
+    clock.advance(31 * DAY);
+    let replace = |query: &CapabilityQuery| {
+        block_on(device.replace_members(CONVERSATION, IMPU, GROUP_URI, query))
+    };
+    let queries = || kds.queries.lock().unwrap().len();
+
+    // Bob's capabilities not had
+    let (query, asked) = answering(&[(BOB_TEL, answered(480, ""))]);
+    let before = queries();
+    assert_eq!(replace(&query), Ok(None));
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    assert_eq!(queries(), before);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert!(!device.replacement_due(CONVERSATION));
+    assert_eq!(replace(&query), Ok(None));
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    clock.advance(60 * MINUTE - MINUTE);
+    assert!(!device.replacement_due(CONVERSATION));
+    clock.advance(2 * MINUTE);
+    assert!(device.replacement_due(CONVERSATION));
+
+    // the Home KDS not able to give his KeyPackages for now
+    let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+    for unavailable in [None, Some(Fetched::Unavailable)] {
+        match unavailable {
+            Some(fetched) => kds.now_knowing(vec![(BOB_TEL, fetched)]),
+            None => *kds.directory.lock().unwrap() = None,
+        }
+        let before = queries();
+        assert_eq!(replace(&query), Ok(None));
+        assert_eq!(queries(), before + 1);
+        assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+        assert!(!device.replacement_due(CONVERSATION));
+        clock.advance(61 * MINUTE);
+    }
+}
+
+#[test]
+fn a_group_whose_clients_cannot_be_replaced_is_moved_to_unencrypted() {
+    for (answer, fetched, reason) in [
+        (
+            answered(
+                200,
+                "+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+            ),
+            Fetched::KeyPackages(Vec::new()),
+            EndMlsReason::GroupMemberFailsCapabilitiesCheck,
+        ),
+        (
+            answered(
+                200,
+                "+g.gsma.rcs.mls.mls-version=\"v2\";+g.gsma.rcs.mls.mls-kds=\"42\"",
+            ),
+            Fetched::KeyPackages(Vec::new()),
+            EndMlsReason::GroupMemberFailsCapabilitiesCheck,
+        ),
+        (
+            mls("42"),
+            Fetched::NotFound,
+            EndMlsReason::CannotFetchKeypackages,
+        ),
+        (
+            mls("42"),
+            Fetched::KeyPackages(Vec::new()),
+            EndMlsReason::CannotFetchKeypackages,
+        ),
+    ] {
+        let (device, kds, _, _, clock) = alice_and_bob_in_time_with_kds();
+        clock.advance(31 * DAY);
+        kds.now_knowing(vec![(BOB_TEL, fetched)]);
+        let (query, _) = answering(&[(BOB_TEL, answer)]);
+        let cpim = block_on(device.replace_members(CONVERSATION, IMPU, GROUP_URI, &query))
+            .unwrap()
+            .expect("a control message");
+        device
+            .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+            .unwrap();
+        assert_eq!(encryption_ended_reason(&device, CONVERSATION), Some(reason));
+        assert!(!device.replacement_due(CONVERSATION));
+    }
+}
+
+#[test]
+fn the_groups_of_the_device_replace_the_clients_of_others_as_they_update_keys() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, mut bobs_group, clock) = alice_and_bob_in_time_with_kds();
+    // the keys of the device updated since, after 50 messages
+    for n in 0..50 {
+        device
+            .encrypt_message(CONVERSATION, &plaintext(&format!("message-{}", n), None))
+            .unwrap();
+    }
+    clock.advance(10 * DAY);
+    let cpim = device
+        .update_keys(CONVERSATION, IMPU, GROUP_URI)
+        .unwrap()
+        .unwrap();
+    device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap();
+    bobs_group
+        .process_commit_bundle(
+            &bob,
+            &ServerCommitBundle {
+                commit_list: commit_bundle_of(&cpim).commit_list,
+                ..ServerCommitBundle::default()
+            },
+        )
+        .unwrap();
+    let update = |groups: &DeviceGroups| {
+        rt.block_on(groups.update_keys(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+        ))
+    };
+
+    // Bob's KeyPackages not to be had for now, nothing is due
+    clock.advance(21 * DAY);
+    assert!(!device.key_update_due(CONVERSATION));
+    let (query, _) = answering(&[(BOB_TEL, answered(480, ""))]);
+    let groups = DeviceGroups::new(&device, query);
+    assert!(groups.key_update_due(CONVERSATION));
+    assert_eq!(update(&groups), None);
+    assert!(!groups.key_update_due(CONVERSATION));
+
+    // an hour later, with them
+    clock.advance(61 * MINUTE);
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    assert!(groups.key_update_due(CONVERSATION));
+    let cpim = update(&groups).expect("a control message");
+    assert!(!bundle_of(&cpim).welcome.is_empty());
+    assert!(!groups.key_update_due(CONVERSATION));
+
+    // the keys of the device updated instead while Bob's Client cannot be
+    // replaced
+    groups.discard(CONVERSATION, false);
+    clock.advance(30 * DAY);
+    assert!(device.key_update_due(CONVERSATION));
+    let (query, _) = answering(&[(BOB_TEL, answered(480, ""))]);
+    let groups = DeviceGroups::new(&device, query);
+    let cpim = update(&groups).expect("a control message");
+    assert!(commit_bundle_of(&cpim).group_info.len() > 0);
+}
+
+const OCTOBER: &str = "2026-10-01";
+
+/// Bob's device on 1 October, in a group with both phones of Alice, 31 days
+/// on by its clock, its Home KDS having a KeyPackage of each phone: the
+/// device, its Home KDS, and the other phone of Alice with its group
+fn bob_with_both_phones_of_alice_31_days_on(
+) -> (Arc<E2eeDevice>, Arc<Kds>, (MlsClient, MlsConversation)) {
+    let clock = Clock::new();
+    let (device, kds, (phone, _), (other_phone, other_phones_group)) =
+        bob_with_both_phones_of_alice_on(OCTOBER, Some(&clock));
+    clock.advance(31 * DAY);
+    kds.now_knowing(vec![(
+        ALICE_TEL,
+        Fetched::KeyPackages(vec![
+            phone.generate_key_package(false).unwrap(),
+            other_phone.generate_key_package(false).unwrap(),
+        ]),
+    )]);
+    (device, kds, (other_phone, other_phones_group))
+}
+
+#[test]
+fn the_clients_of_a_participant_are_replaced_together_once_no_one_is_leaving() {
+    let (device, kds, (other_phone, mut other_phones_group)) =
+        bob_with_both_phones_of_alice_31_days_on();
+    let (query, asked) = answering(&[(ALICE_TEL, mls("42"))]);
+    let replace = || block_on(device.replace_members(CONVERSATION, BOB_IMPU, GROUP_URI, &query));
+
+    // her KeyPackages fetched once for both phones
+    let cpim = replace().unwrap().expect("a control message");
+    assert_eq!(*asked.lock().unwrap(), [ALICE_TEL]);
+    assert_eq!(
+        kds.queries.lock().unwrap().last().unwrap().1,
+        [recipient(ALICE_TEL)]
+    );
+    assert!(!bundle_of(&cpim).welcome.is_empty());
+    device.discard_pending(CONVERSATION, false).unwrap();
+
+    // not while one leaves, whose leave is committed first (RCC.16 section
+    // 9.4)
+    let proposal = other_phones_group.leave(&other_phone).unwrap();
+    device
+        .on_server_message(CONVERSATION, &forwarded_leave(&proposal))
+        .unwrap();
+    assert!(!device.replacement_due(CONVERSATION));
+    assert_eq!(replace(), Ok(None));
+
+    // nor if the leave comes while her KeyPackages are fetched
+    let (device, kds, (other_phone, mut other_phones_group)) =
+        bob_with_both_phones_of_alice_31_days_on();
+    let proposal = other_phones_group.leave(&other_phone).unwrap();
+    let leaving = Arc::clone(&device);
+    kds.during_fetch(move || {
+        leaving
+            .on_server_message(CONVERSATION, &forwarded_leave(&proposal))
+            .unwrap();
+    });
+    assert_eq!(
+        block_on(device.replace_members(CONVERSATION, BOB_IMPU, GROUP_URI, &query)),
+        Ok(None)
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+}
+
+#[test]
+fn what_changes_while_key_packages_are_fetched_is_minded() {
+    // the group of the device with Bob 31 days on, `change` happening while
+    // Bob's KeyPackages are fetched
+    let fetching = |change: fn(&E2eeDevice, MlsClient, MlsConversation)| {
+        let (device, kds, bob, bobs_group, clock) = alice_and_bob_in_time_with_kds();
+        clock.advance(31 * DAY);
+        kds.now_knowing(vec![(
+            BOB_TEL,
+            Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+        )]);
+        let changing = Arc::clone(&device);
+        kds.during_fetch(move || change(&changing, bob, bobs_group));
+        let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+        let replaced = block_on(device.replace_members(CONVERSATION, IMPU, GROUP_URI, &query));
+        (device, replaced)
+    };
+
+    // a Commit of the device made meanwhile is waited for, not put off
+    let (device, replaced) = fetching(|device, _, _| {
+        device
+            .update_keys(CONVERSATION, IMPU, GROUP_URI)
+            .unwrap()
+            .expect("a key update");
+    });
+    assert_eq!(replaced, Err(GroupError::Pending));
+    device.discard_pending(CONVERSATION, false).unwrap();
+    assert!(device.replacement_due(CONVERSATION));
+
+    // Bob updating his keys meanwhile leaves no one to replace
+    let (device, replaced) = fetching(|device, bob, mut bobs_group| {
+        let output = bobs_group.update_keys(&bob).unwrap();
+        device
+            .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+            .unwrap();
+    });
+    assert_eq!(replaced, Ok(None));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
 }

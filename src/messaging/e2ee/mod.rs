@@ -21,6 +21,7 @@ pub mod heal;
 pub mod kds;
 pub mod message;
 pub mod provisioning;
+pub mod replace;
 pub mod store;
 
 #[cfg(test)]

@@ -130,13 +130,15 @@ pub(super) struct Kds {
     /// Whether it takes KeyPackages
     pub(super) taking: AtomicBool,
     /// What it has for the Participants asked for; unavailable without
-    directory: Option<Vec<(String, Fetched)>>,
+    pub(super) directory: Mutex<Option<Vec<(String, Fetched)>>>,
     /// The app, to tell what it had kept by an upload
     app: Option<Arc<App>>,
     pub(super) enrolments: Mutex<Vec<Enrolment>>,
     /// The KeyPackages uploaded, with the state the app had kept by then
     uploads: Mutex<Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)>>,
     pub(super) queries: Mutex<Vec<(Vec<Ciphersuite>, Vec<Recipient>)>>,
+    /// What happens while KeyPackages are fetched, once
+    during_fetch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Kds {
@@ -155,15 +157,24 @@ impl Kds {
 
     /// The KDS, having `directory` for the Participants asked for too
     pub(super) fn knowing_too(self, directory: Vec<(&str, Fetched)>) -> Kds {
-        Kds {
-            directory: Some(
-                directory
-                    .into_iter()
-                    .map(|(tel_uri, fetched)| (String::from(tel_uri), fetched))
-                    .collect(),
-            ),
-            ..self
-        }
+        self.now_knowing(directory);
+        self
+    }
+
+    /// Has the KDS have `directory` for the Participants asked for from now
+    /// on
+    pub(super) fn now_knowing(&self, directory: Vec<(&str, Fetched)>) {
+        *self.directory.lock().unwrap() = Some(
+            directory
+                .into_iter()
+                .map(|(tel_uri, fetched)| (String::from(tel_uri), fetched))
+                .collect(),
+        );
+    }
+
+    /// Has `happening` happen while KeyPackages are next fetched
+    pub(super) fn during_fetch(&self, happening: impl FnOnce() + Send + 'static) {
+        *self.during_fetch.lock().unwrap() = Some(Box::new(happening));
     }
 
     pub(super) fn uploads(&self) -> Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
@@ -202,7 +213,11 @@ impl KeyDistribution for Kds {
             .lock()
             .unwrap()
             .push((ciphersuites, recipients));
-        let directory = self.directory.clone();
+        let happening = self.during_fetch.lock().unwrap().take();
+        if let Some(happening) = happening {
+            happening();
+        }
+        let directory = self.directory.lock().unwrap().clone();
         Box::pin(async move { directory.ok_or(KdsError::Unavailable) })
     }
 }
