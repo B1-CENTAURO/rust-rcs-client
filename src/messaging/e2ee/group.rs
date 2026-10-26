@@ -495,7 +495,7 @@ impl E2eeDevice {
         }
         // the leaf of the device replaced by a KeyPackage Update, it joins
         // again with the Welcome along (section 9.5.4)
-        if taken.is_ok() && !active {
+        if !active {
             if let Err(e) = self.join_group(conversation_id, body) {
                 platform_log(LOG_TAG, format!("group not joined again: {:?}", e));
             }

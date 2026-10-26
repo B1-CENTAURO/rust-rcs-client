@@ -137,6 +137,8 @@ pub(super) struct Kds {
     /// The KeyPackages uploaded, with the state the app had kept by then
     uploads: Mutex<Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)>>,
     pub(super) queries: Mutex<Vec<(Vec<Ciphersuite>, Vec<Recipient>)>>,
+    /// What happens while KeyPackages are fetched, once
+    during_fetch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Kds {
@@ -168,6 +170,11 @@ impl Kds {
                 .map(|(tel_uri, fetched)| (String::from(tel_uri), fetched))
                 .collect(),
         );
+    }
+
+    /// Has `happening` happen while KeyPackages are next fetched
+    pub(super) fn during_fetch(&self, happening: impl FnOnce() + Send + 'static) {
+        *self.during_fetch.lock().unwrap() = Some(Box::new(happening));
     }
 
     pub(super) fn uploads(&self) -> Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
@@ -206,6 +213,10 @@ impl KeyDistribution for Kds {
             .lock()
             .unwrap()
             .push((ciphersuites, recipients));
+        let happening = self.during_fetch.lock().unwrap().take();
+        if let Some(happening) = happening {
+            happening();
+        }
         let directory = self.directory.lock().unwrap().clone();
         Box::pin(async move { directory.ok_or(KdsError::Unavailable) })
     }

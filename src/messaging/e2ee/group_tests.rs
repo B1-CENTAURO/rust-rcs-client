@@ -2753,6 +2753,21 @@ fn bob_with_both_phones_of_alice() -> (
     (MlsClient, MlsConversation),
     (MlsClient, MlsConversation),
 ) {
+    let (device, _, phone, other_phone) = bob_with_both_phones_of_alice_on(LATER, None);
+    (device, phone, other_phone)
+}
+
+/// As bob_with_both_phones_of_alice(), the device as of `date`, telling the
+/// time of `clock` if given, with its Home KDS
+fn bob_with_both_phones_of_alice_on(
+    date: &str,
+    clock: Option<&Clock>,
+) -> (
+    Arc<E2eeDevice>,
+    Arc<Kds>,
+    (MlsClient, MlsConversation),
+    (MlsClient, MlsConversation),
+) {
     let phone = client_later(ALICE, ALICE_KEY, ALICE_PUBLIC_KEY);
     let other_phone = client_later(ALICE_RENEWED, ALICE_RENEWED_KEY, ALICE_RENEWED_PUBLIC_KEY);
     let app = Arc::new(App::default());
@@ -2763,15 +2778,19 @@ fn bob_with_both_phones_of_alice() -> (
             other_phone.generate_key_package(false).unwrap(),
         ]),
     )]));
-    let device = E2eeDevice::new(
-        validator(LATER),
+    let mut device = E2eeDevice::new(
+        validator(date),
         HOME_KDS,
-        kds as Arc<dyn KeyDistribution>,
+        Arc::clone(&kds) as Arc<dyn KeyDistribution>,
         Box::new(|_| true),
         None,
     )
     .unwrap()
     .with_signer(|| Some(signer(BOB_KEY, BOB_PUBLIC_KEY)));
+    if let Some(clock) = clock {
+        let clock = clock.clone();
+        device = device.with_clock(move || clock.now());
+    }
     provision(&device, &[BOB_TEL], None);
     assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now));
     let device = Arc::new(device);
@@ -2787,6 +2806,7 @@ fn bob_with_both_phones_of_alice() -> (
         .unwrap();
     (
         device,
+        kds,
         (phone, phones_group),
         (other_phone, other_phones_group),
     )
@@ -4157,11 +4177,14 @@ fn no_key_update_is_made_with_a_certificate_about_to_expire() {
     assert!(!later.key_update_due(CONVERSATION));
     assert_eq!(later.update_keys(CONVERSATION, IMPU, GROUP_URI), Ok(None));
     assert_eq!(epoch(&later, CONVERSATION), Ok((1, false)));
+    // nor a KeyPackage Update, which updates the leaf of the device too
+    assert!(!later.replacement_due(CONVERSATION));
 
     // which with 30 days left it would be
     let today =
         alice(&app, &kds, TODAY, Some(&app.last().unwrap())).with_clock(move || clock.now());
     assert!(today.key_update_due(CONVERSATION));
+    assert!(today.replacement_due(CONVERSATION));
 }
 
 #[test]
@@ -4462,6 +4485,14 @@ fn a_group_whose_clients_cannot_be_replaced_is_moved_to_unencrypted() {
             EndMlsReason::GroupMemberFailsCapabilitiesCheck,
         ),
         (
+            answered(
+                200,
+                "+g.gsma.rcs.mls.mls-version=\"v2\";+g.gsma.rcs.mls.mls-kds=\"42\"",
+            ),
+            Fetched::KeyPackages(Vec::new()),
+            EndMlsReason::GroupMemberFailsCapabilitiesCheck,
+        ),
+        (
             mls("42"),
             Fetched::NotFound,
             EndMlsReason::CannotFetchKeypackages,
@@ -4553,4 +4584,108 @@ fn the_groups_of_the_device_replace_the_clients_of_others_as_they_update_keys() 
     let groups = DeviceGroups::new(&device, query);
     let cpim = update(&groups).expect("a control message");
     assert!(commit_bundle_of(&cpim).group_info.len() > 0);
+}
+
+const OCTOBER: &str = "2026-10-01";
+
+/// Bob's device on 1 October, in a group with both phones of Alice, 31 days
+/// on by its clock, its Home KDS having a KeyPackage of each phone: the
+/// device, its Home KDS, and the other phone of Alice with its group
+fn bob_with_both_phones_of_alice_31_days_on(
+) -> (Arc<E2eeDevice>, Arc<Kds>, (MlsClient, MlsConversation)) {
+    let clock = Clock::new();
+    let (device, kds, (phone, _), (other_phone, other_phones_group)) =
+        bob_with_both_phones_of_alice_on(OCTOBER, Some(&clock));
+    clock.advance(31 * DAY);
+    kds.now_knowing(vec![(
+        ALICE_TEL,
+        Fetched::KeyPackages(vec![
+            phone.generate_key_package(false).unwrap(),
+            other_phone.generate_key_package(false).unwrap(),
+        ]),
+    )]);
+    (device, kds, (other_phone, other_phones_group))
+}
+
+#[test]
+fn the_clients_of_a_participant_are_replaced_together_once_no_one_is_leaving() {
+    let (device, kds, (other_phone, mut other_phones_group)) =
+        bob_with_both_phones_of_alice_31_days_on();
+    let (query, asked) = answering(&[(ALICE_TEL, mls("42"))]);
+    let replace = || block_on(device.replace_members(CONVERSATION, BOB_IMPU, GROUP_URI, &query));
+
+    // her KeyPackages fetched once for both phones
+    let cpim = replace().unwrap().expect("a control message");
+    assert_eq!(*asked.lock().unwrap(), [ALICE_TEL]);
+    assert_eq!(
+        kds.queries.lock().unwrap().last().unwrap().1,
+        [recipient(ALICE_TEL)]
+    );
+    assert!(!bundle_of(&cpim).welcome.is_empty());
+    device.discard_pending(CONVERSATION, false).unwrap();
+
+    // not while one leaves, whose leave is committed first (RCC.16 section
+    // 9.4)
+    let proposal = other_phones_group.leave(&other_phone).unwrap();
+    device
+        .on_server_message(CONVERSATION, &forwarded_leave(&proposal))
+        .unwrap();
+    assert!(!device.replacement_due(CONVERSATION));
+    assert_eq!(replace(), Ok(None));
+
+    // nor if the leave comes while her KeyPackages are fetched
+    let (device, kds, (other_phone, mut other_phones_group)) =
+        bob_with_both_phones_of_alice_31_days_on();
+    let proposal = other_phones_group.leave(&other_phone).unwrap();
+    let leaving = Arc::clone(&device);
+    kds.during_fetch(move || {
+        leaving
+            .on_server_message(CONVERSATION, &forwarded_leave(&proposal))
+            .unwrap();
+    });
+    assert_eq!(
+        block_on(device.replace_members(CONVERSATION, BOB_IMPU, GROUP_URI, &query)),
+        Ok(None)
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+}
+
+#[test]
+fn what_changes_while_key_packages_are_fetched_is_minded() {
+    // the group of the device with Bob 31 days on, `change` happening while
+    // Bob's KeyPackages are fetched
+    let fetching = |change: fn(&E2eeDevice, MlsClient, MlsConversation)| {
+        let (device, kds, bob, bobs_group, clock) = alice_and_bob_in_time_with_kds();
+        clock.advance(31 * DAY);
+        kds.now_knowing(vec![(
+            BOB_TEL,
+            Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+        )]);
+        let changing = Arc::clone(&device);
+        kds.during_fetch(move || change(&changing, bob, bobs_group));
+        let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+        let replaced = block_on(device.replace_members(CONVERSATION, IMPU, GROUP_URI, &query));
+        (device, replaced)
+    };
+
+    // a Commit of the device made meanwhile is waited for, not put off
+    let (device, replaced) = fetching(|device, _, _| {
+        device
+            .update_keys(CONVERSATION, IMPU, GROUP_URI)
+            .unwrap()
+            .expect("a key update");
+    });
+    assert_eq!(replaced, Err(GroupError::Pending));
+    device.discard_pending(CONVERSATION, false).unwrap();
+    assert!(device.replacement_due(CONVERSATION));
+
+    // Bob updating his keys meanwhile leaves no one to replace
+    let (device, replaced) = fetching(|device, bob, mut bobs_group| {
+        let output = bobs_group.update_keys(&bob).unwrap();
+        device
+            .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+            .unwrap();
+    });
+    assert_eq!(replaced, Ok(None));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
 }
