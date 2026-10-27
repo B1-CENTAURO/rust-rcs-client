@@ -5934,14 +5934,23 @@ fn a_group_is_moved_back_to_encrypted_only_as_it_can_be() {
     bobs_group.withdraw_own_proposals(&bob).unwrap();
 
     // nor once the device is no longer a member
-    let (device, _, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let (device, _, bob, mut bobs_group, clock) = alice_and_bob_in_time_with_kds();
     let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
     let groups = DeviceGroups::new(&device, query);
     moved_to_unencrypted(&device, &groups, &bob, &mut bobs_group);
+    clock.advance(2 * HOUR);
+    assert!(groups.upgrade_due(CONVERSATION));
     let output = bobs_group
         .remove_members(&bob, &[device.store().credential().unwrap()])
         .unwrap();
     let _ = device.on_server_message(CONVERSATION, &focus_commit(&[&output.commit]));
+    let active = device
+        .store()
+        .peek_conversation(CONVERSATION.as_bytes(), |conversation, _| {
+            conversation.is_active()
+        })
+        .unwrap();
+    assert!(!active);
     assert!(groups.encryption_ended(CONVERSATION));
     assert!(!groups.upgrade_due(CONVERSATION));
 }
@@ -6022,6 +6031,7 @@ fn a_client_whose_certificate_does_not_pass_is_replaced_as_the_group_is_moved_ba
         ALICE_TEL,
         Fetched::KeyPackages(vec![phone.generate_key_package(false).unwrap()]),
     )]);
+    let queries = kds.queries.lock().unwrap().len();
     let cpim = rt
         .block_on(groups.upgrade(
             String::from(CONVERSATION),
@@ -6031,6 +6041,7 @@ fn a_client_whose_certificate_does_not_pass_is_replaced_as_the_group_is_moved_ba
         ))
         .expect("a control message");
     assert_eq!(*asked.lock().unwrap(), [ALICE_TEL]);
+    assert_eq!(kds.queries.lock().unwrap().len(), queries + 1);
     assert_eq!(
         kds.queries.lock().unwrap().last().unwrap().1,
         [recipient(ALICE_TEL)]
