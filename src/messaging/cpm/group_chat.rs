@@ -64,6 +64,15 @@ pub struct Participant {
 }
 
 impl Participant {
+    /// Whether it takes part in the group, connected or only invited, not
+    /// disconnected however that was (RFC 4575 sections 5.7.4, 5.7.5)
+    pub fn taking_part(&self) -> bool {
+        !matches!(
+            self.status.as_str(),
+            "disconnected" | "departed" | "booted" | "failed" | "busy"
+        )
+    }
+
     /// Whether the Messaging Server removed it from the group, as it does a
     /// user who lost RCS, saying so with cause 410 and the text "Removed by
     /// server" (RCC.16 section 9.6)
@@ -143,6 +152,11 @@ struct ConferenceInfo {
 
 /// The status an endpoint of `status` and `disconnection_method` gives, the
 /// most connected of a user's endpoints counting
+/// Whether `a` and `b` hold the same URIs, in whatever order
+fn same_members(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().all(|uri| b.contains(uri))
+}
+
 fn endpoint_status(status: Option<String>, disconnection_method: Option<String>) -> String {
     match status.as_deref() {
         Some("disconnected") | None => {
@@ -361,6 +375,17 @@ impl Roster {
 
         changed
     }
+
+    /// The URIs of those taking part in the group as told so far, in the
+    /// order they were told: those not disconnected, whether connected or
+    /// only invited
+    pub fn taking_part(&self) -> Vec<String> {
+        self.participants
+            .iter()
+            .filter(|participant| participant.taking_part())
+            .map(|participant| participant.uri.clone())
+            .collect()
+    }
 }
 
 /// The group chats the client takes part in, followed while their sessions
@@ -505,6 +530,19 @@ impl GroupChats {
             }
         };
 
+        // the group moved back to encrypted, if it was moved to unencrypted
+        // and that is due, once its participants are known, and when its
+        // membership changes (RCC.16 sections 11.1, 11.2)
+        let upgrading = Arc::downgrade(sip_session);
+        let taking_part = move |participants: Vec<String>, membership_changed: bool| {
+            let session_end = upgrading
+                .upgrade()
+                .and_then(|sip_session| sip_session.get_inner().session_end());
+            if let Some(session_end) = session_end {
+                session_end.upgrade_if_due(participants, membership_changed);
+            }
+        };
+
         let core = self.core.lock().unwrap().as_ref().and_then(Weak::upgrade);
         let registered = self.registered_public_identity.lock().unwrap().clone();
         let subscriber = match (core, registered) {
@@ -517,6 +555,7 @@ impl GroupChats {
                 session.mls_opaque_token(),
                 &self.listener,
                 removed_by_server,
+                taking_part,
                 rt,
             )
             .map(|subscriber| (subscriber, core, transport)),
@@ -547,8 +586,10 @@ impl GroupChats {
 }
 
 /// Subscribes to the conference events of the group at `conference_uri`,
-/// telling `listener` of each participant that changes, and
-/// `removed_by_server` of each the Messaging Server removed
+/// telling `listener` of each participant that changes, `removed_by_server`
+/// of each the Messaging Server removed, and `taking_part` of the URIs of
+/// those taking part once a notification changed any participant, and
+/// whether it changed who takes part
 fn subscribe(
     conference_uri: &str,
     core: &Arc<SipCore>,
@@ -558,6 +599,7 @@ fn subscribe(
     mls_opaque_token: Arc<Mutex<Option<String>>>,
     listener: &Arc<dyn Fn(CPMGroupEvent) + Send + Sync>,
     removed_by_server: impl Fn(&str) + Send + Sync + 'static,
+    taking_part: impl Fn(Vec<String>, bool) + Send + Sync + 'static,
     rt: &Arc<Runtime>,
 ) -> Option<Arc<Subscriber>> {
     let roster = Mutex::new(Roster::default());
@@ -575,7 +617,15 @@ fn subscribe(
                     return;
                 }
                 if let Body::Raw(xml) = body.as_ref() {
-                    let changed = roster.lock().unwrap().take_in(xml);
+                    let (changed, before, after) = {
+                        let mut roster = roster.lock().unwrap();
+                        let before = roster.taking_part();
+                        let changed = roster.take_in(xml);
+                        (changed, before, roster.taking_part())
+                    };
+                    if changed.is_empty() {
+                        return;
+                    }
                     for participant in changed {
                         if participant.removed_by_server() {
                             removed_by_server(&participant.uri);
@@ -585,6 +635,9 @@ fn subscribe(
                             participant,
                         ));
                     }
+                    // not a change when first told
+                    let membership_changed = !before.is_empty() && !same_members(&before, &after);
+                    taking_part(after, membership_changed);
                 }
             }
             SubscriberEvent::Terminated(_, _, _) => {
@@ -950,7 +1003,7 @@ impl ClientTransactionCallbacks for InfoAnswer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Participant, Roster};
+    use super::{same_members, Participant, Roster};
 
     fn document(state: &str, version: u32, users: &str) -> Vec<u8> {
         format!(
@@ -1187,5 +1240,57 @@ entity=\"sip:conf1@conf.example.com\" state=\"{}\" version=\"{}\">\
             assert!(!removed(Some(reason)).removed_by_server(), "{}", reason);
         }
         assert!(!removed(None).removed_by_server());
+    }
+
+    #[test]
+    fn those_taking_part_are_those_connected_or_invited() {
+        let mut roster = Roster::default();
+        assert!(roster.taking_part().is_empty());
+        roster.take_in(&document(
+            "full",
+            1,
+            &[
+                user(A, None, &endpoint("connected", None)),
+                user(B, None, &endpoint("pending", None)),
+                user("tel:+15550003", None, &endpoint("on-hold", None)),
+                user(
+                    "tel:+15550004",
+                    None,
+                    &endpoint("disconnected", Some("departed")),
+                ),
+                user(
+                    "tel:+15550005",
+                    None,
+                    &endpoint("disconnected", Some("booted")),
+                ),
+                user(
+                    "tel:+15550006",
+                    None,
+                    &endpoint("disconnected", Some("failed")),
+                ),
+                user(
+                    "tel:+15550007",
+                    None,
+                    &endpoint("disconnected", Some("busy")),
+                ),
+            ]
+            .concat(),
+        ));
+        assert_eq!(roster.taking_part(), [A, B, "tel:+15550003"]);
+        // nor is one disconnected without a method told
+        assert!(!participant(A, None, "disconnected").taking_part());
+    }
+
+    #[test]
+    fn the_same_members_are_told_in_whatever_order() {
+        let members =
+            |uris: &[&str]| -> Vec<String> { uris.iter().map(|u| String::from(*u)).collect() };
+        assert!(same_members(&members(&[A, B]), &members(&[B, A])));
+        assert!(!same_members(&members(&[A, B]), &members(&[A])));
+        assert!(!same_members(&members(&[A]), &members(&[A, B])));
+        assert!(!same_members(
+            &members(&[A, B]),
+            &members(&[A, "tel:+15550003"])
+        ));
     }
 }

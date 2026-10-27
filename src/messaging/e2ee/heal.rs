@@ -78,9 +78,9 @@ struct Heal {
     /// When an Era of it was made, besides Unencrypted Singleton ones, within
     /// ERA_PERIOD (section 11.2.3)
     eras: Vec<Instant>,
-    /// Self-healing it moved it to unencrypted, which the app is yet to be
-    /// told of
-    ended_untold: bool,
+    /// Self-healing it moved it to unencrypted, or back to encrypted, which
+    /// the app is yet to be told of
+    untold: bool,
 }
 
 /// The groups to self-heal and those being self-healed, by Conversation-ID
@@ -233,7 +233,7 @@ impl Heals {
         if let Some(heal) = self.0.lock().unwrap().get_mut(conversation_id) {
             *heal = Heal {
                 eras: std::mem::take(&mut heal.eras),
-                ended_untold: heal.ended_untold,
+                untold: heal.untold,
                 ..Heal::default()
             };
         }
@@ -245,20 +245,20 @@ impl Heals {
         }
     }
 
-    fn ended_by_healing(&self, conversation_id: &str) {
+    fn healing_changed_encryption(&self, conversation_id: &str) {
         let mut heals = self.0.lock().unwrap();
         let heal = heals.entry(String::from(conversation_id)).or_default();
-        heal.ended_untold = true;
+        heal.untold = true;
     }
 
     /// Whether self-healing the group `conversation_id` moved it to
-    /// unencrypted since this was last asked
-    pub(super) fn take_ended_untold(&self, conversation_id: &str) -> bool {
+    /// unencrypted, or back to encrypted, since this was last asked
+    pub(super) fn take_untold(&self, conversation_id: &str) -> bool {
         self.0
             .lock()
             .unwrap()
             .get_mut(conversation_id)
-            .is_some_and(|heal| std::mem::take(&mut heal.ended_untold))
+            .is_some_and(|heal| std::mem::take(&mut heal.untold))
     }
 }
 
@@ -467,9 +467,10 @@ pub(super) async fn heal_once(
     let cpim = heal(&device, &conversation_id, &from, &to, &pull).await;
     if let Some(device) = device.upgrade() {
         // into a group another member moved to unencrypted, as to an
-        // Unencrypted Singleton Era (RCC.16 sections 10.1, 11.2.1)
-        if !ended && device.encryption_ended(&conversation_id) {
-            device.heals().ended_by_healing(&conversation_id);
+        // Unencrypted Singleton Era, or back to encrypted (RCC.16 sections
+        // 10.1, 11.1.2, 11.2.1)
+        if ended != device.encryption_ended(&conversation_id) {
+            device.heals().healing_changed_encryption(&conversation_id);
         }
         device.heals().end(&conversation_id);
     }
