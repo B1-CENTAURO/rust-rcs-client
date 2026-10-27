@@ -5694,11 +5694,11 @@ fn a_group_moved_to_unencrypted_is_moved_back_two_hours_on_with_one_commit() {
     assert!(asked.lock().unwrap().is_empty());
 
     // then with a Commit removing end_mls, each Participant asked for its
-    // capabilities (section 11.1), none of Bob's KeyPackages fetched, as he
-    // stays a member
+    // capabilities once (section 11.1), the user aside, none of Bob's
+    // KeyPackages fetched, as he stays a member
     clock.advance(MINUTE);
     assert!(groups.upgrade_due(CONVERSATION));
-    let cpim = upgrade(&groups, &rt, &[IMPU, BOB_SIP]).expect("a control message");
+    let cpim = upgrade(&groups, &rt, &[IMPU, BOB_SIP, BOB_TEL]).expect("a control message");
     assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
     assert_eq!(kds.queries.lock().unwrap().len(), queries);
     let message = cpim_message(&cpim);
@@ -5931,6 +5931,19 @@ fn a_group_is_moved_back_to_encrypted_only_as_it_can_be() {
     assert!(!groups.upgrade_due(CONVERSATION));
     assert_eq!(upgrade(&groups, &rt, &[IMPU, BOB_SIP]), None);
     assert!(asked.lock().unwrap().is_empty());
+    bobs_group.withdraw_own_proposals(&bob).unwrap();
+
+    // nor once the device is no longer a member
+    let (device, _, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    moved_to_unencrypted(&device, &groups, &bob, &mut bobs_group);
+    let output = bobs_group
+        .remove_members(&bob, &[device.store().credential().unwrap()])
+        .unwrap();
+    let _ = device.on_server_message(CONVERSATION, &focus_commit(&[&output.commit]));
+    assert!(groups.encryption_ended(CONVERSATION));
+    assert!(!groups.upgrade_due(CONVERSATION));
 }
 
 #[test]

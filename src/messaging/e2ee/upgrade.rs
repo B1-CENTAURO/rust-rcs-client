@@ -48,7 +48,6 @@ struct Upgrade {
     attempted: Option<SystemTime>,
     /// When a Participant was last found not to advertise E2EE
     incapable: Option<SystemTime>,
-    ongoing: bool,
 }
 
 /// The groups moved to unencrypted and moved back, by Conversation-ID
@@ -86,36 +85,30 @@ impl Upgrades {
             .is_none_or(|upgrade| due(upgrade, now))
     }
 
-    /// Starts moving the group `conversation_id` back to encrypted at `now`;
-    /// false if it is not due, or is being moved back already
+    /// Starts moving the group `conversation_id` back to encrypted at `now`,
+    /// after which it is not due for two hours; false if it is not due
     fn begin(&self, conversation_id: &str, now: SystemTime) -> bool {
         let mut upgrades = self.0.lock().unwrap();
         let upgrade = upgrades.entry(String::from(conversation_id)).or_default();
         if !due(upgrade, now) {
             return false;
         }
-        upgrade.ongoing = true;
         upgrade.attempted = Some(now);
         true
     }
 
-    /// Ends moving the group `conversation_id` back to encrypted, a
-    /// Participant found then not to advertise E2EE if `incapable` tells
-    /// when
-    fn end(&self, conversation_id: &str, incapable: Option<SystemTime>) {
+    /// Takes note of a Participant of the group `conversation_id` found not
+    /// to advertise E2EE at `now`
+    fn incapable(&self, conversation_id: &str, now: SystemTime) {
         if let Some(upgrade) = self.0.lock().unwrap().get_mut(conversation_id) {
-            upgrade.ongoing = false;
-            if incapable.is_some() {
-                upgrade.incapable = incapable;
-            }
+            upgrade.incapable = Some(now);
         }
     }
 }
 
 /// Whether `upgrade` may be tried at `now`
 fn due(upgrade: &Upgrade, now: SystemTime) -> bool {
-    !upgrade.ongoing
-        && waited(upgrade.ended, UPGRADE_BACKOFF, now)
+    waited(upgrade.ended, UPGRADE_BACKOFF, now)
         && waited(upgrade.attempted, UPGRADE_BACKOFF, now)
         && waited(upgrade.incapable, CAPABILITY_REFRESH, now)
 }
@@ -206,12 +199,11 @@ impl E2eeDevice {
         let resurrected = self
             .resurrect(conversation_id, from, to, participants, capabilities)
             .await;
-        let incapable = matches!(resurrected, Err(NotMoved::Incapable));
-        self.upgrades()
-            .end(conversation_id, incapable.then(|| self.store().now()));
         match resurrected {
             Ok(cpim) => Some(cpim),
             Err(NotMoved::Incapable) => {
+                self.upgrades()
+                    .incapable(conversation_id, self.store().now());
                 platform_log(
                     LOG_TAG,
                     "group not moved back to encrypted, a Participant not E2EE capable",

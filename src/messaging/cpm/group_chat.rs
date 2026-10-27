@@ -588,8 +588,8 @@ impl GroupChats {
 /// Subscribes to the conference events of the group at `conference_uri`,
 /// telling `listener` of each participant that changes, `removed_by_server`
 /// of each the Messaging Server removed, and `taking_part` of the URIs of
-/// those taking part once a notification changed any participant, and
-/// whether it changed who takes part
+/// those taking part with each notification, and whether it changed who
+/// takes part
 fn subscribe(
     conference_uri: &str,
     core: &Arc<SipCore>,
@@ -623,9 +623,6 @@ fn subscribe(
                         let changed = roster.take_in(xml);
                         (changed, before, roster.taking_part())
                     };
-                    if changed.is_empty() {
-                        return;
-                    }
                     for participant in changed {
                         if participant.removed_by_server() {
                             removed_by_server(&participant.uri);
