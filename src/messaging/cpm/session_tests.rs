@@ -6085,6 +6085,8 @@ fn restart_in_new_era(
     let bye = peer.next_request("BYE");
     assert_eq!(header_value(&bye, "Call-ID"), "group-old-era");
     connection.closed(&rt);
+    // nothing restarted before the session ended
+    assert!(peer.next_within(Duration::from_millis(200)).is_none());
     peer.send(&answer(&bye, "200 OK", None));
 
     let restart = peer.next_request("INVITE");

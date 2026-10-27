@@ -1108,6 +1108,23 @@ impl SessionEnd {
         true
     }
 
+    /// Ends the session as end() does with a BYE, `ended` called once the
+    /// BYE is answered, or could not be sent; false, and `ended` not called,
+    /// if the session ended already
+    pub(crate) fn end_then(&self, ended: impl FnOnce() + Send + Sync + 'static) -> bool {
+        if !self.close() {
+            return false;
+        }
+
+        let answered = focus_answer(&self.rt, move |_, _, _| ended());
+        if let Ok(message) = self.dialog.make_request(b"BYE", None) {
+            self.send(message, answered);
+        }
+
+        self.hang_up();
+        true
+    }
+
     /// Leaves the group the session is with, `conference_uri`, for good,
     /// where end() leaves it only until the next session: with a BYE whose
     /// Reason is SIP cause 200 (RCC.07 section 3.2.4.11, by RCC.11),
@@ -1348,17 +1365,19 @@ impl SessionEnd {
             let Some(cpim) = preparing.await else {
                 return;
             };
-            // not once the session ended otherwise, as when the group was
-            // left: its Commit then not sent
-            if !session_end.end(true) {
+            // restarted once the focus answers the BYE, for the session to
+            // end before the next starts; not once the session ended
+            // otherwise, as when the group was left: its Commit then not sent
+            let restarter = session_end.restarter.lock().unwrap().clone();
+            let restart = move || {
+                if let Some(restarter) = restarter {
+                    restarter(conference_uri, cpim);
+                }
+            };
+            if !session_end.end_then(restart) {
                 if let Some(encryption) = encryption {
                     encryption.discard(&conversation_id, false);
                 }
-                return;
-            }
-            let restarter = session_end.restarter.lock().unwrap().clone();
-            if let Some(restarter) = restarter {
-                restarter(conference_uri, cpim);
             }
         });
     }
