@@ -1039,13 +1039,21 @@ impl GroupEncryption for DeviceGroups {
                     }
                 };
                 // or self-healing it did, as into an Unencrypted Singleton
-                // Era (RCC.16 sections 10.1, 11.2.1)
-                let healed_into = device.heals().take_ended_untold(conversation_id);
+                // Era (RCC.16 sections 10.1, 11.1.2, 11.2.1)
+                let healed = device.heals().take_untold(conversation_id);
                 let ended_now = device.encryption_ended(conversation_id);
-                Taken {
+                let taken = Taken {
                     proposals,
-                    encryption_ended: ended_now && (!ended || healed_into),
+                    encryption_ended: ended_now && (!ended || healed),
+                    encryption_resumed: !ended_now && (ended || healed),
+                };
+                // not moved back for two hours (section 11.2)
+                if taken.encryption_ended {
+                    device
+                        .upgrades()
+                        .ended(conversation_id, device.store().now());
                 }
+                taken
             }
             None => Taken::default(),
         };
@@ -1212,6 +1220,35 @@ impl GroupEncryption for DeviceGroups {
         if let Some(device) = self.device.upgrade() {
             device.era_refused(conversation_id, status_code);
         }
+    }
+
+    fn upgrade_due(&self, conversation_id: &str) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.upgrade_due(conversation_id))
+    }
+
+    fn membership_changed(&self, conversation_id: &str) {
+        if let Some(device) = self.device.upgrade() {
+            device.membership_changed(conversation_id);
+        }
+    }
+
+    fn upgrade(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participants: Vec<String>,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        let device = self.device.clone();
+        let capabilities = Arc::clone(&self.capabilities);
+        Box::pin(async move {
+            device
+                .upgrade()?
+                .upgrade_group(&conversation_id, &from, &to, &participants, &capabilities)
+                .await
+        })
     }
 
     fn encrypts(&self, conversation_id: &str) -> bool {

@@ -85,6 +85,8 @@ pub struct Taken {
     /// The end of encryption: the group chat is unencrypted from now on
     /// (section 11.2)
     pub encryption_ended: bool,
+    /// The group chat moved back to encrypted (section 11.1.2)
+    pub encryption_resumed: bool,
 }
 
 /// Why a group chat moves to unencrypted (RCC.16 sections 7.11.2.2, 11.2)
@@ -358,6 +360,29 @@ pub trait GroupEncryption: Send + Sync {
     /// prepare_next_era() made, whose Commit is discarded, another Era then
     /// due (RCC.16 sections 8.3.1, 10.1, 11.2.1)
     fn era_refused(&self, conversation_id: &str, status_code: u16);
+
+    /// Whether the group `conversation_id`, moved to unencrypted, is to be
+    /// moved back to encrypted with upgrade() (RCC.16 sections 11.1, 11.2)
+    fn upgrade_due(&self, conversation_id: &str) -> bool;
+
+    /// Takes note of the membership of the group `conversation_id`
+    /// changing, after which it may be moved back to encrypted sooner
+    /// (RCC.16 sections 11.1.1, 11.2)
+    fn membership_changed(&self, conversation_id: &str);
+
+    /// Moves the group `conversation_id` back to encrypted, if that is due,
+    /// `participants` the URIs of those taking part in it as its Conversation
+    /// Focus tells them (RCC.16 sections 11.1, 11.1.2): the CPIM message
+    /// carrying a `message/mls-rcs-client` with the Commit resurrecting its
+    /// MLS group, to send to the Focus in the session, `from` and `to` that
+    /// of the CPIM message. The Commit is applied once the Focus accepts it.
+    fn upgrade(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        participants: Vec<String>,
+    ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
     /// Whether the group chat `conversation_id` is encrypted, its MLS group
     /// kept

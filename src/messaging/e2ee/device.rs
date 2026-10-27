@@ -34,6 +34,7 @@ use super::kds::{self, EnrolmentError, KeyDistribution};
 use super::provisioning;
 use super::replace::Replacements;
 use super::store::{MlsStore, SaveState, StoreError};
+use super::upgrade::Upgrades;
 
 /// The Cipher Suite the device enrols in: Client Certificates are ECDSA
 /// P-256 or P-384 (RCC.16 Annex A.3.7)
@@ -79,6 +80,8 @@ pub struct E2eeDevice {
     heals: Heals,
     /// The groups whose KeyPackage Update is put off for now
     replacements: Replacements,
+    /// The groups moved to unencrypted, and being moved back
+    upgrades: Upgrades,
 }
 
 impl E2eeDevice {
@@ -109,6 +112,7 @@ impl E2eeDevice {
             control_messages: Mutex::new(HashMap::new()),
             heals: Heals::default(),
             replacements: Replacements::default(),
+            upgrades: Upgrades::default(),
         })
     }
 
@@ -126,6 +130,10 @@ impl E2eeDevice {
 
     pub(super) fn replacements(&self) -> &Replacements {
         &self.replacements
+    }
+
+    pub(super) fn upgrades(&self) -> &Upgrades {
+        &self.upgrades
     }
 
     pub(super) fn home_kds(&self) -> u32 {

@@ -1108,6 +1108,23 @@ impl SessionEnd {
         true
     }
 
+    /// Ends the session as end() does with a BYE, `ended` called once the
+    /// BYE is answered, or could not be sent; false, and `ended` not called,
+    /// if the session ended already
+    pub(crate) fn end_then(&self, ended: impl FnOnce() + Send + Sync + 'static) -> bool {
+        if !self.close() {
+            return false;
+        }
+
+        let answered = focus_answer(&self.rt, move |_, _, _| ended());
+        if let Ok(message) = self.dialog.make_request(b"BYE", None) {
+            self.send(message, answered);
+        }
+
+        self.hang_up();
+        true
+    }
+
     /// Leaves the group the session is with, `conference_uri`, for good,
     /// where end() leaves it only until the next session: with a BYE whose
     /// Reason is SIP cause 200 (RCC.07 section 3.2.4.11, by RCC.11),
@@ -1279,6 +1296,34 @@ impl SessionEnd {
         });
     }
 
+    /// Moves the MLS group of the session back to encrypted, if it was moved
+    /// to unencrypted and that is due, with a Commit sent in the session,
+    /// `participants` the URIs of those taking part in the group as its focus
+    /// tells them, its membership changed since it last told if
+    /// `membership_changed` (RCC.16 sections 11.1, 11.2)
+    pub(crate) fn upgrade_if_due(&self, participants: Vec<String>, membership_changed: bool) {
+        let encrypted = {
+            let inner = self.sip_session.get_inner();
+            let session_info = inner.get_session_info();
+            session_info
+                .encryption
+                .clone()
+                .zip(session_info.conversation_id.clone())
+        };
+        let Some((encryption, conversation_id)) = encrypted else {
+            return;
+        };
+        if membership_changed {
+            encryption.membership_changed(&conversation_id);
+        }
+        if !encryption.upgrade_due(&conversation_id) {
+            return;
+        }
+        self.commit(move |encryption, conversation_id, from, to| {
+            encryption.upgrade(conversation_id, from, to, participants)
+        });
+    }
+
     /// Makes the next Era of the MLS group of the session, as self-healing
     /// it failed, from the GroupInfo the Conversation Focus gives in the
     /// session, and restarts the group with it: the session ended, another
@@ -1320,17 +1365,19 @@ impl SessionEnd {
             let Some(cpim) = preparing.await else {
                 return;
             };
-            // not once the session ended otherwise, as when the group was
-            // left: its Commit then not sent
-            if !session_end.end(true) {
+            // restarted once the focus answers the BYE, for the session to
+            // end before the next starts; not once the session ended
+            // otherwise, as when the group was left: its Commit then not sent
+            let restarter = session_end.restarter.lock().unwrap().clone();
+            let restart = move || {
+                if let Some(restarter) = restarter {
+                    restarter(conference_uri, cpim);
+                }
+            };
+            if !session_end.end_then(restart) {
                 if let Some(encryption) = encryption {
                     encryption.discard(&conversation_id, false);
                 }
-                return;
-            }
-            let restarter = session_end.restarter.lock().unwrap().clone();
-            if let Some(restarter) = restarter {
-                restarter(conference_uri, cpim);
             }
         });
     }
@@ -1590,6 +1637,9 @@ pub enum CPMGroupEvent {
     /// maybe this client, having moved it to unencrypted (RCC.16 section
     /// 11.2)
     EncryptionEnded(String),
+    /// The group at the URI is encrypted end to end again, a member, maybe
+    /// this client, having moved it back to encrypted (RCC.16 section 11.1)
+    EncryptionResumed(String),
 }
 
 pub struct CPMSessionService {
@@ -1844,8 +1894,9 @@ impl CPMSessionService {
                             });
                         }
                     }
-                    // the group moved to unencrypted (section 11.2)
-                    if taken.encryption_ended {
+                    // the group moved to unencrypted (section 11.2), or back
+                    // to encrypted (section 11.1)
+                    if taken.encryption_ended || taken.encryption_resumed {
                         let conference_uri = String::from_utf8_lossy(
                             &session
                                 .get_inner()
@@ -1854,7 +1905,10 @@ impl CPMSessionService {
                                 .service_uri,
                         )
                         .into_owned();
-                        group_listener(CPMGroupEvent::EncryptionEnded(conference_uri));
+                        group_listener(match taken.encryption_ended {
+                            true => CPMGroupEvent::EncryptionEnded(conference_uri),
+                            false => CPMGroupEvent::EncryptionResumed(conference_uri),
+                        });
                     }
                     // or the group healed, if it could not be applied
                     heal_if_needed(session);

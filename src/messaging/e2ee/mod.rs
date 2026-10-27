@@ -24,6 +24,7 @@ pub mod message;
 pub mod provisioning;
 pub mod replace;
 pub mod store;
+pub mod upgrade;
 
 #[cfg(test)]
 mod device_tests;
