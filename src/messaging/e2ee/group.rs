@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 use crate::capability::CapabilityQuery;
 use crate::messaging::cpm::encryption::{
-    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Verified,
+    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade, Verified,
 };
 
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice, CIPHERSUITE};
@@ -490,6 +490,11 @@ impl E2eeDevice {
                 .lock()
                 .unwrap()
                 .remove(conversation_id);
+            // the Era moving it back to encrypted accepted (RCC.16 section
+            // 11.1)
+            if taken.is_ok() {
+                self.upgrades().restart_ended(conversation_id, true);
+            }
         }
         // one that cannot be applied puts the group out of step (RCC.16
         // sections 6.2.6, 10.1)
@@ -584,6 +589,7 @@ impl E2eeDevice {
     /// Drops the pending Commit and Proposals of the device in the group
     /// `conversation_id`, which the Conversation Focus did not take
     fn drop_pending(&self, conversation_id: &str) -> Result<(), StoreError> {
+        self.upgrades().restart_ended(conversation_id, false);
         self.store()
             .with_conversation(conversation_id.as_bytes(), |conversation, client| {
                 conversation.discard_pending_commit(client)?;
@@ -593,13 +599,16 @@ impl E2eeDevice {
     }
 
     /// Whether the group chat `conversation_id` was moved to unencrypted,
-    /// its MLS group having the end_mls extension (RCC.16 section 11.2)
+    /// its MLS group having the end_mls extension (RCC.16 section 11.2), or
+    /// its Conversation Focus having none (section 10.1)
     pub fn encryption_ended(&self, conversation_id: &str) -> bool {
-        self.store()
-            .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
-                conversation.is_encryption_ended()
-            })
-            .unwrap_or(false)
+        self.upgrades().without_group(conversation_id)
+            || self
+                .store()
+                .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
+                    conversation.is_encryption_ended()
+                })
+                .unwrap_or(false)
     }
 
     /// Whether the certificate of the device has 30 days left at least, as
@@ -1038,14 +1047,11 @@ impl GroupEncryption for DeviceGroups {
                         false
                     }
                 };
-                // or self-healing it did, as into an Unencrypted Singleton
-                // Era (RCC.16 sections 10.1, 11.1.2, 11.2.1)
-                let healed = device.heals().take_untold(conversation_id);
                 let ended_now = device.encryption_ended(conversation_id);
                 let taken = Taken {
                     proposals,
-                    encryption_ended: ended_now && (!ended || healed),
-                    encryption_resumed: !ended_now && (ended || healed),
+                    encryption_ended: ended_now && !ended,
+                    encryption_resumed: !ended_now && ended,
                 };
                 // not moved back for two hours (section 11.2)
                 if taken.encryption_ended {
@@ -1240,7 +1246,7 @@ impl GroupEncryption for DeviceGroups {
         from: String,
         to: String,
         participants: Vec<String>,
-    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+    ) -> BoxFuture<'static, Option<Upgrade>> {
         let device = self.device.clone();
         let capabilities = Arc::clone(&self.capabilities);
         Box::pin(async move {

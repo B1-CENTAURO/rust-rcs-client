@@ -82,7 +82,7 @@ use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{
-    EndReason, GroupEncryption, ImdnTold, Sealed, Verified, CONTENT_TYPE_MLS,
+    EndReason, GroupEncryption, ImdnTold, Sealed, Upgrade, Verified, CONTENT_TYPE_MLS,
     CONTENT_TYPE_MLS_RCS_SERVER,
 };
 use super::group_chat::{
@@ -1084,8 +1084,18 @@ pub(crate) struct SessionEnd {
     pub(crate) dialog: Arc<SipDialog>,
     pub(crate) tm: Arc<SipTransactionManager>,
     pub(crate) registered_public_identity: Arc<Mutex<Option<(Arc<SipTransport>, String, String)>>>,
-    pub(crate) restarter: Arc<Mutex<Option<Restarter>>>,
+    pub(crate) links: ServiceLinks,
     pub(crate) rt: Arc<Runtime>,
+}
+
+/// What the sessions of a service take of it: to restart a group, to move
+/// one that is not encrypted to encrypted, and to tell the app of a group
+/// moving to unencrypted or back
+#[derive(Clone)]
+pub struct ServiceLinks {
+    pub(crate) restarter: Arc<Mutex<Option<Restarter>>>,
+    pub(crate) group_encryption: Arc<Mutex<Option<Arc<dyn GroupEncryption>>>>,
+    pub(crate) group_listener: Arc<dyn Fn(CPMGroupEvent) + Send + Sync>,
 }
 
 impl SessionEnd {
@@ -1233,29 +1243,40 @@ impl SessionEnd {
             public_user_identity,
             conference_uri.clone(),
         );
-        let sip_session = Arc::clone(&self.sip_session);
-        let rt = Arc::clone(&self.rt);
+        let session_end = self.clone();
         self.rt.spawn(async move {
-            let Some(cpim) = preparing.await else {
-                return;
-            };
-            let message = CPMMessageParam::new(
-                String::from("message/cpim"),
-                String::new(),
-                new_message_id(),
-                &conference_uri,
-                &RecipientType::Group,
-                &conference_uri,
-                move |status_code, _| {
-                    // not reaching the focus, it is not refused either
-                    if !(200..300).contains(&status_code) {
-                        encryption.discard(&conversation_id, false);
-                    }
-                },
-            )
-            .raw_data(cpim);
-            sip_session.get_inner().send_message(message, &rt);
+            if let Some(cpim) = preparing.await {
+                session_end.send_in_session(encryption, conversation_id, conference_uri, cpim);
+            }
         });
+    }
+
+    /// Sends in the session the control message `cpim` of the encryption
+    /// `encryption` of the group `conversation_id` at `conference_uri`, the
+    /// Commit it carries let go of if the message is not sent
+    fn send_in_session(
+        &self,
+        encryption: Arc<dyn GroupEncryption>,
+        conversation_id: String,
+        conference_uri: String,
+        cpim: Vec<u8>,
+    ) {
+        let message = CPMMessageParam::new(
+            String::from("message/cpim"),
+            String::new(),
+            new_message_id(),
+            &conference_uri,
+            &RecipientType::Group,
+            &conference_uri,
+            move |status_code, _| {
+                // not reaching the focus, it is not refused either
+                if !(200..300).contains(&status_code) {
+                    encryption.discard(&conversation_id, false);
+                }
+            },
+        )
+        .raw_data(cpim);
+        self.sip_session.get_inner().send_message(message, &self.rt);
     }
 
     /// Updates the keys of this client in the MLS group of the session, if
@@ -1290,9 +1311,20 @@ impl SessionEnd {
         if !encryption.needs_healing(&conversation_id) {
             return;
         }
+        // the app told once self-healing moved the group to unencrypted, as
+        // into a group another member moved to unencrypted or when the
+        // Focus has no MLS group for it, or back to encrypted (sections
+        // 10.1, 11.1.2, 11.2.1)
+        let ended = encryption.encryption_ended(&conversation_id);
         let pull = group_info_pull(self);
-        self.commit(move |encryption, conversation_id, from, to| {
-            encryption.heal(conversation_id, from, to, pull)
+        let told = self.clone();
+        self.commit(move |healing, conversation_id, from, to| {
+            let healed = healing.heal(conversation_id.clone(), from, to, pull);
+            Box::pin(async move {
+                let cpim = healed.await;
+                told.tell_encryption_change(&*encryption, &conversation_id, ended);
+                cpim
+            })
         });
     }
 
@@ -1302,15 +1334,20 @@ impl SessionEnd {
     /// tells them, its membership changed since it last told if
     /// `membership_changed` (RCC.16 sections 11.1, 11.2)
     pub(crate) fn upgrade_if_due(&self, participants: Vec<String>, membership_changed: bool) {
-        let encrypted = {
+        // that of the service for a group never encrypted (section 11.1)
+        let (encryption, conversation_id, conference_uri) = {
             let inner = self.sip_session.get_inner();
             let session_info = inner.get_session_info();
-            session_info
-                .encryption
-                .clone()
-                .zip(session_info.conversation_id.clone())
+            (
+                session_info
+                    .encryption
+                    .clone()
+                    .or_else(|| self.links.group_encryption.lock().unwrap().clone()),
+                session_info.conversation_id.clone(),
+                String::from_utf8_lossy(&session_info.cpm_contact.service_uri).into_owned(),
+            )
         };
-        let Some((encryption, conversation_id)) = encrypted else {
+        let Some((encryption, conversation_id)) = encryption.zip(conversation_id) else {
             return;
         };
         if membership_changed {
@@ -1319,8 +1356,70 @@ impl SessionEnd {
         if !encryption.upgrade_due(&conversation_id) {
             return;
         }
-        self.commit(move |encryption, conversation_id, from, to| {
-            encryption.upgrade(conversation_id, from, to, participants)
+        let Some(public_user_identity) = self.public_user_identity() else {
+            return;
+        };
+
+        let preparing = encryption.upgrade(
+            conversation_id.clone(),
+            public_user_identity,
+            conference_uri.clone(),
+            participants,
+        );
+        let session_end = self.clone();
+        self.rt.spawn(async move {
+            match preparing.await {
+                Some(Upgrade::InSession(cpim)) => {
+                    session_end.send_in_session(encryption, conversation_id, conference_uri, cpim)
+                }
+                // an Era of its own, as the Focus has no MLS group for it
+                // (sections 8.3.1, 10.1)
+                Some(Upgrade::Restart(cpim)) => session_end.restart_with(
+                    Some(encryption),
+                    conversation_id,
+                    conference_uri,
+                    cpim,
+                ),
+                None => {}
+            }
+        });
+    }
+
+    /// The public user identity the session is had with, if registered
+    fn public_user_identity(&self) -> Option<String> {
+        self.registered_public_identity
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, public_user_identity, _)| public_user_identity.clone())
+    }
+
+    /// Tells the app of the group chat `conversation_id` of the session
+    /// moving to unencrypted or back to encrypted, if it did as `encryption`
+    /// tells since it was unencrypted as `ended` tells (RCC.16 sections
+    /// 10.1, 11.1, 11.2)
+    fn tell_encryption_change(
+        &self,
+        encryption: &dyn GroupEncryption,
+        conversation_id: &str,
+        ended: bool,
+    ) {
+        let ended_now = encryption.encryption_ended(conversation_id);
+        if ended_now == ended {
+            return;
+        }
+        let conference_uri = String::from_utf8_lossy(
+            &self
+                .sip_session
+                .get_inner()
+                .get_session_info()
+                .cpm_contact
+                .service_uri,
+        )
+        .into_owned();
+        (self.links.group_listener)(match ended_now {
+            true => CPMGroupEvent::EncryptionEnded(conference_uri),
+            false => CPMGroupEvent::EncryptionResumed(conference_uri),
         });
     }
 
@@ -1362,24 +1461,37 @@ impl SessionEnd {
             .clone();
         let session_end = self.clone();
         self.rt.spawn(async move {
-            let Some(cpim) = preparing.await else {
-                return;
-            };
-            // restarted once the focus answers the BYE, for the session to
-            // end before the next starts; not once the session ended
-            // otherwise, as when the group was left: its Commit then not sent
-            let restarter = session_end.restarter.lock().unwrap().clone();
-            let restart = move || {
-                if let Some(restarter) = restarter {
-                    restarter(conference_uri, cpim);
-                }
-            };
-            if !session_end.end_then(restart) {
-                if let Some(encryption) = encryption {
-                    encryption.discard(&conversation_id, false);
-                }
+            if let Some(cpim) = preparing.await {
+                session_end.restart_with(encryption, conversation_id, conference_uri, cpim);
             }
         });
+    }
+
+    /// Restarts the group at `conference_uri` with an INVITE carrying `cpim`,
+    /// the CPIM message of an Era of the MLS group `conversation_id` of
+    /// `encryption`, once the session ended (RCC.16 sections 8.1, 8.3.1)
+    ///
+    /// Restarted once the focus answers the BYE, for the session to end
+    /// before the next starts; not once the session ended otherwise, as when
+    /// the group was left: the Commit of the Era is then let go of.
+    fn restart_with(
+        &self,
+        encryption: Option<Arc<dyn GroupEncryption>>,
+        conversation_id: String,
+        conference_uri: String,
+        cpim: Vec<u8>,
+    ) {
+        let restarter = self.links.restarter.lock().unwrap().clone();
+        let restart = move || {
+            if let Some(restarter) = restarter {
+                restarter(conference_uri, cpim);
+            }
+        };
+        if !self.end_then(restart) {
+            if let Some(encryption) = encryption {
+                encryption.discard(&conversation_id, false);
+            }
+        }
     }
 
     /// Ends the session with the BYE of leave(), carrying the CPIM message
@@ -1950,6 +2062,15 @@ impl CPMSessionService {
         self.group_chats
             .ids_of(conference_uri)
             .map(|ids| ids.conversation_id)
+    }
+
+    /// What the sessions of the service take of it
+    pub(crate) fn links(&self) -> ServiceLinks {
+        ServiceLinks {
+            restarter: Arc::clone(&self.restarter),
+            group_encryption: Arc::clone(&self.group_encryption),
+            group_listener: Arc::clone(&self.group_chats.listener),
+        }
     }
 
     /// The core the conference events of groups are subscribed to with
@@ -2901,7 +3022,7 @@ impl CPMSessionService {
                 let group_chats = Arc::clone(&self.group_chats);
 
                 let registered_public_identity = Arc::clone(&self.registered_public_identity);
-                let restarter = Arc::clone(&self.restarter);
+                let links = self.links();
 
                 let tm = core.get_transaction_manager();
                 let tm_ = Arc::clone(&tm);
@@ -3017,7 +3138,7 @@ impl CPMSessionService {
                                                                 dialog: Arc::clone(&dialog),
                                                                 tm: Arc::clone(&tm_),
                                                                 registered_public_identity: Arc::clone(&registered_public_identity),
-                                                                restarter: Arc::clone(&restarter),
+                                                                links: links.clone(),
                                                                 rt: Arc::clone(&rt_),
                                                             };
                                                             cpm_session.keep_session_end(session_end.clone());
@@ -4129,7 +4250,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                             ongoing_dialogs,
                                             &self.service.ongoing_sessions,
                                             &self.service.group_chats,
-                                            &self.service.restarter,
+                                            &self.service.links(),
                                             &self.tm,
                                             rt,
                                         );
@@ -4248,7 +4369,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                     Arc::clone(&self.service.ongoing_sessions);
                                                 let group_chats =
                                                     Arc::clone(&self.service.group_chats);
-                                                let restarter = Arc::clone(&self.service.restarter);
+                                                let links = self.service.links();
 
                                                 let ongoing_incoming_invitations_ = Arc::clone(
                                                     &self.service.ongoing_incoming_invitations,
@@ -4288,7 +4409,7 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                                 &ongoing_dialogs,
                                                                 &ongoing_sessions,
                                                                 &group_chats,
-                                                                &restarter,
+                                                                &links,
                                                                 &tm_,
                                                                 &rt_,
                                                             );

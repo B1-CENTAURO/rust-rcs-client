@@ -33,6 +33,7 @@ use rust_rcs_core::mls::ErrorKind;
 use crate::messaging::cpm::encryption::GroupInfoPull;
 
 use super::device::E2eeDevice;
+use super::era::NO_MLS_GROUP;
 use super::group::GroupError;
 use super::store::StoreError;
 
@@ -78,9 +79,6 @@ struct Heal {
     /// When an Era of it was made, besides Unencrypted Singleton ones, within
     /// ERA_PERIOD (section 11.2.3)
     eras: Vec<Instant>,
-    /// Self-healing it moved it to unencrypted, or back to encrypted, which
-    /// the app is yet to be told of
-    untold: bool,
 }
 
 /// The groups to self-heal and those being self-healed, by Conversation-ID
@@ -233,7 +231,6 @@ impl Heals {
         if let Some(heal) = self.0.lock().unwrap().get_mut(conversation_id) {
             *heal = Heal {
                 eras: std::mem::take(&mut heal.eras),
-                untold: heal.untold,
                 ..Heal::default()
             };
         }
@@ -243,22 +240,6 @@ impl Heals {
         if let Some(heal) = self.0.lock().unwrap().get_mut(conversation_id) {
             heal.ongoing = false;
         }
-    }
-
-    fn healing_changed_encryption(&self, conversation_id: &str) {
-        let mut heals = self.0.lock().unwrap();
-        let heal = heals.entry(String::from(conversation_id)).or_default();
-        heal.untold = true;
-    }
-
-    /// Whether self-healing the group `conversation_id` moved it to
-    /// unencrypted, or back to encrypted, since this was last asked
-    pub(super) fn take_untold(&self, conversation_id: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .get_mut(conversation_id)
-            .is_some_and(|heal| std::mem::take(&mut heal.untold))
     }
 }
 
@@ -407,6 +388,13 @@ pub(super) async fn heal(
     // the GroupInfo then (section 10.1.1)
     let group_info = match pull(INFO_PACKAGE_MLS_GROUP_INFO_PULL, None).await {
         Some((200, body)) => pulled_group_info(&body),
+        // the Focus has no MLS group for the conversation, which is
+        // unencrypted from now on (sections 6.3.1, 10.1)
+        Some((NO_MLS_GROUP, _)) => {
+            platform_log(LOG_TAG, "group not healed, the focus has no MLS group");
+            device.upgrade()?.lost_group(conversation_id);
+            return None;
+        }
         answer => {
             platform_log(
                 LOG_TAG,
@@ -457,21 +445,11 @@ pub(super) async fn heal_once(
     pull: GroupInfoPull,
     healed: impl FnOnce(),
 ) -> Option<Vec<u8>> {
-    let ended = {
-        let device = device.upgrade()?;
-        if !device.heals().begin(&conversation_id) {
-            return None;
-        }
-        device.encryption_ended(&conversation_id)
-    };
+    if !device.upgrade()?.heals().begin(&conversation_id) {
+        return None;
+    }
     let cpim = heal(&device, &conversation_id, &from, &to, &pull).await;
     if let Some(device) = device.upgrade() {
-        // into a group another member moved to unencrypted, as to an
-        // Unencrypted Singleton Era, or back to encrypted (RCC.16 sections
-        // 10.1, 11.1.2, 11.2.1)
-        if ended != device.encryption_ended(&conversation_id) {
-            device.heals().healing_changed_encryption(&conversation_id);
-        }
         device.heals().end(&conversation_id);
     }
     healed();
