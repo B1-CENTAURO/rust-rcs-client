@@ -233,8 +233,11 @@ impl E2eeDevice {
     }
 
     /// Whether the MLS group `conversation_id` is one moved to unencrypted
-    /// that can be moved back as it is
+    /// that can be moved back as it is, its Conversation Focus having it
     fn resurrectable(&self, conversation_id: &str) -> bool {
+        if self.upgrades().without_group(conversation_id) {
+            return false;
+        }
         self.store()
             .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
                 conversation.is_encryption_ended()

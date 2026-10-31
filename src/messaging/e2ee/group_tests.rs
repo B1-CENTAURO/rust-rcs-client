@@ -6271,3 +6271,48 @@ fn an_era_moving_a_group_back_to_encrypted_the_focus_refuses_is_let_go_of() {
     clock.advance(2 * HOUR);
     assert!(groups.upgrade_due(CONVERSATION));
 }
+
+#[test]
+fn a_group_unencrypted_whose_focus_has_no_mls_group_is_moved_back_with_an_era_without_end_mls() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, mut bobs_group, clock) = alice_and_bob_in_time_with_kds();
+    let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    moved_to_unencrypted(&device, &groups, &bob, &mut bobs_group);
+
+    // the Focus then found to have no MLS group (RCC.16 section 10.1)
+    device.heals().want(CONVERSATION);
+    let (pull, _) = focus_answering(vec![None, Some((469, Vec::new()))]);
+    rt.block_on(groups.heal(
+        String::from(CONVERSATION),
+        String::from(IMPU),
+        String::from(GROUP_URI),
+        pull,
+    ));
+    clock.advance(2 * HOUR);
+    assert!(groups.upgrade_due(CONVERSATION));
+
+    // not resurrected, which the Focus could not take, but made anew in the
+    // next Era, without the end_mls of the group of the device (sections
+    // 8.3.1, 11.1)
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    let cpim = upgrade_by_restart(&groups, &rt, &[IMPU, BOB_SIP]).expect("an Era");
+    let bundle = bundle_of(&cpim);
+    let next = EraBase::of_group_info(&MlsGroupInfo {
+        group_info: bundle.group_info.clone(),
+        ratchet_tree: bundle.ratchet_tree.clone(),
+        pending_proposals: Vec::new(),
+    })
+    .unwrap();
+    assert!(!next.is_encryption_ended());
+    assert_eq!(next.era(), 1);
+    assert!(!joined(&bob, &bundle).is_encryption_ended());
+    groups.on_server_message(
+        CONVERSATION,
+        &accepted(epoch_identifier(&device, CONVERSATION)),
+    );
+    assert!(!groups.encryption_ended(CONVERSATION));
+}
