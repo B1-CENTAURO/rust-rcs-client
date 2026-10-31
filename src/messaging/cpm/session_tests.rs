@@ -43,7 +43,8 @@ use rust_rcs_core::sip::{
 use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{
-    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade, Verified,
+    EndReason, FailedToDecrypt, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade,
+    Verified,
 };
 use super::group_chat::GroupIds;
 use super::imdn::{
@@ -2197,6 +2198,10 @@ struct ScriptedEncryption {
     /// The Conversation-ID, CPIM From and Message-ID, and content of each
     /// message to decrypt
     decrypted: std::sync::Mutex<Vec<(String, String, String, Vec<u8>)>>,
+    /// The negative deliveries of messages not decrypted it gives, once
+    failing_to_decrypt: std::sync::Mutex<Vec<FailedToDecrypt>>,
+    /// The Conversation-ID each time it is asked for those
+    asked_failed: std::sync::Mutex<Vec<String>>,
 }
 
 impl GroupEncryption for ScriptedEncryption {
@@ -2525,6 +2530,14 @@ impl GroupEncryption for ScriptedEncryption {
             mls_message.to_vec(),
         ));
         self.plaintext.clone().map(String::into_bytes)
+    }
+
+    fn failed_to_decrypt(&self, conversation_id: &str) -> Vec<FailedToDecrypt> {
+        self.asked_failed
+            .lock()
+            .unwrap()
+            .push(String::from(conversation_id));
+        std::mem::take(&mut *self.failing_to_decrypt.lock().unwrap())
     }
 }
 
@@ -3263,6 +3276,10 @@ impl GroupEncryption for EncryptingPrepared {
     ) -> Option<Vec<u8>> {
         self.0.decrypt(conversation_id, cpim_info, mls_message)
     }
+
+    fn failed_to_decrypt(&self, conversation_id: &str) -> Vec<FailedToDecrypt> {
+        self.0.failed_to_decrypt(conversation_id)
+    }
 }
 
 #[test]
@@ -3679,6 +3696,7 @@ fn the_notifications_of_an_encrypted_group_are_sent_signed() {
         GROUP,
         &notice.xml,
         &notice.sender_uri,
+        notice.original_message_id.as_deref(),
         |_, _| {},
         &rt
     ));
@@ -3723,6 +3741,208 @@ fn the_notifications_of_an_encrypted_group_are_sent_signed() {
     assert!(
         encryption.encrypted.lock().unwrap().is_empty(),
         "nor encrypted"
+    );
+}
+
+/// The CPIM messages signed by `encryption`, from the first `from` on: of
+/// each, its CPIM To and Original-Message-ID, and the IMDN document
+fn signed_from(
+    encryption: &ScriptedEncryption,
+    from: usize,
+) -> Vec<(String, Option<String>, String)> {
+    encryption.signed.lock().unwrap()[from..]
+        .iter()
+        .map(|(conversation_id, cpim)| {
+            assert_eq!(conversation_id, "conversation-1");
+            let cpim = CPIMMessage::try_from(&Body::construct_message(cpim).unwrap()).unwrap();
+            let info = cpim.get_info().unwrap();
+            let (content_type, xml, _) = cpim.get_message_body().unwrap();
+            assert_eq!(content_type, Some(&b"message/imdn+xml"[..]));
+            (
+                String::from_utf8_lossy(info.to).into_owned(),
+                info.mls_original_message_id
+                    .map(|id| String::from_utf8_lossy(id).into_owned()),
+                String::from_utf8_lossy(xml).into_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_senders_of_messages_not_decrypted_are_told_so_in_the_session() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        signature: Some(String::from(SIGNED)),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-not-decrypted");
+
+    // as the encryption gives them once a message is not decrypted (RCC.16
+    // section 10.2), of an Original Message and of a Re-Sent Message
+    *encryption.failing_to_decrypt.lock().unwrap() = vec![
+        FailedToDecrypt {
+            imdn: String::from("<imdn>peer-message-1</imdn>"),
+            sender_uri: String::from("tel:+15550002"),
+            original_message_id: None,
+        },
+        FailedToDecrypt {
+            imdn: String::from("<imdn>peer-message-5</imdn>"),
+            sender_uri: String::from("tel:+15550003"),
+            original_message_id: Some(String::from("peer-message-4")),
+        },
+    ];
+    let asked = encryption.asked_failed.lock().unwrap().len();
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    for _ in 0..2 {
+        let send = connection.next_message(&rt);
+        assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+        assert_eq!(String::from_utf8_lossy(&send.body), SIGNED);
+        connection.respond(&rt, &send, "200 OK");
+    }
+    assert!(encryption.asked_failed.lock().unwrap().len() > asked);
+
+    // sent signed to their senders, through the focus (sections 7.7.2.2,
+    // 7.7.3)
+    assert_eq!(
+        signed_from(&encryption, 0),
+        [
+            (
+                String::from("<tel:+15550002>"),
+                None,
+                String::from("<imdn>peer-message-1</imdn>")
+            ),
+            (
+                String::from("<tel:+15550003>"),
+                Some(String::from("peer-message-4")),
+                String::from("<imdn>peer-message-5</imdn>")
+            ),
+        ]
+    );
+    connection.quiet(&rt);
+
+    // asked for again once the focus sends a control message, which may
+    // end self-healing
+    *encryption.failing_to_decrypt.lock().unwrap() = vec![FailedToDecrypt {
+        imdn: String::from("<imdn>peer-message-6</imdn>"),
+        sender_uri: String::from("tel:+15550002"),
+        original_message_id: None,
+    }];
+    connection.send_content(
+        &rt,
+        &focus_path,
+        &our_path,
+        "message/cpim",
+        &from_the_focus("a commit"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let send = connection.next_message(&rt);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        signed_from(&encryption, 2),
+        [(
+            String::from("<tel:+15550002>"),
+            None,
+            String::from("<imdn>peer-message-6</imdn>")
+        )]
+    );
+    connection.quiet(&rt);
+}
+
+#[test]
+fn the_notifications_of_a_re_sent_message_tell_of_its_original_message() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    // as the encryption decrypts a Re-Sent Message (RCC.16 section 10.4)
+    let plaintext = format!(
+        "From: <tel:+15550002>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:05:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: peer-message-5\r\n{}NS: mls <http://www.gsma.com/rcs/mls>\r\nmls.Original-Message-ID: peer-message-1\r\n\r\nContent-Type: text/plain\r\n\r\nhi again",
+        GROUP, ASKING
+    );
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        plaintext: Some(plaintext),
+        signature: Some(String::from(SIGNED)),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-resent");
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &encrypted_group_cpim("tel:+15550002", ASKING, "re-sent"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| r.2),
+        Ok(String::from("hi again"))
+    );
+    let send = connection.next_message(&rt);
+    connection.respond(&rt, &send, "200 OK");
+
+    // its display asked for by the Message-ID of its Original Message,
+    // which the app knows it by
+    let notice = client
+        .received_messages
+        .displayed("peer-message-1")
+        .unwrap();
+    assert!(client.sessions.send_group_imdn(
+        GROUP,
+        &notice.xml,
+        &notice.sender_uri,
+        notice.original_message_id.as_deref(),
+        |_, _| {},
+        &rt
+    ));
+    let send = connection.next_message(&rt);
+    connection.respond(&rt, &send, "200 OK");
+
+    // both of the Re-Sent Message, with the Original-Message-ID (sections
+    // 7.7.1, 7.7.3)
+    let told: Vec<(Option<String>, Notification, String)> = signed_from(&encryption, 0)
+        .into_iter()
+        .map(|(to, original_message_id, xml)| {
+            assert_eq!(to, "<tel:+15550002>");
+            let imdn = Imdn::from_xml(xml.as_bytes()).unwrap();
+            (original_message_id, imdn.notification, imdn.message_id)
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (
+                Some(String::from("peer-message-1")),
+                Notification::Delivery,
+                String::from("peer-message-5")
+            ),
+            (
+                Some(String::from("peer-message-1")),
+                Notification::Display,
+                String::from("peer-message-5")
+            ),
+        ]
     );
 }
 
@@ -4069,6 +4289,7 @@ fn a_group_message_asking_to_be_told_of_is_answered_in_the_session_of_the_group(
         GROUP,
         &notice.xml,
         &notice.sender_uri,
+        notice.original_message_id.as_deref(),
         move |status_code, _| {
             let _ = result_tx.lock().unwrap().send(status_code);
         },
@@ -4098,13 +4319,14 @@ fn a_group_message_asking_to_be_told_of_is_answered_in_the_session_of_the_group(
         "sip:conf9@conf.example.com",
         &notice.xml,
         ALICE,
+        None,
         |_, _| {},
         &rt
     ));
     let _one_to_one = incoming_chat(&client, &mut peer, "one-to-one");
     assert!(!client
         .sessions
-        .send_group_imdn(PEER, &notice.xml, ALICE, |_, _| {}, &rt));
+        .send_group_imdn(PEER, &notice.xml, ALICE, None, |_, _| {}, &rt));
 }
 
 /// The Reason of a BYE leaving a group for good

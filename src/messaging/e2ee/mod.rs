@@ -20,6 +20,7 @@ pub mod ffi;
 pub mod group;
 pub mod heal;
 pub mod kds;
+pub mod lost;
 pub mod message;
 pub mod provisioning;
 pub mod replace;

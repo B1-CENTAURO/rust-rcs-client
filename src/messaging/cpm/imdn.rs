@@ -109,7 +109,7 @@ pub fn send_imdn<F>(
         String::from(public_user_identity),
     ));
 
-    let cpim_body = make_cpim_imdn_body(imdn_xml, recipient_uri, public_user_identity);
+    let cpim_body = make_cpim_imdn_body(imdn_xml, recipient_uri, None, public_user_identity);
 
     let sip_body_len = cpim_body.estimated_size();
 
@@ -188,7 +188,8 @@ pub fn acknowledge_delivery<R>(
 /// Notes a message taken in `sip_session`, with the group at
 /// `conference_uri`, from the participant its CPIM From gives, and tells the
 /// participant it was delivered, in the session, as `public_user_identity`
-/// gives us, if it asked to be told
+/// gives us, if it asked to be told; a Re-Sent Message, by its Message-ID and
+/// the Original-Message-ID of its Original Message (RCC.16 section 7.7.1)
 pub fn acknowledge_group_delivery<P>(
     received_messages: &ReceivedMessages,
     sip_session: &Arc<SipSession<CPMSession>>,
@@ -213,10 +214,14 @@ pub fn acknowledge_group_delivery<P>(
         received_messages.on_received_in_group(conference_uri, &sender_uri, cpim_info, content_type)
     {
         if let Some(public_user_identity) = public_user_identity() {
+            let original_message_id = cpim_info
+                .mls_original_message_id
+                .map(|id| String::from_utf8_lossy(id).into_owned());
             send_group_imdn(
                 &sip_session.get_inner(),
                 &imdn_xml,
                 &sender_uri,
+                original_message_id.as_deref(),
                 &public_user_identity,
                 |status_code, reason_phrase| {
                     platform_log(
@@ -235,18 +240,25 @@ pub fn acknowledge_group_delivery<P>(
 
 /// Sends the IMDN document `imdn_xml` in the session `session` with a group,
 /// for its focus to send on to the participant `recipient_uri`, the CPIM To
-/// (RFC 5438 section 9)
+/// (RFC 5438 section 9), with the Original-Message-ID `original_message_id`
+/// if it tells of a Re-Sent Message (RCC.16 sections 7.7.1, 7.7.3)
 pub fn send_group_imdn<F>(
     session: &CPMSession,
     imdn_xml: &str,
     recipient_uri: &str,
+    original_message_id: Option<&str>,
     public_user_identity: &str,
     callback: F,
     rt: &Arc<Runtime>,
 ) where
     F: Fn(u16, String) + Send + Sync + 'static,
 {
-    let body = make_cpim_imdn_body(imdn_xml, recipient_uri, public_user_identity);
+    let body = make_cpim_imdn_body(
+        imdn_xml,
+        recipient_uri,
+        original_message_id,
+        public_user_identity,
+    );
     let mut data = Vec::with_capacity(body.estimated_size());
     if let Ok(mut reader) = body.reader() {
         let _ = reader.read_to_end(&mut data);
@@ -266,12 +278,25 @@ pub fn send_group_imdn<F>(
     session.send_message(message, rt);
 }
 
+/// The Message-ID the app knows the message `cpim_info` tells of by: that of
+/// the Original Message of a Re-Sent Message, which the app never had, else
+/// its own (RCC.16 section 10.4)
+pub fn app_message_id<'a>(cpim_info: &CPIMInfo<'a>) -> &'a [u8] {
+    cpim_info
+        .mls_original_message_id
+        .unwrap_or(cpim_info.imdn_message_id)
+}
+
 /// How many messages taken are kept note of, the oldest forgotten first
 const NOTED: usize = 1024;
 
 /// A message taken, as far as notifying its sender goes
 struct Received {
+    /// The Message-ID it came with, which notifications of it tell of
     message_id: String,
+    /// The Message-ID of its Original Message if it is a Re-Sent Message,
+    /// by which the app knows it (RCC.16 section 10.4)
+    original_message_id: Option<String>,
     sender_uri: String,
     service: ImdnService,
     datetime: String,
@@ -286,6 +311,9 @@ struct Received {
 pub struct Notice {
     pub xml: String,
     pub sender_uri: String,
+    /// The Original-Message-ID it goes with, if of a Re-Sent Message (RCC.16
+    /// section 7.7.3)
+    pub original_message_id: Option<String>,
     pub service: ImdnService,
     pub group: Option<String>,
 }
@@ -359,6 +387,9 @@ impl ReceivedMessages {
         }
 
         let message_id = String::from_utf8_lossy(cpim_info.imdn_message_id).to_string();
+        let original_message_id = cpim_info
+            .mls_original_message_id
+            .map(|id| String::from_utf8_lossy(id).into_owned());
         let datetime = String::from_utf8_lossy(cpim_info.date).to_string();
         let dispositions = match cpim_info.disposition_notification {
             Some(value) => Dispositions::parse(value),
@@ -373,6 +404,7 @@ impl ReceivedMessages {
             }
             received.push_back(Received {
                 message_id: message_id.clone(),
+                original_message_id,
                 sender_uri: String::from(sender_uri),
                 service,
                 datetime: datetime.clone(),
@@ -397,12 +429,14 @@ impl ReceivedMessages {
     }
 
     /// The notification that the message `message_id` was displayed, and
-    /// where to send it
+    /// where to send it; that of a Re-Sent Message, which the app knows by
+    /// the Message-ID of its Original Message, tells of the Re-Sent Message
+    /// (RCC.16 sections 7.7.3, 10.4)
     pub fn displayed(&self, message_id: &str) -> Result<Notice, Refusal> {
         let received = self.received.lock().unwrap();
         let message = received
             .iter()
-            .find(|r| r.message_id == message_id)
+            .find(|r| r.original_message_id.as_ref().unwrap_or(&r.message_id) == message_id)
             .ok_or(Refusal::Unknown)?;
 
         if !message
@@ -426,6 +460,7 @@ impl ReceivedMessages {
         Ok(Notice {
             xml,
             sender_uri: message.sender_uri.clone(),
+            original_message_id: message.original_message_id.clone(),
             service: message.service,
             group: message.group.clone(),
         })
@@ -438,7 +473,7 @@ mod tests {
     use rust_rcs_core::imdn::notification::{Imdn, Notification, Status};
     use rust_rcs_core::internet::Body;
 
-    use super::{ImdnService, ReceivedMessages, Refusal, NOTED};
+    use super::{app_message_id, ImdnService, ReceivedMessages, Refusal, NOTED};
 
     const SENDER: &str = "sip:+15551234@example.com";
 
@@ -474,6 +509,70 @@ hi",
         received
             .on_received(ImdnService::Standalone, SENDER, &info, content_type)
             .map(|xml| Imdn::from_xml(xml.as_bytes()).unwrap())
+    }
+
+    /// A Re-Sent Message `message_id` of `original_message_id`, taken in the
+    /// group at GROUP, as decrypted (RCC.16 section 10.4)
+    fn resent(message_id: &str, original_message_id: &str) -> CPIMMessage {
+        let data = format!(
+            "From: <{}>\r\n\
+To: <sip:conf1@conf.example.com>\r\n\
+DateTime: 2023-04-04T12:20:00.000+08:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: {}\r\n\
+imdn.Disposition-Notification: positive-delivery, display\r\n\
+NS: mls <http://www.gsma.com/rcs/mls>\r\n\
+mls.Original-Message-ID: {}\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+again",
+            SENDER, message_id, original_message_id
+        );
+        CPIMMessage::try_from(&Body::construct_message(data.as_bytes()).unwrap()).unwrap()
+    }
+
+    const GROUP: &str = "sip:conf1@conf.example.com";
+
+    #[test]
+    fn a_re_sent_message_is_known_by_its_original_and_told_of_by_its_own_id() {
+        let received = ReceivedMessages::new();
+        let message = resent("Rs77", "Kn7");
+        let info = message.get_info().unwrap();
+        assert_eq!(app_message_id(&info), b"Kn7");
+        assert_eq!(
+            app_message_id(&self::message("Kn31", None).get_info().unwrap()),
+            b"Kn31"
+        );
+
+        // its delivery, of the Re-Sent Message (RCC.16 section 7.7.1)
+        let xml = received
+            .on_received_in_group(GROUP, SENDER, &info, b"text/plain")
+            .unwrap();
+        let delivery = Imdn::from_xml(xml.as_bytes()).unwrap();
+        assert_eq!(
+            (delivery.message_id.as_str(), delivery.datetime.as_str()),
+            ("Rs77", "2023-04-04T12:20:00.000+08:00")
+        );
+
+        // its display, asked for by the Message-ID the app knows it by
+        // (sections 7.7.3, 10.4)
+        assert_eq!(received.displayed("Rs77"), Err(Refusal::Unknown));
+        let notice = received.displayed("Kn7").unwrap();
+        assert_eq!(notice.original_message_id.as_deref(), Some("Kn7"));
+        assert_eq!(notice.group.as_deref(), Some(GROUP));
+        let display = Imdn::from_xml(notice.xml.as_bytes()).unwrap();
+        assert_eq!(
+            (display.message_id.as_str(), display.notification),
+            ("Rs77", Notification::Display)
+        );
+
+        // a message that was not re-sent has none
+        receive(&received, "Kn31", Some("display"), b"text/plain");
+        assert_eq!(
+            received.displayed("Kn31").unwrap().original_message_id,
+            None
+        );
     }
 
     #[test]

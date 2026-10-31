@@ -42,7 +42,8 @@ use uuid::Uuid;
 
 use crate::capability::CapabilityQuery;
 use crate::messaging::cpm::encryption::{
-    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade, Verified,
+    EndReason, FailedToDecrypt, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade,
+    Verified,
 };
 
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice, CIPHERSUITE};
@@ -1305,6 +1306,13 @@ impl GroupEncryption for DeviceGroups {
                 Verified::Forged
             }
         }
+    }
+
+    fn failed_to_decrypt(&self, conversation_id: &str) -> Vec<FailedToDecrypt> {
+        self.device
+            .upgrade()
+            .map(|device| device.failed_to_decrypt(conversation_id))
+            .unwrap_or_default()
     }
 
     fn decrypt(

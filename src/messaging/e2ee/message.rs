@@ -29,9 +29,9 @@ use rust_rcs_core::mls::rcs::wire::{
     VerifiableDeliveryImdn, VerifiableDerivedContent, VerifiableDisplayImdn,
 };
 use rust_rcs_core::mls::rcs::{
-    credential_tel_uris, is_unencrypted_cpim_header, ClientFailureReason, SecretPayloadType,
-    CPIM_HEADER_DERIVED_CONTENT_SIGNATURE, CPIM_HEADER_EPOCH_AUTHENTICATOR, CPIM_HEADER_ERA_ID,
-    CPIM_NAMESPACE, CPIM_NAMESPACE_PREFIX,
+    credential_tel_uris, is_unencrypted_cpim_header, ClientFailureReason, ResentFailure,
+    SecretPayloadType, CPIM_HEADER_DERIVED_CONTENT_SIGNATURE, CPIM_HEADER_EPOCH_AUTHENTICATOR,
+    CPIM_HEADER_ERA_ID, CPIM_HEADER_ORIGINAL_MESSAGE_ID, CPIM_NAMESPACE, CPIM_NAMESPACE_PREFIX,
 };
 use rust_rcs_core::mls::ErrorKind;
 
@@ -62,6 +62,14 @@ pub enum MessageError {
     /// The group chat is no longer encrypted, its MLS group having the
     /// end_mls extension (RCC.16 section 11.2)
     NotEncrypted,
+    /// A Re-Sent Message of a message this client did not tell its sender
+    /// it could not decrypt, or not re-sent by that sender (RCC.16 section
+    /// 10.4)
+    NotAskedFor,
+    /// A Re-Sent Message to this client that gave no Original Message: its
+    /// sender is told of one not decrypted, not of one not matching its
+    /// HMAC (sections 10.2, 10.4, Annex C.4.2)
+    ResentNotOpened(ResentFailure),
     Store(StoreError),
 }
 
@@ -107,12 +115,16 @@ fn told_sender(cpim_info: &CPIMInfo) -> Option<String> {
 }
 
 /// What the signature of the notification `imdn` covers, sent in the CPIM
-/// message of Message-ID `message_id` in Era `era` (RCC.16 sections 7.5.3.2,
-/// 7.6.3); None if it is no delivery or display notification
-///
-/// The Message-IDs of Original Messages are left empty, as Re-Sent Messages
-/// are not taken yet.
-fn signed_content(message_id: &[u8], era: u32, imdn: &[u8]) -> Option<Vec<u8>> {
+/// message of Message-ID `message_id` in Era `era`, with the
+/// Original-Message-ID `original_message_id` if it tells of a Re-Sent
+/// Message, else empty (RCC.16 sections 7.5.3.2, 7.5.3.3, 7.6.3); None if it
+/// is no delivery or display notification
+fn signed_content(
+    message_id: &[u8],
+    original_message_id: &[u8],
+    era: u32,
+    imdn: &[u8],
+) -> Option<Vec<u8>> {
     let notification = Imdn::from_xml(imdn)?;
     let told_of = notification.message_id.as_bytes();
     let content = match (notification.notification, notification.status) {
@@ -129,7 +141,10 @@ fn signed_content(message_id: &[u8], era: u32, imdn: &[u8]) -> Option<Vec<u8>> {
                 _ => ClientFailureReason::Unset,
             };
             VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
-                status, told_of, b"", reason,
+                status,
+                told_of,
+                original_message_id,
+                reason,
             ))
         }
         (Notification::Display, status) => {
@@ -139,7 +154,11 @@ fn signed_content(message_id: &[u8], era: u32, imdn: &[u8]) -> Option<Vec<u8>> {
                 Status::Error => DisplayNotificationStatus::Error,
                 _ => return None,
             };
-            VerifiableDerivedContent::DisplayImdn(VerifiableDisplayImdn::new(status, told_of, b""))
+            VerifiableDerivedContent::DisplayImdn(VerifiableDisplayImdn::new(
+                status,
+                told_of,
+                original_message_id,
+            ))
         }
         (Notification::Processing, _) => return None,
     };
@@ -309,6 +328,13 @@ impl E2eeDevice {
     /// tells of: its unencrypted headers and what was encrypted, its From the
     /// MLS identity of the sender if that is another (RCC.16 sections
     /// 7.5.3.1, 9.1.1)
+    ///
+    /// A message not decrypted has its sender told so once the group is
+    /// healed (section 10.2). A Re-Sent Message of it to this client gives
+    /// the Original Message, with the Message-ID of the Re-Sent Message and
+    /// the Original-Message-ID of the other, if this client asked for it from
+    /// its sender (section 10.4); one that could not be decrypted has its
+    /// sender told so too. Those to other clients are not taken.
     pub fn decrypt_message(
         &self,
         conversation_id: &str,
@@ -324,12 +350,38 @@ impl E2eeDevice {
                 // as when the group missed a Commit (RCC.16 section 10.1)
                 if e == StoreError::Mls(ErrorKind::Rejected) {
                     self.heals().want(conversation_id);
+                    self.lose_message(conversation_id, cpim_info);
                 }
                 MessageError::Store(e)
             })?;
-        let payload = match (decrypted.payload_type, decrypted.payload) {
-            (SecretPayloadType::Application, Some(payload)) => payload,
-            // Re-Sent Messages are not taken yet
+        let original_message_id = String::from_utf8_lossy(&decrypted.original_message_id);
+        let (payload, resent) = match (
+            decrypted.payload_type,
+            decrypted.payload,
+            decrypted.resent_failure,
+        ) {
+            (SecretPayloadType::Application, Some(payload), _) => (payload, false),
+            (SecretPayloadType::Hpke1To1Message, Some(payload), _) => {
+                if !self.found_resent(conversation_id, &original_message_id, &decrypted.sender) {
+                    return Err(MessageError::NotAskedFor);
+                }
+                (payload, true)
+            }
+            (SecretPayloadType::Hpke1To1Message, None, Some(failure)) => {
+                // its sender told of one not decrypted (sections 10.2, 10.4)
+                if failure == ResentFailure::NotDecrypted
+                    && !self.lose_resent(
+                        conversation_id,
+                        cpim_info,
+                        &original_message_id,
+                        &decrypted.sender,
+                    )
+                {
+                    return Err(MessageError::NotAskedFor);
+                }
+                return Err(MessageError::ResentNotOpened(failure));
+            }
+            // to another client
             _ => {
                 return Err(MessageError::Store(StoreError::Mls(
                     ErrorKind::UnexpectedMessage,
@@ -353,6 +405,14 @@ impl E2eeDevice {
         header_line(&mut data, b"imdn.Message-ID", cpim_info.imdn_message_id);
         if let Some(disposition) = cpim_info.disposition_notification {
             header_line(&mut data, b"imdn.Disposition-Notification", disposition);
+        }
+        if resent {
+            header_line(&mut data, b"NS", b"mls <http://www.gsma.com/rcs/mls>");
+            header_line(
+                &mut data,
+                &[&b"mls."[..], CPIM_HEADER_ORIGINAL_MESSAGE_ID].concat(),
+                original_message_id.as_bytes(),
+            );
         }
         // the headers encrypted, then the MIME body
         data.extend_from_slice(&payload);
@@ -412,8 +472,13 @@ impl E2eeDevice {
         let era = era.ok_or(MessageError::Store(StoreError::Mls(
             ErrorKind::InvalidState,
         )))?;
-        let content =
-            signed_content(info.imdn_message_id, era, imdn).ok_or(MessageError::NotCpim)?;
+        let content = signed_content(
+            info.imdn_message_id,
+            info.mls_original_message_id.unwrap_or_default(),
+            era,
+            imdn,
+        )
+        .ok_or(MessageError::NotCpim)?;
         let signature = self
             .store()
             .with_conversation(conversation_id.as_bytes(), |conversation, client| {
@@ -468,8 +533,13 @@ impl E2eeDevice {
             .store()
             .with_conversation(conversation_id.as_bytes(), |conversation, client| {
                 let era = conversation.era().ok_or(ErrorKind::InvalidState)?;
-                let content = signed_content(cpim_info.imdn_message_id, era, imdn)
-                    .ok_or(ErrorKind::BadFormat)?;
+                let content = signed_content(
+                    cpim_info.imdn_message_id,
+                    cpim_info.mls_original_message_id.unwrap_or_default(),
+                    era,
+                    imdn,
+                )
+                .ok_or(ErrorKind::BadFormat)?;
                 conversation.verify_signature(client, &signature, &content)
             })
             .map_err(MessageError::Store)?;
