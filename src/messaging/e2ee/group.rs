@@ -492,9 +492,7 @@ impl E2eeDevice {
                 .remove(conversation_id);
             // the Era moving it back to encrypted accepted (RCC.16 section
             // 11.1)
-            if taken.is_ok() {
-                self.upgrades().restart_ended(conversation_id, true);
-            }
+            self.upgrades().restart_ended(conversation_id, true);
         }
         // one that cannot be applied puts the group out of step (RCC.16
         // sections 6.2.6, 10.1)

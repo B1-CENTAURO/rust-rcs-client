@@ -6463,7 +6463,11 @@ fn a_group_never_encrypted_is_restarted_with_its_first_era() {
 
 #[test]
 fn self_healing_moving_the_group_to_unencrypted_or_back_is_told_to_the_app() {
-    for (unencrypted, told) in [(false, "unencrypted"), (true, "encrypted")] {
+    for (unencrypted, flips, told) in [
+        (false, true, Some("unencrypted")),
+        (true, true, Some("encrypted")),
+        (false, false, None),
+    ] {
         let (client, mut peer) = start(true);
         let rt = Arc::clone(&client.rt);
         let encryption = Arc::new(ScriptedEncryption {
@@ -6472,7 +6476,7 @@ fn self_healing_moving_the_group_to_unencrypted_or_back_is_told_to_the_app() {
             encrypting: vec![String::from("conversation-1")],
             unencrypted,
             out_of_step: std::sync::atomic::AtomicBool::new(true),
-            healing_flips: true,
+            healing_flips: flips,
             ..ScriptedEncryption::default()
         });
         client
@@ -6492,7 +6496,6 @@ fn self_healing_moving_the_group_to_unencrypted_or_back_is_told_to_the_app() {
             &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
         );
         assert!(connection.next_response(&rt).first_line.contains(" 200"));
-        let expected = format!("{} {}", told, GROUP);
         let events: Vec<String> = std::iter::from_fn(|| {
             client
                 .group_events
@@ -6500,12 +6503,21 @@ fn self_healing_moving_the_group_to_unencrypted_or_back_is_told_to_the_app() {
                 .ok()
         })
         .collect();
-        assert_eq!(
-            events.iter().filter(|event| **event == expected).count(),
-            1,
-            "{:?}",
-            events
-        );
+        // once, or not at all if it did not
+        let encryption_events: Vec<&String> = events
+            .iter()
+            .filter(|event| event.ends_with(&format!("encrypted {}", GROUP)))
+            .collect();
+        match told {
+            Some(told) => assert_eq!(
+                encryption_events,
+                [&format!("{} {}", told, GROUP)],
+                "{:?}",
+                events
+            ),
+            None => assert!(encryption_events.is_empty(), "{:?}", events),
+        }
+        assert_eq!(encryption.healed.lock().unwrap().len(), 1);
     }
 }
 
