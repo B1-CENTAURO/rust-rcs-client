@@ -6095,7 +6095,7 @@ fn upgrade_by_restart(
 #[test]
 fn a_group_whose_focus_has_no_mls_group_is_unencrypted_until_moved_back_with_an_era() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (device, kds, bob, _, clock) = alice_and_bob_in_time_with_kds();
+    let (device, kds, bob, mut bobs_group, clock) = alice_and_bob_in_time_with_kds();
     let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
     let groups = DeviceGroups::new(&device, query);
 
@@ -6123,6 +6123,14 @@ fn a_group_whose_focus_has_no_mls_group_is_unencrypted_until_moved_back_with_an_
         rt.block_on(groups.sign(CONVERSATION, &notification_cpim(IMPU, "imdn-92", "", &xml))),
         None
     );
+    // whatever its MLS group takes meanwhile
+    let output = bobs_group.update_keys(&bob).unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
+        Taken::default()
+    );
+    assert!(groups.encryption_ended(CONVERSATION));
 
     // moved back two hours on (section 11.2), with the next Era of the group
     // of the device, of all of Bob's Clients (sections 8.3.1, 11.1)
@@ -6152,7 +6160,7 @@ fn a_group_whose_focus_has_no_mls_group_is_unencrypted_until_moved_back_with_an_
     );
     clock.advance(2 * HOUR);
     assert!(!groups.upgrade_due(CONVERSATION));
-    let mut bobs_group = joined(&bob, &bundle);
+    bobs_group = joined(&bob, &bundle);
     assert!(!bobs_group.is_encryption_ended());
 
     // then encrypted again, which the app is told of

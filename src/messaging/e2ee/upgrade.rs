@@ -206,11 +206,9 @@ impl E2eeDevice {
     /// Whether the group chat `conversation_id` is unencrypted for want of an
     /// MLS group the Conversation Focus has, as it never had one or lost it,
     /// so that an Era of its own is to move it back to encrypted (RCC.16
-    /// sections 10.1, 11.1); not while one waits for the Focus
+    /// sections 10.1, 11.1); not while one waits for the Focus, its Commit
+    /// pending
     fn era_upgradable(&self, conversation_id: &str) -> bool {
-        if self.upgrades().restarting(conversation_id) {
-            return false;
-        }
         match self
             .store()
             .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
