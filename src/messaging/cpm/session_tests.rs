@@ -43,7 +43,7 @@ use rust_rcs_core::sip::{
 use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{
-    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Verified,
+    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade, Verified,
 };
 use super::group_chat::GroupIds;
 use super::imdn::{
@@ -2143,6 +2143,12 @@ struct ScriptedEncryption {
     /// The CPIM message it prepares for moving a group back to encrypted,
     /// if any
     upgrading: Option<Vec<u8>>,
+    /// Whether it does so with an Era for an INVITE restarting the group
+    upgrading_by_restart: bool,
+    /// Whether self-healing moves its groups to unencrypted, or back
+    healing_flips: bool,
+    /// Whether self-healing did
+    flipped: Arc<std::sync::atomic::AtomicBool>,
     /// The Conversation-ID, from, to and participants of each move back to
     /// encrypted
     upgraded: std::sync::Mutex<Vec<(String, String, String, Vec<String>)>>,
@@ -2381,6 +2387,7 @@ impl GroupEncryption for ScriptedEncryption {
         let pulling = self.pulling.clone();
         let cpim = self.healing.clone();
         let healed = Arc::clone(&self.healed);
+        let flipping = self.healing_flips.then(|| Arc::clone(&self.flipped));
         Box::pin(async move {
             let mut answers = Vec::new();
             for (package, body) in pulling {
@@ -2390,6 +2397,9 @@ impl GroupEncryption for ScriptedEncryption {
                 .lock()
                 .unwrap()
                 .push((conversation_id, from, to, answers));
+            if let Some(flipped) = flipping {
+                flipped.store(true, Ordering::SeqCst);
+            }
             cpim
         })
     }
@@ -2441,14 +2451,20 @@ impl GroupEncryption for ScriptedEncryption {
         from: String,
         to: String,
         participants: Vec<String>,
-    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+    ) -> BoxFuture<'static, Option<Upgrade>> {
         self.upgrade_wanted.store(false, Ordering::SeqCst);
         self.upgraded
             .lock()
             .unwrap()
             .push((conversation_id, from, to, participants));
-        let cpim = self.upgrading.clone();
-        Box::pin(async move { cpim })
+        let upgrade = self
+            .upgrading
+            .clone()
+            .map(|cpim| match self.upgrading_by_restart {
+                true => Upgrade::Restart(cpim),
+                false => Upgrade::InSession(cpim),
+            });
+        Box::pin(async move { upgrade })
     }
 
     fn encrypts(&self, conversation_id: &str) -> bool {
@@ -2456,7 +2472,7 @@ impl GroupEncryption for ScriptedEncryption {
     }
 
     fn encryption_ended(&self, _conversation_id: &str) -> bool {
-        self.unencrypted
+        self.unencrypted != self.flipped.load(Ordering::SeqCst)
     }
 
     fn encrypt(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Sealed> {
@@ -3210,7 +3226,7 @@ impl GroupEncryption for EncryptingPrepared {
         from: String,
         to: String,
         participants: Vec<String>,
-    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+    ) -> BoxFuture<'static, Option<Upgrade>> {
         self.0.upgrade(conversation_id, from, to, participants)
     }
 
@@ -6370,11 +6386,22 @@ fn a_group_not_due_to_move_back_to_encrypted_is_left_as_it_is() {
 }
 
 #[test]
-fn a_group_not_encrypted_is_not_moved_to_encrypted() {
+fn a_group_never_encrypted_is_restarted_with_its_first_era() {
     let (client, mut peer) = start(true);
-    let (_connection, _invite, subscribe, _) = new_group(&client, &mut peer);
-    // set once the group is started without it
-    let encryption = upgrading_in(&client, true);
+    let rt = Arc::clone(&client.rt);
+    let (mut connection, invite, subscribe, _) = new_group(&client, &mut peer);
+    let conversation_id = header_value(&invite, "Conversation-ID");
+    // set once the group is started without it: the session has none, the
+    // service has (RCC.16 section 11.1)
+    let encryption = Arc::new(ScriptedEncryption {
+        upgrade_wanted: std::sync::atomic::AtomicBool::new(true),
+        upgrading: Some(NEXT_ERA_CPIM.to_vec()),
+        upgrading_by_restart: true,
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
     peer.send(&conference_notify(
         &subscribe,
         1,
@@ -6385,8 +6412,113 @@ fn a_group_not_encrypted_is_not_moved_to_encrypted() {
         ),
     ));
     assert_eq!(status_code(&peer.next_response()), 200);
-    std::thread::sleep(Duration::from_millis(200));
-    assert!(encryption.upgraded.lock().unwrap().is_empty());
+
+    // the session ended, then the group restarted with the INVITE carrying
+    // the Era (sections 8.1, 8.3.1)
+    // the BYE, and the end of the subscription to the conference events,
+    // in whatever order the transport takes them
+    let ended = next_requests(&mut peer, &["BYE", "SUBSCRIBE"]);
+    let (bye, unsubscribe) = (&ended[0], &ended[1]);
+    assert_eq!(
+        header_value(bye, "Call-ID"),
+        header_value(&invite, "Call-ID")
+    );
+    assert_eq!(header_value(unsubscribe, "Expires"), "0");
+    connection.closed(&rt);
+    assert!(peer.next_within(Duration::from_millis(200)).is_none());
+    peer.send(&answer(bye, "200 OK", None));
+    let restart = peer.next_request("INVITE");
+    assert_eq!(request_uri(&restart), GROUP);
+    assert_eq!(header_value(&restart, "Conversation-ID"), conversation_id);
+    let parts = parts_of(&restart);
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].0, "application/sdp");
+    assert_eq!(
+        parts[1],
+        (String::from("message/cpim"), NEXT_ERA_CPIM.to_vec())
+    );
+    assert_eq!(
+        *encryption.upgraded.lock().unwrap(),
+        [(
+            conversation_id.clone(),
+            String::from(IMPU),
+            String::from(GROUP),
+            vec![String::from(IMPU), String::from(BOB)]
+        )]
+    );
+
+    // the Focus refusing it, it is told so
+    peer.send(&answer(&restart, "403 Forbidden", None));
+    peer.next_request("ACK");
+    let refused = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.refused_eras.lock().unwrap().is_empty()
+    });
+    assert!(refused);
+    assert_eq!(
+        *encryption.refused_eras.lock().unwrap(),
+        [(conversation_id, 403)]
+    );
+}
+
+#[test]
+fn self_healing_moving_the_group_to_unencrypted_or_back_is_told_to_the_app() {
+    for (unencrypted, flips, told) in [
+        (false, true, Some("unencrypted")),
+        (true, true, Some("encrypted")),
+        (false, false, None),
+    ] {
+        let (client, mut peer) = start(true);
+        let rt = Arc::clone(&client.rt);
+        let encryption = Arc::new(ScriptedEncryption {
+            cpim: Some(MLS_GROUP_CPIM.to_vec()),
+            joining: true,
+            encrypting: vec![String::from("conversation-1")],
+            unencrypted,
+            out_of_step: std::sync::atomic::AtomicBool::new(true),
+            healing_flips: flips,
+            ..ScriptedEncryption::default()
+        });
+        client
+            .sessions
+            .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+        let (mut connection, msrp_path, our_path) =
+            joined_encrypted_group(&client, &mut peer, "group-healing-told");
+
+        // a message not decrypted sets self-healing off, which moves the
+        // group to unencrypted, or back to encrypted (RCC.16 sections 10.1,
+        // 11.1.2)
+        connection.send_content(
+            &rt,
+            &msrp_path,
+            &our_path,
+            "message/cpim",
+            &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
+        );
+        assert!(connection.next_response(&rt).first_line.contains(" 200"));
+        let events: Vec<String> = std::iter::from_fn(|| {
+            client
+                .group_events
+                .recv_timeout(Duration::from_millis(500))
+                .ok()
+        })
+        .collect();
+        // once, or not at all if it did not
+        let encryption_events: Vec<&String> = events
+            .iter()
+            .filter(|event| event.ends_with(&format!("encrypted {}", GROUP)))
+            .collect();
+        match told {
+            Some(told) => assert_eq!(
+                encryption_events,
+                [&format!("{} {}", told, GROUP)],
+                "{:?}",
+                events
+            ),
+            None => assert!(encryption_events.is_empty(), "{:?}", events),
+        }
+        assert_eq!(encryption.healed.lock().unwrap().len(), 1);
+    }
 }
 
 #[test]

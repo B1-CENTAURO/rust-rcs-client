@@ -34,7 +34,7 @@ const LOG_TAG: &str = "e2ee";
 
 /// What the Conversation Focus answers an MLS-Group-Info-Pull with when the
 /// conversation has no MLS group (RCC.16 section 6.3.1)
-const NO_MLS_GROUP: u16 = 469;
+pub(super) const NO_MLS_GROUP: u16 = 469;
 
 /// What the Conversation Focus answers the INVITE carrying a new Era with
 /// when it is not the Era after the latest (RCC.16 section 8.3.1)
@@ -117,7 +117,7 @@ impl E2eeDevice {
 
     /// The next Era after `base` with all the Clients of `recipients`, as
     /// create_next_era() makes it
-    async fn next_era(
+    pub(super) async fn next_era(
         &self,
         conversation_id: &str,
         from: &str,
@@ -368,6 +368,14 @@ impl E2eeDevice {
     /// to an Unencrypted Singleton Era, made again if that is what the Focus
     /// refused.
     pub fn era_refused(&self, conversation_id: &str, status_code: u16) {
+        // one moving the group back to encrypted, which stays unencrypted
+        // until the next try (section 11.1)
+        if self.upgrades().restarting(conversation_id) {
+            if let Err(e) = self.discard_pending(conversation_id, false) {
+                platform_log(LOG_TAG, format!("refused Era not discarded: {:?}", e));
+            }
+            return;
+        }
         let ending = self
             .store()
             .peek_conversation(conversation_id.as_bytes(), |conversation, _| {

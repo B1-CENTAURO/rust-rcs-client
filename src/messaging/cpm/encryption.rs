@@ -89,6 +89,18 @@ pub struct Taken {
     pub encryption_resumed: bool,
 }
 
+/// How a group chat is moved back to encrypted (RCC.16 section 11.1)
+#[derive(Debug, PartialEq)]
+pub enum Upgrade {
+    /// With the CPIM message carrying a Commit to send to the Conversation
+    /// Focus in the session (section 11.1.2)
+    InSession(Vec<u8>),
+    /// With the CPIM message carrying an Era of its MLS group for the INVITE
+    /// restarting the group to carry, once its session ended (sections
+    /// 8.3.1, 8.1)
+    Restart(Vec<u8>),
+}
+
 /// Why a group chat moves to unencrypted (RCC.16 sections 7.11.2.2, 11.2)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EndReason {
@@ -372,17 +384,20 @@ pub trait GroupEncryption: Send + Sync {
 
     /// Moves the group `conversation_id` back to encrypted, if that is due,
     /// `participants` the URIs of those taking part in it as its Conversation
-    /// Focus tells them (RCC.16 sections 11.1, 11.1.2): the CPIM message
-    /// carrying a `message/mls-rcs-client` with the Commit resurrecting its
-    /// MLS group, to send to the Focus in the session, `from` and `to` that
-    /// of the CPIM message. The Commit is applied once the Focus accepts it.
+    /// Focus tells them (RCC.16 section 11.1): the CPIM message carrying a
+    /// `message/mls-rcs-client`, `from` and `to` that of the CPIM message,
+    /// with the Commit resurrecting its MLS group (section 11.1.2), or with
+    /// an Era of its own if the Focus has no MLS group for it (sections
+    /// 8.3.1, 10.1). The Commit is applied once the Focus accepts it, and
+    /// that of an Era discarded if the group does not start otherwise than
+    /// by the Focus refusing it, which era_refused() is for.
     fn upgrade(
         &self,
         conversation_id: String,
         from: String,
         to: String,
         participants: Vec<String>,
-    ) -> BoxFuture<'static, Option<Vec<u8>>>;
+    ) -> BoxFuture<'static, Option<Upgrade>>;
 
     /// Whether the group chat `conversation_id` is encrypted, its MLS group
     /// kept

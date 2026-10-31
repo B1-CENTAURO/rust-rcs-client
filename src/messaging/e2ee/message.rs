@@ -166,6 +166,12 @@ impl E2eeDevice {
         if self.heals().ongoing(conversation_id) {
             return Err(MessageError::Pending);
         }
+        // nor encrypted while the Focus has no MLS group for it, an Era of
+        // the device moving it back to encrypted waiting or not (sections
+        // 10.1, 11.1)
+        if self.upgrades().without_group(conversation_id) {
+            return Err(MessageError::NotEncrypted);
+        }
         let body = Body::construct_message(cpim).map_err(|_| MessageError::NotCpim)?;
         let message = CPIMMessage::try_from(&body).map_err(|_| MessageError::NotCpim)?;
         let message_id = message
@@ -366,6 +372,9 @@ impl E2eeDevice {
     ) -> Result<Vec<u8>, MessageError> {
         if self.heals().ongoing(conversation_id) {
             return Err(MessageError::Pending);
+        }
+        if self.upgrades().without_group(conversation_id) {
+            return Err(MessageError::NotEncrypted);
         }
         let body = Body::construct_message(cpim).map_err(|_| MessageError::NotCpim)?;
         let message = CPIMMessage::try_from(&body).map_err(|_| MessageError::NotCpim)?;

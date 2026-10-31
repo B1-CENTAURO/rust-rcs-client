@@ -44,7 +44,7 @@ use rust_rcs_core::mls::{
 
 use crate::capability::{Capabilities, CapabilityQuery};
 use crate::messaging::cpm::encryption::{
-    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Verified,
+    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade, Verified,
 };
 use crate::messaging::cpm::make_cpim_imdn_body;
 
@@ -5360,36 +5360,9 @@ fn a_group_its_focus_moved_to_unencrypted_is_healed_into_rather_than_made_anew()
             pull,
         ))
         .expect("an External Commit");
+    // unencrypted as soon as healed, which the session tells the app of,
+    // and not again as the Focus forwards it back
     assert!(groups.encryption_ended(CONVERSATION));
-
-    // which the app is told of once, as the Focus forwards it back, also
-    // after self-healing started over
-    device.heals().start_over(CONVERSATION);
-    let ended = Taken {
-        proposals: false,
-        encryption_ended: true,
-        encryption_resumed: false,
-    };
-    assert_eq!(
-        groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
-        ended
-    );
-    assert_eq!(
-        groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
-        Taken::default()
-    );
-
-    // not again for self-healing the group unencrypted already
-    device.heals().want(CONVERSATION);
-    let (pull, _) = focus_answering(vec![None, group_info_answer(group_info)]);
-    let cpim = rt
-        .block_on(groups.heal(
-            String::from(CONVERSATION),
-            String::from(IMPU),
-            String::from(GROUP_URI),
-            pull,
-        ))
-        .expect("an External Commit");
     assert_eq!(
         groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
         Taken::default()
@@ -5630,19 +5603,32 @@ fn the_participants_of_a_new_era_are_asked_for_once_for_all_their_clients() {
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
-/// What the focus tells of those taking part, as the device moves its group
-/// back to encrypted with `groups`
-fn upgrade(
+/// How the device moves its group back to encrypted with `groups`,
+/// `participants` those taking part as the focus tells
+fn upgrading(
     groups: &DeviceGroups,
     rt: &tokio::runtime::Runtime,
     participants: &[&str],
-) -> Option<Vec<u8>> {
+) -> Option<Upgrade> {
     rt.block_on(groups.upgrade(
         String::from(CONVERSATION),
         String::from(IMPU),
         String::from(GROUP_URI),
         participants.iter().map(|p| String::from(*p)).collect(),
     ))
+}
+
+/// The CPIM message of the Commit moving the group back to encrypted in the
+/// session, as upgrading() tells
+fn upgrade(
+    groups: &DeviceGroups,
+    rt: &tokio::runtime::Runtime,
+    participants: &[&str],
+) -> Option<Vec<u8>> {
+    match upgrading(groups, rt, participants)? {
+        Upgrade::InSession(cpim) => Some(cpim),
+        Upgrade::Restart(_) => panic!("an Era, not a Commit in the session"),
+    }
 }
 
 /// The group of the conversation moved to unencrypted by the device, its
@@ -5890,10 +5876,9 @@ fn a_group_is_moved_back_to_encrypted_only_as_it_can_be() {
     let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
     let groups = DeviceGroups::new(&device, query);
 
-    // not a group encrypted, nor one not kept
+    // not a group encrypted
     assert!(!groups.upgrade_due(CONVERSATION));
     assert_eq!(upgrade(&groups, &rt, &[IMPU, BOB_SIP]), None);
-    assert!(!groups.upgrade_due("another"));
 
     // nor while a Commit of the device is pending, as its key update
     let cpim = device
@@ -6032,14 +6017,14 @@ fn a_client_whose_certificate_does_not_pass_is_replaced_as_the_group_is_moved_ba
         Fetched::KeyPackages(vec![phone.generate_key_package(false).unwrap()]),
     )]);
     let queries = kds.queries.lock().unwrap().len();
-    let cpim = rt
-        .block_on(groups.upgrade(
-            String::from(CONVERSATION),
-            String::from(BOB_IMPU),
-            String::from(GROUP_URI),
-            vec![String::from(BOB_IMPU), String::from(ALICE_TEL)],
-        ))
-        .expect("a control message");
+    let Some(Upgrade::InSession(cpim)) = rt.block_on(groups.upgrade(
+        String::from(CONVERSATION),
+        String::from(BOB_IMPU),
+        String::from(GROUP_URI),
+        vec![String::from(BOB_IMPU), String::from(ALICE_TEL)],
+    )) else {
+        panic!("a control message");
+    };
     assert_eq!(*asked.lock().unwrap(), [ALICE_TEL]);
     assert_eq!(kds.queries.lock().unwrap().len(), queries + 1);
     assert_eq!(
@@ -6060,7 +6045,7 @@ fn a_client_whose_certificate_does_not_pass_is_replaced_as_the_group_is_moved_ba
 }
 
 #[test]
-fn self_healing_into_a_group_moved_back_to_encrypted_is_told_once() {
+fn self_healing_into_a_group_moved_back_to_encrypted_encrypts_it_at_once() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (device, _, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
     let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
@@ -6085,18 +6070,257 @@ fn self_healing_into_a_group_moved_back_to_encrypted_is_told_once() {
             pull,
         ))
         .expect("an External Commit");
+    // encrypted as soon as healed, which the session tells the app of, and
+    // not again as the Focus forwards it back
     assert!(!groups.encryption_ended(CONVERSATION));
-
-    // which the app is told of once, as the Focus forwards it back
     assert_eq!(
         groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
+        Taken::default()
+    );
+}
+
+/// The CPIM message of the Era moving the group back to encrypted, as
+/// upgrading() tells
+fn upgrade_by_restart(
+    groups: &DeviceGroups,
+    rt: &tokio::runtime::Runtime,
+    participants: &[&str],
+) -> Option<Vec<u8>> {
+    match upgrading(groups, rt, participants)? {
+        Upgrade::Restart(cpim) => Some(cpim),
+        Upgrade::InSession(_) => panic!("a Commit in the session, not an Era"),
+    }
+}
+
+#[test]
+fn a_group_whose_focus_has_no_mls_group_is_unencrypted_until_moved_back_with_an_era() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, mut bobs_group, clock) = alice_and_bob_in_time_with_kds();
+    let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // self-healing finds the Focus has no MLS group (RCC.16 sections 6.3.1,
+    // 10.1): unencrypted from now on
+    device.heals().want(CONVERSATION);
+    let (pull, _) = focus_answering(vec![None, Some((469, Vec::new()))]);
+    assert_eq!(
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        )),
+        None
+    );
+    assert!(groups.encryption_ended(CONVERSATION));
+    assert!(groups.encrypts(CONVERSATION), "its MLS group kept");
+    assert_eq!(
+        rt.block_on(groups.encrypt(CONVERSATION, &plaintext("message-92", None))),
+        Sealed::Unencrypted
+    );
+    let xml = notification_xml("bob-1", "delivery-notification", "<delivered/>");
+    assert_eq!(
+        rt.block_on(groups.sign(CONVERSATION, &notification_cpim(IMPU, "imdn-92", "", &xml))),
+        None
+    );
+    // whatever its MLS group takes meanwhile
+    let output = bobs_group.update_keys(&bob).unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    assert_eq!(
+        groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
+        Taken::default()
+    );
+    assert!(groups.encryption_ended(CONVERSATION));
+
+    // moved back two hours on (section 11.2), with the next Era of the group
+    // of the device, of all of Bob's Clients (sections 8.3.1, 11.1)
+    assert!(!groups.upgrade_due(CONVERSATION));
+    clock.advance(2 * HOUR);
+    assert!(groups.upgrade_due(CONVERSATION));
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    let cpim = upgrade_by_restart(&groups, &rt, &[IMPU, BOB_SIP]).expect("an Era");
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    assert_eq!(
+        kds.queries.lock().unwrap().last().unwrap().1,
+        [recipient(BOB_TEL)]
+    );
+    let bundle = bundle_of(&cpim);
+    assert!(!bundle.welcome.is_empty());
+    assert!(!bundle.ratchet_tree.is_empty());
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+
+    // unencrypted, and not moved back again, until the Focus accepts it
+    assert!(groups.encryption_ended(CONVERSATION));
+    assert_eq!(
+        rt.block_on(groups.encrypt(CONVERSATION, &plaintext("message-93", None))),
+        Sealed::Unencrypted
+    );
+    clock.advance(2 * HOUR);
+    assert!(!groups.upgrade_due(CONVERSATION));
+    bobs_group = joined(&bob, &bundle);
+    assert!(!bobs_group.is_encryption_ended());
+
+    // then encrypted again, which the app is told of
+    assert_eq!(
+        groups.on_server_message(
+            CONVERSATION,
+            &accepted(epoch_identifier(&device, CONVERSATION)),
+        ),
         Taken {
             encryption_resumed: true,
             ..Taken::default()
         }
     );
-    assert_eq!(
-        groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
-        Taken::default()
+    assert!(!groups.encryption_ended(CONVERSATION));
+    assert!(!groups.upgrade_due(CONVERSATION));
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-94", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
     );
+}
+
+#[test]
+fn a_group_never_encrypted_is_made_encrypted_with_its_first_era() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, _) = enrolled_in_time(
+        Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]),
+        None,
+    );
+    let (query, asked) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    assert!(!groups.encrypts(CONVERSATION));
+
+    // its Participants all advertising E2EE (RCC.16 section 11.1), the first
+    // Era of the conversation, with all of Bob's Clients
+    assert!(groups.upgrade_due(CONVERSATION));
+    let cpim = upgrade_by_restart(&groups, &rt, &[IMPU, BOB_TEL]).expect("an Era");
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    let message = cpim_message(&cpim);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    let bundle = bundle_of(&cpim);
+    assert!(!bundle.welcome.is_empty());
+    assert_eq!(era(&device, CONVERSATION), Some(0));
+    assert!(groups.encrypts(CONVERSATION));
+    // unencrypted, and not made again, until the Focus accepts it
+    assert!(groups.encryption_ended(CONVERSATION));
+    assert!(!groups.upgrade_due(CONVERSATION));
+
+    let mut bobs_group = joined(&bob, &bundle);
+    assert_eq!(
+        groups.on_server_message(
+            CONVERSATION,
+            &accepted(epoch_identifier(&device, CONVERSATION)),
+        ),
+        Taken {
+            encryption_resumed: true,
+            ..Taken::default()
+        }
+    );
+    assert!(!groups.encryption_ended(CONVERSATION));
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("message-95", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &sent))
+            .ends_with("hello Bob")
+    );
+}
+
+#[test]
+fn an_era_moving_a_group_back_to_encrypted_the_focus_refuses_is_let_go_of() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let clock = Clock::new();
+    let (bob, _) = bob_with_key_package();
+    let (device, kds, _) = enrolled_in_time(None, Some(&clock));
+    let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    let key_packages = || {
+        kds.now_knowing(vec![(
+            BOB_TEL,
+            Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+        )])
+    };
+
+    // refused with the INVITE carrying it, whatever the status: let go of,
+    // the group left unencrypted, no other Era due (RCC.16 section 11.1)
+    for (status_code, era_made) in [(409, 0), (403, 1)] {
+        key_packages();
+        assert!(upgrade_by_restart(&groups, &rt, &[IMPU, BOB_TEL]).is_some());
+        assert_eq!(era(&device, CONVERSATION), Some(era_made));
+        groups.era_refused(CONVERSATION, status_code);
+        assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
+        assert!(groups.encryption_ended(CONVERSATION));
+        assert!(!groups.new_era_due(CONVERSATION));
+        // tried again two hours on, with the next Era of the group left
+        assert!(!groups.upgrade_due(CONVERSATION));
+        clock.advance(2 * HOUR);
+        assert!(groups.upgrade_due(CONVERSATION));
+    }
+
+    // and when the Focus refuses its control message
+    key_packages();
+    let cpim = upgrade_by_restart(&groups, &rt, &[IMPU, BOB_TEL]).expect("an Era");
+    assert_eq!(era(&device, CONVERSATION), Some(2));
+    assert_eq!(
+        groups.on_imdn(CONVERSATION, &refusal(&control_id(&cpim), "invalid-commit")),
+        ImdnTold::Refusal
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
+    assert!(groups.encryption_ended(CONVERSATION));
+    clock.advance(2 * HOUR);
+    assert!(groups.upgrade_due(CONVERSATION));
+}
+
+#[test]
+fn a_group_unencrypted_whose_focus_has_no_mls_group_is_moved_back_with_an_era_without_end_mls() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, kds, bob, mut bobs_group, clock) = alice_and_bob_in_time_with_kds();
+    let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    moved_to_unencrypted(&device, &groups, &bob, &mut bobs_group);
+
+    // the Focus then found to have no MLS group (RCC.16 section 10.1)
+    device.heals().want(CONVERSATION);
+    let (pull, _) = focus_answering(vec![None, Some((469, Vec::new()))]);
+    rt.block_on(groups.heal(
+        String::from(CONVERSATION),
+        String::from(IMPU),
+        String::from(GROUP_URI),
+        pull,
+    ));
+    clock.advance(2 * HOUR);
+    assert!(groups.upgrade_due(CONVERSATION));
+
+    // not resurrected, which the Focus could not take, but made anew in the
+    // next Era, without the end_mls of the group of the device (sections
+    // 8.3.1, 11.1)
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    let cpim = upgrade_by_restart(&groups, &rt, &[IMPU, BOB_SIP]).expect("an Era");
+    let bundle = bundle_of(&cpim);
+    let next = EraBase::of_group_info(&MlsGroupInfo {
+        group_info: bundle.group_info.clone(),
+        ratchet_tree: bundle.ratchet_tree.clone(),
+        pending_proposals: Vec::new(),
+    })
+    .unwrap();
+    assert!(!next.is_encryption_ended());
+    assert_eq!(next.era(), 1);
+    assert!(!joined(&bob, &bundle).is_encryption_ended());
+    groups.on_server_message(
+        CONVERSATION,
+        &accepted(epoch_identifier(&device, CONVERSATION)),
+    );
+    assert!(!groups.encryption_ended(CONVERSATION));
 }
