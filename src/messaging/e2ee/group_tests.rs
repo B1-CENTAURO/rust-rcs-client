@@ -6641,10 +6641,10 @@ fn messages_not_decrypted_of_a_group_moved_to_unencrypted_are_not_told_of() {
     device.lost_group(CONVERSATION);
     assert!(groups.encryption_ended(CONVERSATION));
     assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
-    // nor are those of a group let go of
+    // nor are those of a group let go of once healed
     let (device, bob, mut bobs_group) = alice_and_bob();
     let groups = DeviceGroups::new(&device, answering(&[]).0);
-    let (_, _) = missed_by_the_device(&bob, &mut bobs_group);
+    let (commit, group_info) = missed_by_the_device(&bob, &mut bobs_group);
     let (outer, mls_message) = from_bob_asking(
         &bob,
         &mut bobs_group,
@@ -6653,6 +6653,7 @@ fn messages_not_decrypted_of_a_group_moved_to_unencrypted_are_not_told_of() {
         Some("negative-delivery"),
     );
     assert!(decrypted(&device, &outer, &mls_message).is_err());
+    healed_with(&rt, &groups, &bobs_group, &commit, group_info);
     groups.abandon(CONVERSATION);
     assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
 }
