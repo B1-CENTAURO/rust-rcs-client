@@ -3821,9 +3821,11 @@ fn the_senders_of_messages_not_decrypted_are_told_so_in_the_session() {
     assert!(encryption.asked_failed.lock().unwrap().len() > asked);
 
     // sent signed to their senders, through the focus (sections 7.7.2.2,
-    // 7.7.3)
+    // 7.7.3), in no given order
+    let mut signed = signed_from(&encryption, 0);
+    signed.sort();
     assert_eq!(
-        signed_from(&encryption, 0),
+        signed,
         [
             (
                 String::from("<tel:+15550002>"),
@@ -6693,13 +6695,27 @@ fn a_group_never_encrypted_is_restarted_with_its_first_era() {
             &[(IMPU, "connected", ""), (BOB, "connected", "")],
         ),
     ));
-    assert_eq!(status_code(&peer.next_response()), 200);
 
     // the session ended, then the group restarted with the INVITE carrying
     // the Era (sections 8.1, 8.3.1)
     // the BYE, and the end of the subscription to the conference events,
-    // in whatever order the transport takes them
-    let ended = next_requests(&mut peer, &["BYE", "SUBSCRIBE"]);
+    // in whatever order the transport takes them, and with the answer to
+    // the notification, which they may come before
+    let mut answered = None;
+    let mut ended = Vec::new();
+    while answered.is_none() || ended.len() < 2 {
+        let message = peer.next();
+        match message {
+            SipMessage::Response(_, _, _) => answered = Some(status_code(&message)),
+            _ => ended.push(message),
+        }
+    }
+    assert_eq!(answered, Some(200));
+    ended.sort_by_key(|request| first_line(request) != "BYE");
+    assert_eq!(
+        ended.iter().map(first_line).collect::<Vec<_>>(),
+        ["BYE", "SUBSCRIBE"]
+    );
     let (bye, unsubscribe) = (&ended[0], &ended[1]);
     assert_eq!(
         header_value(bye, "Call-ID"),
