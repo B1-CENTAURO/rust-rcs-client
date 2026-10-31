@@ -2200,6 +2200,8 @@ struct ScriptedEncryption {
     decrypted: std::sync::Mutex<Vec<(String, String, String, Vec<u8>)>>,
     /// The negative deliveries of messages not decrypted it gives, once
     failing_to_decrypt: std::sync::Mutex<Vec<FailedToDecrypt>>,
+    /// Whether it gives those only once a group was healed
+    failing_once_healed: bool,
     /// The Conversation-ID each time it is asked for those
     asked_failed: std::sync::Mutex<Vec<String>>,
 }
@@ -2537,6 +2539,9 @@ impl GroupEncryption for ScriptedEncryption {
             .lock()
             .unwrap()
             .push(String::from(conversation_id));
+        if self.failing_once_healed && self.healed.lock().unwrap().is_empty() {
+            return Vec::new();
+        }
         std::mem::take(&mut *self.failing_to_decrypt.lock().unwrap())
     }
 }
@@ -3857,6 +3862,61 @@ fn the_senders_of_messages_not_decrypted_are_told_so_in_the_session() {
             String::from("<tel:+15550002>"),
             None,
             String::from("<imdn>peer-message-6</imdn>")
+        )]
+    );
+    connection.quiet(&rt);
+}
+
+#[test]
+fn the_senders_of_messages_not_decrypted_are_told_so_once_the_group_is_healed() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    // healed with the GroupInfo pull alone, without an External Commit
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        signature: Some(String::from(SIGNED)),
+        out_of_step: std::sync::atomic::AtomicBool::new(true),
+        pulling: vec![(&b"MLS-Group-Info-Pull"[..], None)],
+        failing_once_healed: true,
+        failing_to_decrypt: std::sync::Mutex::new(vec![FailedToDecrypt {
+            imdn: String::from("<imdn>peer-message-1</imdn>"),
+            sender_uri: String::from("tel:+15550002"),
+            original_message_id: None,
+        }]),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-healed-then-told");
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let info = peer.next_request("INFO");
+    peer.send(
+        &answer(&info, "200 OK", Some("group info"))
+            .replace("application/sdp", "message/mls-rcs-server"),
+    );
+
+    // as soon as the group is healed (RCC.16 section 10.2)
+    let send = connection.next_message(&rt);
+    assert_eq!(String::from_utf8_lossy(&send.body), SIGNED);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(encryption.healed.lock().unwrap().len(), 1);
+    assert_eq!(
+        signed_from(&encryption, 0),
+        [(
+            String::from("<tel:+15550002>"),
+            None,
+            String::from("<imdn>peer-message-1</imdn>")
         )]
     );
     connection.quiet(&rt);

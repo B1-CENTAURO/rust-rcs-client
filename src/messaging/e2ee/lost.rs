@@ -301,3 +301,69 @@ impl E2eeDevice {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::{LostMessages, LOST_FOR, LOST_MOST};
+
+    const BOB: &str = "tel:+491707654321";
+
+    fn told(lost: &LostMessages, conversation_id: &str) -> Vec<String> {
+        lost.to_tell(conversation_id)
+            .into_iter()
+            .map(|told| told.imdn)
+            .collect()
+    }
+
+    #[test]
+    fn a_message_lost_is_told_of_once_and_taken_once_re_sent() {
+        let lost = LostMessages::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        lost.lose("group-1", "m1", BOB, "2026-10-25T12:00:00Z", now);
+        lost.lose("group-1", "m1", BOB, "2026-10-25T12:00:00Z", now);
+        lost.lose("group-2", "m1", BOB, "2026-10-25T12:00:00Z", now);
+
+        // by group, once
+        assert!(!lost.found("group-1", "m1", |_| true));
+        assert_eq!(told(&lost, "group-1").len(), 1);
+        assert_eq!(told(&lost, "group-1").len(), 0);
+        // by whom it was from
+        assert!(!lost.found("group-1", "m1", |sender| sender != BOB));
+        assert!(lost.found("group-1", "m1", |sender| sender == BOB));
+        assert!(!lost.found("group-1", "m1", |_| true));
+        assert_eq!(told(&lost, "group-2").len(), 1);
+        lost.forget("group-2");
+        assert!(!lost.found("group-2", "m1", |_| true));
+    }
+
+    #[test]
+    fn messages_lost_are_kept_for_30_days_and_1024_at_most() {
+        let lost = LostMessages::default();
+        let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        lost.lose("group-1", "old", BOB, "", then);
+        lost.lose("group-1", "recent", BOB, "", then + Duration::from_secs(60));
+        assert_eq!(told(&lost, "group-1").len(), 2);
+
+        // the sender re-sends none older (RCC.16 section 10.3)
+        lost.lose(
+            "group-1",
+            "new",
+            BOB,
+            "",
+            then + LOST_FOR + Duration::from_secs(1),
+        );
+        assert!(!lost.found("group-1", "old", |_| true));
+        assert!(lost.found("group-1", "recent", |_| true));
+
+        // the oldest forgotten first
+        let lost = LostMessages::default();
+        for n in 0..=LOST_MOST {
+            lost.lose("group-1", &format!("m{}", n), BOB, "", then);
+        }
+        assert_eq!(told(&lost, "group-1").len(), LOST_MOST);
+        assert!(!lost.found("group-1", "m0", |_| true));
+        assert!(lost.found("group-1", "m1", |_| true));
+    }
+}

@@ -6514,6 +6514,22 @@ fn a_message_not_decrypted_is_told_of_once_the_group_is_healed() {
     assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
     healed_with(&rt, &groups, &bobs_group, &commit, group_info);
 
+    // nor while a Commit of the device waits for the Focus
+    let previous = epoch_identifier(&device, CONVERSATION);
+    let output = device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, client| {
+            conversation.update_keys(client)
+        })
+        .unwrap();
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    bobs_group
+        .process_server_message(&bob, &focus_commit(&[&output.commit]))
+        .unwrap();
+
     // then once, to Bob, of the one asking
     let told = groups.failed_to_decrypt(CONVERSATION);
     assert_eq!(told.len(), 1);
