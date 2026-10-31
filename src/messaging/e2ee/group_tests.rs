@@ -6914,3 +6914,63 @@ fn a_notification_of_a_re_sent_message_is_signed_over_both_its_ids() {
         );
     }
 }
+
+#[test]
+fn messages_not_decrypted_are_told_of_and_taken_after_the_device_restarted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    let (commit, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    let (outer, mls_message) = from_bob_asking(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "bob-1",
+        Some("negative-delivery"),
+    );
+    assert!(decrypted(&device, &outer, &mls_message).is_err());
+    healed_with(&rt, &groups, &bobs_group, &commit, group_info);
+
+    // the device restarting before telling Bob tells him then
+    let restarted = || Arc::new(alice(&app, &kds, TODAY, Some(&app.last().unwrap())));
+    let device = restarted();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    let told = groups.failed_to_decrypt(CONVERSATION);
+    assert_eq!(told.len(), 1);
+    assert_eq!(
+        Imdn::from_xml(told[0].imdn.as_bytes()).unwrap().message_id,
+        "bob-1"
+    );
+
+    // and once restarted again, does not tell him again, and takes the
+    // message he re-sends (RCC.16 section 10.4)
+    let device = restarted();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-4", "bob-1");
+    let plaintext = decrypted(&device, &outer, &mls_message).unwrap();
+    assert_eq!(
+        cpim_message(&plaintext)
+            .get_info()
+            .unwrap()
+            .mls_original_message_id,
+        Some(&b"bob-1"[..])
+    );
+
+    // once, through a restart too
+    let device = restarted();
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-5", "bob-1");
+    assert_eq!(
+        decrypted(&device, &outer, &mls_message),
+        Err(MessageError::NotAskedFor)
+    );
+}

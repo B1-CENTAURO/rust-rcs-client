@@ -362,7 +362,10 @@ impl E2eeDevice {
         ) {
             (SecretPayloadType::Application, Some(payload), _) => (payload, false),
             (SecretPayloadType::Hpke1To1Message, Some(payload), _) => {
-                if !self.found_resent(conversation_id, &original_message_id, &decrypted.sender) {
+                if !self
+                    .found_resent(conversation_id, &original_message_id, &decrypted.sender)
+                    .map_err(MessageError::Store)?
+                {
                     return Err(MessageError::NotAskedFor);
                 }
                 (payload, true)
@@ -370,12 +373,14 @@ impl E2eeDevice {
             (SecretPayloadType::Hpke1To1Message, None, Some(failure)) => {
                 // its sender told of one not decrypted (sections 10.2, 10.4)
                 if failure == ResentFailure::NotDecrypted
-                    && !self.lose_resent(
-                        conversation_id,
-                        cpim_info,
-                        &original_message_id,
-                        &decrypted.sender,
-                    )
+                    && !self
+                        .lose_resent(
+                            conversation_id,
+                            cpim_info,
+                            &original_message_id,
+                            &decrypted.sender,
+                        )
+                        .map_err(MessageError::Store)?
                 {
                     return Err(MessageError::NotAskedFor);
                 }
