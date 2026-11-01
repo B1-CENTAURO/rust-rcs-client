@@ -99,7 +99,7 @@ use crate::connectivity::retry::Reconnect;
 use crate::connectivity::{flow::FlowManager, registration::Registration};
 use crate::context::Context;
 use crate::messaging::config::MessagingConfigs;
-use crate::messaging::cpm::encryption::GroupEncryption;
+use crate::messaging::cpm::encryption::{GroupEncryption, MetadataChange, UploadedIcon};
 use crate::messaging::cpm::group_chat::{GroupIds, GroupInvitation};
 use crate::messaging::cpm::imdn::{
     acknowledge_delivery, acknowledge_group_delivery, app_message_id, send_imdn, ImdnService,
@@ -1350,6 +1350,131 @@ impl RcsEngine {
                 result_callback(404, String::from("Not Found"));
             }
         }
+    }
+
+    /// Sets the encrypted subject of the group chat at `conference_uri`, or
+    /// deletes it if None, in the session there is with it (RCC.16 sections
+    /// 9.7.1.5, 9.7.1.7): 404 if there is none, 488 if the group is not
+    /// encrypted end to end, or if the change cannot be made; else how its
+    /// focus answered, see `CPMSessionService::change_group_metadata()`
+    pub fn set_group_subject<F>(&self, conference_uri: &str, subject: Option<&str>, callback: F)
+    where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        change_group_metadata(
+            &self.cpm_session_service,
+            conference_uri,
+            MetadataChange::Subject(subject.map(String::from)),
+            callback,
+        );
+    }
+
+    /// Sets the encrypted icon of the group chat at `conference_uri` to the
+    /// file at `icon_path`, of `content_type`, or deletes it if None, in the
+    /// session there is with it (RCC.16 sections 9.7.1.4, 9.7.1.6), as
+    /// set_group_subject() does
+    ///
+    /// The icon is encrypted with a key of its own and uploaded to the
+    /// content server first, as `ft_http::upload_sealed_file()` uploads a
+    /// file, then the Commit to its key sent with its URL. An upload that
+    /// fails is told as upload_file() tells it; 403 if there is no content
+    /// server to upload it to.
+    pub fn set_group_icon<F>(
+        &self,
+        conference_uri: &str,
+        icon: Option<(&str, &str)>,
+        msisdn: Option<&str>,
+        http_client: Arc<HttpClient>,
+        gba_context: Arc<GbaContext>,
+        security_context: Arc<SecurityContext>,
+        rt: &Arc<Runtime>,
+        callback: F,
+    ) where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        let Some((icon_path, content_type)) = icon else {
+            change_group_metadata(
+                &self.cpm_session_service,
+                conference_uri,
+                MetadataChange::Icon(None),
+                callback,
+            );
+            return;
+        };
+        // not uploaded unless it is to be set
+        let encryption = match self
+            .cpm_session_service
+            .group_session_encryption(conference_uri)
+        {
+            None => return callback(404, String::from("Not Found")),
+            Some(encrypted) => encrypted
+                .filter(|(encryption, conversation_id)| encryption.encrypts_files(conversation_id)),
+        };
+        let Some((encryption, _)) = encryption else {
+            return callback(488, String::from("Not Acceptable Here"));
+        };
+        let ft_http_cs_uri = match (
+            self.ft_http_configs.ft_auth,
+            &self.ft_http_configs.ft_http_cs_uri,
+        ) {
+            (1, Some(ft_http_cs_uri)) => ft_http_cs_uri.clone(),
+            _ => return callback(403, String::from("Forbidden")),
+        };
+
+        let ft_http_service = Arc::clone(&self.ft_http_service);
+        let cpm_session_service = Arc::clone(&self.cpm_session_service);
+        let credentials = self.ft_http_cs_credentials();
+        let msisdn = msisdn.map(String::from);
+        let conference_uri = String::from(conference_uri);
+        let icon_path = String::from(icon_path);
+        let content_type = String::from(content_type);
+        rt.spawn(async move {
+            let server = ContentServer {
+                http_client: &http_client,
+                gba_context: &gba_context,
+                security_context: &security_context,
+                credentials: credentials
+                    .as_ref()
+                    .map(|(host, user, password)| Credentials {
+                        host,
+                        user,
+                        password,
+                    }),
+                msisdn: msisdn.as_deref(),
+            };
+            let icon = FileInfo {
+                path: &icon_path,
+                name: "",
+                mime: &content_type,
+                hash: None,
+            };
+            let progress_callback: Arc<Box<dyn Fn(u32, i32) + Send + Sync>> =
+                Arc::new(Box::new(|_, _| {}));
+            let seal = |content: &[u8], _: &str, mime: &str| encryption.seal_icon(content, mime);
+            let uploaded = upload_sealed_file(
+                &ft_http_service,
+                &ft_http_cs_uri,
+                Uuid::new_v4(),
+                icon,
+                None,
+                &server,
+                &progress_callback,
+                &seal,
+            )
+            .await;
+            match uploaded {
+                Ok((xml, metadata, _)) => change_group_metadata(
+                    &cpm_session_service,
+                    &conference_uri,
+                    MetadataChange::Icon(Some(UploadedIcon {
+                        xml: xml.into_bytes(),
+                        metadata,
+                    })),
+                    callback,
+                ),
+                Err(e) => callback(e.error_code(), e.error_string()),
+            }
+        });
     }
 
     /// Leaves the group chat at `conference_uri` for good, its session
@@ -3037,5 +3162,34 @@ mod tests {
         assert!(delay >= Duration::from_secs(60) && delay <= Duration::from_secs(120));
 
         assert_eq!(reconnect_delay(Reconnect::Never, 0), None);
+    }
+}
+
+/// Changes the encrypted subject or icon of the group chat at
+/// `conference_uri` as `change` does, in the session there is with it,
+/// `callback` told how its focus answered; 404 if there is no session
+fn change_group_metadata<F>(
+    cpm_session_service: &CPMSessionService,
+    conference_uri: &str,
+    change: MetadataChange,
+    callback: F,
+) where
+    F: FnOnce(u16, String) + Send + Sync + 'static,
+{
+    let callback = Arc::new(Mutex::new(Some(callback)));
+    let callback_ = Arc::clone(&callback);
+    let asked = cpm_session_service.change_group_metadata(
+        conference_uri,
+        change,
+        move |status_code, reason_phrase| {
+            if let Some(callback) = callback_.lock().unwrap().take() {
+                callback(status_code, reason_phrase);
+            }
+        },
+    );
+    if !asked {
+        if let Some(callback) = callback.lock().unwrap().take() {
+            callback(404, String::from("Not Found"));
+        }
     }
 }

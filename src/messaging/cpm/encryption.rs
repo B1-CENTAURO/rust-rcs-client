@@ -176,6 +176,26 @@ pub enum GroupMetadata {
     },
 }
 
+/// A change of the encrypted subject or icon of a group chat the user makes
+/// (RCC.16 sections 9.7.1.4 to 9.7.1.7)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetadataChange {
+    /// The subject set, or deleted if None
+    Subject(Option<String>),
+    /// The icon set, as uploaded sealed with seal_icon(), or deleted if None
+    Icon(Option<UploadedIcon>),
+}
+
+/// An icon uploaded sealed with `GroupEncryption::seal_icon()`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadedIcon {
+    /// The XML the content server answered the upload with, telling where
+    /// it is
+    pub xml: Vec<u8>,
+    /// What seal_icon() gave besides the ciphertext: the key of the icon
+    pub metadata: Vec<u8>,
+}
+
 /// Why a group chat moves to unencrypted (RCC.16 sections 7.11.2.2, 11.2)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EndReason {
@@ -480,6 +500,27 @@ pub trait GroupEncryption: Send + Sync {
     /// the Commit bringing its key is applied (RCC.16 sections 9.7.1.5,
     /// 10.5.4)
     fn metadata_opened(&self, conversation_id: &str) -> Vec<GroupMetadata>;
+
+    /// The icon `icon` of a group chat, of `content_type`, encrypted with a
+    /// key of its own as the icon of a group is, to be uploaded before the
+    /// Commit setting it is made with change_metadata() (RCC.16 section
+    /// 9.7.1.1); None if it cannot be
+    fn seal_icon(&self, icon: &[u8], content_type: &str) -> Option<SealedFile>;
+
+    /// The control message changing the encrypted subject or icon of the
+    /// group chat `conversation_id` as `change` does, `from` and `to` its own,
+    /// once a Commit of this client the Conversation Focus is yet to accept
+    /// is: a CPIM message of a multipart body, the `message/mls-rcs-client`
+    /// of the Commit, bundled with the PrivateMessage of the key set, and the
+    /// CPM group data request (RCC.16 sections 7.13.1, 9.7.1.4 to 9.7.1.7);
+    /// None if the group is not encrypted, or the Commit cannot be made
+    fn change_metadata(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        change: MetadataChange,
+    ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
     /// Lets go of the MLS group `conversation_id`, as its chat did not start,
     /// its invitation was not accepted, or the user left it

@@ -44,7 +44,7 @@ use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{
     EncryptedMetadata, EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull,
-    GroupMetadata, ImdnTold, Sealed, SealedFile, Taken, Upgrade, Verified,
+    GroupMetadata, ImdnTold, MetadataChange, Sealed, SealedFile, Taken, Upgrade, Verified,
 };
 use super::group_chat::GroupIds;
 use super::imdn::{
@@ -2257,6 +2257,11 @@ struct ScriptedEncryption {
     /// The subjects not opened yet, which open with what the focus sends
     /// next: those whose value starts with "later"
     opening: std::sync::Mutex<Vec<GroupMetadata>>,
+    /// The CPIM message it prepares for changing the subject or icon, if any
+    changing_metadata: Option<Vec<u8>>,
+    /// The Conversation-ID, from, to and change each time it is asked for
+    /// one
+    metadata_changed: std::sync::Mutex<Vec<(String, String, String, MetadataChange)>>,
 }
 
 impl GroupEncryption for ScriptedEncryption {
@@ -2509,6 +2514,25 @@ impl GroupEncryption for ScriptedEncryption {
             });
         }
         told
+    }
+
+    fn seal_icon(&self, _icon: &[u8], _content_type: &str) -> Option<SealedFile> {
+        None
+    }
+
+    fn change_metadata(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        change: MetadataChange,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.metadata_changed
+            .lock()
+            .unwrap()
+            .push((conversation_id, from, to, change));
+        let cpim = self.changing_metadata.clone();
+        Box::pin(async move { cpim })
     }
 
     fn metadata_opened(&self, _conversation_id: &str) -> Vec<GroupMetadata> {
@@ -3424,6 +3448,20 @@ impl GroupEncryption for EncryptingPrepared {
 
     fn metadata_opened(&self, conversation_id: &str) -> Vec<GroupMetadata> {
         self.0.metadata_opened(conversation_id)
+    }
+
+    fn seal_icon(&self, icon: &[u8], content_type: &str) -> Option<SealedFile> {
+        self.0.seal_icon(icon, content_type)
+    }
+
+    fn change_metadata(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        change: MetadataChange,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.change_metadata(conversation_id, from, to, change)
     }
 
     fn metadata_keys(
@@ -6392,6 +6430,132 @@ fn the_subject_opened_once_the_group_is_healed_is_told() {
         format!("subject {} healed -", GROUP)
     );
     assert_eq!(encryption.healed.lock().unwrap().len(), 1);
+    connection.quiet(&rt);
+}
+
+/// What the scripted encryption makes a control message changing the
+/// subject or icon carry
+const METADATA_CHANGE_CPIM: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x09\x0bsubject\r\n--b--";
+
+#[test]
+fn the_subject_and_icon_are_changed_in_the_session() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        changing_metadata: Some(METADATA_CHANGE_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let told = move |tx: std::sync::mpsc::Sender<(u16, String)>| {
+        move |status_code, reason_phrase| {
+            let _ = tx.send((status_code, reason_phrase));
+        }
+    };
+
+    // none without a session with the group
+    assert!(!client.sessions.change_group_metadata(
+        GROUP,
+        MetadataChange::Subject(None),
+        told(tx.clone())
+    ));
+
+    let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-changed");
+    let subject = MetadataChange::Subject(Some(String::from("Team")));
+
+    // the control message the encryption makes, sent as it is, the app told
+    // how the focus answered it (RCC.16 sections 9.7.1.4 to 9.7.1.7)
+    assert!(client
+        .sessions
+        .change_group_metadata(GROUP, subject.clone(), told(tx.clone())));
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    assert_eq!(send.body, METADATA_CHANGE_CPIM);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().0, 200);
+    assert_eq!(
+        *encryption.metadata_changed.lock().unwrap(),
+        [(
+            String::from("conversation-1"),
+            String::from(IMPU),
+            String::from(GROUP),
+            subject
+        )]
+    );
+    assert!(encryption.discarded.lock().unwrap().is_empty());
+
+    // one the focus does not take is let go of, no refusal to follow
+    assert!(client.sessions.change_group_metadata(
+        GROUP,
+        MetadataChange::Icon(None),
+        told(tx.clone())
+    ));
+    let send = connection.next_message(&rt);
+    connection.respond(&rt, &send, "403 Forbidden");
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().0, 403);
+    assert_eq!(
+        *encryption.discarded.lock().unwrap(),
+        [(String::from("conversation-1"), false)]
+    );
+    peer.silence();
+}
+
+#[test]
+fn the_subject_is_not_changed_unless_the_encryption_makes_the_change() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // the encryption making none
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-unchanged");
+    let tx_ = tx.clone();
+    assert!(client.sessions.change_group_metadata(
+        GROUP,
+        MetadataChange::Subject(Some(String::from("Team"))),
+        move |status_code, _| {
+            let _ = tx_.send(status_code);
+        }
+    ));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(488));
+    assert_eq!(encryption.metadata_changed.lock().unwrap().len(), 1);
+    connection.quiet(&rt);
+    peer.silence();
+
+    // nor in a group not encrypted, which it is not asked for
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (mut connection, _invite, _subscribe, _) = new_group(&client, &mut peer);
+    let encryption = committing_in(&client);
+    assert_eq!(
+        client
+            .sessions
+            .group_session_encryption(GROUP)
+            .map(|e| e.is_some()),
+        Some(false)
+    );
+    assert!(client.sessions.change_group_metadata(
+        GROUP,
+        MetadataChange::Subject(Some(String::from("Team"))),
+        move |status_code, _| {
+            let _ = tx.send(status_code);
+        }
+    ));
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(488));
+    assert!(encryption.metadata_changed.lock().unwrap().is_empty());
     connection.quiet(&rt);
 }
 
