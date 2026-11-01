@@ -82,8 +82,8 @@ use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{
-    EndReason, FtdAnswer, GroupEncryption, ImdnTold, Sealed, Upgrade, Verified, CONTENT_TYPE_MLS,
-    CONTENT_TYPE_MLS_RCS_SERVER,
+    EncryptedMetadata, EndReason, FtdAnswer, GroupEncryption, GroupMetadata, ImdnTold, Sealed,
+    Upgrade, Verified, CONTENT_TYPE_MLS, CONTENT_TYPE_MLS_RCS_SERVER,
 };
 use super::group_chat::{
     focus_answer, group_info_pull, refer_participants, refer_removal, GroupChats, GroupIds,
@@ -1288,6 +1288,50 @@ impl SessionEnd {
         });
     }
 
+    /// Takes what the focus of the group of the session tells of its
+    /// encrypted `subject` and `icon`, telling the app of them as the
+    /// encryption opens them (RCC.16 sections 7.13.2, 9.7.1); a subject that
+    /// does not open yet is told once it does, and has the Group Metadata
+    /// keys checked (section 10.5.1)
+    pub(crate) fn take_metadata(
+        &self,
+        subject: Option<EncryptedMetadata>,
+        icon: Option<EncryptedMetadata>,
+    ) {
+        self.tell_metadata(|encryption, conversation_id| {
+            encryption.take_metadata(conversation_id, subject, icon)
+        });
+        self.metadata_keys_if_due();
+    }
+
+    /// Tells the app of the subject of the group of the session that did not
+    /// open before, if it opens now (RCC.16 sections 9.7.1.5, 10.5.4)
+    pub(crate) fn tell_metadata_opened(&self) {
+        self.tell_metadata(|encryption, conversation_id| {
+            encryption.metadata_opened(conversation_id)
+        });
+    }
+
+    fn tell_metadata(&self, opened: impl FnOnce(&dyn GroupEncryption, &str) -> Vec<GroupMetadata>) {
+        let (encrypted, conference_uri) = {
+            let inner = self.sip_session.get_inner();
+            let session_info = inner.get_session_info();
+            (
+                session_info
+                    .encryption
+                    .clone()
+                    .zip(session_info.conversation_id.clone()),
+                String::from_utf8_lossy(&session_info.cpm_contact.service_uri).into_owned(),
+            )
+        };
+        let Some((encryption, conversation_id)) = encrypted else {
+            return;
+        };
+        for metadata in opened(&*encryption, &conversation_id) {
+            (self.links.group_listener)(CPMGroupEvent::Metadata(conference_uri.clone(), metadata));
+        }
+    }
+
     /// Asks the other members of the MLS group of the session for the Group
     /// Metadata keys this client misses, or sends them those one of them
     /// asked for, if either is due, with a Commit sent in the session (RCC.16
@@ -1350,7 +1394,9 @@ impl SessionEnd {
                 // is in step (section 10.2)
                 told.tell_failed_to_decrypt();
                 // and the Group Metadata keys asked for applied, sent
-                // (section 10.5.3)
+                // (section 10.5.3), and those the Commits applied brought
+                // taken (section 10.5.4)
+                told.tell_metadata_opened();
                 told.metadata_keys_if_due();
                 cpim
             })
@@ -1879,6 +1925,9 @@ pub enum CPMGroupEvent {
     /// The group at the URI is encrypted end to end again, a member, maybe
     /// this client, having moved it back to encrypted (RCC.16 section 11.1)
     EncryptionResumed(String),
+    /// The encrypted subject or icon of the group at the URI, as it was set
+    /// or deleted (RCC.16 sections 7.13.2, 9.7.1)
+    Metadata(String, GroupMetadata),
 }
 
 pub struct CPMSessionService {
@@ -2180,8 +2229,11 @@ impl CPMSessionService {
                     // once it is in step (section 10.2)
                     tell_failed_to_decrypt(session);
                     // and the Group Metadata keys this client misses asked
-                    // for, or those asked for sent (sections 10.5.2, 10.5.3)
+                    // for, or those asked for sent (sections 10.5.2, 10.5.3),
+                    // the subject told once the keys it waited for came
+                    // (sections 9.7.1.5, 10.5.4)
                     if let Some(session_end) = session.get_inner().session_end() {
+                        session_end.tell_metadata_opened();
                         session_end.metadata_keys_if_due();
                     }
                 }

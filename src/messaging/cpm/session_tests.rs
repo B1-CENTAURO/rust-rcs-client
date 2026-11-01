@@ -43,8 +43,8 @@ use rust_rcs_core::sip::{
 use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{
-    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed,
-    SealedFile, Taken, Upgrade, Verified,
+    EncryptedMetadata, EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull,
+    GroupMetadata, ImdnTold, Sealed, SealedFile, Taken, Upgrade, Verified,
 };
 use super::group_chat::GroupIds;
 use super::imdn::{
@@ -351,6 +351,32 @@ pub fn start(registered: bool) -> (Client, Peer) {
                 CPMGroupEvent::InvitationWithdrawn(group) => format!("withdrawn {}", group),
                 CPMGroupEvent::EncryptionEnded(group) => format!("unencrypted {}", group),
                 CPMGroupEvent::EncryptionResumed(group) => format!("encrypted {}", group),
+                CPMGroupEvent::Metadata(
+                    group,
+                    GroupMetadata::Subject {
+                        subject,
+                        participant,
+                    },
+                ) => format!(
+                    "subject {} {} {}",
+                    group,
+                    subject.as_deref().unwrap_or("-"),
+                    participant.as_deref().unwrap_or("-")
+                ),
+                CPMGroupEvent::Metadata(
+                    group,
+                    GroupMetadata::Icon {
+                        url,
+                        content_type,
+                        participant,
+                    },
+                ) => format!(
+                    "icon {} {} {} {}",
+                    group,
+                    url.as_deref().unwrap_or("-"),
+                    content_type.as_deref().unwrap_or("-"),
+                    participant.as_deref().unwrap_or("-")
+                ),
                 // apart, as the app keeps them
                 CPMGroupEvent::Ids(ids) => {
                     let _ = group_ids_tx.lock().unwrap().send(ids);
@@ -2224,6 +2250,13 @@ struct ScriptedEncryption {
     metadata: Option<Vec<u8>>,
     /// The Conversation-ID, from and to each time they are
     metadata_exchanged: std::sync::Mutex<Vec<(String, String, String)>>,
+    /// The Conversation-ID, encrypted subject and icon each time the focus
+    /// tells of them
+    described:
+        std::sync::Mutex<Vec<(String, Option<EncryptedMetadata>, Option<EncryptedMetadata>)>>,
+    /// The subjects not opened yet, which open with what the focus sends
+    /// next: those whose value starts with "later"
+    opening: std::sync::Mutex<Vec<GroupMetadata>>,
 }
 
 impl GroupEncryption for ScriptedEncryption {
@@ -2442,6 +2475,47 @@ impl GroupEncryption for ScriptedEncryption {
     fn metadata_keys_due(&self, _conversation_id: &str) -> bool {
         self.metadata_due.load(std::sync::atomic::Ordering::SeqCst)
             && (!self.metadata_once_healed || !self.healed.lock().unwrap().is_empty())
+    }
+
+    fn take_metadata(
+        &self,
+        conversation_id: &str,
+        subject: Option<EncryptedMetadata>,
+        icon: Option<EncryptedMetadata>,
+    ) -> Vec<GroupMetadata> {
+        self.described.lock().unwrap().push((
+            String::from(conversation_id),
+            subject.clone(),
+            icon.clone(),
+        ));
+        let mut told = Vec::new();
+        if let Some(subject) = subject {
+            let later = subject.value.starts_with("later");
+            let opened = GroupMetadata::Subject {
+                subject: (!subject.value.is_empty()).then(|| format!("opened-{}", subject.value)),
+                participant: subject.participant,
+            };
+            match later {
+                true => self.opening.lock().unwrap().push(opened),
+                false => told.push(opened),
+            }
+        }
+        if let Some(icon) = icon {
+            let deleted = icon.value.is_empty();
+            told.push(GroupMetadata::Icon {
+                url: (!deleted).then_some(icon.value),
+                content_type: (!deleted).then(|| String::from("image/png")),
+                participant: icon.participant,
+            });
+        }
+        told
+    }
+
+    fn metadata_opened(&self, _conversation_id: &str) -> Vec<GroupMetadata> {
+        if self.metadata_once_healed && self.healed.lock().unwrap().is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut *self.opening.lock().unwrap())
     }
 
     fn metadata_keys(
@@ -3337,6 +3411,19 @@ impl GroupEncryption for EncryptingPrepared {
 
     fn metadata_keys_due(&self, conversation_id: &str) -> bool {
         self.0.metadata_keys_due(conversation_id)
+    }
+
+    fn take_metadata(
+        &self,
+        conversation_id: &str,
+        subject: Option<EncryptedMetadata>,
+        icon: Option<EncryptedMetadata>,
+    ) -> Vec<GroupMetadata> {
+        self.0.take_metadata(conversation_id, subject, icon)
+    }
+
+    fn metadata_opened(&self, conversation_id: &str) -> Vec<GroupMetadata> {
+        self.0.metadata_opened(conversation_id)
     }
 
     fn metadata_keys(
@@ -6135,6 +6222,177 @@ state=\"partial\" version=\"1\"><users><user entity=\"{}\"><endpoint entity=\"{}
     assert_eq!(status_code(&peer.next_response()), 200);
     std::thread::sleep(Duration::from_millis(200));
     assert!(encryption.removed_for_server.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_encrypted_subject_and_icon_the_focus_tells_are_told_as_the_encryption_opens_them() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        metadata: Some(METADATA_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let msrp = encrypted_group_invitation(&client, &mut peer, "group-described");
+    let ok = peer.next_response();
+    peer.send(&ack(&ok, "group-described"));
+    let subscribe = peer.next_request("SUBSCRIBE");
+    let mut connection = msrp.accept(&rt);
+    let our_path = sdp_attribute(&body(&ok), "path").expect("an a=path in the answer");
+    assert!(next_group_event(&client).starts_with("invited "));
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+
+    let notify = |seq: u32, description: &str| {
+        conference_notify(
+            &subscribe,
+            seq,
+            &format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<conference-info xmlns=\"urn:ietf:params:xml:ns:conference-info\" entity=\"{}\" \
+state=\"partial\" version=\"{}\"><conference-description>{}</conference-description>\
+</conference-info>",
+                GROUP, seq, description
+            ),
+        )
+    };
+    let subject = |value: &str, participant: &str| {
+        format!(
+            "<encrypted-subject-description><encrypted-subject>{}</encrypted-subject>\
+<participant>{}</participant></encrypted-subject-description>",
+            value, participant
+        )
+    };
+    let icon = |value: &str| {
+        format!(
+            "<encrypted-icon-description><encrypted-icon>{}</encrypted-icon>\
+</encrypted-icon-description>",
+            value
+        )
+    };
+    let described = |value: &str, participant: Option<&str>| {
+        Some(EncryptedMetadata {
+            value: String::from(value),
+            participant: participant.map(String::from),
+        })
+    };
+
+    // both, as the encryption opens them (RCC.16 sections 7.13.2, 9.7.1)
+    peer.send(&notify(
+        1,
+        &(subject("U3ViamVjdA==", ALICE) + &icon("https://ftcs.example.com/i/1")),
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(
+        next_group_event(&client),
+        format!("subject {} opened-U3ViamVjdA== {}", GROUP, ALICE)
+    );
+    assert_eq!(
+        next_group_event(&client),
+        format!("icon {} https://ftcs.example.com/i/1 image/png -", GROUP)
+    );
+
+    // the icon deleted, the subject as before not told again
+    peer.send(&notify(2, &(subject("U3ViamVjdA==", ALICE) + &icon(""))));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(next_group_event(&client), format!("icon {} - - -", GROUP));
+
+    // a subject not opened yet is told once it opens, after what the focus
+    // sends next; the keys asked for, if due, once the focus told of it
+    // (section 10.5.1)
+    encryption
+        .metadata_due
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    peer.send(&notify(3, &subject("later", BOB)));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, METADATA_CPIM);
+    connection.respond(&rt, &send, "200 OK");
+    connection.send_content(
+        &rt,
+        &msrp.path,
+        &our_path,
+        "message/cpim",
+        &from_the_focus("the Commit bringing its key"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        next_group_event(&client),
+        format!("subject {} opened-later {}", GROUP, BOB)
+    );
+
+    assert_eq!(
+        *encryption.described.lock().unwrap(),
+        [
+            (
+                String::from("conversation-1"),
+                described("U3ViamVjdA==", Some(ALICE)),
+                described("https://ftcs.example.com/i/1", None)
+            ),
+            (String::from("conversation-1"), None, described("", None)),
+            (
+                String::from("conversation-1"),
+                described("later", Some(BOB)),
+                None
+            ),
+        ]
+    );
+    assert!(client
+        .group_events
+        .recv_timeout(Duration::from_millis(200))
+        .is_err());
+    peer.silence();
+}
+
+#[test]
+fn the_subject_opened_once_the_group_is_healed_is_told() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        out_of_step: std::sync::atomic::AtomicBool::new(true),
+        pulling: vec![(&b"MLS-Group-Info-Pull"[..], None)],
+        metadata_once_healed: true,
+        opening: std::sync::Mutex::new(vec![GroupMetadata::Subject {
+            subject: Some(String::from("healed")),
+            participant: None,
+        }]),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-healed-then-subject");
+    assert!(next_group_event(&client).starts_with("invited "));
+    assert_eq!(next_group_event(&client), format!("joined {}", GROUP));
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let info = peer.next_request("INFO");
+    peer.send(
+        &answer(&info, "200 OK", Some("group info"))
+            .replace("application/sdp", "message/mls-rcs-server"),
+    );
+
+    // as the Commits applied bring its key (RCC.16 section 10.5.4)
+    assert_eq!(
+        next_group_event(&client),
+        format!("subject {} healed -", GROUP)
+    );
+    assert_eq!(encryption.healed.lock().unwrap().len(), 1);
+    connection.quiet(&rt);
 }
 
 /// What the scripted encryption makes the External Commit of a self-healing

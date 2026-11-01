@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime};
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::mls::{self, MlsClient, MlsConversation};
 
+use super::description::{self, Icon};
 use super::file::{self, Received};
 use super::lost::{self, Lost};
 use super::sent::{self, Membership, Sent};
@@ -43,6 +44,7 @@ const SECTION_LOST: u8 = 1;
 const SECTION_SENT: u8 = 2;
 const SECTION_MEMBERSHIPS: u8 = 3;
 const SECTION_RECEIVED: u8 = 4;
+const SECTION_ICONS: u8 = 5;
 
 /// What the device keeps besides MLS
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -55,6 +57,8 @@ pub(super) struct NotesData {
     pub(super) memberships: Vec<Membership>,
     /// The keys of the files received encrypted, the oldest first
     pub(super) received: Vec<Received>,
+    /// The encrypted icons of the groups
+    pub(super) icons: Vec<Icon>,
 }
 
 /// What the device keeps besides MLS, as the store keeps it
@@ -199,6 +203,7 @@ fn encode(data: &NotesData) -> Vec<u8> {
         sent::encode_memberships(&data.memberships),
     );
     section(SECTION_RECEIVED, file::encode(&data.received));
+    section(SECTION_ICONS, description::encode(&data.icons));
     notes
 }
 
@@ -222,6 +227,7 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
                     SECTION_SENT => data.sent = sent::decode(&mut body)?,
                     SECTION_MEMBERSHIPS => data.memberships = sent::decode_memberships(&mut body)?,
                     SECTION_RECEIVED => data.received = file::decode(&mut body)?,
+                    SECTION_ICONS => data.icons = description::decode(&mut body)?,
                     _ => {}
                 }
             }
@@ -237,6 +243,7 @@ mod tests {
 
     use crate::messaging::cpm::encryption::FailedToDecrypt;
 
+    use super::super::description::Icon;
     use super::super::file::Received;
     use super::super::lost::Lost;
     use super::super::sent::{Membership, Sent};
@@ -279,6 +286,18 @@ mod tests {
                 metadata: b"metadata".to_vec(),
                 received: then,
             }],
+            icons: vec![
+                Icon {
+                    conversation_id: String::from("group-1"),
+                    url: String::from("https://ftcs.example.com/i/1"),
+                    participant: Some(String::from(BOB)),
+                },
+                Icon {
+                    conversation_id: String::from("group-2"),
+                    url: String::from("https://ftcs.example.com/i/2"),
+                    participant: None,
+                },
+            ],
         }
     }
 

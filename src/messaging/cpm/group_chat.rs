@@ -40,7 +40,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use super::encryption::{says_no_refusal_follows, GroupInfoPull, CONTENT_TYPE_MLS_RCS};
+use super::encryption::{
+    says_no_refusal_follows, EncryptedMetadata, GroupInfoPull, CONTENT_TYPE_MLS_RCS,
+};
 use super::session::{
     add_mls_opaque_token, mls_opaque_token_value, CPMGroupEvent, CPMSession, SessionEnd,
 };
@@ -142,12 +144,16 @@ struct User {
     disconnection_reason: Option<String>,
 }
 
-/// A conference-info document (RFC 4575 section 5), as far as its users go
+/// A conference-info document (RFC 4575 section 5), as far as its users and
+/// the encrypted subject and icon its description tells go (RCC.16 section
+/// 7.13.2)
 #[derive(Debug)]
 struct ConferenceInfo {
     partial: bool,
     version: Option<u32>,
     users: Vec<User>,
+    subject: Option<EncryptedMetadata>,
+    icon: Option<EncryptedMetadata>,
 }
 
 /// The status an endpoint of `status` and `disconnection_method` gives, the
@@ -197,7 +203,24 @@ fn parse_conference_info(xml: &[u8]) -> Option<ConferenceInfo> {
                             partial: attribute(b"state").as_deref() == Some("partial"),
                             version: attribute(b"version").and_then(|v| v.parse().ok()),
                             users: Vec::new(),
+                            subject: None,
+                            icon: None,
                         });
+                    }
+                    // empty once deleted
+                    b"encrypted-subject-description" | b"encrypted-icon-description"
+                        if path.last().map(|p| &p[..]) == Some(b"conference-description") =>
+                    {
+                        if let Some(info) = &mut info {
+                            let described = Some(EncryptedMetadata {
+                                value: String::new(),
+                                participant: None,
+                            });
+                            match &name[..] {
+                                b"encrypted-subject-description" => info.subject = described,
+                                _ => info.icon = described,
+                            }
+                        }
                     }
                     b"user" if path.last().map(|p| &p[..]) == Some(b"users") => {
                         user = Some(User {
@@ -255,6 +278,24 @@ fn parse_conference_info(xml: &[u8]) -> Option<ConferenceInfo> {
                             endpoint.2 = Some(text);
                         }
                     }
+                    (Some(b"encrypted-subject-description"), Some(field))
+                    | (Some(b"encrypted-icon-description"), Some(field)) => {
+                        let described = info.as_mut().and_then(|info| match grandparent {
+                            Some(b"encrypted-subject-description") => info.subject.as_mut(),
+                            _ => info.icon.as_mut(),
+                        });
+                        if let Some(described) = described {
+                            match field {
+                                // Base64, across lines maybe
+                                b"encrypted-subject" => described
+                                    .value
+                                    .extend(text.chars().filter(|c| !c.is_ascii_whitespace())),
+                                b"encrypted-icon" => described.value.push_str(&text),
+                                b"participant" => described.participant = Some(text),
+                                _ => {}
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -294,11 +335,25 @@ fn parse_conference_info(xml: &[u8]) -> Option<ConferenceInfo> {
     info
 }
 
-/// Who takes part in a group chat, as told so far
+/// What a conference-info document changes of a group chat
+#[derive(Debug, Default, PartialEq)]
+pub struct Told {
+    /// The participants it changes
+    pub participants: Vec<Participant>,
+    /// The encrypted subject and icon, if told other than before (RCC.16
+    /// section 7.13.2)
+    pub subject: Option<EncryptedMetadata>,
+    pub icon: Option<EncryptedMetadata>,
+}
+
+/// Who takes part in a group chat, and its encrypted subject and icon, as
+/// told so far
 #[derive(Default)]
 pub struct Roster {
     version: Option<u32>,
     participants: Vec<Participant>,
+    subject: Option<String>,
+    icon: Option<String>,
 }
 
 impl Roster {
@@ -306,22 +361,38 @@ impl Roster {
     /// it changes. A document older than the last one taken changes nothing
     /// (RFC 4575 section 4.1).
     pub fn take_in(&mut self, xml: &[u8]) -> Vec<Participant> {
+        self.take(xml).participants
+    }
+
+    /// Takes in the conference-info document `xml`, as take_in() does, giving
+    /// too the encrypted subject and icon it tells, if other than before
+    /// (RCC.16 section 7.13.2)
+    pub fn take(&mut self, xml: &[u8]) -> Told {
         let info = match parse_conference_info(xml) {
             Some(info) => info,
             None => {
                 platform_log(LOG_TAG, "conference-info not read");
-                return Vec::new();
+                return Told::default();
             }
         };
 
         if let (Some(current), Some(version)) = (self.version, info.version) {
             if version <= current {
-                return Vec::new();
+                return Told::default();
             }
         }
         if info.version.is_some() {
             self.version = info.version;
         }
+
+        // told again as before, not changed
+        let anew = |told: Option<EncryptedMetadata>, before: &mut Option<String>| {
+            let told = told.filter(|told| before.as_ref() != Some(&told.value))?;
+            *before = Some(told.value.clone());
+            Some(told)
+        };
+        let subject = anew(info.subject, &mut self.subject);
+        let icon = anew(info.icon, &mut self.icon);
 
         let mut changed = Vec::new();
 
@@ -373,7 +444,11 @@ impl Roster {
         self.participants
             .retain(|participant| participant.status != "disconnected");
 
-        changed
+        Told {
+            participants: changed,
+            subject,
+            icon,
+        }
     }
 
     /// The URIs of those taking part in the group as told so far, in the
@@ -543,6 +618,19 @@ impl GroupChats {
             }
         };
 
+        // the encrypted subject and icon told decrypted, as the focus tells
+        // of them (RCC.16 sections 7.13.2, 9.7.1)
+        let describing = Arc::downgrade(sip_session);
+        let described = move |subject: Option<EncryptedMetadata>,
+                              icon: Option<EncryptedMetadata>| {
+            let session_end = describing
+                .upgrade()
+                .and_then(|sip_session| sip_session.get_inner().session_end());
+            if let Some(session_end) = session_end {
+                session_end.take_metadata(subject, icon);
+            }
+        };
+
         let core = self.core.lock().unwrap().as_ref().and_then(Weak::upgrade);
         let registered = self.registered_public_identity.lock().unwrap().clone();
         let subscriber = match (core, registered) {
@@ -556,6 +644,7 @@ impl GroupChats {
                 &self.listener,
                 removed_by_server,
                 taking_part,
+                described,
                 rt,
             )
             .map(|subscriber| (subscriber, core, transport)),
@@ -587,9 +676,9 @@ impl GroupChats {
 
 /// Subscribes to the conference events of the group at `conference_uri`,
 /// telling `listener` of each participant that changes, `removed_by_server`
-/// of each the Messaging Server removed, and `taking_part` of the URIs of
-/// those taking part with each notification, and whether it changed who
-/// takes part
+/// of each the Messaging Server removed, `taking_part` of the URIs of those
+/// taking part with each notification, and whether it changed who takes
+/// part, and `described` of the encrypted subject and icon, as told anew
 fn subscribe(
     conference_uri: &str,
     core: &Arc<SipCore>,
@@ -600,6 +689,7 @@ fn subscribe(
     listener: &Arc<dyn Fn(CPMGroupEvent) + Send + Sync>,
     removed_by_server: impl Fn(&str) + Send + Sync + 'static,
     taking_part: impl Fn(Vec<String>, bool) + Send + Sync + 'static,
+    described: impl Fn(Option<EncryptedMetadata>, Option<EncryptedMetadata>) + Send + Sync + 'static,
     rt: &Arc<Runtime>,
 ) -> Option<Arc<Subscriber>> {
     let roster = Mutex::new(Roster::default());
@@ -617,13 +707,13 @@ fn subscribe(
                     return;
                 }
                 if let Body::Raw(xml) = body.as_ref() {
-                    let (changed, before, after) = {
+                    let (told, before, after) = {
                         let mut roster = roster.lock().unwrap();
                         let before = roster.taking_part();
-                        let changed = roster.take_in(xml);
-                        (changed, before, roster.taking_part())
+                        let told = roster.take(xml);
+                        (told, before, roster.taking_part())
                     };
-                    for participant in changed {
+                    for participant in told.participants {
                         if participant.removed_by_server() {
                             removed_by_server(&participant.uri);
                         }
@@ -631,6 +721,9 @@ fn subscribe(
                             conference_uri_.clone(),
                             participant,
                         ));
+                    }
+                    if told.subject.is_some() || told.icon.is_some() {
+                        described(told.subject, told.icon);
                     }
                     // not a change when first told
                     let membership_changed = !before.is_empty() && !same_members(&before, &after);
@@ -1000,7 +1093,8 @@ impl ClientTransactionCallbacks for InfoAnswer {
 
 #[cfg(test)]
 mod tests {
-    use super::{same_members, Participant, Roster};
+    use super::super::encryption::EncryptedMetadata;
+    use super::{same_members, Participant, Roster, Told};
 
     fn document(state: &str, version: u32, users: &str) -> Vec<u8> {
         format!(
@@ -1131,6 +1225,124 @@ entity=\"sip:conf1@conf.example.com\" state=\"{}\" version=\"{}\">\
                 .is_empty());
         }
         assert!(roster.take_in(b"not xml at all <").is_empty());
+    }
+
+    /// A conference-info document of `version`, `state` full or partial,
+    /// its description telling `description`
+    fn described(state: &str, version: u32, description: &str) -> Vec<u8> {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<conference-info xmlns=\"urn:ietf:params:xml:ns:conference-info\" \
+entity=\"sip:conf1@conf.example.com\" state=\"{}\" version=\"{}\">\
+<conference-description><display-text>the group</display-text>{}</conference-description>\
+<users>{}</users></conference-info>",
+            state,
+            version,
+            description,
+            user(A, None, &endpoint("connected", None))
+        )
+        .into_bytes()
+    }
+
+    fn told(value: &str, participant: Option<&str>) -> Option<EncryptedMetadata> {
+        Some(EncryptedMetadata {
+            value: String::from(value),
+            participant: participant.map(String::from),
+        })
+    }
+
+    #[test]
+    fn the_encrypted_subject_and_icon_are_told_anew_as_the_description_tells() {
+        let mut roster = Roster::default();
+        let told_1 = roster.take(&described(
+            "full",
+            1,
+            &format!(
+                "<encrypted-subject-description>\
+<encrypted-subject>\n  Tm90QVJl\n  YWxQcm90by4=\n</encrypted-subject>\
+<participant>{}</participant><timestamp>2026-11-01T10:00:00Z</timestamp>\
+<other>passed over</other></encrypted-subject-description>\
+<encrypted-icon-description><encrypted-icon>\
+https://ftcs.example.com/i/1?a=1&amp;b=2</encrypted-icon></encrypted-icon-description>",
+                B
+            ),
+        ));
+        assert_eq!(
+            told_1,
+            Told {
+                participants: vec![participant(A, None, "connected")],
+                subject: told("Tm90QVJlYWxQcm90by4=", Some(B)),
+                icon: told("https://ftcs.example.com/i/1?a=1&b=2", None),
+            }
+        );
+
+        // the same again is not told anew, whoever it says set it
+        let same = format!(
+            "<encrypted-subject-description><encrypted-subject>Tm90QVJlYWxQcm90by4=\
+</encrypted-subject><participant>{}</participant></encrypted-subject-description>",
+            A
+        );
+        assert_eq!(roster.take(&described("full", 2, &same)), Told::default());
+
+        // deleted as empty, as an element empty or of no text; another
+        // subject told anew
+        assert_eq!(
+            roster.take(&described(
+                "partial",
+                3,
+                &format!(
+                    "<encrypted-icon-description><encrypted-icon/>\
+<participant>{}</participant></encrypted-icon-description>",
+                    A
+                )
+            )),
+            Told {
+                icon: told("", Some(A)),
+                ..Told::default()
+            }
+        );
+        assert_eq!(
+            roster.take(&described(
+                "partial",
+                4,
+                "<encrypted-subject-description><encrypted-subject></encrypted-subject>\
+</encrypted-subject-description>"
+            )),
+            Told {
+                subject: told("", None),
+                ..Told::default()
+            }
+        );
+        assert_eq!(
+            roster.take(&described(
+                "partial",
+                5,
+                "<encrypted-subject-description><encrypted-subject>QW5vdGhlcg==\
+</encrypted-subject></encrypted-subject-description>"
+            )),
+            Told {
+                subject: told("QW5vdGhlcg==", None),
+                ..Told::default()
+            }
+        );
+
+        // not in an older document, nor outside the description of the
+        // conference
+        assert_eq!(
+            roster.take(&described(
+                "partial",
+                5,
+                "<encrypted-subject-description><encrypted-subject>T2xk\
+</encrypted-subject></encrypted-subject-description>"
+            )),
+            Told::default()
+        );
+        let outside = b"<conference-info xmlns=\"urn:ietf:params:xml:ns:conference-info\" \
+state=\"partial\" version=\"6\"><encrypted-subject-description><encrypted-subject>T3V0\
+</encrypted-subject></encrypted-subject-description><users/></conference-info>";
+        assert_eq!(roster.take(outside), Told::default());
+        // nor a document without them
+        assert_eq!(roster.take(&described("full", 7, "")).subject, None);
     }
 
     #[test]

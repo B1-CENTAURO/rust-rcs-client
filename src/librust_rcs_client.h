@@ -198,8 +198,13 @@ extern void rcs_client_create_group_chat(struct rcs_runtime *runtime, struct rcs
 // told of a group chat taken part in: joined (event 0), a participant's status (1), left (2),
 // that an invitation to it waiting for the user's answer was withdrawn by whoever sent it (3),
 // that it is no longer encrypted end to end, as RCC.16 section 11.2 moves it to unencrypted (4),
-// or that it is encrypted end to end again, as RCC.16 section 11.1 moves it back to encrypted (5);
-// for 1, the participant's URI, display name (or NULL) and status: connected, pending, ..., departed, booted, disconnected
+// or that it is encrypted end to end again, as RCC.16 section 11.1 moves it back to encrypted (5),
+// and of its encrypted subject (6) and icon (7) as they are set or deleted (RCC.16 sections 7.13.2, 9.7.1);
+// for 1, the participant's URI, display name (or NULL) and status: connected, pending, ..., departed, booted, disconnected;
+// for 6, the URI of the participant who set it (or NULL), and the subject decrypted in display_name, once it is;
+// for 7, the URI of the participant who set it (or NULL), the URL of the icon in display_name, and its Content-Type in status (or NULL),
+// a download of the icon at that URL being decrypted, and 7 told again if one did not decrypt and another key of the icon came since;
+// for 6 and 7, display_name is NULL once deleted
 typedef void (*group_chat_event_callback) (int32_t event, const char *conference_uri, const char *participant_uri,
                                 const char *display_name, const char *status, void *context);
 

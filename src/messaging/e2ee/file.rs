@@ -518,21 +518,29 @@ impl E2eeDevice {
     }
 
     /// Whether the file at `url` was received encrypted, its key kept for it
-    /// to be opened once downloaded (RCC.16 section 9.1.2.2)
+    /// to be opened once downloaded (RCC.16 section 9.1.2.2), or is the
+    /// encrypted icon of a group chat (section 9.7.1.4)
     pub fn opens_file(&self, url: &str) -> bool {
         let now = self.store().now();
         self.notes()
             .read(|data| received_file(data, url, now))
             .is_some()
+            || self.icon_at(url).is_some()
     }
 
     /// `ciphertext`, downloaded from `url`, decrypted with the key kept for
     /// it, its tag checked first, and the key forgotten then (RCC.16 section
     /// 9.1.2.2, Annex C.3); None if no key is kept for it, or if it does not
     /// open with it, which keeps the key
+    ///
+    /// The encrypted icon of a group chat is decrypted with the key of the
+    /// icon kept for the group, which is kept on (section 9.7.1.4).
     pub fn open_file(&self, url: &str, ciphertext: &[u8]) -> Option<Vec<u8>> {
         let now = self.store().now();
-        let metadata = self.notes().read(|data| received_file(data, url, now))?;
+        let Some(metadata) = self.notes().read(|data| received_file(data, url, now)) else {
+            let conversation_id = self.icon_at(url)?;
+            return self.open_icon(&conversation_id, ciphertext);
+        };
         let opened = decrypt_file(
             ciphertext,
             &metadata.file_name,

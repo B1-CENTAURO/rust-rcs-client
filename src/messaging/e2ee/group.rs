@@ -42,8 +42,8 @@ use uuid::Uuid;
 
 use crate::capability::CapabilityQuery;
 use crate::messaging::cpm::encryption::{
-    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed,
-    SealedFile, Taken, Upgrade, Verified,
+    EncryptedMetadata, EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull,
+    GroupMetadata, ImdnTold, Sealed, SealedFile, Taken, Upgrade, Verified,
 };
 
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice, CIPHERSUITE};
@@ -767,6 +767,7 @@ impl E2eeDevice {
             .unwrap()
             .remove(conversation_id);
         self.recoveries().forget(conversation_id);
+        self.forget_metadata(conversation_id);
         self.store().delete_conversation(conversation_id.as_bytes())
     }
 }
@@ -1263,6 +1264,25 @@ impl GroupEncryption for DeviceGroups {
         self.device
             .upgrade()
             .is_some_and(|device| device.metadata_keys_due(conversation_id))
+    }
+
+    fn take_metadata(
+        &self,
+        conversation_id: &str,
+        subject: Option<EncryptedMetadata>,
+        icon: Option<EncryptedMetadata>,
+    ) -> Vec<GroupMetadata> {
+        self.device
+            .upgrade()
+            .map(|device| device.take_metadata(conversation_id, subject, icon))
+            .unwrap_or_default()
+    }
+
+    fn metadata_opened(&self, conversation_id: &str) -> Vec<GroupMetadata> {
+        self.device
+            .upgrade()
+            .map(|device| device.metadata_opened(conversation_id))
+            .unwrap_or_default()
     }
 
     fn metadata_keys(
