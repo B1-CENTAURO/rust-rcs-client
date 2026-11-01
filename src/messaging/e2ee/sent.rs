@@ -622,3 +622,75 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod resend_tests {
+    use std::time::{Duration, SystemTime};
+
+    use rust_rcs_core::mls::rcs::participant_keys;
+
+    use super::super::kds_tests::certificates::{ALICE, BOB, CA};
+    use super::super::kds_tests::credential;
+    use super::super::notes::NotesData;
+    use super::{note_sent, to_resend, KEY_CHANGE_GRACE};
+
+    const BOB_TEL: &str = "tel:+491707654321";
+
+    fn then() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000)
+    }
+
+    /// The message m1 sent at then(), Bob's Client a member with the
+    /// Participant Key `key`
+    fn sent_to_bob_with(key: &[u8]) -> NotesData {
+        let mut data = NotesData::default();
+        note_sent(
+            &mut data,
+            "group-1",
+            "m1",
+            b"payload",
+            Vec::new(),
+            b"negative-delivery",
+            vec![(String::from(BOB_TEL), key.to_vec())],
+            then(),
+        );
+        data
+    }
+
+    #[test]
+    fn a_message_is_re_sent_to_a_member_whose_participant_key_is_the_same_or_rolled() {
+        let bob = credential(&[BOB, CA]);
+        let keys = participant_keys(&bob).unwrap();
+        let long_after = then() + 2 * KEY_CHANGE_GRACE;
+        // as it was, or as a key roll vouches for (RCC.16 section 10.3,
+        // Annex A.3.8.9)
+        for key in &keys {
+            let data = sent_to_bob_with(key);
+            let to_resend = to_resend(&data, "group-1", "m1", None, &bob, long_after)
+                .unwrap_or_else(|why| panic!("{}", why));
+            assert_eq!(to_resend.payload, b"payload");
+            assert_eq!(to_resend.disposition, b"negative-delivery");
+        }
+
+        // another, not over an hour after the message was sent
+        let alice_key = participant_keys(&credential(&[ALICE, CA]))
+            .unwrap()
+            .remove(0);
+        let data = sent_to_bob_with(&alice_key);
+        assert!(to_resend(
+            &data,
+            "group-1",
+            "m1",
+            None,
+            &bob,
+            then() + KEY_CHANGE_GRACE
+        )
+        .is_ok());
+        assert!(to_resend(&data, "group-1", "m1", None, &bob, long_after).is_err());
+
+        // nor of another message, or in another group
+        let data = sent_to_bob_with(&keys[0]);
+        assert!(to_resend(&data, "group-1", "m2", None, &bob, then()).is_err());
+        assert!(to_resend(&data, "group-2", "m1", None, &bob, then()).is_err());
+    }
+}

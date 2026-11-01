@@ -509,7 +509,7 @@ mod tests {
     use rust_rcs_core::imdn::notification::{Imdn, Notification, Status};
     use rust_rcs_core::internet::Body;
 
-    use super::{app_message_id, ImdnService, ReceivedMessages, Refusal, NOTED};
+    use super::{app_message_id, telling_of, ImdnService, ReceivedMessages, Refusal, NOTED};
 
     const SENDER: &str = "sip:+15551234@example.com";
 
@@ -614,6 +614,26 @@ again",
             received.displayed("Kn31").unwrap().original_message_id,
             None
         );
+    }
+
+    #[test]
+    fn a_notification_is_made_to_tell_of_another_message() {
+        let xml = b"<imdn><message-id>Rs77</message-id><datetime>t</datetime><delivery-notification><status><delivered/></status></delivery-notification></imdn>";
+        assert_eq!(
+            telling_of(xml, b"Kn7"),
+            b"<imdn><message-id>Kn7</message-id><datetime>t</datetime><delivery-notification><status><delivered/></status></delivery-notification></imdn>"
+        );
+        // escaped as XML text
+        assert_eq!(
+            Imdn::from_xml(&telling_of(xml, b"a<b&c>"))
+                .unwrap()
+                .message_id,
+            "a<b&c>"
+        );
+        // as it is if it tells of none
+        for xml in [&b"<imdn></imdn>"[..], b"<imdn><message-id>Rs77</imdn>"] {
+            assert_eq!(telling_of(xml, b"Kn7"), xml);
+        }
     }
 
     #[test]

@@ -493,6 +493,63 @@ fn the_notes_of_the_device_are_kept_with_its_state() {
 }
 
 #[test]
+fn notes_kept_along_with_a_call_are_kept_with_its_state_or_not_at_all() {
+    let app = Arc::new(App::default());
+    let device = store(&app);
+    device
+        .create(|config, validator| MlsClient::new(b"alice", CIPHERSUITE, config, validator))
+        .unwrap();
+    let (group_id, _bobs) = group_with(&device, &member("bob"));
+    let kept = app.kept();
+
+    // kept once, with the state the call leaves
+    let message = device
+        .with_conversation_and_notes(
+            &group_id,
+            |conversation, client| conversation.encrypt(client, b"one"),
+            |message| Some(message.len().to_be_bytes().to_vec()),
+        )
+        .unwrap();
+    assert_eq!(app.kept(), kept + 1);
+    assert_eq!(device.notes(), message.len().to_be_bytes());
+    let again = store(&app);
+    again.restore(&app.last()).unwrap();
+    assert_eq!(again.notes(), message.len().to_be_bytes());
+
+    // none of a call failing, nor of one the app does not keep
+    let before = device.notes();
+    assert_eq!(
+        device.with_conversation_and_notes(
+            &group_id,
+            |_, _| Err::<(), _>(ErrorKind::InvalidState),
+            |_| Some(b"failed".to_vec()),
+        ),
+        Err(StoreError::Mls(ErrorKind::InvalidState))
+    );
+    assert_eq!(device.notes(), before);
+    app.refuse(true);
+    assert_eq!(
+        device.with_conversation_and_notes(
+            &group_id,
+            |conversation, client| conversation.encrypt(client, b"two"),
+            |_| Some(b"not kept".to_vec()),
+        ),
+        Err(StoreError::NotSaved)
+    );
+    app.refuse(false);
+    assert_eq!(device.notes(), before);
+    // and none changed when none are given
+    device
+        .with_conversation_and_notes(
+            &group_id,
+            |conversation, client| conversation.encrypt(client, b"three"),
+            |_| None,
+        )
+        .unwrap();
+    assert_eq!(device.notes(), before);
+}
+
+#[test]
 fn a_state_kept_before_notes_were_is_taken_on_with_none() {
     let app = Arc::new(App::default());
     let device = store(&app);

@@ -7229,6 +7229,9 @@ fn only_negative_deliveries_of_messages_not_decrypted_are_answered() {
     );
     moved_to_unencrypted(&device, &groups, &bob, &mut bobs_group);
     assert_eq!(ftd_answer(&device, &cpim, &xml), FtdAnswer::Ignored);
+    // nor unsigned, as notifications may be then (section 11.2)
+    let unsigned = notification_cpim(BOB_TEL, "imdn-22", "", &xml);
+    assert_eq!(ftd_answer(&device, &unsigned, &xml), FtdAnswer::Ignored);
 }
 
 #[test]
