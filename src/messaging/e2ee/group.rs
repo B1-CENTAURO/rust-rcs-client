@@ -1233,6 +1233,32 @@ impl GroupEncryption for DeviceGroups {
             .is_some_and(|device| device.uploaded(conversation_id, xml, file, thumbnail))
     }
 
+    fn decrypt_file_transfer(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        xml: &[u8],
+    ) -> Option<Vec<u8>> {
+        let device = self.device.upgrade()?;
+        match device.decrypt_file_transfer(conversation_id, cpim_info, xml) {
+            Ok(cpim) => Some(cpim),
+            Err(e) => {
+                platform_log(LOG_TAG, format!("file transfer not decrypted: {:?}", e));
+                None
+            }
+        }
+    }
+
+    fn opens_file(&self, url: &str) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.opens_file(url))
+    }
+
+    fn open_file(&self, url: &str, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        self.device.upgrade()?.open_file(url, ciphertext)
+    }
+
     fn metadata_keys_due(&self, conversation_id: &str) -> bool {
         self.device
             .upgrade()

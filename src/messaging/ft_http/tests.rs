@@ -30,7 +30,7 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 use super::content_server::{ContentServer, Credentials};
-use super::download::{download_file, FileDownloadError};
+use super::download::{download_file, download_sealed_file, FileDownloadError};
 use super::upload::{
     upload_file, upload_sealed_file, FileInfo, FileUploadError, SEALED_FILE_SUFFIX,
 };
@@ -784,4 +784,97 @@ fn a_file_that_cannot_be_sealed_is_not_uploaded() {
     assert!(matches!(result, Err(FileUploadError::IO)));
     assert_eq!(*count.lock().unwrap(), 0);
     assert!(taken.recv_timeout(Duration::from_millis(300)).is_err());
+}
+
+impl Client {
+    /// Downloads `uri` to `path` as download_sealed_file() does with `open`
+    pub fn download_sealed(
+        &self,
+        uri: &str,
+        path: &str,
+        total: Option<usize>,
+        open: &(dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync),
+    ) -> Result<(), FileDownloadError> {
+        self.rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                download_sealed_file(uri, path, total, &self.server(), |_, _| {}, open),
+            )
+            .await
+            .expect("the download to end")
+        })
+    }
+}
+
+/// Opens what was sealed as counting_seal() seals
+fn unsealing(ciphertext: &[u8]) -> Option<Vec<u8>> {
+    ciphertext.strip_prefix(b"sealed ").map(<[u8]>::to_vec)
+}
+
+#[test]
+fn a_file_received_sealed_is_downloaded_next_to_where_it_is_opened() {
+    let client = Client::new();
+    let (base, taken) = content_server(|_| {
+        response(
+            "200 OK",
+            &["Content-Type: message/mls-ft"],
+            b"sealed the picture",
+        )
+    });
+    let path = std::env::temp_dir().join(format!("ft-http-test-{}", Uuid::new_v4()));
+    let path = path.to_string_lossy().into_owned();
+    let sealed = format!("{}{}", path, SEALED_FILE_SUFFIX);
+
+    let result = client.download_sealed(&format!("{}/f/1", base), &path, Some(18), &unsealing);
+    assert!(result.is_ok());
+    // opened where the app asked, the file downloaded deleted (RCC.16
+    // section 9.1.2.2)
+    assert_eq!(std::fs::read(&path).unwrap(), b"the picture");
+    assert!(std::fs::metadata(&sealed).is_err());
+    assert_eq!(next(&taken).header("Range"), None);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_file_received_sealed_goes_on_from_what_was_downloaded_of_it() {
+    let client = Client::new();
+    let (base, taken) = content_server(|_| {
+        response(
+            "206 Partial Content",
+            &["Content-Range: bytes 7-17/18"],
+            b"the picture",
+        )
+    });
+    let path = std::env::temp_dir().join(format!("ft-http-test-{}", Uuid::new_v4()));
+    let path = path.to_string_lossy().into_owned();
+    std::fs::write(format!("{}{}", path, SEALED_FILE_SUFFIX), b"sealed ").unwrap();
+
+    let result = client.download_sealed(&format!("{}/f/1", base), &path, Some(18), &unsealing);
+    assert!(result.is_ok());
+    assert_eq!(next(&taken).header("Range"), Some("bytes=7-"));
+    assert_eq!(std::fs::read(&path).unwrap(), b"the picture");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_file_received_sealed_that_does_not_open_is_not_given() {
+    let client = Client::new();
+    let (base, _taken) = content_server(|_| response("200 OK", &[], b"not sealed as it was told"));
+    let path = std::env::temp_dir().join(format!("ft-http-test-{}", Uuid::new_v4()));
+    let path = path.to_string_lossy().into_owned();
+
+    let result = client.download_sealed(&format!("{}/f/1", base), &path, None, &unsealing);
+    assert_eq!(
+        result.err().map(|e| e.error_string()),
+        Some(String::from("NotOpened"))
+    );
+    // nothing given, and what was downloaded deleted, to be downloaded afresh
+    assert!(std::fs::metadata(&path).is_err());
+    assert!(std::fs::metadata(format!("{}{}", path, SEALED_FILE_SUFFIX)).is_err());
+
+    // nor one that is not downloaded
+    let (base, _taken) = content_server(|_| response("404 Not Found", &[], b""));
+    let result = client.download_sealed(&format!("{}/f/1", base), &path, None, &unsealing);
+    assert_eq!(result.err().map(|e| e.error_code()), Some(404));
+    assert!(std::fs::metadata(&path).is_err());
 }

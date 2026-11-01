@@ -115,6 +115,7 @@ use crate::messaging::cpm::MessagingSessionHandle;
 use crate::messaging::ffi::RecipientType;
 use crate::messaging::ft_http::config::FileTransferOverHTTPConfigs;
 use crate::messaging::ft_http::download_file;
+use crate::messaging::ft_http::download_sealed_file;
 use crate::messaging::ft_http::upload_file;
 use crate::messaging::ft_http::upload_sealed_file;
 use crate::messaging::ft_http::FileInfo;
@@ -1794,6 +1795,12 @@ impl RcsEngine {
     /// Downloads the file at `file_uri` to `download_path`, from `start` of
     /// its `total` size if known, through the download proxy if one is
     /// provisioned, told what `origin` tells of the message that brought it
+    ///
+    /// One received encrypted in a group chat is downloaded encrypted next to
+    /// `download_path`, going on from what is there of it rather than from
+    /// `start`, then opened into `download_path` with its key, which is
+    /// forgotten then (RCC.16 section 9.1.2.2), see
+    /// `ft_http::download_sealed_file()`.
     pub fn download_file<PF, RF>(
         &self,
         file_uri: &str,
@@ -1815,6 +1822,13 @@ impl RcsEngine {
         let ft_auth = self.ft_http_configs.ft_auth;
 
         if ft_auth == 1 {
+            // one received encrypted, opened once downloaded (RCC.16 section
+            // 9.1.2.2)
+            let opening = self
+                .cpm_session_service
+                .group_encryption()
+                .filter(|encryption| encryption.opens_file(file_uri))
+                .map(|encryption| (String::from(file_uri), encryption));
             let file_uri = download_uri(
                 self.ft_http_configs.ft_http_dl_uri.as_deref(),
                 file_uri,
@@ -1846,16 +1860,32 @@ impl RcsEngine {
                     msisdn: msisdn.as_deref(),
                 };
 
-                match download_file(
-                    &file_uri,
-                    &download_path,
-                    start,
-                    total,
-                    &server,
-                    download_file_progress_callback,
-                )
-                .await
-                {
+                let downloaded = match &opening {
+                    Some((url, encryption)) => {
+                        let open = |ciphertext: &[u8]| encryption.open_file(url, ciphertext);
+                        download_sealed_file(
+                            &file_uri,
+                            &download_path,
+                            total,
+                            &server,
+                            download_file_progress_callback,
+                            &open,
+                        )
+                        .await
+                    }
+                    None => {
+                        download_file(
+                            &file_uri,
+                            &download_path,
+                            start,
+                            total,
+                            &server,
+                            download_file_progress_callback,
+                        )
+                        .await
+                    }
+                };
+                match downloaded {
                     Ok(()) => {
                         download_file_result_callback(200, String::from("Ok"));
                     }

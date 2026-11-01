@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime};
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::mls::{self, MlsClient, MlsConversation};
 
+use super::file::{self, Received};
 use super::lost::{self, Lost};
 use super::sent::{self, Membership, Sent};
 use super::store::{MlsStore, StoreError};
@@ -41,6 +42,7 @@ const NOTES_VERSION: u8 = 2;
 const SECTION_LOST: u8 = 1;
 const SECTION_SENT: u8 = 2;
 const SECTION_MEMBERSHIPS: u8 = 3;
+const SECTION_RECEIVED: u8 = 4;
 
 /// What the device keeps besides MLS
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -51,6 +53,8 @@ pub(super) struct NotesData {
     pub(super) sent: Vec<Sent>,
     /// The members of the groups when those were sent
     pub(super) memberships: Vec<Membership>,
+    /// The keys of the files received encrypted, the oldest first
+    pub(super) received: Vec<Received>,
 }
 
 /// What the device keeps besides MLS, as the store keeps it
@@ -194,6 +198,7 @@ fn encode(data: &NotesData) -> Vec<u8> {
         SECTION_MEMBERSHIPS,
         sent::encode_memberships(&data.memberships),
     );
+    section(SECTION_RECEIVED, file::encode(&data.received));
     notes
 }
 
@@ -216,6 +221,7 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
                     SECTION_LOST => data.lost = lost::decode(&mut body)?,
                     SECTION_SENT => data.sent = sent::decode(&mut body)?,
                     SECTION_MEMBERSHIPS => data.memberships = sent::decode_memberships(&mut body)?,
+                    SECTION_RECEIVED => data.received = file::decode(&mut body)?,
                     _ => {}
                 }
             }
@@ -231,6 +237,7 @@ mod tests {
 
     use crate::messaging::cpm::encryption::FailedToDecrypt;
 
+    use super::super::file::Received;
     use super::super::lost::Lost;
     use super::super::sent::{Membership, Sent};
     use super::{decode, encode, NotesData, NOTES_VERSION_LOST};
@@ -266,6 +273,11 @@ mod tests {
                 conversation_id: String::from("group-1"),
                 id: 7,
                 members: vec![(String::from(BOB), b"key".to_vec())],
+            }],
+            received: vec![Received {
+                url: String::from("https://ftcs.example.com/f/1"),
+                metadata: b"metadata".to_vec(),
+                received: then,
             }],
         }
     }
