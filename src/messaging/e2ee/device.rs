@@ -31,6 +31,7 @@ use crate::rcs_engine::RcsEngine;
 
 use super::heal::Heals;
 use super::kds::{self, EnrolmentError, KeyDistribution};
+use super::metadata::Recoveries;
 use super::notes::Notes;
 use super::provisioning;
 use super::replace::Replacements;
@@ -85,6 +86,8 @@ pub struct E2eeDevice {
     upgrades: Upgrades,
     /// The messages not decrypted, and those sent, kept with the MLS state
     notes: Notes,
+    /// The groups whose Group Metadata keys are recovered
+    recoveries: Recoveries,
 }
 
 impl E2eeDevice {
@@ -118,6 +121,7 @@ impl E2eeDevice {
             replacements: Replacements::default(),
             upgrades: Upgrades::default(),
             notes,
+            recoveries: Recoveries::default(),
         })
     }
 
@@ -143,6 +147,10 @@ impl E2eeDevice {
 
     pub(super) fn upgrades(&self) -> &Upgrades {
         &self.upgrades
+    }
+
+    pub(super) fn recoveries(&self) -> &Recoveries {
+        &self.recoveries
     }
 
     pub(super) fn home_kds(&self) -> u32 {

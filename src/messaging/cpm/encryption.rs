@@ -353,6 +353,27 @@ pub trait GroupEncryption: Send + Sync {
         to: String,
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
+    /// Whether this client is to ask the other members of the group chat
+    /// `conversation_id` for the Group Metadata keys it misses, the keys of
+    /// the icon and subject and the continuity token, or to send them those
+    /// one of them asked for (RCC.16 sections 10.5.2, 10.5.3), as
+    /// metadata_keys() does
+    fn metadata_keys_due(&self, conversation_id: &str) -> bool;
+
+    /// The CPIM message carrying a `message/mls-rcs-client` with the Commit
+    /// asking for the Group Metadata keys of the group chat `conversation_id`
+    /// this client misses, or sending those another asked for, as
+    /// metadata_keys_due() tells, to send to the Conversation Focus in the
+    /// session, `from` and `to` that of the CPIM message (RCC.16 sections
+    /// 9.5.1, 10.5.2, 10.5.3), once a Commit of this client the Focus is yet
+    /// to accept is; None if neither is due then
+    fn metadata_keys(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>>;
+
     /// Lets go of the MLS group `conversation_id`, as its chat did not start,
     /// its invitation was not accepted, or the user left it
     fn abandon(&self, conversation_id: &str);

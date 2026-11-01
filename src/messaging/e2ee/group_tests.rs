@@ -3472,7 +3472,7 @@ fn the_group_info_of_another_group_is_not_rejoined_in_its_stead() {
         pending_proposals: Vec::new(),
     };
     assert_eq!(
-        device.rejoin_group(CONVERSATION, IMPU, GROUP_URI, &group_info),
+        device.rejoin_group(CONVERSATION, IMPU, GROUP_URI, &group_info, None),
         Err(GroupError::Store(StoreError::Mls(
             ErrorKind::UnexpectedMessage
         )))
@@ -7400,4 +7400,479 @@ fn a_message_sent_is_re_sent_after_the_device_restarted() {
             other => panic!("{}: {:?}", n, other),
         }
     }
+}
+
+/// What the Conversation Focus forwards of the Commit the control message
+/// `cpim` carries, with the PrivateMessage bundled with it
+fn forwarded_bundle(cpim: &[u8]) -> Vec<u8> {
+    let bundle = commit_bundle_of(cpim);
+    proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: bundle.commit_list,
+                private_message: bundle.private_message,
+                ..ServerCommitBundle::default()
+            },
+        )),
+    })
+}
+
+/// What the Conversation Focus forwards of the Commit `output` of a member,
+/// with the PrivateMessage bundled with it
+fn focus_bundle(output: &rust_rcs_core::mls::CommitOutput) -> ServerMlsRcsMessage {
+    ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: encode_message_list(&[&output.commit]).unwrap(),
+                private_message: output.private_message.clone().unwrap_or_default(),
+                ..ServerCommitBundle::default()
+            },
+        )),
+    }
+}
+
+/// Bob sets the subject of the group, whose key the device takes
+fn subject_set_by_bob(device: &E2eeDevice, bob: &MlsClient, bobs_group: &mut MlsConversation) {
+    let (output, _) = bobs_group
+        .set_group_subject(bob, "Team", b"bob-subject")
+        .unwrap();
+    bobs_group.merge_pending_commit(bob).unwrap();
+    device
+        .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&output)))
+        .unwrap();
+}
+
+/// Bob, who lost his Group Metadata keys, asks for them, his Commit applied
+/// by the device
+fn asked_by_bob(device: &E2eeDevice, bob: &MlsClient, bobs_group: &mut MlsConversation) {
+    bob.forget_group_metadata(CONVERSATION.as_bytes()).unwrap();
+    let output = bobs_group.request_group_metadata_keys(bob).unwrap();
+    bobs_group.merge_pending_commit(bob).unwrap();
+    device
+        .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+        .unwrap();
+}
+
+/// The Group Metadata keys the device keeps for the group of the
+/// conversation
+fn metadata(device: &E2eeDevice) -> proto::GroupMetadataKeys {
+    device
+        .store()
+        .peek_conversation(CONVERSATION.as_bytes(), |_, client| {
+            client.group_metadata(CONVERSATION.as_bytes())
+        })
+        .unwrap()
+        .unwrap()
+}
+
+fn metadata_in_sync(device: &E2eeDevice) -> bool {
+    device
+        .store()
+        .peek_conversation(CONVERSATION.as_bytes(), |conversation, client| {
+            conversation.group_metadata_in_sync(client)
+        })
+        .unwrap()
+        .unwrap()
+}
+
+fn metadata_keys(device: &E2eeDevice) -> Option<Vec<u8>> {
+    device.metadata_keys(CONVERSATION, IMPU, GROUP_URI).unwrap()
+}
+
+/// Has the device forget its Group Metadata keys
+fn forgotten_metadata(device: &E2eeDevice) {
+    device
+        .store()
+        .with_client(|client| client.forget_group_metadata(CONVERSATION.as_bytes()))
+        .unwrap();
+}
+
+/// The Commit of the device the Conversation Focus accepts
+fn accepted_from_device(device: &E2eeDevice) {
+    let previous = epoch_identifier(device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+}
+
+#[test]
+fn the_metadata_keys_another_member_asks_for_are_sent_by_the_device_keeping_them() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    subject_set_by_bob(&device, &bob, &mut bobs_group);
+    assert!(metadata_in_sync(&device));
+    // none asked for
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(metadata_keys(&device), None);
+
+    // asked for by Bob (RCC.16 section 10.5.3)
+    asked_by_bob(&device, &bob, &mut bobs_group);
+    assert!(device.metadata_keys_due(CONVERSATION));
+    let cpim = metadata_keys(&device).expect("the keys sent");
+    let info = cpim_message(&cpim);
+    let info = info.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    // a Commit removing the request, bundled with a PrivateMessage carrying
+    // them, which waits for the Focus
+    let bundle = commit_bundle_of(&cpim);
+    assert!(!bundle.private_message.is_empty());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((3, true)));
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(metadata_keys(&device), None);
+
+    // Bob takes the key of the subject and the continuity token (section
+    // 10.5.4)
+    match bobs_group
+        .process_server_message(&bob, &forwarded_bundle(&cpim))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { .. }, IncomingMessage::GroupMetadataKeys {
+            subject,
+            continuity_token_matches,
+            ..
+        }] => {
+            assert!(*subject);
+            assert_eq!(*continuity_token_matches, Some(true));
+        }
+        _ => panic!("expected a Commit with the keys"),
+    }
+    assert!(bobs_group.group_metadata_in_sync(&bob).unwrap());
+    assert!(!bobs_group.group_metadata_keys_requested());
+    assert_eq!(
+        bob.group_metadata(CONVERSATION.as_bytes()).unwrap(),
+        metadata(&device)
+    );
+    // once the Focus accepts them, they are asked for no more
+    accepted_from_device(&device);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((4, false)));
+    assert!(!device.metadata_keys_due(CONVERSATION));
+
+    // not sent by the device missing the key of the subject, its Commit
+    // taken without the PrivateMessage
+    let (output, _) = bobs_group
+        .set_group_subject(&bob, "Team again", b"bob-subject-2")
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    device
+        .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+        .unwrap();
+    assert!(!metadata_in_sync(&device));
+    assert!(!metadata(&device).continuity_token.is_empty());
+    asked_by_bob(&device, &bob, &mut bobs_group);
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(metadata_keys(&device), None);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((6, false)));
+
+    // nor by the device missing the continuity token, in a group without
+    // icon or subject
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    asked_by_bob(&device, &bob, &mut bobs_group);
+    assert!(device.metadata_keys_due(CONVERSATION));
+    forgotten_metadata(&device);
+    assert!(metadata_in_sync(&device));
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(metadata_keys(&device), None);
+}
+
+/// Self-heals the group of the conversation with the GroupInfo the
+/// Conversation Focus answers `answers` with: the External Commit
+fn rejoined(groups: &DeviceGroups, answers: Vec<Option<(u16, Vec<u8>)>>) -> Vec<u8> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (pull, _) = focus_answering(answers);
+    rt.block_on(groups.heal(
+        String::from(CONVERSATION),
+        String::from(IMPU),
+        String::from(GROUP_URI),
+        pull,
+    ))
+    .expect("an External Commit")
+}
+
+#[test]
+fn the_device_asks_for_the_metadata_keys_it_misses_once_it_rejoined_the_group() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    subject_set_by_bob(&device, &bob, &mut bobs_group);
+    let token = bob
+        .group_metadata(CONVERSATION.as_bytes())
+        .unwrap()
+        .continuity_token;
+    // the device out of step, its keys lost
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    forgotten_metadata(&device);
+    device.heals().want(CONVERSATION);
+
+    // the GroupInfo pulled (RCC.16 sections 10.1.1, 10.5.1)
+    let cpim = rejoined(&groups, vec![None, group_info_answer(group_info)]);
+    assert!(!metadata_in_sync(&device));
+    // not asked for while the External Commit waits for the Focus
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(metadata_keys(&device), None);
+    bobs_group
+        .process_server_message(&bob, &forwarded_commit(&cpim))
+        .unwrap();
+    accepted_from_device(&device);
+
+    // then with a Commit of its own (section 10.5.2)
+    assert!(device.metadata_keys_due(CONVERSATION));
+    let cpim = metadata_keys(&device).expect("the keys asked for");
+    assert!(commit_bundle_of(&cpim).private_message.is_empty());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((4, true)));
+    bobs_group
+        .process_server_message(&bob, &forwarded_commit(&cpim))
+        .unwrap();
+    assert!(bobs_group.group_metadata_keys_requested());
+    accepted_from_device(&device);
+    // not again, nor sent by the device, while they are asked for
+    assert!(!device.metadata_keys_due(CONVERSATION));
+
+    // Bob sends them, which the device keeps (section 10.5.4)
+    let output = bobs_group
+        .send_group_metadata_keys(&bob, b"bob-keys")
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    device
+        .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&output)))
+        .unwrap();
+    assert!(metadata_in_sync(&device));
+    assert_eq!(metadata(&device).continuity_token, token);
+    assert!(!device.metadata_keys_due(CONVERSATION));
+}
+
+#[test]
+fn the_metadata_keys_are_asked_for_5_times_a_day_at_most() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    forgotten_metadata(&device);
+    device.heals().want(CONVERSATION);
+    rejoined(&groups, vec![None, group_info_answer(group_info)]);
+    accepted_from_device(&device);
+
+    // the Focus refusing each request, as when another member's Commit came
+    // first, it is asked for again
+    for _ in 0..5 {
+        assert!(device.metadata_keys_due(CONVERSATION));
+        assert!(metadata_keys(&device).is_some());
+        device.discard_pending(CONVERSATION, false).unwrap();
+    }
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(metadata_keys(&device), None);
+}
+
+#[test]
+fn the_device_asks_for_the_metadata_keys_if_its_continuity_token_is_not_the_one_of_the_group() {
+    for renewed in [false, true] {
+        let (device, bob, mut bobs_group) = alice_and_bob();
+        let (query, _) = answering(&[]);
+        let groups = DeviceGroups::new(&device, query);
+        let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+        if renewed {
+            device
+                .store()
+                .with_client(|client| client.renew_continuity_token(CONVERSATION.as_bytes()))
+                .unwrap();
+        }
+        let kept = metadata(&device).continuity_token;
+        device.heals().want(CONVERSATION);
+
+        // the enhanced GroupInfo gives the epoch authenticator the GroupInfo
+        // commits to the token at (RCC.16 sections 7.11.12.2, 10.5.1)
+        let enhanced = proto::encode(&MlsEnhancedGroupInfo {
+            latest_epoch_identifier: Some(bobs_group.epoch_identifier()),
+            mls_group_info: Some(group_info),
+            ..MlsEnhancedGroupInfo::default()
+        });
+        let cpim = rejoined(&groups, vec![Some((200, enhanced))]);
+        bobs_group
+            .process_server_message(&bob, &forwarded_commit(&cpim))
+            .unwrap();
+        accepted_from_device(&device);
+        assert!(metadata_in_sync(&device));
+        assert_eq!(device.metadata_keys_due(CONVERSATION), renewed);
+        if !renewed {
+            continue;
+        }
+
+        // asked for, the device keeps its own token when Bob sends another
+        // (section 10.5.4), and has none to send
+        let cpim = metadata_keys(&device).expect("the keys asked for");
+        bobs_group
+            .process_server_message(&bob, &forwarded_commit(&cpim))
+            .unwrap();
+        accepted_from_device(&device);
+        let output = bobs_group
+            .send_group_metadata_keys(&bob, b"bob-keys")
+            .unwrap();
+        bobs_group.merge_pending_commit(&bob).unwrap();
+        device
+            .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&output)))
+            .unwrap();
+        assert_eq!(metadata(&device).continuity_token, kept);
+        assert!(!device.metadata_keys_due(CONVERSATION));
+        asked_by_bob(&device, &bob, &mut bobs_group);
+        assert!(!device.metadata_keys_due(CONVERSATION));
+        assert_eq!(encryption_ended_reason(&device, CONVERSATION), None);
+    }
+}
+
+/// The next Era Bob makes, the token renewed if `renew`, with the device
+/// added, as the Conversation Focus sends it
+fn era_of_bob(
+    bob: &MlsClient,
+    bobs_group: &MlsConversation,
+    kds: &Kds,
+    renew: bool,
+) -> (MlsConversation, Vec<u8>) {
+    let base = EraBase::of_conversation(bobs_group);
+    let mut next = bob.create_next_era(&base, renew).unwrap();
+    let output = next
+        .add_members(bob, &[&uploaded_key_package(kds, 0)])
+        .unwrap();
+    next.merge_pending_commit(bob).unwrap();
+    let server_message = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: encode_message_list(&[&output.commit]).unwrap(),
+                welcome: output.welcome.unwrap(),
+                private_message: Vec::new(),
+                ratchet_tree: output.ratchet_tree.unwrap(),
+            },
+        )),
+    });
+    (next, server_message)
+}
+
+#[test]
+fn a_new_era_of_a_group_the_device_had_has_its_metadata_keys_checked() {
+    // the continuity token going on, nothing is asked for
+    let (device, kds, bob, bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let (_, server_message) = era_of_bob(&bob, &bobs_group, &kds, false);
+    device.join_group(CONVERSATION, &server_message).unwrap();
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+    assert!(!device.metadata_keys_due(CONVERSATION));
+
+    // a token renewed in the Welcome is not the one kept: the keys are
+    // asked for (RCC.16 section 10.5.1)
+    let (device, kds, bob, bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let kept = continuity_token(&device);
+    let (mut next, server_message) = era_of_bob(&bob, &bobs_group, &kds, true);
+    device.join_group(CONVERSATION, &server_message).unwrap();
+    let token = continuity_token(&device);
+    assert_ne!(token, kept);
+    assert!(metadata_in_sync(&device));
+    assert!(device.metadata_keys_due(CONVERSATION));
+    let cpim = metadata_keys(&device).expect("the keys asked for");
+    next.process_server_message(&bob, &forwarded_commit(&cpim))
+        .unwrap();
+    accepted_from_device(&device);
+    // nor are they sent meanwhile
+    assert!(next.group_metadata_keys_requested());
+    assert!(!device.metadata_keys_due(CONVERSATION));
+
+    // Bob's, which the device misses and heals with, match the token of
+    // the Era: the device sends them once asked for again
+    let output = next.send_group_metadata_keys(&bob, b"bob-keys").unwrap();
+    next.merge_pending_commit(&bob).unwrap();
+    let latest = next.epoch_identifier();
+    let enhanced = proto::encode(&MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(latest.clone()),
+        committed_control_messages: vec![EpochControlMessages {
+            rcs_message_id: String::from("focus-keys-1"),
+            server_mls_rcs_message: Some(focus_bundle(&output)),
+        }],
+        paginated_epoch_identifier: Some(latest),
+        ..MlsEnhancedGroupInfo::default()
+    });
+    device.heals().want(CONVERSATION);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let (pull, _) = focus_answering(vec![Some((200, enhanced))]);
+    assert_eq!(
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        )),
+        None
+    );
+    assert_eq!(continuity_token(&device), token);
+    asked_by_bob(&device, &bob, &mut next);
+    assert!(device.metadata_keys_due(CONVERSATION));
+}
+
+#[test]
+fn a_new_era_the_device_makes_asks_for_the_metadata_keys_it_misses() {
+    let (device, kds, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
+    subject_set_by_bob(&device, &bob, &mut bobs_group);
+    let token = continuity_token(&device);
+    // the device lost its group and its keys, the Focus a Commit ahead
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    device
+        .store()
+        .delete_conversation(CONVERSATION.as_bytes())
+        .unwrap();
+    forgotten_metadata(&device);
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+
+    // the Participants members of the group, the token is asked for, and
+    // the key of the subject (RCC.16 sections 8.3.1.3, 10.5.2)
+    let cpim = block_on(device.create_next_era(
+        CONVERSATION,
+        IMPU,
+        GROUP_URI,
+        vec![recipient(BOB_TEL)],
+        Some(&group_info),
+    ))
+    .unwrap();
+    assert_eq!(era(&device, CONVERSATION), Some(1));
+    assert!(continuity_token(&device).is_empty());
+    let mut bobs_next = joined(&bob, &bundle_of(&cpim));
+    assert!(bobs_next.group_metadata_keys_requested());
+    accepted_from_device(&device);
+    assert!(!device.metadata_keys_due(CONVERSATION));
+
+    // which Bob sends
+    let output = bobs_next
+        .send_group_metadata_keys(&bob, b"bob-keys")
+        .unwrap();
+    bobs_next.merge_pending_commit(&bob).unwrap();
+    device
+        .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&output)))
+        .unwrap();
+    assert!(metadata_in_sync(&device));
+    assert_eq!(continuity_token(&device), token);
+
+    // a Participant not a member, a new token is made instead (section
+    // 8.3.1.3)
+    let (device, kds, bob, _, _) = alice_and_bob_in_time_with_kds();
+    let cpim = device
+        .remove_from_group(CONVERSATION, IMPU, GROUP_URI, BOB_TEL)
+        .unwrap();
+    device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap();
+    forgotten_metadata(&device);
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    let cpim = block_on(device.create_next_era(
+        CONVERSATION,
+        IMPU,
+        GROUP_URI,
+        vec![recipient(BOB_TEL)],
+        None,
+    ))
+    .unwrap();
+    assert!(!continuity_token(&device).is_empty());
+    assert!(!joined(&bob, &bundle_of(&cpim)).group_metadata_keys_requested());
 }

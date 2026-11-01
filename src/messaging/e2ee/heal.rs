@@ -269,12 +269,13 @@ impl E2eeDevice {
     /// Applies the control messages the MlsEnhancedGroupInfo `body` of the
     /// Conversation Focus carries to the group `conversation_id`, telling
     /// whether it is up to date, more are to be asked for, or it is to be
-    /// rejoined (RCC.16 section 10.1.2)
+    /// rejoined (RCC.16 section 10.1.2), and the epoch authenticator of the
+    /// latest epoch of the Focus, that of the GroupInfo to rejoin with
     pub fn process_enhanced_group_info(
         &self,
         conversation_id: &str,
         body: &[u8],
-    ) -> Result<SelfHealProgress, StoreError> {
+    ) -> Result<(SelfHealProgress, Vec<u8>), StoreError> {
         let (healed, pending) = self.store().with_conversation(
             conversation_id.as_bytes(),
             |conversation, client| {
@@ -289,9 +290,11 @@ impl E2eeDevice {
                 .unwrap()
                 .remove(conversation_id);
         }
-        healed
-            .map(|healed| healed.progress)
-            .map_err(StoreError::Mls)
+        let healed = healed.map_err(StoreError::Mls)?;
+        for (_, taken) in &healed.applied {
+            self.metadata_keys_received(conversation_id, taken);
+        }
+        Ok((healed.progress, healed.latest_epoch.epoch_authenticator))
     }
 
     /// Rejoins the MLS group `conversation_id` with an External Commit, from
@@ -302,13 +305,25 @@ impl E2eeDevice {
     ///
     /// Unlike other Commits, the External Commit is applied at once. A Focus
     /// refusing it leaves the group to be self-healed again.
+    ///
+    /// The Group Metadata keys of the device are then to be checked, and
+    /// asked for if out of sync once the Focus took the External Commit
+    /// (sections 10.1.1, 10.5.1): if it misses the key of the icon or subject
+    /// the group commits to, if it keeps no continuity token, or if the one
+    /// it keeps is not the one the GroupInfo commits to. That is told by the
+    /// epoch authenticator of the GroupInfo, `epoch_authenticator`, which
+    /// the enhanced GroupInfo of the Focus gives alone.
     pub fn rejoin_group(
         &self,
         conversation_id: &str,
         from: &str,
         to: &str,
         group_info: &MlsGroupInfo,
+        epoch_authenticator: Option<&[u8]>,
     ) -> Result<Vec<u8>, GroupError> {
+        let token_mismatch = epoch_authenticator.is_some_and(|epoch_authenticator| {
+            self.token_mismatched(conversation_id, &group_info.group_info, epoch_authenticator)
+        });
         let (group_id, client_message) = self
             .store()
             .add_conversation(|client| {
@@ -323,6 +338,7 @@ impl E2eeDevice {
                 ErrorKind::UnexpectedMessage,
             )));
         }
+        self.recoveries().check(conversation_id, token_mismatch);
         Ok(self.sent_in(conversation_id, from, to, &client_message))
     }
 }
@@ -373,10 +389,17 @@ pub(super) async fn heal(
             _ => break,
         };
         match progress {
-            Ok(SelfHealProgress::UpToDate) => return None,
-            Ok(SelfHealProgress::NextPage) => {}
-            Ok(SelfHealProgress::Rejoin(group_info)) => {
-                return rejoin(device, conversation_id, from, to, &group_info)
+            Ok((SelfHealProgress::UpToDate, _)) => return None,
+            Ok((SelfHealProgress::NextPage, _)) => {}
+            Ok((SelfHealProgress::Rejoin(group_info), epoch_authenticator)) => {
+                return rejoin(
+                    device,
+                    conversation_id,
+                    from,
+                    to,
+                    &group_info,
+                    Some(&epoch_authenticator),
+                )
             }
             Err(e) => {
                 platform_log(LOG_TAG, format!("enhanced GroupInfo not taken: {:?}", e));
@@ -407,7 +430,7 @@ pub(super) async fn heal(
         }
     };
     match group_info {
-        Some(group_info) => rejoin(device, conversation_id, from, to, &group_info),
+        Some(group_info) => rejoin(device, conversation_id, from, to, &group_info, None),
         None => {
             platform_log(LOG_TAG, "group not healed, its GroupInfo not read");
             None
@@ -421,10 +444,11 @@ fn rejoin(
     from: &str,
     to: &str,
     group_info: &MlsGroupInfo,
+    epoch_authenticator: Option<&[u8]>,
 ) -> Option<Vec<u8>> {
     match device
         .upgrade()?
-        .rejoin_group(conversation_id, from, to, group_info)
+        .rejoin_group(conversation_id, from, to, group_info, epoch_authenticator)
     {
         Ok(cpim) => Some(cpim),
         Err(e) => {
