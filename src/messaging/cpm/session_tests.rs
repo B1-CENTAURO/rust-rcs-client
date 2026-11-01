@@ -3626,6 +3626,14 @@ fn an_encrypted_message_in_a_group_not_encrypted_is_not_given_to_the_app() {
             .map(|r| r.2),
         Ok(String::from("plain"))
     );
+    // a file transfer message with an mls-file is given as it comes
+    connection.send_cpim(&rt, &focus_path, &our_path, &encrypted_file_transfer());
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let received = client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(received.2.contains("<mls-file>AAEC</mls-file>"));
     assert!(encryption.decrypted.lock().unwrap().is_empty());
     assert!(encryption.encrypted.lock().unwrap().is_empty());
 }

@@ -8361,10 +8361,19 @@ fn a_file_transfer_message_is_not_taken_unless_its_mls_file_tells_of_its_file() 
         device.decrypt_file_transfer(CONVERSATION, &cpim_message(outer).get_info().unwrap(), xml)
     };
 
-    // a message of another type (RCC.16 section 7.8.1)
-    let (outer, xml, _, _) = file_transfer_from_bob(&bob, &mut bobs_group, url, "bob-ft-1", |_| {
-        b"\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi".to_vec()
-    });
+    // a message of another type, though it carries a FileInfo (RCC.16
+    // section 7.8.1)
+    let (outer, xml, _, _) =
+        file_transfer_from_bob(&bob, &mut bobs_group, url, "bob-ft-1", |file_info| {
+            let file_info = proto::encode(file_info);
+            let mut payload = format!(
+                "\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                file_info.len()
+            )
+            .into_bytes();
+            payload.extend_from_slice(&file_info);
+            payload
+        });
     assert_eq!(decrypted(&outer, &xml), Err(MessageError::NotFileTransfer));
     // a FileInfo of no file
     let (outer, xml, _, _) =
