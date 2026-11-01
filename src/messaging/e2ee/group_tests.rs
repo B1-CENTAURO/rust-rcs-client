@@ -9029,9 +9029,13 @@ fn the_icon_is_not_set_unless_uploaded_sealed_as_one() {
 
     // a file sealed as a file, not as an icon
     let file = super::file::seal_file(b"the icon", "icon.png", "image/png").unwrap();
+    // the key of no encryption
+    let mut unencrypted: proto::FileMetadata = proto::decode(&sealed.metadata).unwrap();
+    unencrypted.encryption_info = None;
     // an XML telling no file, a key not one
     for (xml, metadata) in [
         (super::file::upload_xml(url), file.metadata),
+        (super::file::upload_xml(url), proto::encode(&unencrypted)),
         (String::from("<file/>"), sealed.metadata.clone()),
         (super::file::upload_xml(url), b"not a key".to_vec()),
     ] {
@@ -9055,6 +9059,15 @@ fn the_subject_and_icon_are_not_changed_while_the_group_is_out_of_step_or_unencr
     let (device, _, _) = alice_and_bob();
     let before = epoch(&device, CONVERSATION);
     device.heals().want(CONVERSATION);
+    assert_eq!(change_metadata(&device, subject.clone()), None);
+    assert_eq!(epoch(&device, CONVERSATION), before);
+
+    // to be made anew in a new Era, or being so (section 8.3)
+    let (device, _, _) = alice_and_bob();
+    device.heals().want_new_era(CONVERSATION);
+    assert_eq!(change_metadata(&device, subject.clone()), None);
+    assert!(device.heals().begin_new_era(CONVERSATION).is_some());
+    assert!(!device.new_era_due(CONVERSATION) && !device.needs_healing(CONVERSATION));
     assert_eq!(change_metadata(&device, subject.clone()), None);
     assert_eq!(epoch(&device, CONVERSATION), before);
 
