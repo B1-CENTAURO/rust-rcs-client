@@ -7860,6 +7860,30 @@ fn a_new_era_of_a_group_the_device_had_has_its_metadata_keys_checked() {
 }
 
 #[test]
+fn a_group_let_go_of_has_its_continuity_token_check_forgotten() {
+    // the token of a new Era found mismatched, the device sends no keys
+    let (device, kds, bob, bobs_group, _) = alice_and_bob_in_time_with_kds();
+    let (_, server_message) = era_of_bob(&bob, &bobs_group, &kds, true);
+    device.join_group(CONVERSATION, &server_message).unwrap();
+    assert!(device.metadata_keys_due(CONVERSATION));
+
+    // let go of, then joined anew with another client of Bob, it sends them
+    // once asked
+    device.abandon(CONVERSATION).unwrap();
+    let other_bob = super::kds_tests::bob();
+    let (mut bobs_new, server_message) = focus_welcome(
+        &other_bob,
+        CONVERSATION,
+        &uploaded_key_package(&kds, 1),
+        |_| Vec::new(),
+    );
+    device.join_group(CONVERSATION, &server_message).unwrap();
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    asked_by_bob(&device, &other_bob, &mut bobs_new);
+    assert!(device.metadata_keys_due(CONVERSATION));
+}
+
+#[test]
 fn a_new_era_the_device_makes_asks_for_the_metadata_keys_it_misses() {
     let (device, kds, bob, mut bobs_group, _) = alice_and_bob_in_time_with_kds();
     subject_set_by_bob(&device, &bob, &mut bobs_group);
