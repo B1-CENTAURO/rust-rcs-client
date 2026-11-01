@@ -7575,6 +7575,59 @@ fn the_metadata_keys_another_member_asks_for_are_sent_by_the_device_keeping_them
     assert_eq!(metadata_keys(&device), None);
 }
 
+/// Whether the group of the conversation of the device asks for the Group
+/// Metadata keys
+fn metadata_requested(device: &E2eeDevice) -> bool {
+    device
+        .store()
+        .peek_conversation(CONVERSATION.as_bytes(), |conversation, _| {
+            conversation.group_metadata_keys_requested()
+        })
+        .unwrap()
+}
+
+#[test]
+fn metadata_keys_are_not_sent_while_the_group_is_out_of_step_or_unencrypted() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    asked_by_bob(&device, &bob, &mut bobs_group);
+    assert!(device.metadata_keys_due(CONVERSATION));
+
+    // nor while a Commit of the device waits, sent or not
+    device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, client| {
+            conversation.update_keys(client).map(|_| ())
+        })
+        .unwrap();
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(metadata_keys(&device), None);
+    device.discard_pending(CONVERSATION, false).unwrap();
+    assert!(device.metadata_keys_due(CONVERSATION));
+
+    // nor while the group is to be healed (RCC.16 section 10.1)
+    device.heals().want(CONVERSATION);
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(metadata_keys(&device), None);
+
+    // nor once it is unencrypted (section 11.2), though it still asks
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    asked_by_bob(&device, &bob, &mut bobs_group);
+    device
+        .end_encryption(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            EndMlsReason::ClientFailureEncryptionNotAvailable,
+        )
+        .unwrap()
+        .unwrap();
+    accepted_from_device(&device);
+    assert!(device.encryption_ended(CONVERSATION));
+    assert!(metadata_requested(&device));
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(metadata_keys(&device), None);
+}
+
 /// Self-heals the group of the conversation with the GroupInfo the
 /// Conversation Focus answers `answers` with: the External Commit
 fn rejoined(groups: &DeviceGroups, answers: Vec<Option<(u16, Vec<u8>)>>) -> Vec<u8> {
