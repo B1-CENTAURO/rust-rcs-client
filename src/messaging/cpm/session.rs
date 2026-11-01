@@ -2105,10 +2105,13 @@ impl CPMSessionService {
                             for_app = Some(telling_of(content_body, original_message_id));
                         }
                     }
-                } else if is_plaintext_message(content_type) {
+                } else if is_plaintext_message(content_type)
+                    && !carries_mls_file(content_type, content_body)
+                {
                     // as does a message sent unencrypted in an encrypted
                     // group (RCC.16 section 11.2), which the app takes all
-                    // the same
+                    // the same; not a file transfer message carrying the
+                    // keys of its files encrypted (section 7.8.2)
                     let inner = session.get_inner();
                     let session_info = inner.get_session_info();
                     let encrypted = session_info
@@ -3610,6 +3613,16 @@ fn end_encryption(session: &Arc<SipSession<CPMSession>>, reason: EndReason) {
 /// notification, is an RCS message, which in an encrypted group comes as
 /// `message/mls` (RCC.16 section 9.1.1), rather than an is-composing or what
 /// the Conversation Focus sends of the MLS group
+/// Whether `content` of `content_type` is the XML of a file transfer
+/// message with the mls-file element, as one of an encrypted group chat is
+/// (RCC.16 section 7.8.2)
+fn carries_mls_file(content_type: &[u8], content: &[u8]) -> bool {
+    is_media_type(content_type, "application/vnd.gsma.rcs-ft-http+xml")
+        && content
+            .windows(b"mls-file>".len())
+            .any(|w| w == b"mls-file>")
+}
+
 fn is_plaintext_message(content_type: &[u8]) -> bool {
     !is_media_type(content_type, IS_COMPOSING)
         && !content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS_RCS_SERVER)
