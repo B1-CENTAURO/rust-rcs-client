@@ -8496,7 +8496,8 @@ fn the_encrypted_subject_is_told_decrypted_once_its_key_is_kept() {
     );
 
     // deleted, told as none; one kept not told once deleted
-    let (later, _) = subject_by_bob(&device, &bob, &mut bobs_group, "Later", false, false);
+    let (later, later_commit) =
+        subject_by_bob(&device, &bob, &mut bobs_group, "Later", false, false);
     assert_eq!(
         device.take_metadata(CONVERSATION, described(&later, None), None),
         []
@@ -8516,6 +8517,11 @@ fn the_encrypted_subject_is_told_decrypted_once_its_key_is_kept() {
     );
     assert_eq!(device.metadata_opened(CONVERSATION), []);
     assert_eq!(device.metadata_opened("another-group"), []);
+    // the one kept before the deletion not told once its key comes
+    device
+        .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&later_commit)))
+        .unwrap();
+    assert_eq!(device.metadata_opened(CONVERSATION), []);
 }
 
 #[test]
@@ -8675,13 +8681,36 @@ fn the_encrypted_icon_is_told_by_its_url_and_opened_once_downloaded() {
     bobs_group.merge_pending_commit(&bob).unwrap();
     assert_eq!(restored.metadata_opened(CONVERSATION), []);
 
+    // one told anew after its download did not open is told as it is then,
+    // not again for the download before
+    let url_3 = "https://ftcs.example.com/i/3";
+    let (icon_3, output) = icon_by_bob(
+        &restored,
+        &bob,
+        &mut bobs_group,
+        b"a third icon",
+        "image/gif",
+        false,
+    );
+    restored.take_metadata(CONVERSATION, None, described(url_3, None));
+    assert_eq!(restored.open_file(url_3, &icon_3), None);
+    assert_eq!(
+        restored.take_metadata(CONVERSATION, None, described(url_3, None)),
+        [icon_told(Some(url_3), Some("image/jpeg"), None)]
+    );
+    restored
+        .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&output)))
+        .unwrap();
+    assert_eq!(restored.metadata_opened(CONVERSATION), []);
+    assert!(!restored.opens_file(url_2));
+
     // deleted, told as none, and no longer opened
     assert_eq!(
         restored.take_metadata(CONVERSATION, None, described("", Some(BOB_TEL))),
         [icon_told(None, None, Some(BOB_TEL))]
     );
-    assert!(!restored.opens_file(url_2));
-    assert_eq!(restored.open_file(url_2, &icon_2), None);
+    assert!(!restored.opens_file(url_3));
+    assert_eq!(restored.open_file(url_3, &icon_3), None);
 
     // nor once the group is let go of
     restored.take_metadata(CONVERSATION, None, described(url_2, None));
@@ -8730,5 +8759,12 @@ fn an_icon_that_does_not_open_has_the_metadata_keys_checked() {
     assert_eq!(
         device.open_file(url, &icon).as_deref(),
         Some(&b"the icon"[..])
+    );
+
+    // one whose key tells no type told without one
+    icon_by_bob(&device, &bob, &mut bobs_group, b"untyped", "", true);
+    assert_eq!(
+        device.take_metadata(CONVERSATION, None, described(url, None)),
+        [icon_told(Some(url), None, None)]
     );
 }
