@@ -46,8 +46,8 @@ use rust_rcs_core::mls::{
 
 use crate::capability::{Capabilities, CapabilityQuery};
 use crate::messaging::cpm::encryption::{
-    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed,
-    SealedFile, Taken, Upgrade, Verified,
+    EncryptedMetadata, EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull,
+    GroupMetadata, ImdnTold, Sealed, SealedFile, Taken, Upgrade, Verified,
 };
 use crate::messaging::cpm::make_cpim_imdn_body;
 
@@ -8406,4 +8406,329 @@ fn a_file_transfer_message_is_not_taken_unless_its_mls_file_tells_of_its_file() 
     assert!(decrypted(&outer, &xml).is_err());
     assert!(!device.opens_file(url));
     assert!(!device.opens_file(THUMBNAIL_URL));
+}
+
+/// What the Conversation Focus tells of an encrypted subject or icon, `value`
+/// set by `participant` (RCC.16 section 7.13.2)
+fn described(value: &str, participant: Option<&str>) -> Option<EncryptedMetadata> {
+    Some(EncryptedMetadata {
+        value: String::from(value),
+        participant: participant.map(String::from),
+    })
+}
+
+fn subject_told(subject: Option<&str>, participant: Option<&str>) -> GroupMetadata {
+    GroupMetadata::Subject {
+        subject: subject.map(String::from),
+        participant: participant.map(String::from),
+    }
+}
+
+fn icon_told(
+    url: Option<&str>,
+    content_type: Option<&str>,
+    participant: Option<&str>,
+) -> GroupMetadata {
+    GroupMetadata::Icon {
+        url: url.map(String::from),
+        content_type: content_type.map(String::from),
+        participant: participant.map(String::from),
+    }
+}
+
+/// Bob sets the subject `subject` of the group, his Commit applied by the
+/// device with the PrivateMessage carrying its key if `with_key`, and not at
+/// all if not `applied`: the subject encrypted, Base64 encoded, as the
+/// Conversation Focus tells it (RCC.16 section 9.7.1.5)
+fn subject_by_bob(
+    device: &E2eeDevice,
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+    subject: &str,
+    applied: bool,
+    with_key: bool,
+) -> (String, rust_rcs_core::mls::CommitOutput) {
+    let (output, encrypted) = bobs_group
+        .set_group_subject(bob, subject, b"bob-subject")
+        .unwrap();
+    bobs_group.merge_pending_commit(bob).unwrap();
+    if applied {
+        let forwarded = match with_key {
+            true => proto::encode(&focus_bundle(&output)),
+            false => focus_commit(&[&output.commit]),
+        };
+        device.on_server_message(CONVERSATION, &forwarded).unwrap();
+    }
+    (
+        general_purpose::STANDARD.encode(encrypted.ciphertext),
+        output,
+    )
+}
+
+#[test]
+fn the_encrypted_subject_is_told_decrypted_once_its_key_is_kept() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+
+    // told before the Commit bringing its key: kept until it opens, then told
+    // once (RCC.16 sections 7.13.2, 9.7.1.5)
+    let (team, output) = subject_by_bob(&device, &bob, &mut bobs_group, "Team", false, false);
+    assert_eq!(
+        device.take_metadata(CONVERSATION, described(&team, Some(BOB_TEL)), None),
+        []
+    );
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(device.metadata_opened(CONVERSATION), []);
+    device
+        .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&output)))
+        .unwrap();
+    assert_eq!(
+        device.metadata_opened(CONVERSATION),
+        [subject_told(Some("Team"), Some(BOB_TEL))]
+    );
+    assert_eq!(device.metadata_opened(CONVERSATION), []);
+    assert!(!device.metadata_keys_due(CONVERSATION));
+
+    // told at once once its key is kept, across lines too
+    let across_lines = format!("{}\n  {}", &team[..8], &team[8..]);
+    assert_eq!(
+        device.take_metadata(CONVERSATION, described(&across_lines, None), None),
+        [subject_told(Some("Team"), None)]
+    );
+
+    // deleted, told as none; one kept not told once deleted
+    let (later, _) = subject_by_bob(&device, &bob, &mut bobs_group, "Later", false, false);
+    assert_eq!(
+        device.take_metadata(CONVERSATION, described(&later, None), None),
+        []
+    );
+    assert_eq!(
+        device.take_metadata(CONVERSATION, described("", Some(BOB_TEL)), None),
+        [subject_told(None, Some(BOB_TEL))]
+    );
+    // nor one not Base64, nor one of another group
+    assert_eq!(
+        device.take_metadata(CONVERSATION, described("not base64!", None), None),
+        []
+    );
+    assert_eq!(
+        device.take_metadata("another-group", described(&team, None), None),
+        []
+    );
+    assert_eq!(device.metadata_opened(CONVERSATION), []);
+    assert_eq!(device.metadata_opened("another-group"), []);
+}
+
+#[test]
+fn a_subject_that_does_not_open_has_the_metadata_keys_checked() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (team, _) = subject_by_bob(&device, &bob, &mut bobs_group, "Team", true, true);
+
+    // the keys lost, they are asked for once the subject does not open
+    // (RCC.16 section 10.5.1, item 3)
+    forgotten_metadata(&device);
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(
+        device.take_metadata(CONVERSATION, described(&team, Some(BOB_TEL)), None),
+        []
+    );
+    assert!(device.metadata_keys_due(CONVERSATION));
+    let cpim = metadata_keys(&device).expect("the keys asked for");
+    bobs_group
+        .process_server_message(&bob, &forwarded_commit(&cpim))
+        .unwrap();
+    accepted_from_device(&device);
+    assert_eq!(device.metadata_opened(CONVERSATION), []);
+
+    // Bob sends them, with which it opens (section 10.5.4)
+    let output = bobs_group
+        .send_group_metadata_keys(&bob, b"bob-keys")
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    device
+        .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&output)))
+        .unwrap();
+    assert_eq!(
+        device.metadata_opened(CONVERSATION),
+        [subject_told(Some("Team"), Some(BOB_TEL))]
+    );
+    assert!(!device.metadata_keys_due(CONVERSATION));
+
+    // one told before its Commit, which comes without its key: checked
+    // again as it still does not open
+    let (again, output) =
+        subject_by_bob(&device, &bob, &mut bobs_group, "Team again", false, false);
+    assert_eq!(
+        device.take_metadata(CONVERSATION, described(&again, None), None),
+        []
+    );
+    // in sync until the Commit is applied
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    device
+        .on_server_message(CONVERSATION, &focus_commit(&[&output.commit]))
+        .unwrap();
+    assert!(!metadata_in_sync(&device));
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(device.metadata_opened(CONVERSATION), []);
+    assert!(device.metadata_keys_due(CONVERSATION));
+}
+
+/// Bob sets the icon `icon` of the group, of the type `content_type`, his
+/// Commit applied by the device with the PrivateMessage carrying its key if
+/// `applied`: the icon encrypted, as Bob uploads it (RCC.16 section 9.7.1.4)
+fn icon_by_bob(
+    device: &E2eeDevice,
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+    icon: &[u8],
+    content_type: &str,
+    applied: bool,
+) -> (Vec<u8>, rust_rcs_core::mls::CommitOutput) {
+    let (output, encrypted) = bobs_group
+        .set_group_icon(bob, icon, content_type, b"bob-icon")
+        .unwrap();
+    bobs_group.merge_pending_commit(bob).unwrap();
+    if applied {
+        device
+            .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&output)))
+            .unwrap();
+    }
+    (encrypted.ciphertext, output)
+}
+
+#[test]
+fn the_encrypted_icon_is_told_by_its_url_and_opened_once_downloaded() {
+    let clock = Clock::new();
+    let (device, kds, app, bob, mut bobs_group) = alice_and_bob_kept(&clock);
+    let url = "https://ftcs.example.com/i/1?a=1&b=2";
+
+    // told with the type its key tells (RCC.16 sections 7.13.2, 9.7.1.4)
+    let (icon, _) = icon_by_bob(
+        &device,
+        &bob,
+        &mut bobs_group,
+        b"the icon",
+        "image/png",
+        true,
+    );
+    assert!(!device.opens_file(url));
+    assert_eq!(
+        device.take_metadata(CONVERSATION, None, described(url, Some(BOB_TEL))),
+        [icon_told(Some(url), Some("image/png"), Some(BOB_TEL))]
+    );
+
+    // opened once downloaded, with its key, which is kept on; through a
+    // restart too
+    assert!(device.opens_file(url));
+    assert_eq!(
+        device.open_file(url, &icon).as_deref(),
+        Some(&b"the icon"[..])
+    );
+    let restored = {
+        let clock = clock.clone();
+        alice(&app, &kds, TODAY, Some(&app.last().unwrap())).with_clock(move || clock.now())
+    };
+    assert!(restored.opens_file(url));
+    assert_eq!(
+        restored.open_file(url, &icon).as_deref(),
+        Some(&b"the icon"[..])
+    );
+    assert!(!restored.metadata_keys_due(CONVERSATION));
+    assert_eq!(restored.metadata_opened(CONVERSATION), []);
+
+    // another told before the Commit bringing its key: told again once
+    // another key is kept, as its download did not open
+    let url_2 = "https://ftcs.example.com/i/2";
+    let (icon_2, output) = icon_by_bob(
+        &restored,
+        &bob,
+        &mut bobs_group,
+        b"another icon",
+        "image/jpeg",
+        false,
+    );
+    assert_eq!(
+        restored.take_metadata(CONVERSATION, None, described(url_2, None)),
+        [icon_told(Some(url_2), Some("image/png"), None)]
+    );
+    assert!(!restored.opens_file(url));
+    assert_eq!(restored.open_file(url_2, &icon_2), None);
+    assert_eq!(restored.metadata_opened(CONVERSATION), []);
+    restored
+        .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&output)))
+        .unwrap();
+    assert_eq!(
+        restored.metadata_opened(CONVERSATION),
+        [icon_told(Some(url_2), Some("image/jpeg"), None)]
+    );
+    assert_eq!(restored.metadata_opened(CONVERSATION), []);
+    assert_eq!(
+        restored.open_file(url_2, &icon_2).as_deref(),
+        Some(&b"another icon"[..])
+    );
+    // not told again once it opened
+    restored
+        .on_server_message(
+            CONVERSATION,
+            &focus_commit(&[&bobs_group.update_keys(&bob).unwrap().commit]),
+        )
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    assert_eq!(restored.metadata_opened(CONVERSATION), []);
+
+    // deleted, told as none, and no longer opened
+    assert_eq!(
+        restored.take_metadata(CONVERSATION, None, described("", Some(BOB_TEL))),
+        [icon_told(None, None, Some(BOB_TEL))]
+    );
+    assert!(!restored.opens_file(url_2));
+    assert_eq!(restored.open_file(url_2, &icon_2), None);
+
+    // nor once the group is let go of
+    restored.take_metadata(CONVERSATION, None, described(url_2, None));
+    assert!(restored.opens_file(url_2));
+    restored.abandon(CONVERSATION).unwrap();
+    assert!(!restored.opens_file(url_2));
+}
+
+#[test]
+fn an_icon_that_does_not_open_has_the_metadata_keys_checked() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let url = "https://ftcs.example.com/i/1";
+    let (icon, _) = icon_by_bob(
+        &device,
+        &bob,
+        &mut bobs_group,
+        b"the icon",
+        "image/png",
+        true,
+    );
+    device.take_metadata(CONVERSATION, None, described(url, None));
+
+    // the keys lost, they are asked for once it does not open (RCC.16
+    // section 10.5.1, item 3), and it is told again once they come
+    forgotten_metadata(&device);
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(device.open_file(url, &icon), None);
+    assert!(device.metadata_keys_due(CONVERSATION));
+    let cpim = metadata_keys(&device).expect("the keys asked for");
+    bobs_group
+        .process_server_message(&bob, &forwarded_commit(&cpim))
+        .unwrap();
+    accepted_from_device(&device);
+    assert_eq!(device.metadata_opened(CONVERSATION), []);
+    let output = bobs_group
+        .send_group_metadata_keys(&bob, b"bob-keys")
+        .unwrap();
+    bobs_group.merge_pending_commit(&bob).unwrap();
+    device
+        .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(&output)))
+        .unwrap();
+    assert_eq!(
+        device.metadata_opened(CONVERSATION),
+        [icon_told(Some(url), Some("image/png"), None)]
+    );
+    assert_eq!(
+        device.open_file(url, &icon).as_deref(),
+        Some(&b"the icon"[..])
+    );
 }

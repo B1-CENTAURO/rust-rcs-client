@@ -144,6 +144,38 @@ pub struct SealedFile {
     pub metadata: Vec<u8>,
 }
 
+/// What the Conversation Focus of an encrypted group chat tells of its
+/// subject or icon in a NOTIFY (RCC.16 section 7.13.2)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncryptedMetadata {
+    /// The encrypted subject, Base64 encoded, or the URL of the encrypted
+    /// icon; empty once deleted
+    pub value: String,
+    /// The URI of the participant who set it, if told
+    pub participant: Option<String>,
+}
+
+/// The subject or the icon of an encrypted group chat, as the app is told
+/// of it (RCC.16 sections 9.7.1.4 to 9.7.1.7)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupMetadata {
+    Subject {
+        /// The subject decrypted; None once deleted
+        subject: Option<String>,
+        /// The URI of the participant who set it, if told
+        participant: Option<String>,
+    },
+    Icon {
+        /// The URL of the icon, which the client opens once downloaded;
+        /// None once deleted
+        url: Option<String>,
+        /// Its Content-Type, if its key tells it yet
+        content_type: Option<String>,
+        /// The URI of the participant who set it, if told
+        participant: Option<String>,
+    },
+}
+
 /// Why a group chat moves to unencrypted (RCC.16 sections 7.11.2.2, 11.2)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EndReason {
@@ -429,6 +461,25 @@ pub trait GroupEncryption: Send + Sync {
     /// it, which is forgotten then (RCC.16 section 9.1.2.2, Annex C.3); None
     /// if it does not open
     fn open_file(&self, url: &str, ciphertext: &[u8]) -> Option<Vec<u8>>;
+
+    /// Takes what the Conversation Focus of the group chat `conversation_id`
+    /// tells of its encrypted `subject` and `icon`, if it does: what the app
+    /// is to be told of them now, the subject decrypted and the URL of the
+    /// icon, which open_file() opens once downloaded (RCC.16 sections 7.13.2,
+    /// 9.7.1.4 to 9.7.1.7); a subject not decrypted yet is kept for
+    /// metadata_opened()
+    fn take_metadata(
+        &self,
+        conversation_id: &str,
+        subject: Option<EncryptedMetadata>,
+        icon: Option<EncryptedMetadata>,
+    ) -> Vec<GroupMetadata>;
+
+    /// What the app is to be told of the subject of the group chat
+    /// `conversation_id` kept by take_metadata(), once it decrypts, as once
+    /// the Commit bringing its key is applied (RCC.16 sections 9.7.1.5,
+    /// 10.5.4)
+    fn metadata_opened(&self, conversation_id: &str) -> Vec<GroupMetadata>;
 
     /// Lets go of the MLS group `conversation_id`, as its chat did not start,
     /// its invitation was not accepted, or the user left it

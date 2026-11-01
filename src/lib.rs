@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 // use backtrace::Backtrace;
 
 use libc::c_char;
+use messaging::cpm::encryption::GroupMetadata;
 use messaging::cpm::group_chat::GroupIds;
 use messaging::cpm::session::CPMGroupEvent;
 use messaging::cpm::MessagingSessionHandle;
@@ -1212,6 +1213,14 @@ unsafe fn participant_list(
 /// participant's status (1), left (2), of an invitation that waited for the
 /// user's answer being withdrawn (3), and of a group moved to unencrypted (4)
 /// or back to encrypted (5). The context of one set before is let go of.
+///
+/// The encrypted subject (6) and icon (7) of a group are told as they are
+/// set or deleted, `uri` the participant who did if told (RCC.16 sections
+/// 7.13.2, 9.7.1): the subject decrypted in `display_name`, once it is; the
+/// URL of the icon in `display_name`, and its Content-Type in `status` if
+/// known. A download of the icon at that URL is decrypted; the icon is told
+/// again if one did not decrypt and another key of the icon came since.
+/// Either is told with a null `display_name` once deleted.
 #[no_mangle]
 pub unsafe extern "C" fn rcs_client_set_group_chat_listener(
     client: *mut RcsClient,
@@ -1225,27 +1234,52 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_listener(
 
     if let (Some(client), Some(cb)) = (client.as_ref(), cb) {
         client.engine.set_group_chat_listener(move |event| {
-            let (event, conference_uri, participant) = match event {
-                CPMGroupEvent::Joined(conference_uri) => (0, conference_uri, None),
-                CPMGroupEvent::Participant(conference_uri, participant) => {
-                    (1, conference_uri, Some(participant))
+            // the URI, display name and status of a participant, or of a
+            // subject or icon the participant who set it, then the subject
+            // or the URL of the icon, and its Content-Type
+            let (event, conference_uri, uri, display_name, status) = match event {
+                CPMGroupEvent::Joined(conference_uri) => (0, conference_uri, None, None, None),
+                CPMGroupEvent::Participant(conference_uri, participant) => (
+                    1,
+                    conference_uri,
+                    Some(participant.uri),
+                    participant.display_name,
+                    Some(participant.status),
+                ),
+                CPMGroupEvent::Left(conference_uri) => (2, conference_uri, None, None, None),
+                CPMGroupEvent::InvitationWithdrawn(conference_uri) => {
+                    (3, conference_uri, None, None, None)
                 }
-                CPMGroupEvent::Left(conference_uri) => (2, conference_uri, None),
-                CPMGroupEvent::InvitationWithdrawn(conference_uri) => (3, conference_uri, None),
-                CPMGroupEvent::EncryptionEnded(conference_uri) => (4, conference_uri, None),
-                CPMGroupEvent::EncryptionResumed(conference_uri) => (5, conference_uri, None),
+                CPMGroupEvent::EncryptionEnded(conference_uri) => {
+                    (4, conference_uri, None, None, None)
+                }
+                CPMGroupEvent::EncryptionResumed(conference_uri) => {
+                    (5, conference_uri, None, None, None)
+                }
+                CPMGroupEvent::Metadata(
+                    conference_uri,
+                    GroupMetadata::Subject {
+                        subject,
+                        participant,
+                    },
+                ) => (6, conference_uri, participant, subject, None),
+                CPMGroupEvent::Metadata(
+                    conference_uri,
+                    GroupMetadata::Icon {
+                        url,
+                        content_type,
+                        participant,
+                    },
+                ) => (7, conference_uri, participant, url, content_type),
                 // told through listeners of their own
                 CPMGroupEvent::Invited(_) | CPMGroupEvent::Ids(_) => return,
             };
             let conference_uri = c_string(conference_uri);
-            let (uri, display_name, status) = match participant {
-                Some(participant) => (
-                    Some(c_string(participant.uri)),
-                    participant.display_name.map(c_string),
-                    Some(c_string(participant.status)),
-                ),
-                None => (None, None, None),
-            };
+            let (uri, display_name, status) = (
+                uri.map(c_string),
+                display_name.map(c_string),
+                status.map(c_string),
+            );
             let as_ptr = |s: &Option<CString>| s.as_ref().map_or(ptr::null(), |s| s.as_ptr());
             let cb_context = cb_context
                 .as_ref()
