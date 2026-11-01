@@ -2212,6 +2212,15 @@ struct ScriptedEncryption {
     updating_once_answered: bool,
     /// The Conversation-ID each time it is asked for those
     asked_failed: std::sync::Mutex<Vec<String>>,
+    /// Whether Group Metadata keys are to be asked for or sent, until they
+    /// are
+    metadata_due: std::sync::atomic::AtomicBool,
+    /// Whether they are due only once a group was healed
+    metadata_once_healed: bool,
+    /// The CPIM message it prepares for asking for or sending them, if any
+    metadata: Option<Vec<u8>>,
+    /// The Conversation-ID, from and to each time they are
+    metadata_exchanged: std::sync::Mutex<Vec<(String, String, String)>>,
 }
 
 impl GroupEncryption for ScriptedEncryption {
@@ -2380,6 +2389,27 @@ impl GroupEncryption for ScriptedEncryption {
             true => None,
             false => self.updating.clone(),
         };
+        Box::pin(async move { cpim })
+    }
+
+    fn metadata_keys_due(&self, _conversation_id: &str) -> bool {
+        self.metadata_due.load(std::sync::atomic::Ordering::SeqCst)
+            && (!self.metadata_once_healed || !self.healed.lock().unwrap().is_empty())
+    }
+
+    fn metadata_keys(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.metadata_due
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.metadata_exchanged
+            .lock()
+            .unwrap()
+            .push((conversation_id, from, to));
+        let cpim = self.metadata.clone();
         Box::pin(async move { cpim })
     }
 
@@ -3222,6 +3252,19 @@ impl GroupEncryption for EncryptingPrepared {
         self.0.update_keys(conversation_id, from, to)
     }
 
+    fn metadata_keys_due(&self, conversation_id: &str) -> bool {
+        self.0.metadata_keys_due(conversation_id)
+    }
+
+    fn metadata_keys(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.0.metadata_keys(conversation_id, from, to)
+    }
+
     fn abandon(&self, conversation_id: &str) {
         self.0.abandon(conversation_id)
     }
@@ -4001,12 +4044,24 @@ fn the_senders_of_messages_not_decrypted_are_told_so_in_the_session() {
         &our_path,
         &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
     );
-    assert!(connection.next_response(&rt).first_line.contains(" 200"));
-    for _ in 0..2 {
-        let send = connection.next_message(&rt);
-        assert_eq!(send.header("Content-Type"), Some("message/cpim"));
-        assert_eq!(String::from_utf8_lossy(&send.body), SIGNED);
-        connection.respond(&rt, &send, "200 OK");
+    // the answer to it, and the negative deliveries, which may be sent
+    // before it
+    let (mut answered, mut sent) = (false, 0);
+    while !answered || sent < 2 {
+        let frame = connection.next(&rt);
+        if !frame.first_line.ends_with(" SEND") {
+            assert!(!answered && frame.first_line.contains(" 200"));
+            answered = true;
+            continue;
+        }
+        connection.respond(&rt, &frame, "200 OK");
+        // those that bind the connection
+        if frame.body.is_empty() {
+            continue;
+        }
+        assert_eq!(frame.header("Content-Type"), Some("message/cpim"));
+        assert_eq!(String::from_utf8_lossy(&frame.body), SIGNED);
+        sent += 1;
     }
     assert!(encryption.asked_failed.lock().unwrap().len() > asked);
 
@@ -4111,6 +4166,52 @@ fn the_senders_of_messages_not_decrypted_are_told_so_once_the_group_is_healed() 
             String::from("<imdn>peer-message-1</imdn>")
         )]
     );
+    connection.quiet(&rt);
+}
+
+#[test]
+fn group_metadata_keys_are_asked_for_or_sent_once_the_group_is_healed() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    // healed with the GroupInfo pull alone, as the keys asked for come
+    // with the Commits it applies
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        out_of_step: std::sync::atomic::AtomicBool::new(true),
+        pulling: vec![(&b"MLS-Group-Info-Pull"[..], None)],
+        metadata_due: std::sync::atomic::AtomicBool::new(true),
+        metadata_once_healed: true,
+        metadata: Some(METADATA_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-healed-then-keys");
+    assert!(encryption.metadata_exchanged.lock().unwrap().is_empty());
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let info = peer.next_request("INFO");
+    peer.send(
+        &answer(&info, "200 OK", Some("group info"))
+            .replace("application/sdp", "message/mls-rcs-server"),
+    );
+
+    // as soon as the group is healed (RCC.16 section 10.5.3)
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, METADATA_CPIM);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(encryption.healed.lock().unwrap().len(), 1);
+    assert_eq!(encryption.metadata_exchanged.lock().unwrap().len(), 1);
     connection.quiet(&rt);
 }
 
@@ -5731,6 +5832,85 @@ fn from_the_focus(content: &str) -> String {
         "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:01.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: focus-1\r\n\r\nContent-Type: message/mls-rcs-server\r\n\r\n{}",
         GROUP, IMPU, content
     )
+}
+
+/// What the scripted encryption makes a Commit asking for Group Metadata
+/// keys, or sending them, carry
+const METADATA_CPIM: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x09\x0ametadata keys";
+
+#[test]
+fn group_metadata_keys_are_asked_for_or_sent_in_the_session() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        metadata_due: std::sync::atomic::AtomicBool::new(true),
+        metadata: Some(METADATA_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let exchanged = (
+        String::from("conversation-1"),
+        String::from(IMPU),
+        String::from(GROUP),
+    );
+
+    // due once the group is joined, the Commit sent as the session starts
+    // (RCC.16 sections 9.5.1, 10.5.2, 10.5.3)
+    let (mut connection, msrp_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-metadata");
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    assert_eq!(send.body, METADATA_CPIM);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        *encryption.metadata_exchanged.lock().unwrap(),
+        [exchanged.clone()]
+    );
+
+    // not again until due, as after what the focus sends
+    connection.send_content(
+        &rt,
+        &msrp_path,
+        &our_path,
+        "message/cpim",
+        &from_the_focus("a Commit"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    connection.quiet(&rt);
+    encryption
+        .metadata_due
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    connection.send_content(
+        &rt,
+        &msrp_path,
+        &our_path,
+        "message/cpim",
+        &from_the_focus("a Commit asking for them"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, METADATA_CPIM);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        *encryption.metadata_exchanged.lock().unwrap(),
+        [exchanged.clone(), exchanged]
+    );
+    assert_eq!(
+        *encryption.server_messages.lock().unwrap(),
+        [
+            (String::from("conversation-1"), b"a Commit".to_vec()),
+            (
+                String::from("conversation-1"),
+                b"a Commit asking for them".to_vec()
+            )
+        ]
+    );
+    peer.silence();
 }
 
 #[test]

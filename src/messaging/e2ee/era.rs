@@ -28,6 +28,7 @@ use super::device::{is_of, E2eeDevice};
 use super::group::{recipients, GroupError};
 use super::heal::{pulled_group_info, NextEra};
 use super::kds::Recipient;
+use super::metadata::continuity_token;
 use super::store::StoreError;
 
 const LOG_TAG: &str = "e2ee";
@@ -53,6 +54,12 @@ impl E2eeDevice {
     /// extensions it copies. The continuity token goes on in it, unless a
     /// Participant is not a member of that group, or the group has members the
     /// group of the device does not have (section 8.3.1.2).
+    ///
+    /// The Era asks its members for the Group Metadata keys the device
+    /// misses (sections 8.3, 10.5.2): the key of the icon or subject it
+    /// commits to, or the continuity token if none is kept and each
+    /// Participant is a member of that group (section 8.3.1.3); a new token
+    /// is made otherwise.
     ///
     /// The group of the Era before is let go of once the KeyPackages are
     /// fetched. The Commit is applied once the Focus accepts it.
@@ -189,7 +196,12 @@ impl E2eeDevice {
             .add_conversation(|client| {
                 let participants: Vec<&str> = participants.iter().map(|p| &p[..]).collect();
                 let kept = client.load_conversation(base.group_id()).ok();
-                let renew = !base.continuity_holds(kept.as_ref(), &participants);
+                let renew = match continuity_token(client, base.group_id())?.is_empty() {
+                    false => !base.continuity_holds(kept.as_ref(), &participants),
+                    // asked for of the members, if the Participants are
+                    // members (section 8.3.1.3)
+                    true => !base.has_participants(&participants),
+                };
                 drop(kept);
 
                 let mut conversation = client.create_next_era(base, renew)?;

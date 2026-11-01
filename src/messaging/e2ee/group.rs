@@ -50,6 +50,7 @@ use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice, CI
 use super::heal::heal_once;
 use super::kds::{fetch_key_packages, Fetched, KdsError, Recipient};
 use super::message::MessageError;
+use super::metadata::continuity_token;
 use super::store::StoreError;
 
 const LOG_TAG: &str = "e2ee";
@@ -346,7 +347,20 @@ impl E2eeDevice {
         to: &str,
         client_message: &[u8],
     ) -> Vec<u8> {
-        let (message_id, cpim) = control_message(from, to, client_message);
+        self.sent_as(conversation_id, from, to, new_message_id(), client_message)
+    }
+
+    /// The control message carrying `client_message` in the group chat
+    /// `conversation_id`, as sent_in() makes it, its Message-ID `message_id`
+    pub(super) fn sent_as(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        message_id: String,
+        client_message: &[u8],
+    ) -> Vec<u8> {
+        let cpim = control_message(from, to, &message_id, client_message);
         self.control_messages()
             .lock()
             .unwrap()
@@ -435,28 +449,50 @@ impl E2eeDevice {
             _ => return Err(StoreError::Mls(ErrorKind::UnexpectedMessage)),
         };
 
-        self.store()
-            .add_conversation(|client| {
-                let mut conversation =
-                    client.join_conversation(&bundle.welcome, &bundle.ratchet_tree)?;
-                let joined = if conversation.group_id() != conversation_id.as_bytes() {
-                    Err(ErrorKind::Rejected)
-                } else if bundle.private_message.is_empty() {
-                    Ok(())
-                } else {
-                    conversation
-                        .process(client, &bundle.private_message)
-                        .map(|_| ())
-                };
-                match joined {
-                    Ok(()) => Ok((conversation, ())),
-                    Err(e) => {
-                        let _ = conversation.delete(client);
-                        Err(e)
-                    }
+        let had = self.era_and_token(conversation_id);
+        self.store().add_conversation(|client| {
+            let mut conversation =
+                client.join_conversation(&bundle.welcome, &bundle.ratchet_tree)?;
+            let joined = if conversation.group_id() != conversation_id.as_bytes() {
+                Err(ErrorKind::Rejected)
+            } else if bundle.private_message.is_empty() {
+                Ok(())
+            } else {
+                conversation
+                    .process(client, &bundle.private_message)
+                    .map(|_| ())
+            };
+            match joined {
+                Ok(()) => Ok((conversation, ())),
+                Err(e) => {
+                    let _ = conversation.delete(client);
+                    Err(e)
                 }
+            }
+        })?;
+        // a new Era of a group the device had has its keys checked, its
+        // continuity token mismatched if the Welcome brought another
+        // (RCC.16 section 10.5.1)
+        if let (Some((era, token)), Some((new_era, new_token))) =
+            (had, self.era_and_token(conversation_id))
+        {
+            if new_era > era {
+                self.recoveries().check(conversation_id, token != new_token);
+            }
+        }
+        Ok(())
+    }
+
+    /// The Era of the group `conversation_id` the device has, and the
+    /// continuity token it keeps for it
+    fn era_and_token(&self, conversation_id: &str) -> Option<(u32, Vec<u8>)> {
+        self.store()
+            .peek_conversation(conversation_id.as_bytes(), |conversation, client| {
+                let token = continuity_token(client, conversation.group_id()).ok()?;
+                Some((conversation.era()?, token))
             })
-            .map(|_| ())
+            .ok()
+            .flatten()
     }
 
     /// Takes what the Conversation Focus of the group `conversation_id` sent
@@ -497,8 +533,9 @@ impl E2eeDevice {
         }
         // one that cannot be applied puts the group out of step (RCC.16
         // sections 6.2.6, 10.1)
-        if taken.is_err() {
-            self.heals().want(conversation_id);
+        match &taken {
+            Ok(taken) => self.metadata_keys_received(conversation_id, taken),
+            Err(_) => self.heals().want(conversation_id),
         }
         // the leaf of the device replaced by a KeyPackage Update, it joins
         // again with the Welcome along (section 9.5.4)
@@ -728,18 +765,24 @@ impl E2eeDevice {
             .lock()
             .unwrap()
             .remove(conversation_id);
+        self.recoveries().forget(conversation_id);
         self.store().delete_conversation(conversation_id.as_bytes())
     }
 }
 
-/// A CPIM message carrying the `message/mls-rcs-client` `client_message`,
-/// with only the headers left unencrypted, asking to be told if it is
-/// refused (RCC.16 sections 6.2.5, 7.5.6, 7.5.7, 7.9), and its Message-ID
-fn control_message(from: &str, to: &str, client_message: &[u8]) -> (String, Vec<u8>) {
-    let message_id = Uuid::new_v4()
+/// A new Message-ID for a control message
+pub(super) fn new_message_id() -> String {
+    Uuid::new_v4()
         .as_hyphenated()
         .encode_lower(&mut Uuid::encode_buffer())
-        .to_string();
+        .to_string()
+}
+
+/// A CPIM message carrying the `message/mls-rcs-client` `client_message`,
+/// its Message-ID `message_id`, with only the headers left unencrypted,
+/// asking to be told if it is refused (RCC.16 sections 6.2.5, 7.5.6, 7.5.7,
+/// 7.9)
+fn control_message(from: &str, to: &str, message_id: &str, client_message: &[u8]) -> Vec<u8> {
     let message = CPIMMessage::new(
         &[(b"imdn", b"urn:ietf:params:imdn")],
         vec![
@@ -749,7 +792,7 @@ fn control_message(from: &str, to: &str, client_message: &[u8]) -> (String, Vec<
                 b"DateTime",
                 Local::now().to_rfc3339_opts(SecondsFormat::Millis, false),
             ),
-            Header::new(b"imdn.Message-ID", message_id.clone()),
+            Header::new(b"imdn.Message-ID", String::from(message_id)),
             Header::new(b"imdn.Disposition-Notification", b"negative-delivery"),
         ],
         Body::Message(MessageBody {
@@ -766,7 +809,7 @@ fn control_message(from: &str, to: &str, client_message: &[u8]) -> (String, Vec<
     if message.get_readers(&mut readers).is_ok() {
         let _ = DynamicChain::new(readers).read_to_end(&mut data);
     }
-    (message_id, data)
+    data
 }
 
 /// The group chats created encrypted by the device, for as long as it is kept
@@ -1165,6 +1208,24 @@ impl GroupEncryption for DeviceGroups {
                 }
             }
         })
+    }
+
+    fn metadata_keys_due(&self, conversation_id: &str) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.metadata_keys_due(conversation_id))
+    }
+
+    fn metadata_keys(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.once_settled(
+            move |device| device.metadata_keys(&conversation_id, &from, &to),
+            "metadata keys not asked for nor sent",
+        )
     }
 
     fn abandon(&self, conversation_id: &str) {

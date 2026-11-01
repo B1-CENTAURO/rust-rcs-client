@@ -1288,6 +1288,29 @@ impl SessionEnd {
         });
     }
 
+    /// Asks the other members of the MLS group of the session for the Group
+    /// Metadata keys this client misses, or sends them those one of them
+    /// asked for, if either is due, with a Commit sent in the session (RCC.16
+    /// sections 9.5.1, 10.5.2, 10.5.3)
+    pub(crate) fn metadata_keys_if_due(&self) {
+        let due = {
+            let inner = self.sip_session.get_inner();
+            let session_info = inner.get_session_info();
+            session_info
+                .encryption
+                .as_ref()
+                .zip(session_info.conversation_id.as_ref())
+                .is_some_and(|(encryption, conversation_id)| {
+                    encryption.metadata_keys_due(conversation_id)
+                })
+        };
+        if due {
+            self.commit(|encryption, conversation_id, from, to| {
+                encryption.metadata_keys(conversation_id, from, to)
+            });
+        }
+    }
+
     /// Self-heals the MLS group of the session if it fell out of step with
     /// that of the Conversation Focus, asking the focus with INFO requests in
     /// the session's dialog, and sending it the External Commit that may come
@@ -1326,6 +1349,9 @@ impl SessionEnd {
                 // and the senders of messages not decrypted, once the group
                 // is in step (section 10.2)
                 told.tell_failed_to_decrypt();
+                // and the Group Metadata keys asked for applied, sent
+                // (section 10.5.3)
+                told.metadata_keys_if_due();
                 cpim
             })
         });
@@ -2144,6 +2170,11 @@ impl CPMSessionService {
                     // and the senders of messages not decrypted told so,
                     // once it is in step (section 10.2)
                     tell_failed_to_decrypt(session);
+                    // and the Group Metadata keys this client misses asked
+                    // for, or those asked for sent (sections 10.5.2, 10.5.3)
+                    if let Some(session_end) = session.get_inner().session_end() {
+                        session_end.metadata_keys_if_due();
+                    }
                 }
             };
 
@@ -3924,6 +3955,11 @@ impl SipDialogEventCallbacks for CPMSessionDialogEventReceiver {
         if let Some(group_chats) = &self.group_chats {
             group_chats.started(&self.sip_session, &self.rt);
         }
+
+        // the Group Metadata keys asked for in the group joined sent, or
+        // those it misses asked for (RCC.16 sections 10.5.2, 10.5.3), once
+        // the session starts
+        self.session_end.metadata_keys_if_due();
 
         let session_end = self.session_end.clone();
         let session = self.sip_session.get_inner();
