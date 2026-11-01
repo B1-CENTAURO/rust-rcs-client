@@ -42,11 +42,12 @@ use uuid::Uuid;
 
 use crate::capability::CapabilityQuery;
 use crate::messaging::cpm::encryption::{
-    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken,
-    Upgrade, Verified,
+    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed,
+    SealedFile, Taken, Upgrade, Verified,
 };
 
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice, CIPHERSUITE};
+use super::file::seal_file;
 use super::heal::heal_once;
 use super::kds::{fetch_key_packages, Fetched, KdsError, Recipient};
 use super::message::MessageError;
@@ -1208,6 +1209,28 @@ impl GroupEncryption for DeviceGroups {
                 }
             }
         })
+    }
+
+    fn encrypts_files(&self, conversation_id: &str) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.encrypts_files(conversation_id))
+    }
+
+    fn seal_file(&self, content: &[u8], name: &str, content_type: &str) -> Option<SealedFile> {
+        seal_file(content, name, content_type)
+    }
+
+    fn uploaded(
+        &self,
+        conversation_id: &str,
+        xml: &[u8],
+        file: &[u8],
+        thumbnail: Option<&[u8]>,
+    ) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.uploaded(conversation_id, xml, file, thumbnail))
     }
 
     fn metadata_keys_due(&self, conversation_id: &str) -> bool {

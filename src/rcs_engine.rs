@@ -116,6 +116,7 @@ use crate::messaging::ffi::RecipientType;
 use crate::messaging::ft_http::config::FileTransferOverHTTPConfigs;
 use crate::messaging::ft_http::download_file;
 use crate::messaging::ft_http::upload_file;
+use crate::messaging::ft_http::upload_sealed_file;
 use crate::messaging::ft_http::FileInfo;
 use crate::messaging::ft_http::FileTransferOverHTTPService;
 use crate::messaging::ft_http::{ContentServer, Credentials};
@@ -1590,9 +1591,19 @@ impl RcsEngine {
         ))
     }
 
+    /// Uploads the file at `file_path`, with the thumbnail at
+    /// `thumbnail_path` if any, as `tid`, resuming the upload if `tid` was
+    /// uploaded before: the result callback is given the XML of the content
+    /// server telling where they are
+    ///
+    /// For the group chat of Conversation-ID `conversation_id` while it is
+    /// encrypted, they are encrypted first, their keys kept for the message
+    /// sending them to carry (RCC.16 section 9.1.2.1), see
+    /// `ft_http::upload_sealed_file()`.
     pub fn upload_file<PF, RF>(
         &self,
         tid: &str,
+        conversation_id: Option<&str>,
         file_path: &str,
         file_name: &str,
         file_mime: &str,
@@ -1619,6 +1630,13 @@ impl RcsEngine {
                 if ft_auth == 1 {
                     if let Some(ft_http_cs_uri) = &self.ft_http_configs.ft_http_cs_uri {
                         let ft_http_service = Arc::clone(&self.ft_http_service);
+                        // that of an encrypted group chat, sealed
+                        let sealing = conversation_id.and_then(|conversation_id| {
+                            self.cpm_session_service
+                                .group_encryption()
+                                .filter(|encryption| encryption.encrypts_files(conversation_id))
+                                .map(|encryption| (String::from(conversation_id), encryption))
+                        });
 
                         let ft_http_cs_uri = String::from(ft_http_cs_uri);
                         let credentials = self.ft_http_cs_credentials();
@@ -1699,17 +1717,53 @@ impl RcsEngine {
                                 msisdn: msisdn.as_deref(),
                             };
 
-                            match upload_file(
-                                &ft_http_service,
-                                &ft_http_cs_uri,
-                                tid,
-                                file,
-                                thumbnail,
-                                &server,
-                                &progress_callback,
-                            )
-                            .await
-                            {
+                            let uploaded = match &sealing {
+                                Some((conversation_id, encryption)) => {
+                                    let seal = |content: &[u8], name: &str, mime: &str| {
+                                        encryption.seal_file(content, name, mime)
+                                    };
+                                    upload_sealed_file(
+                                        &ft_http_service,
+                                        &ft_http_cs_uri,
+                                        tid,
+                                        file,
+                                        thumbnail,
+                                        &server,
+                                        &progress_callback,
+                                        &seal,
+                                    )
+                                    .await
+                                    .map(
+                                        |(xml, file, thumbnail)| {
+                                            if !encryption.uploaded(
+                                                conversation_id,
+                                                xml.as_bytes(),
+                                                &file,
+                                                thumbnail.as_deref(),
+                                            ) {
+                                                platform_log(
+                                                    LOG_TAG,
+                                                    "the keys of the file uploaded not kept",
+                                                );
+                                            }
+                                            xml
+                                        },
+                                    )
+                                }
+                                None => {
+                                    upload_file(
+                                        &ft_http_service,
+                                        &ft_http_cs_uri,
+                                        tid,
+                                        file,
+                                        thumbnail,
+                                        &server,
+                                        &progress_callback,
+                                    )
+                                    .await
+                                }
+                            };
+                            match uploaded {
                                 Ok(result_xml) => {
                                     upload_file_result_callback(
                                         200,

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
@@ -26,16 +27,21 @@ pub use content_server::{ContentServer, Credentials};
 pub use download::download_file;
 
 pub use upload::upload_file;
+pub use upload::upload_sealed_file;
 pub use upload::FileInfo;
 
 pub struct FileTransferOverHTTPService {
     recorded_tids: Arc<Mutex<Vec<Uuid>>>,
+    /// The files of the uploads sealed before they are uploaded, by tid, for
+    /// an upload resumed to go on with what was sealed for it
+    sealed: Arc<Mutex<HashMap<Uuid, upload::SealedUpload>>>,
 }
 
 impl FileTransferOverHTTPService {
     pub fn new() -> FileTransferOverHTTPService {
         FileTransferOverHTTPService {
             recorded_tids: Arc::new(Mutex::new(Vec::with_capacity(1024))),
+            sealed: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

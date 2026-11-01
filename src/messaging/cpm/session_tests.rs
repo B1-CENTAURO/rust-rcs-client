@@ -43,8 +43,8 @@ use rust_rcs_core::sip::{
 use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{
-    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken,
-    Upgrade, Verified,
+    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed,
+    SealedFile, Taken, Upgrade, Verified,
 };
 use super::group_chat::GroupIds;
 use super::imdn::{
@@ -2392,6 +2392,27 @@ impl GroupEncryption for ScriptedEncryption {
         Box::pin(async move { cpim })
     }
 
+    fn encrypts_files(&self, conversation_id: &str) -> bool {
+        self.encrypting.iter().any(|c| c == conversation_id)
+    }
+
+    fn seal_file(&self, content: &[u8], name: &str, content_type: &str) -> Option<SealedFile> {
+        Some(SealedFile {
+            ciphertext: [b"sealed ", content].concat(),
+            metadata: format!("{} {}", name, content_type).into_bytes(),
+        })
+    }
+
+    fn uploaded(
+        &self,
+        _conversation_id: &str,
+        _xml: &[u8],
+        _file: &[u8],
+        _thumbnail: Option<&[u8]>,
+    ) -> bool {
+        true
+    }
+
     fn metadata_keys_due(&self, _conversation_id: &str) -> bool {
         self.metadata_due.load(std::sync::atomic::Ordering::SeqCst)
             && (!self.metadata_once_healed || !self.healed.lock().unwrap().is_empty())
@@ -3250,6 +3271,24 @@ impl GroupEncryption for EncryptingPrepared {
         to: String,
     ) -> BoxFuture<'static, Option<Vec<u8>>> {
         self.0.update_keys(conversation_id, from, to)
+    }
+
+    fn encrypts_files(&self, conversation_id: &str) -> bool {
+        self.0.encrypts_files(conversation_id)
+    }
+
+    fn seal_file(&self, content: &[u8], name: &str, content_type: &str) -> Option<SealedFile> {
+        self.0.seal_file(content, name, content_type)
+    }
+
+    fn uploaded(
+        &self,
+        conversation_id: &str,
+        xml: &[u8],
+        file: &[u8],
+        thumbnail: Option<&[u8]>,
+    ) -> bool {
+        self.0.uploaded(conversation_id, xml, file, thumbnail)
     }
 
     fn metadata_keys_due(&self, conversation_id: &str) -> bool {
@@ -6337,7 +6376,9 @@ fn what_is_not_an_rcs_message_does_not_move_the_group_to_unencrypted() {
     let (mut connection, msrp_path, our_path) =
         joined_encrypted_group(&client, &mut peer, "group-not-ending");
 
-    // an is-composing, a notification signed, nor what the focus sends
+    // an is-composing, a notification signed, nor what the focus sends,
+    // nor a file transfer message carrying the keys of its files encrypted
+    // (RCC.16 section 7.8.2)
     for (content_type, content) in [
         (
             "application/im-iscomposing+xml",
@@ -6345,11 +6386,16 @@ fn what_is_not_an_rcs_message_does_not_move_the_group_to_unencrypted() {
         ),
         ("message/cpim", group_imdn_cpim("message-1", "<delivered/>")),
         ("message/cpim", from_the_focus("a control message")),
+        (
+            "message/cpim",
+            group_cpim(ALICE, "", "<file><mls-file>AAEC</mls-file></file>")
+                .replace("text/plain", "application/vnd.gsma.rcs-ft-http+xml"),
+        ),
     ] {
         connection.send_content(&rt, &msrp_path, &our_path, content_type, &content);
         assert!(connection.next_response(&rt).first_line.contains(" 200"));
     }
-    for _ in 0..2 {
+    for _ in 0..3 {
         assert!(client.received.recv_timeout(Duration::from_secs(5)).is_ok());
     }
 

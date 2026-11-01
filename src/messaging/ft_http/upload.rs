@@ -31,11 +31,21 @@ use rust_rcs_core::{
 use url::Url;
 use uuid::Uuid;
 
+use crate::messaging::cpm::encryption::SealedFile;
+
 use super::{
     content_server::{read_text, reason_phrase, Auth, ContentServer},
     resume_info_xml::parse_xml,
     FileTransferOverHTTPService,
 };
+
+/// The name and the type a sealed file is uploaded under (RCC.16 section
+/// 9.1.2.1)
+pub const SEALED_FILE_NAME: &str = "encrypted_file";
+pub const SEALED_FILE_TYPE: &str = "message/mls-ft";
+
+/// What is appended to the path of a file for that of the file sealed of it
+pub const SEALED_FILE_SUFFIX: &str = ".mls-ft";
 
 const LOG_TAG: &str = "fthttp";
 
@@ -420,4 +430,112 @@ pub async fn upload_file(
         )
         .await
     }
+}
+
+/// The file and the thumbnail of an upload sealed, at the path of each, with
+/// what was given of each besides its ciphertext
+#[derive(Clone)]
+pub(super) struct SealedUpload {
+    file: (String, Vec<u8>),
+    thumbnail: Option<(String, Vec<u8>)>,
+}
+
+/// The file `file` sealed with `seal`, the ciphertext written at its path
+/// with SEALED_FILE_SUFFIX appended: that path, and what `seal` gave of it
+/// besides
+fn sealed(
+    file: &FileInfo<'_>,
+    seal: &(dyn Fn(&[u8], &str, &str) -> Option<SealedFile> + Send + Sync),
+) -> Result<(String, Vec<u8>), FileUploadError> {
+    let content = fs::read(file.path).map_err(|_| FileUploadError::IO)?;
+    let sealed = seal(&content, file.name, file.mime).ok_or(FileUploadError::IO)?;
+    let path = format!("{}{}", file.path, SEALED_FILE_SUFFIX);
+    fs::write(&path, &sealed.ciphertext).map_err(|_| FileUploadError::IO)?;
+    Ok((path, sealed.metadata))
+}
+
+/// Uploads `file`, with `thumbnail`, as upload_file() does, each sealed
+/// with `seal` first, its name and type taken in, into a file at its path
+/// with SEALED_FILE_SUFFIX appended, under the name SEALED_FILE_NAME and the
+/// type SEALED_FILE_TYPE (RCC.16 section 9.1.2.1): the XML the server tells
+/// where they are with, and what `seal` gave of the file and the thumbnail
+/// besides the ciphertext
+///
+/// The files sealed are deleted once they are uploaded. Until then, an
+/// upload of the same `tid` resumed uploads them, sealed as they were.
+pub async fn upload_sealed_file(
+    ft_http_service: &Arc<FileTransferOverHTTPService>,
+    ft_http_cs_uri: &str,
+    tid: Uuid,
+    file: FileInfo<'_>,
+    thumbnail: Option<FileInfo<'_>>,
+    server: &ContentServer<'_>,
+    progress_callback: &Arc<Box<dyn Fn(u32, i32) + Send + Sync>>,
+    seal: &(dyn Fn(&[u8], &str, &str) -> Option<SealedFile> + Send + Sync),
+) -> Result<(String, Vec<u8>, Option<Vec<u8>>), FileUploadError> {
+    let kept = ft_http_service
+        .sealed
+        .lock()
+        .unwrap()
+        .get(&tid)
+        .cloned()
+        .filter(|kept| {
+            fs::metadata(&kept.file.0).is_ok()
+                && kept
+                    .thumbnail
+                    .as_ref()
+                    .map_or(true, |thumbnail| fs::metadata(&thumbnail.0).is_ok())
+        });
+    let upload = match kept {
+        Some(kept) => kept,
+        None => {
+            let upload = SealedUpload {
+                file: sealed(&file, seal)?,
+                thumbnail: match &thumbnail {
+                    Some(thumbnail) => Some(sealed(thumbnail, seal)?),
+                    None => None,
+                },
+            };
+            ft_http_service
+                .sealed
+                .lock()
+                .unwrap()
+                .insert(tid, upload.clone());
+            upload
+        }
+    };
+
+    let sealed_file = FileInfo {
+        path: &upload.file.0,
+        name: SEALED_FILE_NAME,
+        mime: SEALED_FILE_TYPE,
+        hash: None,
+    };
+    let sealed_thumbnail = upload.thumbnail.as_ref().map(|(path, _)| FileInfo {
+        path,
+        name: SEALED_FILE_NAME,
+        mime: SEALED_FILE_TYPE,
+        hash: None,
+    });
+    let xml = upload_file(
+        ft_http_service,
+        ft_http_cs_uri,
+        tid,
+        sealed_file,
+        sealed_thumbnail,
+        server,
+        progress_callback,
+    )
+    .await?;
+
+    ft_http_service.sealed.lock().unwrap().remove(&tid);
+    let _ = fs::remove_file(&upload.file.0);
+    if let Some((path, _)) = &upload.thumbnail {
+        let _ = fs::remove_file(path);
+    }
+    Ok((
+        xml,
+        upload.file.1,
+        upload.thumbnail.map(|(_, metadata)| metadata),
+    ))
 }

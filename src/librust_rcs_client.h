@@ -289,6 +289,14 @@ extern void rcs_client_upload_file(struct rcs_runtime *runtime, struct rcs_clien
                                 upload_file_progress_callback progress_cb, void* progress_cb_context,
                                 upload_file_result_callback result_cb, void *result_cb_context);
 
+// as rcs_client_upload_file(), for a file to send in the group chat of Conversation-ID conversation_id,
+// the file and thumbnail encrypted before they are uploaded while it is encrypted (RCC.16 section 9.1.2.1)
+extern void rcs_client_upload_group_file(struct rcs_runtime *runtime, struct rcs_client *client, const char *tid, const char *conversation_id,
+                                const char *file_path, const char *file_name, const char *file_mime, const char *file_hash,
+                                const char *thumbnail_path, const char *thumbnail_name, const char *thumbnail_mime, const char *thumbnail_hash,
+                                upload_file_progress_callback progress_cb, void* progress_cb_context,
+                                upload_file_result_callback result_cb, void *result_cb_context);
+
 typedef void (*download_file_progress_callback) (uint32_t current, int32_t total, void *context);
 
 void download_file_progress_callback_context_release(void *context);
