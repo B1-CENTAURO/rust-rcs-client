@@ -2200,6 +2200,11 @@ impl CPMSessionService {
         *self.group_encryption.lock().unwrap() = Some(encryption);
     }
 
+    /// The encryption of group chats, once set
+    pub fn group_encryption(&self) -> Option<Arc<dyn GroupEncryption>> {
+        self.group_encryption.lock().unwrap().clone()
+    }
+
     /// Takes note of the identifiers of a group the app kept from before, for
     /// the group to be restarted with them, and known when its focus
     /// restarts it (RCC.07 section 3.2.4.10)

@@ -17,6 +17,7 @@
 pub mod device;
 pub mod era;
 pub mod ffi;
+pub mod file;
 pub mod group;
 pub mod heal;
 pub mod kds;

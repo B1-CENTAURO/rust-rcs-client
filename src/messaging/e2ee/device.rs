@@ -29,6 +29,7 @@ use crate::provisioning::ims_application::ImsApplication;
 use crate::provisioning::rcs_application::RcsApplication;
 use crate::rcs_engine::RcsEngine;
 
+use super::file::Uploads;
 use super::heal::Heals;
 use super::kds::{self, EnrolmentError, KeyDistribution};
 use super::metadata::Recoveries;
@@ -88,6 +89,9 @@ pub struct E2eeDevice {
     notes: Notes,
     /// The groups whose Group Metadata keys are recovered
     recoveries: Recoveries,
+    /// The keys of the files uploaded for groups, for the messages sending
+    /// them
+    uploads: Uploads,
 }
 
 impl E2eeDevice {
@@ -122,6 +126,7 @@ impl E2eeDevice {
             upgrades: Upgrades::default(),
             notes,
             recoveries: Recoveries::default(),
+            uploads: Uploads::default(),
         })
     }
 
@@ -151,6 +156,10 @@ impl E2eeDevice {
 
     pub(super) fn recoveries(&self) -> &Recoveries {
         &self.recoveries
+    }
+
+    pub(super) fn uploads(&self) -> &Uploads {
+        &self.uploads
     }
 
     pub(super) fn home_kds(&self) -> u32 {

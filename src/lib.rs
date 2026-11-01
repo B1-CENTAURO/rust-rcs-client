@@ -1562,6 +1562,91 @@ pub unsafe extern "C" fn rcs_client_upload_file(
 ) {
     platform_log(LOG_TAG, "calling rcs_client_upload_file()");
 
+    upload_file(
+        rcs_runtime,
+        client,
+        tid,
+        None,
+        file_path,
+        file_name,
+        file_mime,
+        file_hash,
+        thumbnail_path,
+        thumbnail_name,
+        thumbnail_mime,
+        thumbnail_hash,
+        progress_cb,
+        progress_cb_context,
+        result_cb,
+        result_cb_context,
+    );
+}
+
+/// As rcs_client_upload_file(), for a file to send in the group chat of
+/// Conversation-ID `conversation_id`: while it is encrypted, the file and the
+/// thumbnail are encrypted before they are uploaded, each into a file next
+/// to it, its path with `.mls-ft` after, deleted once it is uploaded. The
+/// message sending them, as the XML the result callback gives tells them,
+/// carries their keys if it is sent within a day (RCC.16 section 9.1.2.1).
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_upload_group_file(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    tid: *const c_char,
+    conversation_id: *const c_char,
+    file_path: *const c_char,
+    file_name: *const c_char,
+    file_mime: *const c_char,
+    file_hash: *const c_char,
+    thumbnail_path: *const c_char,
+    thumbnail_name: *const c_char,
+    thumbnail_mime: *const c_char,
+    thumbnail_hash: *const c_char,
+    progress_cb: Option<UploadFileProgressCallback>,
+    progress_cb_context: *mut UploadFileProgressCallbackContext,
+    result_cb: Option<UploadFileResultCallback>,
+    result_cb_context: *mut UploadFileResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_upload_group_file()");
+
+    upload_file(
+        rcs_runtime,
+        client,
+        tid,
+        optional_string(conversation_id),
+        file_path,
+        file_name,
+        file_mime,
+        file_hash,
+        thumbnail_path,
+        thumbnail_name,
+        thumbnail_mime,
+        thumbnail_hash,
+        progress_cb,
+        progress_cb_context,
+        result_cb,
+        result_cb_context,
+    );
+}
+
+unsafe fn upload_file(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    tid: *const c_char,
+    conversation_id: Option<String>,
+    file_path: *const c_char,
+    file_name: *const c_char,
+    file_mime: *const c_char,
+    file_hash: *const c_char,
+    thumbnail_path: *const c_char,
+    thumbnail_name: *const c_char,
+    thumbnail_mime: *const c_char,
+    thumbnail_hash: *const c_char,
+    progress_cb: Option<UploadFileProgressCallback>,
+    progress_cb_context: *mut UploadFileProgressCallbackContext,
+    result_cb: Option<UploadFileResultCallback>,
+    result_cb_context: *mut UploadFileResultCallbackContext,
+) {
     let progress_cb_context = if progress_cb_context.is_null() {
         None
     } else {
@@ -1637,6 +1722,7 @@ pub unsafe extern "C" fn rcs_client_upload_file(
 
                 client.engine.upload_file(
                     &tid,
+                    conversation_id.as_deref(),
                     &file_path,
                     &file_name,
                     &file_mime,

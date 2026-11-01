@@ -7953,3 +7953,228 @@ fn a_new_era_the_device_makes_asks_for_the_metadata_keys_it_misses() {
     assert!(!continuity_token(&device).is_empty());
     assert!(!joined(&bob, &bundle_of(&cpim)).group_metadata_keys_requested());
 }
+
+/// A CPIM message from Alice to the group sending the files the FT HTTP XML
+/// `xml` tells of (RCC.07 section 4.1.15)
+fn file_transfer(message_id: &str, xml: &str) -> Vec<u8> {
+    format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:00.000+00:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: {}\r\n\
+imdn.Disposition-Notification: positive-delivery, display\r\n\
+\r\n\
+Content-Type: application/vnd.gsma.rcs-ft-http+xml\r\n\
+Content-Length: {}\r\n\
+\r\n\
+{}",
+        IMPU,
+        GROUP_URI,
+        message_id,
+        xml.len(),
+        xml
+    )
+    .into_bytes()
+}
+
+/// The MlsMessage the mls-file element of the XML `xml` carries
+fn mls_file(xml: &[u8]) -> Vec<u8> {
+    let xml = String::from_utf8_lossy(xml);
+    let start = xml.find("<mls-file>").expect("an mls-file") + "<mls-file>".len();
+    let end = xml.find("</mls-file>").unwrap();
+    general_purpose::STANDARD.decode(&xml[start..end]).unwrap()
+}
+
+/// The content of the MIME body after the headers of the payload `payload`,
+/// and its Content-Type
+fn mime_body(payload: &[u8]) -> (String, Vec<u8>) {
+    // after the encrypted headers, if any, and the empty line
+    let mime = match payload.strip_prefix(b"\r\n") {
+        Some(mime) => mime,
+        None => {
+            let split = payload
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("the encrypted headers");
+            &payload[split + 4..]
+        }
+    };
+    let body_at = mime
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("the MIME headers");
+    let headers = String::from_utf8_lossy(&mime[..body_at]).into_owned();
+    let content_type = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Type: "))
+        .unwrap_or_default()
+        .to_string();
+    (content_type, mime[body_at + 4..].to_vec())
+}
+
+#[test]
+fn a_file_transfer_message_carries_the_keys_of_its_files_encrypted_in_its_xml() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    assert!(groups.encrypts_files(CONVERSATION));
+    assert!(!groups.encrypts_files("group-2"));
+
+    // the file and the thumbnail sealed, each with a key of its own, and
+    // uploaded (RCC.16 section 9.1.2.1)
+    let file = groups
+        .seal_file(b"the picture", "picture.jpg", "image/jpeg")
+        .unwrap();
+    let thumbnail = groups
+        .seal_file(b"the thumbnail", "thumbnail.jpg", "image/jpeg")
+        .unwrap();
+    let xml = super::file::upload_xml("https://ftcs.example.com/f/1");
+    assert!(groups.uploaded(
+        CONVERSATION,
+        xml.as_bytes(),
+        &file.metadata,
+        Some(&thumbnail.metadata)
+    ));
+
+    let sent = device
+        .encrypt_message(CONVERSATION, &file_transfer("ft-1", &xml))
+        .unwrap();
+    // the XML as it was uploaded, with the mls-file last in it, in a CPIM
+    // message with the Epoch-Authenticator and Era-ID (section 7.8.2)
+    let outer = cpim_message(&sent);
+    let (content_type, body, _) = outer.get_message_body().unwrap();
+    assert_eq!(
+        content_type,
+        Some(&b"application/vnd.gsma.rcs-ft-http+xml"[..])
+    );
+    let without = &xml[..xml.len() - "</file>\n".len()];
+    assert!(String::from_utf8_lossy(body).starts_with(without));
+    let info = outer.get_info().unwrap();
+    assert_eq!(info.imdn_message_id, b"ft-1");
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"positive-delivery, display, negative-delivery"[..])
+    );
+    let names = header_names(&outer);
+    for name in [
+        "<http://www.gsma.com/rcs/mls>.Epoch-Authenticator",
+        "<http://www.gsma.com/rcs/mls>.Era-ID",
+    ] {
+        assert!(names.iter().any(|n| n == name), "{:?}", names);
+    }
+
+    // what Bob decrypts of it is the FileInfo, as message/mls-rcs-file-info
+    // (section 7.8.1)
+    let decrypted = bobs_group.decrypt(&bob, &mls_file(body), b"ft-1").unwrap();
+    assert_eq!(decrypted.payload_type, SecretPayloadType::Application);
+    let payload = decrypted.payload.unwrap();
+    let (content_type, file_info) = mime_body(&payload);
+    assert_eq!(content_type, "message/mls-rcs-file-info");
+    let file_info: proto::FileInfo = proto::decode(&file_info).unwrap();
+    // with which he opens the files he downloads (section 9.1.2.2)
+    for (metadata, ciphertext, name, content) in [
+        (
+            file_info.file.unwrap(),
+            &file.ciphertext,
+            "picture.jpg",
+            &b"the picture"[..],
+        ),
+        (
+            file_info.thumbnail.unwrap(),
+            &thumbnail.ciphertext,
+            "thumbnail.jpg",
+            b"the thumbnail",
+        ),
+    ] {
+        assert_eq!(metadata.file_name, name);
+        assert_eq!(metadata.content_type, "image/jpeg");
+        let opened = rust_rcs_core::mls::rcs::file::decrypt_file(
+            ciphertext,
+            name,
+            &metadata.encryption_info.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(opened, content);
+    }
+
+    // nor kept to be re-sent, the Re-Sent Message not telling where the file
+    // is
+    let (cpim, xml) = failed_to_decrypt_by(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "imdn-1",
+        "ft-1",
+        None,
+        ClientFailureReason::FailureToDecrypt,
+    );
+    assert_eq!(ftd_answer(&device, &cpim, &xml), FtdAnswer::Ignored);
+}
+
+#[test]
+fn a_file_transfer_message_is_not_sent_unless_its_files_were_sealed_for_the_group() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, _, _, clock) = alice_and_bob_in_time();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let file = groups
+        .seal_file(b"the picture", "picture.jpg", "image/jpeg")
+        .unwrap();
+    let xml = super::file::upload_xml("https://ftcs.example.com/f/1");
+
+    // not uploaded sealed, nor for this group, nor told where (RCC.16
+    // section 9.1.2.1)
+    let not_fit = |xml: &str| device.encrypt_message(CONVERSATION, &file_transfer("ft-1", xml));
+    assert_eq!(not_fit(&xml), Err(MessageError::FileNotFit));
+    assert!(groups.uploaded("group-2", xml.as_bytes(), &file.metadata, None));
+    assert_eq!(not_fit(&xml), Err(MessageError::FileNotFit));
+    assert!(!groups.uploaded(CONVERSATION, b"<file/>", &file.metadata, None));
+    assert!(!groups.uploaded(CONVERSATION, xml.as_bytes(), b"\xff", None));
+    assert!(!groups.uploaded(CONVERSATION, xml.as_bytes(), &file.metadata, Some(b"\xff")));
+    assert_eq!(not_fit(&xml), Err(MessageError::FileNotFit));
+    assert!(matches!(
+        rt.block_on(groups.encrypt(CONVERSATION, &file_transfer("ft-1", &xml))),
+        Sealed::Failed
+    ));
+
+    // uploaded sealed for it, within a day
+    assert!(groups.uploaded(CONVERSATION, xml.as_bytes(), &file.metadata, None));
+    assert!(not_fit(&xml).is_ok());
+    // nor in an XML of another document than a file
+    let other = xml
+        .replace("<file ", "<files ")
+        .replace("</file>", "</files>");
+    assert_eq!(not_fit(&other), Err(MessageError::FileNotFit));
+    clock.advance(DAY);
+    assert_eq!(not_fit(&xml), Err(MessageError::FileNotFit));
+
+    // once the group is unencrypted, a file sealed for it is not sent, one
+    // that was not is sent as it is (section 11.2)
+    assert!(groups.uploaded(CONVERSATION, xml.as_bytes(), &file.metadata, None));
+    device
+        .end_encryption(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            EndMlsReason::ClientFailureEncryptionNotAvailable,
+        )
+        .unwrap()
+        .unwrap();
+    accepted_from_device(&device);
+    assert!(!groups.encrypts_files(CONVERSATION));
+    assert_eq!(not_fit(&xml), Err(MessageError::FileNotFit));
+    let plain = super::file::upload_xml("https://ftcs.example.com/f/2");
+    assert_eq!(not_fit(&plain), Err(MessageError::NotEncrypted));
+
+    // as when the Focus has no MLS group for it (sections 10.1, 11.1)
+    let (device, _, _) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    assert!(groups.uploaded(CONVERSATION, xml.as_bytes(), &file.metadata, None));
+    device.lost_group(CONVERSATION);
+    assert!(!groups.encrypts_files(CONVERSATION));
+    let not_fit = |xml: &str| device.encrypt_message(CONVERSATION, &file_transfer("ft-2", xml));
+    assert_eq!(not_fit(&xml), Err(MessageError::FileNotFit));
+    assert_eq!(not_fit(&plain), Err(MessageError::NotEncrypted));
+}

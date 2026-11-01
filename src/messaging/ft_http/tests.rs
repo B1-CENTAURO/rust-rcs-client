@@ -31,8 +31,11 @@ use uuid::Uuid;
 
 use super::content_server::{ContentServer, Credentials};
 use super::download::{download_file, FileDownloadError};
-use super::upload::{upload_file, FileInfo, FileUploadError};
+use super::upload::{
+    upload_file, upload_sealed_file, FileInfo, FileUploadError, SEALED_FILE_SUFFIX,
+};
 use super::FileTransferOverHTTPService;
+use crate::messaging::cpm::encryption::SealedFile;
 
 /// A request the content server took
 pub struct Taken {
@@ -559,4 +562,226 @@ fn an_upload_resumed_the_server_knows_nothing_of_is_made_afresh() {
     assert!(next(&taken).target.ends_with("&get_upload_info"));
     assert_eq!(next(&taken).body.len(), 0);
     assert!(String::from_utf8_lossy(&next(&taken).body).contains("0123456789"));
+}
+
+/// Seals as the encryption of a group chat would, counting the files
+/// sealed: the content after `sealed `, and the name and type as what is
+/// given besides
+fn counting_seal(
+    sealed: &Arc<Mutex<usize>>,
+) -> impl Fn(&[u8], &str, &str) -> Option<SealedFile> + Send + Sync {
+    let sealed = Arc::clone(sealed);
+    move |content: &[u8], name: &str, mime: &str| {
+        *sealed.lock().unwrap() += 1;
+        Some(SealedFile {
+            ciphertext: [b"sealed ", content].concat(),
+            metadata: format!("{} {}", name, mime).into_bytes(),
+        })
+    }
+}
+
+impl Client {
+    /// Uploads the file at `path`, with the thumbnail at `thumbnail`, as
+    /// upload_sealed_file() does with `seal`
+    pub fn upload_sealed(
+        &self,
+        service: &Arc<FileTransferOverHTTPService>,
+        cs_uri: &str,
+        tid: Uuid,
+        path: &str,
+        thumbnail: Option<&str>,
+        seal: &(dyn Fn(&[u8], &str, &str) -> Option<SealedFile> + Send + Sync),
+    ) -> Result<(String, Vec<u8>, Option<Vec<u8>>), FileUploadError> {
+        let progress: Arc<Box<dyn Fn(u32, i32) + Send + Sync>> = Arc::new(Box::new(|_, _| {}));
+        self.rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                upload_sealed_file(
+                    service,
+                    cs_uri,
+                    tid,
+                    FileInfo {
+                        path,
+                        name: "picture.jpg",
+                        mime: "image/jpeg",
+                        hash: Some("sha-256"),
+                    },
+                    thumbnail.map(|path| FileInfo {
+                        path,
+                        name: "thumbnail.jpg",
+                        mime: "image/jpeg",
+                        hash: None,
+                    }),
+                    &self.server(),
+                    &progress,
+                    seal,
+                ),
+            )
+            .await
+            .expect("the upload to end")
+        })
+    }
+}
+
+fn sealed_path(file: &TempFile) -> String {
+    format!("{}{}", file.0, SEALED_FILE_SUFFIX)
+}
+
+#[test]
+fn a_file_sealed_is_uploaded_in_its_stead_as_an_encrypted_file() {
+    let client = Client::new();
+    let (base, taken) = content_server(|request| {
+        if request.body.is_empty() {
+            response("204 No Content", &[], b"")
+        } else {
+            response("200 OK", &["Content-Type: application/xml"], RESULT_XML)
+        }
+    });
+    let file = TempFile::new(b"the picture");
+    let thumbnail = TempFile::new(b"the thumbnail");
+    let service = Arc::new(FileTransferOverHTTPService::new());
+    let count = Arc::new(Mutex::new(0));
+
+    let result = client.upload_sealed(
+        &service,
+        &format!("{}/upload", base),
+        Uuid::new_v4(),
+        &file.0,
+        Some(&thumbnail.0),
+        &counting_seal(&count),
+    );
+    // the XML, and what was given of the file and the thumbnail besides
+    // their ciphertext
+    let (xml, sealed_file, sealed_thumbnail) = result.ok().unwrap();
+    assert_eq!(xml.as_bytes(), RESULT_XML);
+    assert_eq!(sealed_file, b"picture.jpg image/jpeg");
+    assert_eq!(
+        sealed_thumbnail.as_deref(),
+        Some(&b"thumbnail.jpg image/jpeg"[..])
+    );
+    assert_eq!(*count.lock().unwrap(), 2);
+
+    // each under the name encrypted_file and the type message/mls-ft, with
+    // no hash (RCC.16 section 9.1.2.1)
+    next(&taken);
+    let body = String::from_utf8_lossy(&next(&taken).body).into_owned();
+    assert!(!body.contains("\r\n\r\nthe picture"), "{}", body);
+    assert!(body.contains("sealed the picture"), "{}", body);
+    assert!(body.contains("sealed the thumbnail"), "{}", body);
+    assert_eq!(
+        body.matches("filename=\"encrypted_file\"").count(),
+        2,
+        "{}",
+        body
+    );
+    assert_eq!(
+        body.matches("Content-Type: message/mls-ft").count(),
+        2,
+        "{}",
+        body
+    );
+    assert!(
+        !body.contains("picture.jpg") && !body.contains("sha-256"),
+        "{}",
+        body
+    );
+    // what was sealed deleted, the files as they were
+    assert!(std::fs::metadata(sealed_path(&file)).is_err());
+    assert!(std::fs::metadata(sealed_path(&thumbnail)).is_err());
+    assert_eq!(file.content(), b"the picture");
+    assert!(service.sealed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_upload_sealed_resumed_goes_on_with_what_was_sealed() {
+    let client = Client::new();
+    let fail = Arc::new(Mutex::new(true));
+    let fail_ = Arc::clone(&fail);
+    let (base, taken) = content_server(move |request| {
+        if request.target.ends_with("&get_upload_info") {
+            response("404 Not Found", &[], b"")
+        } else if request.body.is_empty() {
+            response("204 No Content", &[], b"")
+        } else if *fail_.lock().unwrap() {
+            response("500 Server Error", &[], b"")
+        } else {
+            response("200 OK", &[], RESULT_XML)
+        }
+    });
+    let file = TempFile::new(b"the picture");
+    let service = Arc::new(FileTransferOverHTTPService::new());
+    let count = Arc::new(Mutex::new(0));
+    let seal = counting_seal(&count);
+    let tid = Uuid::new_v4();
+    let cs_uri = format!("{}/upload", base);
+
+    // failed, what was sealed is kept
+    let result = client.upload_sealed(&service, &cs_uri, tid, &file.0, None, &seal);
+    assert_eq!(result.err().map(|e| e.error_code()), Some(500));
+    assert_eq!(
+        std::fs::read(sealed_path(&file)).unwrap(),
+        b"sealed the picture"
+    );
+    next(&taken);
+    next(&taken);
+
+    // resumed, uploaded as it was sealed, not sealed again
+    *fail.lock().unwrap() = false;
+    let (_, sealed_file, sealed_thumbnail) = client
+        .upload_sealed(&service, &cs_uri, tid, &file.0, None, &seal)
+        .ok()
+        .unwrap();
+    assert_eq!(sealed_file, b"picture.jpg image/jpeg");
+    assert_eq!(sealed_thumbnail, None);
+    assert_eq!(*count.lock().unwrap(), 1);
+    assert!(next(&taken).target.ends_with("&get_upload_info"));
+    next(&taken);
+    assert!(String::from_utf8_lossy(&next(&taken).body).contains("sealed the picture"));
+    assert!(std::fs::metadata(sealed_path(&file)).is_err());
+
+    // what was sealed gone, it is sealed again
+    let tid = Uuid::new_v4();
+    *fail.lock().unwrap() = true;
+    assert!(client
+        .upload_sealed(&service, &cs_uri, tid, &file.0, None, &seal)
+        .is_err());
+    std::fs::remove_file(sealed_path(&file)).unwrap();
+    *fail.lock().unwrap() = false;
+    assert!(client
+        .upload_sealed(&service, &cs_uri, tid, &file.0, None, &seal)
+        .is_ok());
+    assert_eq!(*count.lock().unwrap(), 3);
+}
+
+#[test]
+fn a_file_that_cannot_be_sealed_is_not_uploaded() {
+    let client = Client::new();
+    let (base, taken) = content_server(|_| response("200 OK", &[], RESULT_XML));
+    let file = TempFile::new(b"the picture");
+    let service = Arc::new(FileTransferOverHTTPService::new());
+    let cs_uri = format!("{}/upload", base);
+
+    let not_sealing = |_: &[u8], _: &str, _: &str| None;
+    let result = client.upload_sealed(
+        &service,
+        &cs_uri,
+        Uuid::new_v4(),
+        &file.0,
+        None,
+        &not_sealing,
+    );
+    assert!(matches!(result, Err(FileUploadError::IO)));
+    // nor one not there
+    let count = Arc::new(Mutex::new(0));
+    let result = client.upload_sealed(
+        &service,
+        &cs_uri,
+        Uuid::new_v4(),
+        "/nonexistent/file",
+        None,
+        &counting_seal(&count),
+    );
+    assert!(matches!(result, Err(FileUploadError::IO)));
+    assert_eq!(*count.lock().unwrap(), 0);
+    assert!(taken.recv_timeout(Duration::from_millis(300)).is_err());
 }

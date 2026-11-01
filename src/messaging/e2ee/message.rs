@@ -24,18 +24,21 @@ use rust_rcs_core::cpim::{CPIMHeaders, CPIMInfo, CPIMMessage};
 use rust_rcs_core::imdn::notification::{Imdn, Notification, Status};
 use rust_rcs_core::internet::Body;
 use rust_rcs_core::mls::rcs::imdn::{failure_reason, FailureReason};
+use rust_rcs_core::mls::rcs::proto;
 use rust_rcs_core::mls::rcs::wire::{
     self, AuthenticatedData, DeliveryNotificationStatus, DisplayNotificationStatus,
     VerifiableDeliveryImdn, VerifiableDerivedContent, VerifiableDisplayImdn,
 };
 use rust_rcs_core::mls::rcs::{
     credential_tel_uris, is_unencrypted_cpim_header, ClientFailureReason, ResentFailure,
-    SecretPayloadType, CPIM_HEADER_DERIVED_CONTENT_SIGNATURE, CPIM_HEADER_EPOCH_AUTHENTICATOR,
-    CPIM_HEADER_ERA_ID, CPIM_HEADER_ORIGINAL_MESSAGE_ID, CPIM_NAMESPACE, CPIM_NAMESPACE_PREFIX,
+    SecretPayloadType, CONTENT_TYPE_MLS_RCS_FILE_INFO, CPIM_HEADER_DERIVED_CONTENT_SIGNATURE,
+    CPIM_HEADER_EPOCH_AUTHENTICATOR, CPIM_HEADER_ERA_ID, CPIM_HEADER_ORIGINAL_MESSAGE_ID,
+    CPIM_NAMESPACE, CPIM_NAMESPACE_PREFIX,
 };
 use rust_rcs_core::mls::{Credential, ErrorKind};
 
 use super::device::{is_of, participant_tel_uri, E2eeDevice};
+use super::file::{file_urls, with_mls_file, CONTENT_TYPE_FT_HTTP};
 use super::sent::{members_besides, note_sent};
 use super::store::StoreError;
 
@@ -71,6 +74,11 @@ pub enum MessageError {
     /// sender is told of one not decrypted, not of one not matching its
     /// HMAC (sections 10.2, 10.4, Annex C.4.2)
     ResentNotOpened(ResentFailure),
+    /// A file transfer message telling of a file not uploaded as the group
+    /// chat is: not encrypted for it while it is encrypted, as when it was
+    /// uploaded otherwise or over a day before, or encrypted for it once it
+    /// is no longer (RCC.16 section 9.1.2.1)
+    FileNotFit,
     Store(StoreError),
 }
 
@@ -120,6 +128,28 @@ pub(super) fn outer_cpim(
     era: u32,
     mls_message: &[u8],
 ) -> Vec<u8> {
+    outer_cpim_of(
+        headers,
+        disposition,
+        original_message_id,
+        epoch_authenticator,
+        era,
+        b"message/mls",
+        mls_message,
+    )
+}
+
+/// The CPIM message carrying `body`, of `content_type`, of the headers
+/// outer_cpim() is of
+fn outer_cpim_of(
+    headers: &[(Vec<u8>, Vec<u8>)],
+    disposition: &[u8],
+    original_message_id: Option<&[u8]>,
+    epoch_authenticator: &[u8],
+    era: u32,
+    content_type: &[u8],
+    body: &[u8],
+) -> Vec<u8> {
     let mut data = Vec::new();
     let (core, prefixed): (Vec<_>, Vec<_>) =
         headers.iter().partition(|(name, _)| !name.contains(&b'.'));
@@ -155,15 +185,23 @@ pub(super) fn outer_cpim(
         era.to_string().as_bytes(),
     );
     data.extend_from_slice(b"\r\n");
-    header_line(&mut data, b"Content-Type", b"message/mls");
+    header_line(&mut data, b"Content-Type", content_type);
     header_line(
         &mut data,
         b"Content-Length",
-        mls_message.len().to_string().as_bytes(),
+        body.len().to_string().as_bytes(),
     );
     data.extend_from_slice(b"\r\n");
-    data.extend_from_slice(mls_message);
+    data.extend_from_slice(body);
     data
+}
+
+/// Whether the Content-Type `content_type` is of the media type `media_type`
+fn is_of_type(content_type: &[u8], media_type: &[u8]) -> bool {
+    content_type
+        .split(|b| *b == b';')
+        .next()
+        .is_some_and(|t| t.trim_ascii().eq_ignore_ascii_case(media_type))
 }
 
 /// The tel URI of the participant the CPIM From of `cpim_info` gives, if any
@@ -232,6 +270,13 @@ impl E2eeDevice {
     /// carrying it as `message/mls` (RCC.16 sections 7.5, 7.5.1.2, 7.5.5 to
     /// 7.5.7)
     ///
+    /// A file transfer message carries the XML telling where the file is in
+    /// its stead, with the mls-file element carrying the MlsMessage: what is
+    /// encrypted carries the FileInfo of the file and its thumbnail, as
+    /// `message/mls-rcs-file-info` (sections 7.8, 9.1.2.1). They are to be
+    /// uploaded encrypted for the group within a day, as upload_group_file()
+    /// of the engine does; such a message is not kept to be re-sent.
+    ///
     /// Not while a Commit of this client waits for the Conversation Focus to
     /// accept it, as the message would be of an epoch the others leave, nor
     /// once the Focus refused the Commit that made the group.
@@ -245,14 +290,44 @@ impl E2eeDevice {
         if self.heals().ongoing(conversation_id) {
             return Err(MessageError::Pending);
         }
+        let body = Body::construct_message(cpim).map_err(|_| MessageError::NotCpim)?;
+        let message = CPIMMessage::try_from(&body).map_err(|_| MessageError::NotCpim)?;
+        // a file transfer message, of a file encrypted for the group, whose
+        // FileInfo is encrypted in place of what it carries (sections 7.8,
+        // 9.1.2.1)
+        let file_transfer = match message.get_message_body() {
+            Some((Some(content_type), xml, false))
+                if is_of_type(content_type, CONTENT_TYPE_FT_HTTP) =>
+            {
+                let file_info = file_urls(xml)
+                    .0
+                    .and_then(|url| self.uploaded_file_info(conversation_id, &url));
+                Some((xml.to_vec(), file_info))
+            }
+            _ => None,
+        };
+        let not_encrypted = || match &file_transfer {
+            Some((_, Some(_))) => MessageError::FileNotFit,
+            _ => MessageError::NotEncrypted,
+        };
         // nor encrypted while the Focus has no MLS group for it, an Era of
         // the device moving it back to encrypted waiting or not (sections
         // 10.1, 11.1)
         if self.upgrades().without_group(conversation_id) {
-            return Err(MessageError::NotEncrypted);
+            return Err(not_encrypted());
         }
-        let body = Body::construct_message(cpim).map_err(|_| MessageError::NotCpim)?;
-        let message = CPIMMessage::try_from(&body).map_err(|_| MessageError::NotCpim)?;
+        let file_transfer = match file_transfer {
+            Some((xml, Some(file_info))) if with_mls_file(&xml, b"").is_some() => {
+                Some((xml, file_info))
+            }
+            // one not sealed is sent as it is once the group is unencrypted
+            // (section 11.2)
+            Some((_, None)) if self.encryption_ended(conversation_id) => {
+                return Err(MessageError::NotEncrypted)
+            }
+            Some(_) => return Err(MessageError::FileNotFit),
+            None => None,
+        };
         let message_id = message
             .get_info()
             .map_err(|_| MessageError::NotCpim)?
@@ -301,9 +376,28 @@ impl E2eeDevice {
             header_line(&mut payload, &name, value);
         }
         payload.extend_from_slice(b"\r\n");
-        if let Ok(mut reader) = message.body.reader() {
-            // in memory, it does not fail
-            let _ = reader.read_to_end(&mut payload);
+        match &file_transfer {
+            Some((_, file_info)) => {
+                let file_info = proto::encode(file_info);
+                header_line(
+                    &mut payload,
+                    b"Content-Type",
+                    CONTENT_TYPE_MLS_RCS_FILE_INFO,
+                );
+                header_line(
+                    &mut payload,
+                    b"Content-Length",
+                    file_info.len().to_string().as_bytes(),
+                );
+                payload.extend_from_slice(b"\r\n");
+                payload.extend_from_slice(&file_info);
+            }
+            None => {
+                if let Ok(mut reader) = message.body.reader() {
+                    // in memory, it does not fail
+                    let _ = reader.read_to_end(&mut payload);
+                }
+            }
         }
 
         let (pending, epoch, ended) = self
@@ -320,7 +414,10 @@ impl E2eeDevice {
             return Err(MessageError::Pending);
         }
         if ended {
-            return Err(MessageError::NotEncrypted);
+            return Err(match file_transfer {
+                Some(_) => MessageError::FileNotFit,
+                None => MessageError::NotEncrypted,
+            });
         }
         // the group of the device alone, as no Commit was applied to it
         if epoch == 0 {
@@ -358,16 +455,20 @@ impl E2eeDevice {
                     ))
                 },
                 |data, (_, members)| {
-                    note_sent(
-                        data,
-                        conversation_id,
-                        &message_id_text,
-                        &payload,
-                        kept_headers,
-                        &disposition,
-                        members.clone(),
-                        now,
-                    )
+                    // not a file transfer message, whose Re-Sent Message
+                    // would not tell where the file is
+                    if file_transfer.is_none() {
+                        note_sent(
+                            data,
+                            conversation_id,
+                            &message_id_text,
+                            &payload,
+                            kept_headers,
+                            &disposition,
+                            members.clone(),
+                            now,
+                        )
+                    }
                 },
             )
             .map(|((made, _), noted)| (made, noted))
@@ -377,14 +478,27 @@ impl E2eeDevice {
             .into_iter()
             .map(|(name, value)| (name, value.to_vec()))
             .collect();
-        Ok(outer_cpim(
-            &unencrypted,
-            &disposition,
-            None,
-            &epoch_authenticator,
-            era,
-            &mls_message,
-        ))
+        Ok(match file_transfer {
+            // the XML telling where the file is, with the MlsMessage
+            // (section 7.8.2)
+            Some((xml, _)) => outer_cpim_of(
+                &unencrypted,
+                &disposition,
+                None,
+                &epoch_authenticator,
+                era,
+                CONTENT_TYPE_FT_HTTP,
+                &with_mls_file(&xml, &mls_message).ok_or(MessageError::FileNotFit)?,
+            ),
+            None => outer_cpim(
+                &unencrypted,
+                &disposition,
+                None,
+                &epoch_authenticator,
+                era,
+                &mls_message,
+            ),
+        })
     }
 
     /// The CPIM message the `message/mls` `mls_message` of the MLS group

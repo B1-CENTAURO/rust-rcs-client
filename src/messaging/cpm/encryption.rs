@@ -133,6 +133,17 @@ pub enum FtdAnswer {
     Heal,
 }
 
+/// A file encrypted with a key of its own before it is uploaded for an
+/// encrypted group chat (RCC.16 section 9.1.2.1, Annex C.2)
+#[derive(Clone, Debug, PartialEq)]
+pub struct SealedFile {
+    /// What is uploaded in place of the file
+    pub ciphertext: Vec<u8>,
+    /// What the FileInfo the message sending it carries is to tell of it:
+    /// its name, its type and its key, as a FileMetadata (section 7.8.1)
+    pub metadata: Vec<u8>,
+}
+
 /// Why a group chat moves to unencrypted (RCC.16 sections 7.11.2.2, 11.2)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EndReason {
@@ -373,6 +384,29 @@ pub trait GroupEncryption: Send + Sync {
         from: String,
         to: String,
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
+
+    /// Whether the files sent in the group chat `conversation_id` are to be
+    /// encrypted before they are uploaded, as it is encrypted (RCC.16 section
+    /// 9.1.2.1)
+    fn encrypts_files(&self, conversation_id: &str) -> bool;
+
+    /// The file `content`, named `name` and of `content_type`, encrypted with
+    /// a key of its own, its name taken in (RCC.16 section 9.1.2.1, Annex
+    /// C.2); None if it cannot be
+    fn seal_file(&self, content: &[u8], name: &str, content_type: &str) -> Option<SealedFile>;
+
+    /// Keeps what the FileInfo of the files sealed with seal_file() is to
+    /// tell, the file's `file` and its thumbnail's `thumbnail`, for the
+    /// message sending them in the group chat `conversation_id` to carry, by
+    /// the URL of the file the XML `xml` of the content server tells (RCC.16
+    /// sections 7.8, 9.1.2.1); false if it tells none
+    fn uploaded(
+        &self,
+        conversation_id: &str,
+        xml: &[u8],
+        file: &[u8],
+        thumbnail: Option<&[u8]>,
+    ) -> bool;
 
     /// Lets go of the MLS group `conversation_id`, as its chat did not start,
     /// its invitation was not accepted, or the user left it
