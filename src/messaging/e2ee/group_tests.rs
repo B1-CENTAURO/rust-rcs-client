@@ -46,8 +46,8 @@ use rust_rcs_core::mls::{
 
 use crate::capability::{Capabilities, CapabilityQuery};
 use crate::messaging::cpm::encryption::{
-    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken,
-    Upgrade, Verified,
+    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed,
+    SealedFile, Taken, Upgrade, Verified,
 };
 use crate::messaging::cpm::make_cpim_imdn_body;
 
@@ -8177,4 +8177,224 @@ fn a_file_transfer_message_is_not_sent_unless_its_files_were_sealed_for_the_grou
     let not_fit = |xml: &str| device.encrypt_message(CONVERSATION, &file_transfer("ft-2", xml));
     assert_eq!(not_fit(&xml), Err(MessageError::FileNotFit));
     assert_eq!(not_fit(&plain), Err(MessageError::NotEncrypted));
+}
+
+/// The device, enrolled and telling the time of `clock`, in a group with
+/// Bob, the Commit making it accepted, and the app keeping its state
+fn alice_and_bob_kept(
+    clock: &Clock,
+) -> (
+    Arc<E2eeDevice>,
+    Arc<Kds>,
+    Arc<App>,
+    MlsClient,
+    MlsConversation,
+) {
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) = enrolled_in_time(
+        Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]),
+        Some(clock),
+    );
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let bobs_group = joined(&bob, &bundle_of(&cpim));
+    accepted_from_device(&device);
+    (device, kds, app, bob, bobs_group)
+}
+
+/// What Bob sends the group of a file and its thumbnail he uploaded
+/// encrypted, the file at `file_url`, its FileInfo the payload of the
+/// mls-file as it is encrypted (RCC.16 sections 7.8, 9.1.2.1): the CPIM
+/// message carrying it, its XML, and the file and the thumbnail sealed
+fn file_transfer_from_bob(
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+    file_url: &str,
+    message_id: &str,
+    payload: impl FnOnce(&proto::FileInfo) -> Vec<u8>,
+) -> (Vec<u8>, Vec<u8>, SealedFile, SealedFile) {
+    let file = super::file::seal_file(b"the picture", "picture <1>.jpg", "image/jpeg").unwrap();
+    let thumbnail = super::file::seal_file(b"the thumbnail", "thumbnail.jpg", "image/png").unwrap();
+    let file_info = proto::FileInfo {
+        file: Some(proto::decode(&file.metadata).unwrap()),
+        thumbnail: Some(proto::decode(&thumbnail.metadata).unwrap()),
+        ..proto::FileInfo::default()
+    };
+    let mls_message = bobs_group
+        .encrypt_cpim(bob, &payload(&file_info), message_id.as_bytes(), b"")
+        .unwrap();
+    let xml =
+        super::file::with_mls_file(super::file::upload_xml(file_url).as_bytes(), &mls_message)
+            .unwrap();
+    let mut outer = format!(
+        "From: <tel:+491707654321>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:01.000+00:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: {}\r\n\
+imdn.Disposition-Notification: positive-delivery, negative-delivery\r\n\
+\r\n\
+Content-Type: application/vnd.gsma.rcs-ft-http+xml\r\n\
+Content-Length: {}\r\n\
+\r\n",
+        GROUP_URI,
+        message_id,
+        xml.len()
+    )
+    .into_bytes();
+    outer.extend_from_slice(&xml);
+    (outer, xml, file, thumbnail)
+}
+
+/// The payload of the FileInfo `file_info`, with no encrypted header (RCC.16
+/// section 7.8.1)
+fn file_info_payload(file_info: &proto::FileInfo) -> Vec<u8> {
+    let file_info = proto::encode(file_info);
+    let mut payload = format!(
+        "\r\nContent-Type: message/mls-rcs-file-info\r\nContent-Length: {}\r\n\r\n",
+        file_info.len()
+    )
+    .into_bytes();
+    payload.extend_from_slice(&file_info);
+    payload
+}
+
+const THUMBNAIL_URL: &str = "https://ftcs.example.com/t/1?a=1&b=2";
+
+#[test]
+fn a_file_transfer_message_received_gives_the_xml_of_its_files_and_keeps_their_keys() {
+    let clock = Clock::new();
+    let (device, kds, app, bob, mut bobs_group) = alice_and_bob_kept(&clock);
+    let url = "https://ftcs.example.com/f/1";
+    let (outer, xml, file, thumbnail) =
+        file_transfer_from_bob(&bob, &mut bobs_group, url, "bob-ft-1", file_info_payload);
+    let info = cpim_message(&outer);
+    let info = info.get_info().unwrap();
+    assert!(!device.opens_file(url));
+
+    // the XML with the names and types the files had, without the mls-file,
+    // in the CPIM message it came in (RCC.16 section 9.1.2.2)
+    let cpim = device
+        .decrypt_file_transfer(CONVERSATION, &info, &xml)
+        .unwrap();
+    let message = cpim_message(&cpim);
+    let decrypted = message.get_info().unwrap();
+    assert_eq!(decrypted.from, b"<tel:+491707654321>");
+    assert_eq!(decrypted.imdn_message_id, b"bob-ft-1");
+    let (content_type, opened, _) = message.get_message_body().unwrap();
+    assert_eq!(
+        content_type,
+        Some(&b"application/vnd.gsma.rcs-ft-http+xml"[..])
+    );
+    let opened = String::from_utf8_lossy(opened).into_owned();
+    assert!(
+        opened.contains("<file-name>picture &lt;1&gt;.jpg</file-name>"),
+        "{}",
+        opened
+    );
+    assert!(
+        opened.contains("<content-type>image/jpeg</content-type>"),
+        "{}",
+        opened
+    );
+    assert!(
+        opened.contains("<content-type>image/png</content-type>"),
+        "{}",
+        opened
+    );
+    assert!(!opened.contains("mls-file") && !opened.contains("encrypted_file"));
+    assert!(!opened.contains("message/mls-ft"));
+    assert_eq!(
+        super::file::file_urls(opened.as_bytes()),
+        (Some(String::from(url)), Some(String::from(THUMBNAIL_URL)))
+    );
+
+    // their keys kept with the MLS state, through a restart
+    assert!(device.opens_file(url) && device.opens_file(THUMBNAIL_URL));
+    assert!(!device.opens_file("https://ftcs.example.com/f/2"));
+    let restored = {
+        let clock = clock.clone();
+        alice(&app, &kds, TODAY, Some(&app.last().unwrap())).with_clock(move || clock.now())
+    };
+    assert!(restored.opens_file(url));
+
+    // each downloaded opened with its key, which is forgotten then; not what
+    // does not open, its key kept (Annex C.3)
+    assert_eq!(restored.open_file(url, &thumbnail.ciphertext), None);
+    assert!(restored.opens_file(url));
+    assert_eq!(
+        restored.open_file(url, &file.ciphertext).as_deref(),
+        Some(&b"the picture"[..])
+    );
+    assert!(!restored.opens_file(url));
+    assert_eq!(restored.open_file(url, &file.ciphertext), None);
+    assert_eq!(
+        restored
+            .open_file(THUMBNAIL_URL, &thumbnail.ciphertext)
+            .as_deref(),
+        Some(&b"the thumbnail"[..])
+    );
+
+    // kept 30 days
+    let url = "https://ftcs.example.com/f/3";
+    let (outer, xml, _, _) =
+        file_transfer_from_bob(&bob, &mut bobs_group, url, "bob-ft-2", file_info_payload);
+    restored
+        .decrypt_file_transfer(
+            CONVERSATION,
+            &cpim_message(&outer).get_info().unwrap(),
+            &xml,
+        )
+        .unwrap();
+    clock.advance(30 * DAY - Duration::from_secs(1));
+    assert!(restored.opens_file(url));
+    clock.advance(Duration::from_secs(1));
+    assert!(!restored.opens_file(url));
+    assert!(!restored.opens_file(THUMBNAIL_URL));
+}
+
+#[test]
+fn a_file_transfer_message_is_not_taken_unless_its_mls_file_tells_of_its_file() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let url = "https://ftcs.example.com/f/1";
+    let decrypted = |outer: &[u8], xml: &[u8]| {
+        device.decrypt_file_transfer(CONVERSATION, &cpim_message(outer).get_info().unwrap(), xml)
+    };
+
+    // a message of another type (RCC.16 section 7.8.1)
+    let (outer, xml, _, _) = file_transfer_from_bob(&bob, &mut bobs_group, url, "bob-ft-1", |_| {
+        b"\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi".to_vec()
+    });
+    assert_eq!(decrypted(&outer, &xml), Err(MessageError::NotFileTransfer));
+    // a FileInfo of no file
+    let (outer, xml, _, _) =
+        file_transfer_from_bob(&bob, &mut bobs_group, url, "bob-ft-2", |file_info| {
+            file_info_payload(&proto::FileInfo {
+                file: None,
+                ..file_info.clone()
+            })
+        });
+    assert_eq!(decrypted(&outer, &xml), Err(MessageError::NotFileTransfer));
+    // an XML telling of no file
+    let (outer, xml, _, _) =
+        file_transfer_from_bob(&bob, &mut bobs_group, url, "bob-ft-3", file_info_payload);
+    let no_file = String::from_utf8_lossy(&xml).replace("type=\"file\"", "type=\"other\"");
+    assert_eq!(
+        decrypted(&outer, no_file.as_bytes()),
+        Err(MessageError::NotFileTransfer)
+    );
+    // nor one of no mls-file
+    let plain = super::file::upload_xml(url);
+    assert_eq!(
+        decrypted(&outer, plain.as_bytes()),
+        Err(MessageError::NotFileTransfer)
+    );
+    // nor one of another Message-ID than the CPIM message (section 7.5.3.1)
+    let (_, xml, _, _) =
+        file_transfer_from_bob(&bob, &mut bobs_group, url, "bob-ft-4", file_info_payload);
+    let (outer, _, _, _) =
+        file_transfer_from_bob(&bob, &mut bobs_group, url, "bob-ft-5", file_info_payload);
+    assert!(decrypted(&outer, &xml).is_err());
+    assert!(!device.opens_file(url));
+    assert!(!device.opens_file(THUMBNAIL_URL));
 }

@@ -25,6 +25,7 @@ pub mod upload;
 
 pub use content_server::{ContentServer, Credentials};
 pub use download::download_file;
+pub use download::download_sealed_file;
 
 pub use upload::upload_file;
 pub use upload::upload_sealed_file;

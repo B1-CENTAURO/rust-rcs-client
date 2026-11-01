@@ -408,6 +408,28 @@ pub trait GroupEncryption: Send + Sync {
         thumbnail: Option<&[u8]>,
     ) -> bool;
 
+    /// The CPIM message the file transfer message of the group chat
+    /// `conversation_id`, delivered in the CPIM message `cpim_info` tells of
+    /// with the XML `xml` and its mls-file, carries decrypted: the XML with
+    /// the names and types of the files as they were, without the mls-file,
+    /// whose keys are kept for the files to be opened once downloaded
+    /// (RCC.16 sections 7.8, 9.1.2.2); None if it cannot be decrypted
+    fn decrypt_file_transfer(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        xml: &[u8],
+    ) -> Option<Vec<u8>>;
+
+    /// Whether the file at `url` was received encrypted, its key kept for it
+    /// to be opened once downloaded with open_file() (RCC.16 section 9.1.2.2)
+    fn opens_file(&self, url: &str) -> bool;
+
+    /// `ciphertext`, downloaded from `url`, decrypted with the key kept for
+    /// it, which is forgotten then (RCC.16 section 9.1.2.2, Annex C.3); None
+    /// if it does not open
+    fn open_file(&self, url: &str, ciphertext: &[u8]) -> Option<Vec<u8>>;
+
     /// Lets go of the MLS group `conversation_id`, as its chat did not start,
     /// its invitation was not accepted, or the user left it
     fn abandon(&self, conversation_id: &str);

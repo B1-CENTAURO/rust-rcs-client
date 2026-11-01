@@ -2001,16 +2001,25 @@ impl CPMSessionService {
                   content_type: &[u8],
                   content_body: &[u8]| {
                 // what an encrypted message carries, decrypted (RCC.16
-                // section 9.1.1); none of an unencrypted one taken
-                if content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS) {
+                // section 9.1.1); none of an unencrypted one taken; and a
+                // file transfer message of an encrypted group with the keys
+                // of its files (section 9.1.2.2)
+                let file_transfer = carries_mls_file(content_type, content_body)
+                    && session.get_inner().get_session_info().encryption.is_some();
+                if content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS) || file_transfer {
                     let inner = session.get_inner();
                     let session_info = inner.get_session_info();
                     let decrypted = session_info
                         .encryption
                         .as_ref()
                         .zip(session_info.conversation_id.as_ref())
-                        .and_then(|(encryption, conversation_id)| {
-                            encryption.decrypt(conversation_id, cpim_info, content_body)
+                        .and_then(|(encryption, conversation_id)| match file_transfer {
+                            true => encryption.decrypt_file_transfer(
+                                conversation_id,
+                                cpim_info,
+                                content_body,
+                            ),
+                            false => encryption.decrypt(conversation_id, cpim_info, content_body),
                         });
                     if let Some(cpim) = decrypted {
                         let message = Body::construct_message(&cpim)
@@ -2105,13 +2114,10 @@ impl CPMSessionService {
                             for_app = Some(telling_of(content_body, original_message_id));
                         }
                     }
-                } else if is_plaintext_message(content_type)
-                    && !carries_mls_file(content_type, content_body)
-                {
+                } else if is_plaintext_message(content_type) {
                     // as does a message sent unencrypted in an encrypted
                     // group (RCC.16 section 11.2), which the app takes all
-                    // the same; not a file transfer message carrying the
-                    // keys of its files encrypted (section 7.8.2)
+                    // the same
                     let inner = session.get_inner();
                     let session_info = inner.get_session_info();
                     let encrypted = session_info

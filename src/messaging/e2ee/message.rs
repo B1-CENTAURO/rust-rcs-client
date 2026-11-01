@@ -79,6 +79,10 @@ pub enum MessageError {
     /// uploaded otherwise or over a day before, or encrypted for it once it
     /// is no longer (RCC.16 section 9.1.2.1)
     FileNotFit,
+    /// A file transfer message whose mls-file is not that of a FileInfo
+    /// telling of the file the XML tells where it is (RCC.16 sections 7.8,
+    /// 9.1.2.2)
+    NotFileTransfer,
     Store(StoreError),
 }
 

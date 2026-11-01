@@ -2185,6 +2185,9 @@ struct ScriptedEncryption {
     encrypted: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     /// The CPIM message it decrypts the encrypted messages to, if it can
     plaintext: Option<String>,
+    /// The CPIM message it decrypts the file transfer messages carrying an
+    /// mls-file to, if it can
+    file_transfer: Option<String>,
     /// What it signs the notifications of those as, if it can
     signature: Option<String>,
     /// The Conversation-ID and CPIM message of each notification to sign
@@ -2411,6 +2414,29 @@ impl GroupEncryption for ScriptedEncryption {
         _thumbnail: Option<&[u8]>,
     ) -> bool {
         true
+    }
+
+    fn decrypt_file_transfer(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        xml: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.decrypted.lock().unwrap().push((
+            String::from(conversation_id),
+            String::from_utf8_lossy(cpim_info.from).into_owned(),
+            String::from_utf8_lossy(cpim_info.imdn_message_id).into_owned(),
+            xml.to_vec(),
+        ));
+        self.file_transfer.clone().map(String::into_bytes)
+    }
+
+    fn opens_file(&self, _url: &str) -> bool {
+        false
+    }
+
+    fn open_file(&self, _url: &str, _ciphertext: &[u8]) -> Option<Vec<u8>> {
+        None
     }
 
     fn metadata_keys_due(&self, _conversation_id: &str) -> bool {
@@ -3289,6 +3315,24 @@ impl GroupEncryption for EncryptingPrepared {
         thumbnail: Option<&[u8]>,
     ) -> bool {
         self.0.uploaded(conversation_id, xml, file, thumbnail)
+    }
+
+    fn decrypt_file_transfer(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        xml: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.0
+            .decrypt_file_transfer(conversation_id, cpim_info, xml)
+    }
+
+    fn opens_file(&self, url: &str) -> bool {
+        self.0.opens_file(url)
+    }
+
+    fn open_file(&self, url: &str, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        self.0.open_file(url, ciphertext)
     }
 
     fn metadata_keys_due(&self, conversation_id: &str) -> bool {
@@ -6368,6 +6412,52 @@ fn what_a_client_not_encrypting_sends_moves_the_group_to_unencrypted() {
     }
 }
 
+/// A file transfer message of an encrypted group from Alice, carrying the
+/// keys of its file in its mls-file (RCC.16 section 7.8.2)
+fn encrypted_file_transfer() -> String {
+    group_cpim(
+        ALICE,
+        "",
+        "<file><file-info type=\"file\"><data url=\"https://ftcs.example.com/f/1\"/></file-info><mls-file>AAEC</mls-file></file>",
+    )
+    .replace("text/plain", "application/vnd.gsma.rcs-ft-http+xml")
+}
+
+#[test]
+fn a_file_transfer_message_of_an_encrypted_group_is_given_to_the_app_decrypted() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = ending_in(
+        &client,
+        ScriptedEncryption {
+            file_transfer: Some(format!(
+                "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: alice-ft-1\r\n\r\nContent-Type: application/vnd.gsma.rcs-ft-http+xml\r\n\r\n<file>picture.jpg</file>",
+                ALICE, GROUP
+            )),
+            ..ScriptedEncryption::default()
+        },
+    );
+    let (mut connection, msrp_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-file-transfer");
+
+    connection.send_cpim(&rt, &msrp_path, &our_path, &encrypted_file_transfer());
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    // the XML the encryption gives in its place (section 9.1.2.2)
+    let received = client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(received.1, "application/vnd.gsma.rcs-ft-http+xml");
+    assert_eq!(received.2, "<file>picture.jpg</file>");
+    let decrypted = encryption.decrypted.lock().unwrap().clone();
+    assert_eq!(decrypted.len(), 1);
+    assert_eq!(decrypted[0].0, "conversation-1");
+    assert!(String::from_utf8_lossy(&decrypted[0].3).contains("<mls-file>AAEC</mls-file>"));
+    // nor did it move the group to unencrypted
+    connection.quiet(&rt);
+    assert!(encryption.ended.lock().unwrap().is_empty());
+}
+
 #[test]
 fn what_is_not_an_rcs_message_does_not_move_the_group_to_unencrypted() {
     let (client, mut peer) = start(true);
@@ -6378,7 +6468,7 @@ fn what_is_not_an_rcs_message_does_not_move_the_group_to_unencrypted() {
 
     // an is-composing, a notification signed, nor what the focus sends,
     // nor a file transfer message carrying the keys of its files encrypted
-    // (RCC.16 section 7.8.2)
+    // (RCC.16 section 7.8.2), which it does not decrypt
     for (content_type, content) in [
         (
             "application/im-iscomposing+xml",
@@ -6386,16 +6476,12 @@ fn what_is_not_an_rcs_message_does_not_move_the_group_to_unencrypted() {
         ),
         ("message/cpim", group_imdn_cpim("message-1", "<delivered/>")),
         ("message/cpim", from_the_focus("a control message")),
-        (
-            "message/cpim",
-            group_cpim(ALICE, "", "<file><mls-file>AAEC</mls-file></file>")
-                .replace("text/plain", "application/vnd.gsma.rcs-ft-http+xml"),
-        ),
+        ("message/cpim", encrypted_file_transfer()),
     ] {
         connection.send_content(&rt, &msrp_path, &our_path, content_type, &content);
         assert!(connection.next_response(&rt).first_line.contains(" 200"));
     }
-    for _ in 0..3 {
+    for _ in 0..2 {
         assert!(client.received.recv_timeout(Duration::from_secs(5)).is_ok());
     }
 

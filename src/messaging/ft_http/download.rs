@@ -33,6 +33,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 use url::Url;
 
 use super::content_server::{reason_phrase, Auth, ContentServer};
+use super::upload::SEALED_FILE_SUFFIX;
 
 const LOG_TAG: &str = "fthttp";
 
@@ -41,6 +42,9 @@ pub enum FileDownloadError {
     IO,
     MalformedHost,
     NetworkIO,
+    /// A file received encrypted that did not open with its key (RCC.16
+    /// section 9.1.2.2)
+    NotOpened,
 }
 
 impl FileDownloadError {
@@ -50,6 +54,7 @@ impl FileDownloadError {
             FileDownloadError::IO => 0,
             FileDownloadError::MalformedHost => 0,
             FileDownloadError::NetworkIO => 0,
+            FileDownloadError::NotOpened => 0,
         }
     }
 
@@ -59,6 +64,7 @@ impl FileDownloadError {
             FileDownloadError::IO => String::from("IO"),
             FileDownloadError::MalformedHost => String::from("MalformedHost"),
             FileDownloadError::NetworkIO => String::from("NetworkIO"),
+            FileDownloadError::NotOpened => String::from("NotOpened"),
         }
     }
 }
@@ -72,6 +78,7 @@ impl Display for FileDownloadError {
             FileDownloadError::IO => f.write_str("IO"),
             FileDownloadError::MalformedHost => f.write_str("MalformedHost"),
             FileDownloadError::NetworkIO => f.write_str("NetworkIO"),
+            FileDownloadError::NotOpened => f.write_str("NotOpened"),
         }
     }
 }
@@ -268,4 +275,44 @@ fn get_progress_total(total: Option<usize>) -> i32 {
     } else {
         -1
     }
+}
+
+/// Downloads the file at `file_uri`, received encrypted, as download_file()
+/// does, into a file at `download_path` with SEALED_FILE_SUFFIX appended,
+/// going on from what is there of it, then has `open` decrypt it into
+/// `download_path` and deletes it (RCC.16 section 9.1.2.2)
+///
+/// One that does not open is deleted all the same, for it to be downloaded
+/// afresh.
+pub async fn download_sealed_file<F>(
+    file_uri: &str,
+    download_path: &str,
+    total: Option<usize>,
+    server: &ContentServer<'_>,
+    progress_callback: F,
+    open: &(dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync),
+) -> Result<(), FileDownloadError>
+where
+    F: Fn(u32, i32) + Send + Sync + 'static,
+{
+    let sealed_path = format!("{}{}", download_path, SEALED_FILE_SUFFIX);
+    let start = std::fs::metadata(&sealed_path)
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        .unwrap_or(0);
+    download_file(
+        file_uri,
+        &sealed_path,
+        start,
+        total,
+        server,
+        progress_callback,
+    )
+    .await?;
+
+    let ciphertext = std::fs::read(&sealed_path).map_err(|_| FileDownloadError::IO)?;
+    let opened = open(&ciphertext);
+    let _ = std::fs::remove_file(&sealed_path);
+    let opened = opened.ok_or(FileDownloadError::NotOpened)?;
+    std::fs::write(download_path, opened).map_err(|_| FileDownloadError::IO)
 }
