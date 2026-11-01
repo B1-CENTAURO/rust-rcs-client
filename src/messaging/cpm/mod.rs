@@ -266,10 +266,12 @@ pub fn make_cpim_message_content_body(
 
 /// The CPIM message of the IMDN document `imdn_xml`, to `recipient_uri`: the
 /// document as it is, as a notification (RFC 5438 section 7.1), and asking
-/// for no notification of itself
+/// for no notification of itself; with the Original-Message-ID
+/// `original_message_id` if it tells of a Re-Sent Message
 pub fn make_cpim_imdn_body(
     imdn_xml: &str,
     recipient_uri: &str,
+    original_message_id: Option<&str>,
     public_user_identity: &str,
 ) -> Body {
     let content_body = Vec::from(imdn_xml);
@@ -287,7 +289,7 @@ pub fn make_cpim_imdn_body(
 
     let utc: DateTime<Local> = Local::now();
 
-    let cpim_headers = vec![
+    let mut cpim_headers = vec![
         Header::new("From", format!("<{}>", public_user_identity)),
         Header::new("To", format!("<{}>", recipient_uri)),
         Header::new(
@@ -297,6 +299,15 @@ pub fn make_cpim_imdn_body(
         Header::new("NS", "imdn <urn:ietf:params:imdn>"),
         Header::new("imdn.Message-ID", new_message_id()),
     ];
+    // that of a Re-Sent Message, telling of its Original Message too (RCC.16
+    // sections 7.2.3, 7.7.1, 7.7.3)
+    if let Some(original_message_id) = original_message_id {
+        cpim_headers.push(Header::new("NS", "mls <http://www.gsma.com/rcs/mls>"));
+        cpim_headers.push(Header::new(
+            "mls.Original-Message-ID",
+            String::from(original_message_id),
+        ));
+    }
 
     Body::Message(MessageBody {
         headers: cpim_headers,

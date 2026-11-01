@@ -31,6 +31,7 @@ use crate::rcs_engine::RcsEngine;
 
 use super::heal::Heals;
 use super::kds::{self, EnrolmentError, KeyDistribution};
+use super::lost::LostMessages;
 use super::provisioning;
 use super::replace::Replacements;
 use super::store::{MlsStore, SaveState, StoreError};
@@ -82,6 +83,8 @@ pub struct E2eeDevice {
     replacements: Replacements,
     /// The groups moved to unencrypted, and being moved back
     upgrades: Upgrades,
+    /// The messages not decrypted, kept with the MLS state
+    lost: LostMessages,
 }
 
 impl E2eeDevice {
@@ -102,6 +105,7 @@ impl E2eeDevice {
             store.restore(saved)?;
         }
 
+        let lost = LostMessages::kept_by(&store);
         Ok(E2eeDevice {
             store,
             validator,
@@ -113,6 +117,7 @@ impl E2eeDevice {
             heals: Heals::default(),
             replacements: Replacements::default(),
             upgrades: Upgrades::default(),
+            lost,
         })
     }
 
@@ -130,6 +135,10 @@ impl E2eeDevice {
 
     pub(super) fn replacements(&self) -> &Replacements {
         &self.replacements
+    }
+
+    pub(super) fn lost(&self) -> &LostMessages {
+        &self.lost
     }
 
     pub(super) fn upgrades(&self) -> &Upgrades {

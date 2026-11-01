@@ -19,9 +19,11 @@ use std::time::{Duration, SystemTime};
 use base64::{engine::general_purpose, Engine as _};
 use futures::executor::block_on;
 use rust_rcs_core::cpim::{CPIMHeaders, CPIMMessage};
+use rust_rcs_core::imdn::notification::{Imdn, Notification, Status};
 use rust_rcs_core::internet::Body;
 use rust_rcs_core::mls::rcs::certificate::CertificateError;
 use rust_rcs_core::mls::rcs::era::EraBase;
+use rust_rcs_core::mls::rcs::imdn::{failure_reason, FailureReason};
 use rust_rcs_core::mls::rcs::proto::{
     self, client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage,
     ClientMlsRcsMessage, CommitBundle, EndMlsReason, EpochControlMessages, EpochIdentifier,
@@ -34,7 +36,7 @@ use rust_rcs_core::mls::rcs::wire::{
     VerifiableDisplayImdn,
 };
 use rust_rcs_core::mls::rcs::{
-    is_unencrypted_cpim_header, ClientFailureReason, ServerFailureReason,
+    is_unencrypted_cpim_header, ClientFailureReason, ResentFailure, ServerFailureReason,
     CONTENT_TYPE_MLS_RCS_CLIENT, INFO_PACKAGE_MLS_ENHANCED_GROUP_INFO_PULL,
     INFO_PACKAGE_MLS_GROUP_INFO_PULL,
 };
@@ -44,7 +46,8 @@ use rust_rcs_core::mls::{
 
 use crate::capability::{Capabilities, CapabilityQuery};
 use crate::messaging::cpm::encryption::{
-    EndReason, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade, Verified,
+    EndReason, FailedToDecrypt, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade,
+    Verified,
 };
 use crate::messaging::cpm::make_cpim_imdn_body;
 
@@ -1269,36 +1272,6 @@ fn a_message_with_no_rcs_header_declares_no_rcs_namespace() {
 }
 
 #[test]
-fn a_message_re_sent_is_not_taken_yet() {
-    let (device, bob, mut bobs_group) = alice_and_bob();
-    let resent = bobs_group
-        .encrypt_resent(
-            &bob,
-            b"\r\nContent-Type: text/plain\r\n\r\nagain",
-            &credential(&[ALICE, CA]),
-            b"bob-2",
-            b"bob-1",
-        )
-        .unwrap();
-    let mut outer = format!(
-        "From: <tel:+491707654321>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:02.000+00:00\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: bob-2\r\n\r\nContent-Type: message/mls\r\n\r\n",
-        GROUP_URI
-    )
-    .into_bytes();
-    outer.extend_from_slice(&resent);
-    assert_eq!(
-        device.decrypt_message(
-            CONVERSATION,
-            &cpim_message(&outer).get_info().unwrap(),
-            &resent
-        ),
-        Err(MessageError::Store(StoreError::Mls(
-            ErrorKind::UnexpectedMessage
-        )))
-    );
-}
-
-#[test]
 fn the_groups_of_a_device_restored_are_encrypted() {
     let (bob, bobs) = bob_with_key_package();
     let (device, kds, app) =
@@ -2046,7 +2019,7 @@ fn the_notifications_of_the_groups_of_the_device_are_signed_once_its_commit_is_a
 fn a_notification_as_the_client_makes_one_is_signed() {
     let (device, bob, mut bobs_group) = alice_and_bob();
     let xml = notification_xml("bob-1", "delivery-notification", "<delivered/>");
-    let body = make_cpim_imdn_body(&xml, BOB_TEL, IMPU);
+    let body = make_cpim_imdn_body(&xml, BOB_TEL, None, IMPU);
     let mut cpim = Vec::new();
     body.reader().unwrap().read_to_end(&mut cpim).unwrap();
 
@@ -6323,4 +6296,681 @@ fn a_group_unencrypted_whose_focus_has_no_mls_group_is_moved_back_with_an_era_wi
         &accepted(epoch_identifier(&device, CONVERSATION)),
     );
     assert!(!groups.encryption_ended(CONVERSATION));
+}
+
+/// A message of Bob, `message_id`, from `from`, asking to be told of
+/// `disposition`, as the device receives it: the CPIM message, and the
+/// MlsMessage it carries
+fn from_bob_asking(
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+    from: &str,
+    message_id: &str,
+    disposition: Option<&str>,
+) -> (Vec<u8>, Vec<u8>) {
+    let mls_message = bobs_group
+        .encrypt_cpim(
+            bob,
+            b"NS: cpm <http://www.openmobilealliance.org/cpm/>\r\ncpm.Payload-Type: text/plain\r\n\r\nContent-Type: text/plain\r\n\r\nhi Alice",
+            message_id.as_bytes(),
+            b"",
+        )
+        .unwrap();
+    let mut outer = format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:01.000+00:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: {}\r\n\
+{}\
+\r\n\
+Content-Type: message/mls\r\n\
+\r\n",
+        from,
+        GROUP_URI,
+        message_id,
+        disposition
+            .map(|d| format!("imdn.Disposition-Notification: {}\r\n", d))
+            .unwrap_or_default()
+    )
+    .into_bytes();
+    outer.extend_from_slice(&mls_message);
+    (outer, mls_message)
+}
+
+/// The CPIM message the device decrypts of `outer`, carrying `mls_message`
+fn decrypted(
+    device: &E2eeDevice,
+    outer: &[u8],
+    mls_message: &[u8],
+) -> Result<Vec<u8>, MessageError> {
+    device.decrypt_message(
+        CONVERSATION,
+        &cpim_message(outer).get_info().unwrap(),
+        mls_message,
+    )
+}
+
+/// What the Original Message of a Re-Sent Message holds, as Bob encrypted it
+const ORIGINAL: &[u8] = b"NS: cpm <http://www.openmobilealliance.org/cpm/>\r\ncpm.Payload-Type: text/plain\r\n\r\nContent-Type: text/plain\r\n\r\nhi Alice, again";
+
+/// Bob's Re-Sent Message `message_id` of `original_message_id`, from `from`,
+/// to the device, as it receives it (RCC.16 sections 7.5.3, 10.3)
+fn resent_by_bob(
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+    from: &str,
+    message_id: &str,
+    original_message_id: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    let mls_message = bobs_group
+        .encrypt_resent(
+            bob,
+            ORIGINAL,
+            &credential(&[ALICE, CA]),
+            message_id.as_bytes(),
+            original_message_id.as_bytes(),
+        )
+        .unwrap();
+    let mut outer = format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:05:00.000+00:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: {}\r\n\
+imdn.Disposition-Notification: positive-delivery, display, negative-delivery\r\n\
+NS: mls <http://www.gsma.com/rcs/mls>\r\n\
+mls.Original-Message-ID: {}\r\n\
+\r\n\
+Content-Type: message/mls\r\n\
+\r\n",
+        from, GROUP_URI, message_id, original_message_id
+    )
+    .into_bytes();
+    outer.extend_from_slice(&mls_message);
+    (outer, mls_message)
+}
+
+/// The device healed by the Focus giving Bob's `commit` it missed (RCC.16
+/// section 10.1.2), without an External Commit
+fn healed_with(
+    rt: &tokio::runtime::Runtime,
+    groups: &DeviceGroups,
+    bobs_group: &MlsConversation,
+    commit: &[u8],
+    group_info: MlsGroupInfo,
+) {
+    let latest = bobs_group.epoch_identifier();
+    let enhanced = proto::encode(&MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(latest.clone()),
+        mls_group_info: Some(group_info),
+        committed_control_messages: vec![EpochControlMessages {
+            rcs_message_id: String::from("focus-commit-1"),
+            server_mls_rcs_message: Some(ServerMlsRcsMessage {
+                payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+                    ServerCommitBundle {
+                        commit_list: encode_message_list(&[commit]).unwrap(),
+                        ..ServerCommitBundle::default()
+                    },
+                )),
+            }),
+        }],
+        paginated_epoch_identifier: Some(latest),
+    });
+    let (pull, _) = focus_answering(vec![Some((200, enhanced))]);
+    assert_eq!(
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        )),
+        None
+    );
+}
+
+/// A message of Bob the device missed the epoch of, which it then heals
+/// into, and the negative delivery it tells Bob of it with
+fn lost_and_told(
+    rt: &tokio::runtime::Runtime,
+    device: &E2eeDevice,
+    groups: &DeviceGroups,
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+    from: &str,
+) -> Vec<FailedToDecrypt> {
+    let (commit, group_info) = missed_by_the_device(bob, bobs_group);
+    let (outer, mls_message) = from_bob_asking(
+        bob,
+        bobs_group,
+        from,
+        "bob-1",
+        Some("positive-delivery, negative-delivery"),
+    );
+    assert!(decrypted(device, &outer, &mls_message).is_err());
+    healed_with(rt, groups, bobs_group, &commit, group_info);
+    groups.failed_to_decrypt(CONVERSATION)
+}
+
+/// The CPIM message of the notification `imdn` to `recipient_uri`, as the
+/// client sends it, signed by the device
+fn signed_by_the_device(
+    device: &E2eeDevice,
+    imdn: &str,
+    recipient_uri: &str,
+    original_message_id: Option<&str>,
+) -> CPIMMessage {
+    let body = make_cpim_imdn_body(imdn, recipient_uri, original_message_id, IMPU);
+    let mut cpim = Vec::new();
+    body.reader().unwrap().read_to_end(&mut cpim).unwrap();
+    cpim_message(&device.sign_notification(CONVERSATION, &cpim).unwrap())
+}
+
+/// Whether Bob finds the notification `message`, signed by the device, to
+/// be signed over `content`
+fn checked_by_bob(
+    bob: &MlsClient,
+    bobs_group: &mut MlsConversation,
+    message: &CPIMMessage,
+    content: VerifiableDerivedContent,
+) -> bool {
+    let info = message.get_info().unwrap();
+    let signature = general_purpose::STANDARD
+        .decode(info.mls_derived_content_signature.unwrap())
+        .unwrap();
+    let cpim_id = String::from_utf8(info.imdn_message_id.to_vec()).unwrap();
+    bobs_group
+        .verify_signature(bob, &signature, &derived(&cpim_id, content))
+        .is_ok()
+}
+
+#[test]
+fn a_message_not_decrypted_is_told_of_once_the_group_is_healed() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let (commit, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+
+    // Bob's messages of the epoch the device missed: one asking to be told
+    // of a negative delivery, as encrypted messages do (RCC.16 section
+    // 7.5.6), taken twice, and two not asking
+    for (message_id, disposition) in [
+        ("bob-1", Some("positive-delivery, negative-delivery")),
+        ("bob-1", Some("positive-delivery, negative-delivery")),
+        ("bob-2", Some("positive-delivery")),
+        ("bob-3", None),
+    ] {
+        let (outer, mls_message) =
+            from_bob_asking(&bob, &mut bobs_group, BOB_TEL, message_id, disposition);
+        assert_eq!(
+            decrypted(&device, &outer, &mls_message),
+            Err(MessageError::Store(StoreError::Mls(ErrorKind::Rejected)))
+        );
+    }
+
+    // not told of while the group is to be healed (section 10.2)
+    assert!(groups.needs_healing(CONVERSATION));
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+    healed_with(&rt, &groups, &bobs_group, &commit, group_info);
+
+    // nor while a Commit of the device waits for the Focus
+    let previous = epoch_identifier(&device, CONVERSATION);
+    let output = device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, client| {
+            conversation.update_keys(client)
+        })
+        .unwrap();
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    bobs_group
+        .process_server_message(&bob, &focus_commit(&[&output.commit]))
+        .unwrap();
+
+    // then once, to Bob, of the one asking
+    let told = groups.failed_to_decrypt(CONVERSATION);
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].sender_uri, BOB_TEL);
+    assert_eq!(told[0].original_message_id, None);
+    let imdn = Imdn::from_xml(told[0].imdn.as_bytes()).unwrap();
+    assert_eq!(
+        (
+            imdn.message_id.as_str(),
+            imdn.datetime.as_str(),
+            imdn.notification,
+            imdn.status
+        ),
+        (
+            "bob-1",
+            "2026-10-25T12:00:01.000+00:00",
+            Notification::Delivery,
+            Status::Failed
+        )
+    );
+    assert_eq!(
+        failure_reason(told[0].imdn.as_bytes()),
+        Some(FailureReason::Client(ClientFailureReason::FailureToDecrypt))
+    );
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+
+    // signed, as a client generated negative delivery is (sections 7.6,
+    // 7.7.2.2)
+    let message = signed_by_the_device(&device, &told[0].imdn, BOB_TEL, None);
+    assert!(checked_by_bob(
+        &bob,
+        &mut bobs_group,
+        &message,
+        VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+            DeliveryNotificationStatus::Failed,
+            b"bob-1",
+            b"",
+            ClientFailureReason::FailureToDecrypt,
+        )),
+    ));
+}
+
+#[test]
+fn a_message_not_decrypted_is_told_of_once_the_focus_takes_the_external_commit() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    let (outer, mls_message) = from_bob_asking(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "bob-1",
+        Some("negative-delivery"),
+    );
+    assert!(decrypted(&device, &outer, &mls_message).is_err());
+
+    // rejoined with an External Commit, applied at once (RCC.16 section
+    // 10.1.1)
+    let enhanced = proto::encode(&MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(bobs_group.epoch_identifier()),
+        mls_group_info: Some(group_info),
+        ..MlsEnhancedGroupInfo::default()
+    });
+    let (pull, _) = focus_answering(vec![Some((200, enhanced))]);
+    let cpim = rt
+        .block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        ))
+        .expect("an External Commit");
+
+    // the negative delivery not sent ahead of it, nor before the Focus
+    // takes it
+    assert!(!groups.needs_healing(CONVERSATION));
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+    device
+        .on_server_message(CONVERSATION, &forwarded_commit(&cpim))
+        .unwrap();
+    let told = groups.failed_to_decrypt(CONVERSATION);
+    assert_eq!(told.len(), 1);
+    assert_eq!(
+        Imdn::from_xml(told[0].imdn.as_bytes()).unwrap().message_id,
+        "bob-1"
+    );
+}
+
+#[test]
+fn messages_not_decrypted_of_a_group_moved_to_unencrypted_are_not_told_of() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let (commit, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    let (outer, mls_message) = from_bob_asking(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "bob-1",
+        Some("negative-delivery"),
+    );
+    assert!(decrypted(&device, &outer, &mls_message).is_err());
+    healed_with(&rt, &groups, &bobs_group, &commit, group_info);
+
+    // its messages not to be re-sent unencrypted (RCC.16 section 10.3)
+    device.lost_group(CONVERSATION);
+    assert!(groups.encryption_ended(CONVERSATION));
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+    // nor are those of a group let go of once healed
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    let (commit, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    let (outer, mls_message) = from_bob_asking(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "bob-1",
+        Some("negative-delivery"),
+    );
+    assert!(decrypted(&device, &outer, &mls_message).is_err());
+    healed_with(&rt, &groups, &bobs_group, &commit, group_info);
+    groups.abandon(CONVERSATION);
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+}
+
+#[test]
+fn a_message_told_of_is_taken_as_its_sender_re_sends_it() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let (commit, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    let (outer, mls_message) = from_bob_asking(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "bob-1",
+        Some("negative-delivery"),
+    );
+    assert!(decrypted(&device, &outer, &mls_message).is_err());
+    healed_with(&rt, &groups, &bobs_group, &commit, group_info);
+
+    // not before Bob is told of it (RCC.16 section 10.4)
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-4", "bob-1");
+    assert_eq!(
+        decrypted(&device, &outer, &mls_message),
+        Err(MessageError::NotAskedFor)
+    );
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION).len(), 1);
+
+    // then with its Message-ID, telling of the Original Message, and the
+    // headers it came with
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-5", "bob-1");
+    let plaintext = decrypted(&device, &outer, &mls_message).unwrap();
+    let message = cpim_message(&plaintext);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.imdn_message_id, b"bob-5");
+    assert_eq!(info.mls_original_message_id, Some(&b"bob-1"[..]));
+    assert_eq!(info.from, format!("<{}>", BOB_TEL).as_bytes());
+    assert_eq!(info.date, b"2026-10-25T12:05:00.000+00:00");
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"positive-delivery, display, negative-delivery"[..])
+    );
+    assert_eq!(
+        message.get_message_body(),
+        Some((Some(&b"text/plain"[..]), &b"hi Alice, again"[..], false))
+    );
+
+    // once
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-6", "bob-1");
+    assert_eq!(
+        decrypted(&device, &outer, &mls_message),
+        Err(MessageError::NotAskedFor)
+    );
+}
+
+#[test]
+fn a_message_re_sent_unasked_or_by_another_is_not_taken() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // of a message the device never missed (RCC.16 section 10.4)
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-2", "bob-1");
+    assert_eq!(
+        decrypted(&device, &outer, &mls_message),
+        Err(MessageError::NotAskedFor)
+    );
+
+    // re-sent by another than the one who sent it, as its CPIM From told
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    let told = lost_and_told(&rt, &device, &groups, &bob, &mut bobs_group, CAROL_TEL);
+    assert_eq!(told[0].sender_uri, CAROL_TEL);
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-4", "bob-1");
+    assert_eq!(
+        decrypted(&device, &outer, &mls_message),
+        Err(MessageError::NotAskedFor)
+    );
+
+    // or of another message than the one told of
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    lost_and_told(&rt, &device, &groups, &bob, &mut bobs_group, BOB_TEL);
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-4", "bob-0");
+    assert_eq!(
+        decrypted(&device, &outer, &mls_message),
+        Err(MessageError::NotAskedFor)
+    );
+    // which Bob is still to re-send
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-5", "bob-1");
+    assert!(decrypted(&device, &outer, &mls_message).is_ok());
+}
+
+#[test]
+fn a_message_re_sent_whose_inner_layer_is_not_decrypted_is_told_of_too() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    lost_and_told(&rt, &device, &groups, &bob, &mut bobs_group, BOB_TEL);
+
+    // sealed to the leaf key the device replaces before it takes it
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-4", "bob-1");
+    let previous = epoch_identifier(&device, CONVERSATION);
+    let output = device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, client| {
+            conversation.update_keys(client)
+        })
+        .unwrap();
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    bobs_group
+        .process_server_message(&bob, &focus_commit(&[&output.commit]))
+        .unwrap();
+    assert_eq!(
+        decrypted(&device, &outer, &mls_message),
+        Err(MessageError::ResentNotOpened(ResentFailure::NotDecrypted))
+    );
+
+    // which Bob is told of, of the Re-Sent Message (RCC.16 sections 10.2,
+    // 10.4)
+    let told = groups.failed_to_decrypt(CONVERSATION);
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].sender_uri, BOB_TEL);
+    assert_eq!(told[0].original_message_id.as_deref(), Some("bob-1"));
+    let imdn = Imdn::from_xml(told[0].imdn.as_bytes()).unwrap();
+    assert_eq!(
+        (
+            imdn.message_id.as_str(),
+            imdn.datetime.as_str(),
+            imdn.status
+        ),
+        ("bob-4", "2026-10-25T12:05:00.000+00:00", Status::Failed)
+    );
+    assert_eq!(
+        failure_reason(told[0].imdn.as_bytes()),
+        Some(FailureReason::Client(
+            ClientFailureReason::InnerResentMessageFailureToDecrypt
+        ))
+    );
+    let message = signed_by_the_device(&device, &told[0].imdn, BOB_TEL, Some("bob-1"));
+    assert!(checked_by_bob(
+        &bob,
+        &mut bobs_group,
+        &message,
+        VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+            DeliveryNotificationStatus::Failed,
+            b"bob-4",
+            b"bob-1",
+            ClientFailureReason::InnerResentMessageFailureToDecrypt,
+        )),
+    ));
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+
+    // the message re-sent again is taken
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-5", "bob-1");
+    let plaintext = decrypted(&device, &outer, &mls_message).unwrap();
+    assert_eq!(
+        cpim_message(&plaintext)
+            .get_info()
+            .unwrap()
+            .mls_original_message_id,
+        Some(&b"bob-1"[..])
+    );
+
+    // one not asked for is not told of
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-6", "bob-1");
+    let previous = epoch_identifier(&device, CONVERSATION);
+    let output = device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, client| {
+            conversation.update_keys(client)
+        })
+        .unwrap();
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    bobs_group
+        .process_server_message(&bob, &focus_commit(&[&output.commit]))
+        .unwrap();
+    assert_eq!(
+        decrypted(&device, &outer, &mls_message),
+        Err(MessageError::NotAskedFor)
+    );
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+}
+
+#[test]
+fn a_notification_of_a_re_sent_message_is_signed_over_both_its_ids() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+
+    // the Re-Sent Message told of, and its Original Message (RCC.16
+    // sections 7.5.3.3, 7.7.1)
+    let xml = notification_xml("bob-5", "delivery-notification", "<delivered/>");
+    let message = signed_by_the_device(&device, &xml, BOB_TEL, Some("bob-1"));
+    assert_eq!(
+        message.get_info().unwrap().mls_original_message_id,
+        Some(&b"bob-1"[..])
+    );
+    assert!(checked_by_bob(
+        &bob,
+        &mut bobs_group,
+        &message,
+        VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+            DeliveryNotificationStatus::Delivered,
+            b"bob-5",
+            b"bob-1",
+            ClientFailureReason::Unset,
+        )),
+    ));
+    let xml = notification_xml("bob-5", "display-notification", "<displayed/>");
+    let message = signed_by_the_device(&device, &xml, BOB_TEL, Some("bob-1"));
+    assert!(checked_by_bob(
+        &bob,
+        &mut bobs_group,
+        &message,
+        VerifiableDerivedContent::DisplayImdn(VerifiableDisplayImdn::new(
+            DisplayNotificationStatus::Displayed,
+            b"bob-5",
+            b"bob-1",
+        )),
+    ));
+
+    // and Bob's, of the device's, checked over both
+    let xml = notification_xml("alice-5", "display-notification", "<displayed/>");
+    let signature = bobs_group
+        .sign(
+            &bob,
+            &derived(
+                "imdn-7",
+                VerifiableDerivedContent::DisplayImdn(VerifiableDisplayImdn::new(
+                    DisplayNotificationStatus::Displayed,
+                    b"alice-5",
+                    b"alice-1",
+                )),
+            ),
+        )
+        .unwrap();
+    for (original_message_id, taken) in [("alice-1", true), ("alice-2", false)] {
+        let extra = format!(
+            "NS: mls <http://www.gsma.com/rcs/mls>\r\nmls.MLS-Derived-Content-Signature: {}\r\nmls.Era-ID: 0\r\nmls.Original-Message-ID: {}\r\n",
+            general_purpose::STANDARD.encode(&signature),
+            original_message_id
+        );
+        let cpim = notification_cpim(BOB_TEL, "imdn-7", &extra, &xml);
+        assert_eq!(
+            device
+                .verify_notification(
+                    CONVERSATION,
+                    &cpim_message(&cpim).get_info().unwrap(),
+                    xml.as_bytes()
+                )
+                .is_ok(),
+            taken,
+            "{}",
+            original_message_id
+        );
+    }
+}
+
+#[test]
+fn messages_not_decrypted_are_told_of_and_taken_after_the_device_restarted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    let (commit, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+    let (outer, mls_message) = from_bob_asking(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "bob-1",
+        Some("negative-delivery"),
+    );
+    assert!(decrypted(&device, &outer, &mls_message).is_err());
+    healed_with(&rt, &groups, &bobs_group, &commit, group_info);
+
+    // the device restarting before telling Bob tells him then
+    let restarted = || Arc::new(alice(&app, &kds, TODAY, Some(&app.last().unwrap())));
+    let device = restarted();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    let told = groups.failed_to_decrypt(CONVERSATION);
+    assert_eq!(told.len(), 1);
+    assert_eq!(
+        Imdn::from_xml(told[0].imdn.as_bytes()).unwrap().message_id,
+        "bob-1"
+    );
+
+    // and once restarted again, does not tell him again, and takes the
+    // message he re-sends (RCC.16 section 10.4)
+    let device = restarted();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-4", "bob-1");
+    let plaintext = decrypted(&device, &outer, &mls_message).unwrap();
+    assert_eq!(
+        cpim_message(&plaintext)
+            .get_info()
+            .unwrap()
+            .mls_original_message_id,
+        Some(&b"bob-1"[..])
+    );
+
+    // once, through a restart too
+    let device = restarted();
+    let (outer, mls_message) = resent_by_bob(&bob, &mut bobs_group, BOB_TEL, "bob-5", "bob-1");
+    assert_eq!(
+        decrypted(&device, &outer, &mls_message),
+        Err(MessageError::NotAskedFor)
+    );
 }

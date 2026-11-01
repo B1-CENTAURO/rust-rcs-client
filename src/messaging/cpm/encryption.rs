@@ -101,6 +101,19 @@ pub enum Upgrade {
     Restart(Vec<u8>),
 }
 
+/// A negative delivery telling the sender of a message that it could not be
+/// decrypted (RCC.16 sections 7.7.2.2, 10.2, 10.4)
+#[derive(Clone, Debug, PartialEq)]
+pub struct FailedToDecrypt {
+    /// The `message/imdn+xml` document
+    pub imdn: String,
+    /// The URI of the participant who sent the message, whom the
+    /// notification goes to
+    pub sender_uri: String,
+    /// The Original-Message-ID of the message, if it was a Re-Sent Message
+    pub original_message_id: Option<String>,
+}
+
 /// Why a group chat moves to unencrypted (RCC.16 sections 7.11.2.2, 11.2)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EndReason {
@@ -428,10 +441,20 @@ pub trait GroupEncryption: Send + Sync {
     /// 7.7), as any may once the group chat is unencrypted (section 11.2)
     fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> Verified;
 
+    /// The negative deliveries to send in the group chat `conversation_id`,
+    /// telling senders that messages of theirs could not be decrypted, once
+    /// the group is healed and nothing of this client waits for the
+    /// Conversation Focus (RCC.16 sections 10.2, 10.4); each once
+    fn failed_to_decrypt(&self, conversation_id: &str) -> Vec<FailedToDecrypt>;
+
     /// The CPIM message the `message/mls` `mls_message` of the group chat
     /// `conversation_id` carried, delivered in the CPIM message `cpim_info`
     /// tells of; its From the MLS identity of the sender if that is another
     /// (RCC.16 sections 7.5.3.1, 9.1.1); None if it cannot be decrypted
+    ///
+    /// That of a Re-Sent Message gives its Original Message, carrying the
+    /// Message-ID of the Re-Sent Message and the Original-Message-ID of the
+    /// other (section 10.4).
     fn decrypt(
         &self,
         conversation_id: &str,

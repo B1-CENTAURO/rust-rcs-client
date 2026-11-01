@@ -102,8 +102,8 @@ use crate::messaging::config::MessagingConfigs;
 use crate::messaging::cpm::encryption::GroupEncryption;
 use crate::messaging::cpm::group_chat::{GroupIds, GroupInvitation};
 use crate::messaging::cpm::imdn::{
-    acknowledge_delivery, acknowledge_group_delivery, send_imdn, ImdnService, ReceivedMessages,
-    Refusal,
+    acknowledge_delivery, acknowledge_group_delivery, app_message_id, send_imdn, ImdnService,
+    ReceivedMessages, Refusal,
 };
 use crate::messaging::cpm::new_message_id;
 use crate::messaging::cpm::session::CPMSessionServiceWrapper;
@@ -613,8 +613,10 @@ impl RcsEngine {
                     std::str::from_utf8(content_type),
                     std::str::from_utf8(message_body),
                 ) {
+                    // a Re-Sent Message known by the Message-ID of its
+                    // Original Message (RCC.16 section 10.4)
                     if let (Ok(imdn_message_id), Ok(cpim_date)) = (
-                        std::str::from_utf8(cpim_info.imdn_message_id),
+                        std::str::from_utf8(app_message_id(cpim_info)),
                         std::str::from_utf8(cpim_info.date),
                     ) {
                         let cpim_from = if let Some(uri) = &cpim_info.from_uri {
@@ -1542,6 +1544,7 @@ impl RcsEngine {
                 group,
                 &notice.xml,
                 &notice.sender_uri,
+                notice.original_message_id.as_deref(),
                 move |status_code, reason_phrase| {
                     let result_callback = result_callback_.lock().unwrap().take();
                     if let Some(result_callback) = result_callback {

@@ -1323,9 +1323,52 @@ impl SessionEnd {
             Box::pin(async move {
                 let cpim = healed.await;
                 told.tell_encryption_change(&*encryption, &conversation_id, ended);
+                // and the senders of messages not decrypted, once the group
+                // is in step (section 10.2)
+                told.tell_failed_to_decrypt();
                 cpim
             })
         });
+    }
+
+    /// Tells the senders of the messages of the group chat of the session
+    /// that could not be decrypted so, with negative deliveries sent in the
+    /// session and signed, once the group is healed and nothing of this
+    /// client waits for the Conversation Focus (RCC.16 sections 7.7.2.2,
+    /// 10.2, 10.4)
+    pub(crate) fn tell_failed_to_decrypt(&self) {
+        let encrypted = {
+            let inner = self.sip_session.get_inner();
+            let session_info = inner.get_session_info();
+            session_info
+                .encryption
+                .clone()
+                .zip(session_info.conversation_id.clone())
+        };
+        let Some(((encryption, conversation_id), public_user_identity)) =
+            encrypted.zip(self.public_user_identity())
+        else {
+            return;
+        };
+        for failed in encryption.failed_to_decrypt(&conversation_id) {
+            send_group_imdn(
+                &self.sip_session.get_inner(),
+                &failed.imdn,
+                &failed.sender_uri,
+                failed.original_message_id.as_deref(),
+                &public_user_identity,
+                |status_code, reason_phrase| {
+                    platform_log(
+                        LOG_TAG,
+                        format!(
+                            "negative delivery answered with {} {}",
+                            status_code, reason_phrase
+                        ),
+                    );
+                },
+                &self.rt,
+            );
+        }
     }
 
     /// Moves the MLS group of the session back to encrypted, if it was moved
@@ -1725,6 +1768,7 @@ impl MsrpDataWriter for IsComposingWriter {
             payload_type: None,
             disposition_notification: None,
             mls_derived_content_signature: None,
+            mls_original_message_id: None,
         };
         (self.callback)(&info, &self.content_type, &self.data);
         Ok(())
@@ -1912,8 +1956,10 @@ impl CPMSessionService {
                         }
                     }
                     // the group healed if it could not be decrypted (RCC.16
-                    // section 10.1)
+                    // section 10.1), and the sender told so once it is
+                    // (section 10.2)
                     heal_if_needed(session);
+                    tell_failed_to_decrypt(session);
                     // and the keys of this client updated once due, the
                     // group being active (section 9.5.2)
                     update_keys_if_due(session);
@@ -2024,6 +2070,9 @@ impl CPMSessionService {
                     }
                     // or the group healed, if it could not be applied
                     heal_if_needed(session);
+                    // and the senders of messages not decrypted told so,
+                    // once it is in step (section 10.2)
+                    tell_failed_to_decrypt(session);
                 }
             };
 
@@ -2370,12 +2419,15 @@ impl CPMSessionService {
 
     /// Sends the IMDN document `imdn_xml` in the session with the group at
     /// `conference_uri`, for its focus to send on to the participant
-    /// `recipient_uri`; false, and nothing sent, if there is no such session
+    /// `recipient_uri`, with the Original-Message-ID `original_message_id` if
+    /// it tells of a Re-Sent Message; false, and nothing sent, if there is no
+    /// such session
     pub fn send_group_imdn<F>(
         &self,
         conference_uri: &str,
         imdn_xml: &str,
         recipient_uri: &str,
+        original_message_id: Option<&str>,
         callback: F,
         rt: &Arc<Runtime>,
     ) -> bool
@@ -2394,6 +2446,7 @@ impl CPMSessionService {
                     &session,
                     imdn_xml,
                     recipient_uri,
+                    original_message_id,
                     &public_user_identity,
                     callback,
                     rt,
@@ -3392,6 +3445,14 @@ fn group_session<'s>(
 fn heal_if_needed(session: &Arc<SipSession<CPMSession>>) {
     if let Some(session_end) = session.get_inner().session_end() {
         session_end.heal_if_needed();
+    }
+}
+
+/// Tells the senders of messages not decrypted in the group chat of
+/// `session` so, as SessionEnd::tell_failed_to_decrypt() does
+fn tell_failed_to_decrypt(session: &Arc<SipSession<CPMSession>>) {
+    if let Some(session_end) = session.get_inner().session_end() {
+        session_end.tell_failed_to_decrypt();
     }
 }
 

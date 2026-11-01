@@ -344,7 +344,7 @@ fn a_state_with_a_participant_key_that_is_not_one_is_refused() {
     let device = store(&app);
     device.participant_public_key().unwrap();
     let kept = app.last();
-    let key_length = b"RCS-E2EE2".len();
+    let key_length = b"RCS-E2EE3".len();
 
     let mut short = kept.clone();
     short[key_length] = 200;
@@ -419,7 +419,7 @@ fn a_state_of_another_layout_is_refused() {
     let device = store(&app);
     device.participant_public_key().unwrap();
     let kept = app.last();
-    let uploaded_at = b"RCS-E2EE2".len() + 1 + 32;
+    let uploaded_at = b"RCS-E2EE3".len() + 1 + 32;
 
     let mut not_a_flag = kept.clone();
     not_a_flag[uploaded_at] = 2;
@@ -433,6 +433,100 @@ fn a_state_of_another_layout_is_refused() {
         );
     }
     assert!(store(&app).restore(&kept).is_ok());
+}
+
+#[test]
+fn the_notes_of_the_device_are_kept_with_its_state() {
+    let app = Arc::new(App::default());
+    let device = store(&app);
+    assert!(device.notes().is_empty());
+    let restored = || {
+        let again = store(&app);
+        again.restore(&app.last()).unwrap();
+        again.notes()
+    };
+
+    // kept at once, once, before there is a client or a Participant Key
+    device.keep_notes(b"notes".to_vec()).unwrap();
+    let kept = app.kept();
+    device.keep_notes(b"notes".to_vec()).unwrap();
+    assert_eq!(app.kept(), kept);
+    assert_eq!(device.notes(), b"notes");
+    assert_eq!(restored(), b"notes");
+    // and as those are made
+    device.participant_public_key().unwrap();
+    assert_eq!(restored(), b"notes");
+    device
+        .create(|config, validator| MlsClient::new(b"alice", CIPHERSUITE, config, validator))
+        .unwrap();
+    assert_eq!(restored(), b"notes");
+
+    // not taken on if not kept
+    app.refuse(true);
+    assert_eq!(
+        device.keep_notes(b"other".to_vec()),
+        Err(StoreError::NotSaved)
+    );
+    app.refuse(false);
+    assert_eq!(device.notes(), b"notes");
+
+    // along with the changes that follow, and through one undone
+    let (group_id, _bobs) = group_with(&device, &member("bob"));
+    app.refuse(true);
+    assert_eq!(
+        encrypt(&device, &group_id, "one"),
+        Err(StoreError::NotSaved)
+    );
+    app.refuse(false);
+    assert_eq!(device.notes(), b"notes");
+    let again = store(&app);
+    again.restore(&app.last()).unwrap();
+    assert_eq!(again.notes(), b"notes");
+    assert_eq!(again.credential(), device.credential());
+
+    // and by a new client
+    device
+        .create(|config, validator| MlsClient::new(b"alice", CIPHERSUITE, config, validator))
+        .unwrap();
+    assert_eq!(device.notes(), b"notes");
+    assert_eq!(restored(), b"notes");
+}
+
+#[test]
+fn a_state_kept_before_notes_were_is_taken_on_with_none() {
+    let app = Arc::new(App::default());
+    let device = store(&app);
+    device.participant_public_key().unwrap();
+    device
+        .create(|config, validator| MlsClient::new(b"alice", CIPHERSUITE, config, validator))
+        .unwrap();
+    let kept = app.last();
+
+    // the layout before: no notes after whether KeyPackages were uploaded
+    let notes_at = b"RCS-E2EE3".len() + 1 + 32 + 1;
+    assert_eq!(&kept[..9], b"RCS-E2EE3");
+    assert_eq!(kept[notes_at..notes_at + 4], [0, 0, 0, 0]);
+    let mut before = b"RCS-E2EE2".to_vec();
+    before.extend_from_slice(&kept[9..notes_at]);
+    before.extend_from_slice(&kept[notes_at + 4..]);
+    let again = store(&app);
+    again.restore(&before).unwrap();
+    assert!(again.notes().is_empty());
+    assert_eq!(again.credential(), device.credential());
+    assert_eq!(
+        again.participant_public_key(),
+        device.participant_public_key()
+    );
+
+    // notes longer than the state, or their length cut
+    let mut too_long = kept.clone();
+    too_long[notes_at..notes_at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+    for state in [too_long, kept[..notes_at + 2].to_vec()] {
+        assert_eq!(
+            store(&app).restore(&state),
+            Err(StoreError::Mls(ErrorKind::BadFormat))
+        );
+    }
 }
 
 #[test]
