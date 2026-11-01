@@ -661,8 +661,8 @@ fn a_file_sealed_is_uploaded_in_its_stead_as_an_encrypted_file() {
     );
     assert_eq!(*count.lock().unwrap(), 2);
 
-    // each under the name encrypted_file and the type message/mls-ft, with
-    // no hash (RCC.16 section 9.1.2.1)
+    // each under the name encrypted_file and the type message/mls-ft
+    // (RCC.16 section 9.1.2.1)
     next(&taken);
     let body = String::from_utf8_lossy(&next(&taken).body).into_owned();
     assert!(!body.contains("\r\n\r\nthe picture"), "{}", body);
