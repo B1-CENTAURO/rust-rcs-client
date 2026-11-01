@@ -278,13 +278,49 @@ pub fn send_group_imdn<F>(
     session.send_message(message, rt);
 }
 
-/// The Message-ID the app knows the message `cpim_info` tells of by: that of
-/// the Original Message of a Re-Sent Message, which the app never had, else
-/// its own (RCC.16 section 10.4)
-pub fn app_message_id<'a>(cpim_info: &CPIMInfo<'a>) -> &'a [u8] {
-    cpim_info
-        .mls_original_message_id
-        .unwrap_or(cpim_info.imdn_message_id)
+/// The Message-ID the app knows the message `cpim_info` tells of by, of
+/// `content_type`: that of the Original Message of a Re-Sent Message, which
+/// the app never had, else its own, as a notification's is (RCC.16 section
+/// 10.4)
+pub fn app_message_id<'a>(cpim_info: &CPIMInfo<'a>, content_type: &[u8]) -> &'a [u8] {
+    match is_media_type(content_type, "message/imdn+xml") {
+        true => cpim_info.imdn_message_id,
+        false => cpim_info
+            .mls_original_message_id
+            .unwrap_or(cpim_info.imdn_message_id),
+    }
+}
+
+/// The IMDN document `imdn` telling of the message `message_id` in place
+/// of the one it tells of, as one of a Re-Sent Message is to tell the app
+/// of its Original Message (RCC.16 section 10.4); `imdn` as it is if it
+/// tells of none
+pub fn telling_of(imdn: &[u8], message_id: &[u8]) -> Vec<u8> {
+    const START: &[u8] = b"<message-id>";
+    const END: &[u8] = b"</message-id>";
+    let found = |what: &[u8], from: usize| {
+        imdn.get(from..)?
+            .windows(what.len())
+            .position(|window| window == what)
+            .map(|at| at + from)
+    };
+    let Some(start) = found(START, 0).map(|at| at + START.len()) else {
+        return imdn.to_vec();
+    };
+    let Some(end) = found(END, start) else {
+        return imdn.to_vec();
+    };
+    let mut told = imdn[..start].to_vec();
+    for byte in message_id {
+        match byte {
+            b'&' => told.extend_from_slice(b"&amp;"),
+            b'<' => told.extend_from_slice(b"&lt;"),
+            b'>' => told.extend_from_slice(b"&gt;"),
+            byte => told.push(*byte),
+        }
+    }
+    told.extend_from_slice(&imdn[end..]);
+    told
 }
 
 /// How many messages taken are kept note of, the oldest forgotten first
@@ -539,11 +575,16 @@ again",
         let received = ReceivedMessages::new();
         let message = resent("Rs77", "Kn7");
         let info = message.get_info().unwrap();
-        assert_eq!(app_message_id(&info), b"Kn7");
+        assert_eq!(app_message_id(&info, b"text/plain"), b"Kn7");
         assert_eq!(
-            app_message_id(&self::message("Kn31", None).get_info().unwrap()),
+            app_message_id(
+                &self::message("Kn31", None).get_info().unwrap(),
+                b"text/plain"
+            ),
             b"Kn31"
         );
+        // a notification by its own
+        assert_eq!(app_message_id(&info, b"message/imdn+xml"), b"Rs77");
 
         // its delivery, of the Re-Sent Message (RCC.16 section 7.7.1)
         let xml = received

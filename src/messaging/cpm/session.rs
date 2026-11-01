@@ -82,14 +82,14 @@ use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{
-    EndReason, GroupEncryption, ImdnTold, Sealed, Upgrade, Verified, CONTENT_TYPE_MLS,
+    EndReason, FtdAnswer, GroupEncryption, ImdnTold, Sealed, Upgrade, Verified, CONTENT_TYPE_MLS,
     CONTENT_TYPE_MLS_RCS_SERVER,
 };
 use super::group_chat::{
     focus_answer, group_info_pull, refer_participants, refer_removal, GroupChats, GroupIds,
     GroupInvitation, Participant,
 };
-use super::imdn::send_group_imdn;
+use super::imdn::{send_group_imdn, telling_of};
 use super::session_invitation::{
     decline_hanging_invitation, end_cancelled_invitation, try_accept_hanging_invitation,
     try_accept_invitation, CPMSessionInvitation, CPMSessionInvitationResponse,
@@ -1331,6 +1331,63 @@ impl SessionEnd {
         });
     }
 
+    /// Answers the notification `imdn` received in the session, in the CPIM
+    /// message `cpim_info` tells of, if it is a negative delivery telling
+    /// that a message of this client could not be decrypted: with the
+    /// message re-sent in the session to whom it is from, then a key update
+    /// of this client, or else with the group self-healed if it is not
+    /// signed by whom it is from (RCC.16 section 10.3); whether it is
+    /// answered so, which is not for the app then
+    pub(crate) fn answer_failed_to_decrypt(&self, cpim_info: &CPIMInfo, imdn: &[u8]) -> bool {
+        let (encrypted, conference_uri) = {
+            let inner = self.sip_session.get_inner();
+            let session_info = inner.get_session_info();
+            (
+                session_info
+                    .encryption
+                    .clone()
+                    .zip(session_info.conversation_id.clone()),
+                String::from_utf8_lossy(&session_info.cpm_contact.service_uri).into_owned(),
+            )
+        };
+        let Some((encryption, conversation_id)) = encrypted else {
+            return false;
+        };
+        match encryption.answer_failed_to_decrypt(&conversation_id, cpim_info, imdn) {
+            FtdAnswer::Resend(cpim) => {
+                // the key update after the message, which is of the epoch
+                // the update ends
+                let session_end = self.clone();
+                let message = CPMMessageParam::new(
+                    String::from("message/cpim"),
+                    String::new(),
+                    new_message_id(),
+                    &conference_uri,
+                    &RecipientType::Group,
+                    &conference_uri,
+                    move |status_code, reason_phrase| {
+                        platform_log(
+                            LOG_TAG,
+                            format!(
+                                "message re-sent answered with {} {}",
+                                status_code, reason_phrase
+                            ),
+                        );
+                        session_end.update_keys();
+                    },
+                )
+                .raw_data(cpim);
+                self.sip_session.get_inner().send_message(message, &self.rt);
+                true
+            }
+            FtdAnswer::Heal => {
+                self.heal_if_needed();
+                true
+            }
+            FtdAnswer::NotOne | FtdAnswer::Ignored => false,
+        }
+    }
+
     /// Tells the senders of the messages of the group chat of the session
     /// that could not be decrypted so, with negative deliveries sent in the
     /// session and signed, once the group is healed and nothing of this
@@ -1965,6 +2022,8 @@ impl CPMSessionService {
                     update_keys_if_due(session);
                     return;
                 }
+                // what the app is given in place of what came, if anything
+                let mut for_app: Option<Vec<u8>> = None;
                 if is_media_type(content_type, "message/imdn+xml") {
                     let inner = session.get_inner();
                     let session_info = inner.get_session_info();
@@ -1989,6 +2048,12 @@ impl CPMSessionService {
                             ),
                             ImdnTold::Nothing => {}
                         }
+                        // nor is a negative delivery telling a message of
+                        // this client was not decrypted, which has it
+                        // re-sent, or the group healed (section 10.3)
+                        if answer_failed_to_decrypt(session, cpim_info, content_body) {
+                            return;
+                        }
                         // nor is one not signed by whom it is from (section
                         // 7.6.2); one not signed at all, as a client not
                         // encrypting sends, moves the group to unencrypted
@@ -2006,6 +2071,12 @@ impl CPMSessionService {
                                 );
                                 return;
                             }
+                        }
+                        // one of a Re-Sent Message of this client telling
+                        // of its Original Message, the one the app knows
+                        // (section 10.4)
+                        if let Some(original_message_id) = cpim_info.mls_original_message_id {
+                            for_app = Some(telling_of(content_body, original_message_id));
                         }
                     }
                 } else if is_plaintext_message(content_type) {
@@ -2031,7 +2102,7 @@ impl CPMSessionService {
                         contact,
                         cpim_info,
                         content_type,
-                        content_body,
+                        for_app.as_deref().unwrap_or(content_body),
                     );
                     return;
                 }
@@ -3446,6 +3517,20 @@ fn heal_if_needed(session: &Arc<SipSession<CPMSession>>) {
     if let Some(session_end) = session.get_inner().session_end() {
         session_end.heal_if_needed();
     }
+}
+
+/// Answers the notification `imdn` received in the group chat of `session`,
+/// in the CPIM message `cpim_info` tells of, as SessionEnd::answer_failed_to_decrypt()
+/// does; whether it is taken so
+fn answer_failed_to_decrypt(
+    session: &Arc<SipSession<CPMSession>>,
+    cpim_info: &CPIMInfo,
+    imdn: &[u8],
+) -> bool {
+    session
+        .get_inner()
+        .session_end()
+        .is_some_and(|session_end| session_end.answer_failed_to_decrypt(cpim_info, imdn))
 }
 
 /// Tells the senders of messages not decrypted in the group chat of

@@ -616,7 +616,7 @@ impl RcsEngine {
                     // a Re-Sent Message known by the Message-ID of its
                     // Original Message (RCC.16 section 10.4)
                     if let (Ok(imdn_message_id), Ok(cpim_date)) = (
-                        std::str::from_utf8(app_message_id(cpim_info)),
+                        std::str::from_utf8(app_message_id(cpim_info, content_type.as_bytes())),
                         std::str::from_utf8(cpim_info.date),
                     ) {
                         let cpim_from = if let Some(uri) = &cpim_info.from_uri {

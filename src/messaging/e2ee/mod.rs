@@ -22,8 +22,10 @@ pub mod heal;
 pub mod kds;
 pub mod lost;
 pub mod message;
+pub mod notes;
 pub mod provisioning;
 pub mod replace;
+pub mod sent;
 pub mod store;
 pub mod upgrade;
 

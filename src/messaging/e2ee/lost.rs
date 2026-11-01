@@ -16,11 +16,9 @@
 //! senders told so once the group is healed, and the messages taken when they
 //! are re-sent (RCC.16 sections 10.2, 10.4)
 //!
-//! They are kept with the MLS state, as the notes of the device, for a
-//! message to be taken when it is re-sent after the device restarted. A
-//! change to them is kept before anything it brings is given out.
+//! They are kept with the MLS state, in the notes of the device, for a
+//! message to be taken when it is re-sent after the device restarted.
 
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use rust_rcs_core::cpim::CPIMInfo;
@@ -33,6 +31,7 @@ use rust_rcs_core::mls::{Credential, ErrorKind};
 use crate::messaging::cpm::encryption::FailedToDecrypt;
 
 use super::device::{is_of, participant_tel_uri, E2eeDevice};
+use super::notes::{put, put_time, Notes, Reader};
 use super::store::{MlsStore, StoreError};
 
 const LOG_TAG: &str = "e2ee";
@@ -45,72 +44,56 @@ const LOST_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// forgotten first
 const LOST_MOST: usize = 1024;
 
-/// Starts the notes of the device, which hold the messages not decrypted
-const NOTES_VERSION: u8 = 1;
-
 /// A message not decrypted
 #[derive(Clone, Debug, PartialEq)]
-struct Lost {
-    conversation_id: String,
+pub(super) struct Lost {
+    pub(super) conversation_id: String,
     /// The Message-ID of the Original Message
-    message_id: String,
+    pub(super) message_id: String,
     /// The URI of the participant who sent it, as its CPIM From tells
-    sender_uri: String,
+    pub(super) sender_uri: String,
     /// When it was taken
-    taken: SystemTime,
+    pub(super) taken: SystemTime,
     /// The negative delivery to send of it, of the Original Message or of the
     /// last Re-Sent Message of it whose inner layer was not decrypted, until
     /// it is sent
-    to_tell: Option<FailedToDecrypt>,
+    pub(super) to_tell: Option<FailedToDecrypt>,
     /// Whether one was sent, without which a Re-Sent Message of it is not
     /// taken (section 10.4)
-    told: bool,
+    pub(super) told: bool,
 }
 
-/// The messages not decrypted, of every group, as the store keeps them
-pub(super) struct LostMessages(Mutex<Vec<Lost>>);
+/// Where the message `original_message_id` of the group `conversation_id` is
+/// in `lost`, told as not decrypted to its sender, who `is_sender` tells
+fn told_of(
+    lost: &[Lost],
+    conversation_id: &str,
+    original_message_id: &str,
+    is_sender: impl Fn(&str) -> bool,
+) -> Option<usize> {
+    lost.iter().position(|lost| {
+        lost.conversation_id == conversation_id
+            && lost.message_id == original_message_id
+            && lost.told
+            && is_sender(&lost.sender_uri)
+    })
+}
 
-impl LostMessages {
-    /// Those `store` kept; none if it kept notes that cannot be read, as
-    /// losing those is better than losing the MLS state they came with
-    pub(super) fn kept_by(store: &MlsStore) -> LostMessages {
-        let lost = decode(&store.notes()).unwrap_or_else(|| {
-            platform_log(LOG_TAG, "messages not decrypted not read, forgotten");
-            Vec::new()
-        });
-        LostMessages(Mutex::new(lost))
-    }
-
-    /// Changes the messages as `change` does, kept by `store` first; none
-    /// changed if they cannot be
-    fn change<R>(
-        &self,
-        store: &MlsStore,
-        change: impl FnOnce(&mut Vec<Lost>) -> R,
-    ) -> Result<R, StoreError> {
-        let mut lost = self.0.lock().unwrap();
-        let mut changed = lost.clone();
-        let result = change(&mut changed);
-        if changed != *lost {
-            store.keep_notes(encode(&changed))?;
-            *lost = changed;
-        }
-        Ok(result)
-    }
-
-    /// Whether any message of the group `conversation_id` is as `what` tells
-    fn any(&self, conversation_id: &str, what: impl Fn(&Lost) -> bool) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|lost| lost.conversation_id == conversation_id && what(lost))
+impl Notes {
+    /// Whether any message not decrypted of the group `conversation_id` is
+    /// as `what` tells
+    fn any_lost(&self, conversation_id: &str, what: impl Fn(&Lost) -> bool) -> bool {
+        self.read(|data| {
+            data.lost
+                .iter()
+                .any(|lost| lost.conversation_id == conversation_id && what(lost))
+        })
     }
 
     /// Takes note of the message `message_id` of the group `conversation_id`
     /// not being decrypted, sent at `datetime` by `sender_uri`, its sender to
     /// be told so; once only
-    fn lose(
+    pub(super) fn lose(
         &self,
         store: &MlsStore,
         conversation_id: &str,
@@ -119,7 +102,8 @@ impl LostMessages {
         datetime: &str,
         now: SystemTime,
     ) -> Result<(), StoreError> {
-        self.change(store, |lost| {
+        self.change(store, |data| {
+            let lost = &mut data.lost;
             lost.retain(|lost| {
                 now.duration_since(lost.taken)
                     .is_ok_and(|age| age <= LOST_FOR)
@@ -151,28 +135,11 @@ impl LostMessages {
         })
     }
 
-    /// Where the message `original_message_id` of the group
-    /// `conversation_id` is, told as not decrypted to its sender, who
-    /// `is_sender` tells
-    fn told_of(
-        lost: &[Lost],
-        conversation_id: &str,
-        original_message_id: &str,
-        is_sender: impl Fn(&str) -> bool,
-    ) -> Option<usize> {
-        lost.iter().position(|lost| {
-            lost.conversation_id == conversation_id
-                && lost.message_id == original_message_id
-                && lost.told
-                && is_sender(&lost.sender_uri)
-        })
-    }
-
     /// Takes note of a Re-Sent Message `message_id` of the message
     /// `original_message_id`, sent at `datetime` by whom `is_sender` tells,
     /// whose inner layer was not decrypted, its sender to be told so; false
     /// if this client did not ask for it
-    fn lose_resent(
+    pub(super) fn lose_resent(
         &self,
         store: &MlsStore,
         conversation_id: &str,
@@ -181,13 +148,13 @@ impl LostMessages {
         datetime: &str,
         is_sender: impl Fn(&str) -> bool,
     ) -> Result<bool, StoreError> {
-        self.change(store, |lost| {
+        self.change(store, |data| {
             let Some(told_of) =
-                Self::told_of(lost, conversation_id, original_message_id, is_sender)
+                told_of(&data.lost, conversation_id, original_message_id, is_sender)
             else {
                 return false;
             };
-            let lost = &mut lost[told_of];
+            let lost = &mut data.lost[told_of];
             lost.to_tell = Some(FailedToDecrypt {
                 imdn: negative_delivery(
                     message_id,
@@ -204,35 +171,36 @@ impl LostMessages {
     /// Lets go of the message `original_message_id` of the group
     /// `conversation_id`, re-sent by whom `is_sender` tells; false if this
     /// client did not ask for it
-    fn found(
+    pub(super) fn found(
         &self,
         store: &MlsStore,
         conversation_id: &str,
         original_message_id: &str,
         is_sender: impl Fn(&str) -> bool,
     ) -> Result<bool, StoreError> {
-        self.change(store, |lost| {
-            let Some(found) = Self::told_of(lost, conversation_id, original_message_id, is_sender)
+        self.change(store, |data| {
+            let Some(found) = told_of(&data.lost, conversation_id, original_message_id, is_sender)
             else {
                 return false;
             };
-            lost.remove(found);
+            data.lost.remove(found);
             true
         })
     }
 
     /// The negative deliveries to send of the group `conversation_id`, taken
     /// as sent
-    fn to_tell(
+    pub(super) fn to_tell(
         &self,
         store: &MlsStore,
         conversation_id: &str,
     ) -> Result<Vec<FailedToDecrypt>, StoreError> {
-        if !self.any(conversation_id, |lost| lost.to_tell.is_some()) {
+        if !self.any_lost(conversation_id, |lost| lost.to_tell.is_some()) {
             return Ok(Vec::new());
         }
-        self.change(store, |lost| {
-            lost.iter_mut()
+        self.change(store, |data| {
+            data.lost
+                .iter_mut()
                 .filter(|lost| lost.conversation_id == conversation_id)
                 .filter_map(|lost| {
                     let to_tell = lost.to_tell.take()?;
@@ -243,40 +211,30 @@ impl LostMessages {
         })
     }
 
-    /// Lets go of the messages of the group `conversation_id`
-    fn forget(&self, store: &MlsStore, conversation_id: &str) -> Result<(), StoreError> {
-        if !self.any(conversation_id, |_| true) {
+    /// Lets go of the messages not decrypted of the group `conversation_id`
+    pub(super) fn forget_lost(
+        &self,
+        store: &MlsStore,
+        conversation_id: &str,
+    ) -> Result<(), StoreError> {
+        if !self.any_lost(conversation_id, |_| true) {
             return Ok(());
         }
-        self.change(store, |lost| {
-            lost.retain(|lost| lost.conversation_id != conversation_id)
+        self.change(store, |data| {
+            data.lost
+                .retain(|lost| lost.conversation_id != conversation_id)
         })
     }
 }
 
-/// `bytes`, their length first on four bytes
-fn put(data: &mut Vec<u8>, bytes: &[u8]) {
-    data.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    data.extend_from_slice(bytes);
-}
-
-/// The notes of the device holding the messages `lost`: none for none, else
-/// NOTES_VERSION, then each message
-fn encode(lost: &[Lost]) -> Vec<u8> {
-    if lost.is_empty() {
-        return Vec::new();
-    }
-    let mut data = vec![NOTES_VERSION];
+/// The messages not decrypted `lost`, as the notes of the device hold them
+pub(super) fn encode(lost: &[Lost]) -> Vec<u8> {
+    let mut data = Vec::new();
     for lost in lost {
         put(&mut data, lost.conversation_id.as_bytes());
         put(&mut data, lost.message_id.as_bytes());
         put(&mut data, lost.sender_uri.as_bytes());
-        let taken = lost
-            .taken
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|taken| taken.as_secs())
-            .unwrap_or_default();
-        data.extend_from_slice(&taken.to_be_bytes());
+        put_time(&mut data, lost.taken);
         data.push(u8::from(lost.told));
         match &lost.to_tell {
             None => data.push(0),
@@ -297,57 +255,15 @@ fn encode(lost: &[Lost]) -> Vec<u8> {
     data
 }
 
-/// What is left to read of notes
-struct Reader<'a>(&'a [u8]);
-
-impl<'a> Reader<'a> {
-    fn bytes(&mut self, length: usize) -> Option<&'a [u8]> {
-        (self.0.len() >= length).then(|| {
-            let (bytes, rest) = self.0.split_at(length);
-            self.0 = rest;
-            bytes
-        })
-    }
-
-    fn byte(&mut self) -> Option<u8> {
-        self.bytes(1).map(|bytes| bytes[0])
-    }
-
-    fn flag(&mut self) -> Option<bool> {
-        match self.byte()? {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        }
-    }
-
-    fn string(&mut self) -> Option<String> {
-        let length = u32::from_be_bytes(self.bytes(4)?.try_into().ok()?) as usize;
-        String::from_utf8(self.bytes(length)?.to_vec()).ok()
-    }
-
-    fn secs(&mut self) -> Option<SystemTime> {
-        let secs = u64::from_be_bytes(self.bytes(8)?.try_into().ok()?);
-        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
-    }
-}
-
-/// The messages the notes of the device `data` hold; None if they cannot be
-/// read
-fn decode(data: &[u8]) -> Option<Vec<Lost>> {
-    if data.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut reader = Reader(data);
-    if reader.byte()? != NOTES_VERSION {
-        return None;
-    }
+/// The messages not decrypted `reader` reads to its end; None if they
+/// cannot be read
+pub(super) fn decode(reader: &mut Reader) -> Option<Vec<Lost>> {
     let mut lost = Vec::new();
-    while !reader.0.is_empty() {
+    while !reader.is_empty() {
         let conversation_id = reader.string()?;
         let message_id = reader.string()?;
         let sender_uri = reader.string()?;
-        let taken = reader.secs()?;
+        let taken = reader.time()?;
         let told = reader.flag()?;
         let to_tell = match reader.flag()? {
             false => None,
@@ -399,7 +315,7 @@ impl E2eeDevice {
         let Some(sender_uri) = sender_uri(cpim_info).filter(|_| asks) else {
             return;
         };
-        if let Err(e) = self.lost().lose(
+        if let Err(e) = self.notes().lose(
             self.store(),
             conversation_id,
             &String::from_utf8_lossy(cpim_info.imdn_message_id),
@@ -422,7 +338,7 @@ impl E2eeDevice {
         original_message_id: &str,
         sender: &Credential,
     ) -> Result<bool, StoreError> {
-        self.lost().lose_resent(
+        self.notes().lose_resent(
             self.store(),
             conversation_id,
             original_message_id,
@@ -441,7 +357,7 @@ impl E2eeDevice {
         original_message_id: &str,
         sender: &Credential,
     ) -> Result<bool, StoreError> {
-        self.lost().found(
+        self.notes().found(
             self.store(),
             conversation_id,
             original_message_id,
@@ -480,7 +396,7 @@ impl E2eeDevice {
             });
         match pending {
             Ok(false) => self
-                .lost()
+                .notes()
                 .to_tell(self.store(), conversation_id)
                 .unwrap_or_else(|e| {
                     platform_log(LOG_TAG, format!("negative deliveries not kept: {:?}", e));
@@ -495,7 +411,7 @@ impl E2eeDevice {
     }
 
     fn forget_lost(&self, conversation_id: &str) {
-        if let Err(e) = self.lost().forget(self.store(), conversation_id) {
+        if let Err(e) = self.notes().forget_lost(self.store(), conversation_id) {
             platform_log(
                 LOG_TAG,
                 format!("messages not decrypted not let go of: {:?}", e),
@@ -512,10 +428,9 @@ mod tests {
 
     use rust_rcs_core::mls::{Credential, CredentialValidator, MlsConfig};
 
-    use crate::messaging::cpm::encryption::FailedToDecrypt;
-
+    use super::super::notes::Notes;
     use super::super::store::{MlsStore, StoreError};
-    use super::{decode, encode, Lost, LostMessages, LOST_FOR, LOST_MOST};
+    use super::{LOST_FOR, LOST_MOST};
 
     const BOB: &str = "tel:+491707654321";
 
@@ -529,12 +444,12 @@ mod tests {
 
     /// The state the app last kept, and whether it refuses to keep any
     #[derive(Default)]
-    struct App {
-        last: Mutex<Vec<u8>>,
-        refusing: AtomicBool,
+    pub(in crate::messaging::e2ee) struct App {
+        pub(in crate::messaging::e2ee) last: Mutex<Vec<u8>>,
+        pub(in crate::messaging::e2ee) refusing: AtomicBool,
     }
 
-    fn store(app: &Arc<App>) -> MlsStore {
+    pub(in crate::messaging::e2ee) fn store(app: &Arc<App>) -> MlsStore {
         let app = Arc::clone(app);
         MlsStore::new(
             MlsConfig::default(),
@@ -549,8 +464,9 @@ mod tests {
         )
     }
 
-    fn told(lost: &LostMessages, store: &MlsStore, conversation_id: &str) -> Vec<String> {
-        lost.to_tell(store, conversation_id)
+    fn told(notes: &Notes, store: &MlsStore, conversation_id: &str) -> Vec<String> {
+        notes
+            .to_tell(store, conversation_id)
             .unwrap()
             .into_iter()
             .map(|told| told.imdn)
@@ -563,95 +479,100 @@ mod tests {
     fn a_message_lost_is_told_of_once_and_taken_once_re_sent() {
         let app = Arc::new(App::default());
         let store = store(&app);
-        let lost = LostMessages::kept_by(&store);
+        let notes = Notes::kept_by(&store);
         let now = SystemTime::UNIX_EPOCH + THEN;
         for conversation_id in ["group-1", "group-1", "group-2"] {
-            lost.lose(
-                &store,
-                conversation_id,
-                "m1",
-                BOB,
-                "2026-10-25T12:00:00Z",
-                now,
-            )
-            .unwrap();
+            notes
+                .lose(
+                    &store,
+                    conversation_id,
+                    "m1",
+                    BOB,
+                    "2026-10-25T12:00:00Z",
+                    now,
+                )
+                .unwrap();
         }
 
         // by group, once
-        assert_eq!(lost.found(&store, "group-1", "m1", |_| true), Ok(false));
-        assert_eq!(told(&lost, &store, "group-1").len(), 1);
-        assert_eq!(told(&lost, &store, "group-1").len(), 0);
+        assert_eq!(notes.found(&store, "group-1", "m1", |_| true), Ok(false));
+        assert_eq!(told(&notes, &store, "group-1").len(), 1);
+        assert_eq!(told(&notes, &store, "group-1").len(), 0);
         // by whom it was from
         assert_eq!(
-            lost.found(&store, "group-1", "m1", |sender| sender != BOB),
+            notes.found(&store, "group-1", "m1", |sender| sender != BOB),
             Ok(false)
         );
         assert_eq!(
-            lost.found(&store, "group-1", "m1", |sender| sender == BOB),
+            notes.found(&store, "group-1", "m1", |sender| sender == BOB),
             Ok(true)
         );
-        assert_eq!(lost.found(&store, "group-1", "m1", |_| true), Ok(false));
-        assert_eq!(told(&lost, &store, "group-2").len(), 1);
-        lost.forget(&store, "group-2").unwrap();
-        assert_eq!(lost.found(&store, "group-2", "m1", |_| true), Ok(false));
+        assert_eq!(notes.found(&store, "group-1", "m1", |_| true), Ok(false));
+        assert_eq!(told(&notes, &store, "group-2").len(), 1);
+        notes.forget_lost(&store, "group-2").unwrap();
+        assert_eq!(notes.found(&store, "group-2", "m1", |_| true), Ok(false));
     }
 
     #[test]
     fn messages_lost_are_kept_for_30_days_and_1024_at_most() {
         let app = Arc::new(App::default());
         let store = store(&app);
-        let lost = LostMessages::kept_by(&store);
+        let notes = Notes::kept_by(&store);
         let then = SystemTime::UNIX_EPOCH + THEN;
-        lost.lose(&store, "group-1", "old", BOB, "", then).unwrap();
-        lost.lose(
-            &store,
-            "group-1",
-            "recent",
-            BOB,
-            "",
-            then + Duration::from_secs(60),
-        )
-        .unwrap();
-        assert_eq!(told(&lost, &store, "group-1").len(), 2);
+        notes.lose(&store, "group-1", "old", BOB, "", then).unwrap();
+        notes
+            .lose(
+                &store,
+                "group-1",
+                "recent",
+                BOB,
+                "",
+                then + Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(told(&notes, &store, "group-1").len(), 2);
 
         // the sender re-sends none older (RCC.16 section 10.3)
-        lost.lose(
-            &store,
-            "group-1",
-            "new",
-            BOB,
-            "",
-            then + LOST_FOR + Duration::from_secs(1),
-        )
-        .unwrap();
-        assert_eq!(lost.found(&store, "group-1", "old", |_| true), Ok(false));
-        assert_eq!(lost.found(&store, "group-1", "recent", |_| true), Ok(true));
+        notes
+            .lose(
+                &store,
+                "group-1",
+                "new",
+                BOB,
+                "",
+                then + LOST_FOR + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(notes.found(&store, "group-1", "old", |_| true), Ok(false));
+        assert_eq!(notes.found(&store, "group-1", "recent", |_| true), Ok(true));
 
         // the oldest forgotten first
-        let lost = LostMessages::kept_by(&store);
-        lost.forget(&store, "group-1").unwrap();
+        notes.forget_lost(&store, "group-1").unwrap();
         for n in 0..=LOST_MOST {
-            lost.lose(&store, "group-1", &format!("m{}", n), BOB, "", then)
+            notes
+                .lose(&store, "group-1", &format!("m{}", n), BOB, "", then)
                 .unwrap();
         }
-        assert_eq!(told(&lost, &store, "group-1").len(), LOST_MOST);
-        assert_eq!(lost.found(&store, "group-1", "m0", |_| true), Ok(false));
-        assert_eq!(lost.found(&store, "group-1", "m1", |_| true), Ok(true));
+        assert_eq!(told(&notes, &store, "group-1").len(), LOST_MOST);
+        assert_eq!(notes.found(&store, "group-1", "m0", |_| true), Ok(false));
+        assert_eq!(notes.found(&store, "group-1", "m1", |_| true), Ok(true));
     }
 
     #[test]
     fn messages_lost_are_kept_with_the_state_of_the_device() {
         let app = Arc::new(App::default());
         let store = store(&app);
-        let lost = LostMessages::kept_by(&store);
+        let notes = Notes::kept_by(&store);
         let then = SystemTime::UNIX_EPOCH + THEN;
-        lost.lose(&store, "group-1", "m1", BOB, "2026-10-25T12:00:00Z", then)
+        notes
+            .lose(&store, "group-1", "m1", BOB, "2026-10-25T12:00:00Z", then)
             .unwrap();
-        lost.lose(&store, "group-1", "m2", BOB, "2026-10-25T12:00:01Z", then)
+        notes
+            .lose(&store, "group-1", "m2", BOB, "2026-10-25T12:00:01Z", then)
             .unwrap();
-        assert_eq!(told(&lost, &store, "group-1").len(), 2);
+        assert_eq!(told(&notes, &store, "group-1").len(), 2);
         assert_eq!(
-            lost.lose_resent(
+            notes.lose_resent(
                 &store,
                 "group-1",
                 "m2",
@@ -665,8 +586,11 @@ mod tests {
         // as they are, once the state is restored
         let again = self::store(&app);
         again.restore(&app.last.lock().unwrap()).unwrap();
-        let restored = LostMessages::kept_by(&again);
-        assert_eq!(*restored.0.lock().unwrap(), *lost.0.lock().unwrap());
+        let restored = Notes::kept_by(&again);
+        assert_eq!(
+            restored.read(|data| data.clone()),
+            notes.read(|data| data.clone())
+        );
         let resent = restored.to_tell(&again, "group-1").unwrap();
         assert_eq!(resent.len(), 1);
         assert_eq!(resent[0].original_message_id.as_deref(), Some("m2"));
@@ -691,55 +615,10 @@ mod tests {
 
     #[test]
     fn notes_that_cannot_be_read_have_no_message() {
-        let then = SystemTime::UNIX_EPOCH + THEN;
-        let lost = vec![
-            Lost {
-                conversation_id: String::from("group-1"),
-                message_id: String::from("m1"),
-                sender_uri: String::from(BOB),
-                taken: then,
-                to_tell: None,
-                told: true,
-            },
-            Lost {
-                conversation_id: String::from("group-2"),
-                message_id: String::from("m2"),
-                sender_uri: String::from(BOB),
-                taken: then + Duration::from_secs(1),
-                to_tell: Some(FailedToDecrypt {
-                    imdn: String::from("<imdn/>"),
-                    sender_uri: String::from(BOB),
-                    original_message_id: Some(String::from("m0")),
-                }),
-                told: false,
-            },
-        ];
-        let notes = encode(&lost);
-        assert_eq!(decode(&notes), Some(lost));
-        assert_eq!(encode(&[]), Vec::<u8>::new());
-        assert_eq!(decode(&[]), Some(Vec::new()));
-
-        // cut, of another version, or with a flag that is none
-        let mut another_version = notes.clone();
-        another_version[0] = 2;
-        // the told flag of the first, after the version, its strings and time
-        let told_at = 1 + (4 + "group-1".len()) + (4 + "m1".len()) + (4 + BOB.len()) + 8;
-        assert_eq!(notes[told_at], 1);
-        let mut not_a_flag = notes.clone();
-        not_a_flag[told_at] = 2;
-        for notes in [
-            notes[..notes.len() - 1].to_vec(),
-            another_version,
-            not_a_flag,
-        ] {
-            assert_eq!(decode(&notes), None);
-        }
-
-        // and none taken from a state holding such notes
         let app = Arc::new(App::default());
         let store = store(&app);
-        store.keep_notes(vec![2, 0]).unwrap();
-        let lost = LostMessages::kept_by(&store);
-        assert!(lost.0.lock().unwrap().is_empty());
+        store.keep_notes(vec![9, 0]).unwrap();
+        let notes = Notes::kept_by(&store);
+        assert!(notes.read(|data| data.lost.is_empty() && data.sent.is_empty()));
     }
 }
