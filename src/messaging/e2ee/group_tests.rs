@@ -23,7 +23,7 @@ use rust_rcs_core::imdn::notification::{Imdn, Notification, Status};
 use rust_rcs_core::internet::Body;
 use rust_rcs_core::mls::rcs::certificate::CertificateError;
 use rust_rcs_core::mls::rcs::era::EraBase;
-use rust_rcs_core::mls::rcs::imdn::{failure_reason, FailureReason};
+use rust_rcs_core::mls::rcs::imdn::{failure_reason, negative_delivery, FailureReason};
 use rust_rcs_core::mls::rcs::proto::{
     self, client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage,
     ClientMlsRcsMessage, CommitBundle, EndMlsReason, EpochControlMessages, EpochIdentifier,
@@ -36,8 +36,8 @@ use rust_rcs_core::mls::rcs::wire::{
     VerifiableDisplayImdn,
 };
 use rust_rcs_core::mls::rcs::{
-    is_unencrypted_cpim_header, ClientFailureReason, ResentFailure, ServerFailureReason,
-    CONTENT_TYPE_MLS_RCS_CLIENT, INFO_PACKAGE_MLS_ENHANCED_GROUP_INFO_PULL,
+    is_unencrypted_cpim_header, ClientFailureReason, ResentFailure, SecretPayloadType,
+    ServerFailureReason, CONTENT_TYPE_MLS_RCS_CLIENT, INFO_PACKAGE_MLS_ENHANCED_GROUP_INFO_PULL,
     INFO_PACKAGE_MLS_GROUP_INFO_PULL,
 };
 use rust_rcs_core::mls::{
@@ -46,8 +46,8 @@ use rust_rcs_core::mls::{
 
 use crate::capability::{Capabilities, CapabilityQuery};
 use crate::messaging::cpm::encryption::{
-    EndReason, FailedToDecrypt, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade,
-    Verified,
+    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken,
+    Upgrade, Verified,
 };
 use crate::messaging::cpm::make_cpim_imdn_body;
 
@@ -6973,4 +6973,431 @@ fn messages_not_decrypted_are_told_of_and_taken_after_the_device_restarted() {
         decrypted(&device, &outer, &mls_message),
         Err(MessageError::NotAskedFor)
     );
+}
+
+/// A negative delivery of `member`'s Client, from `from`, telling that the
+/// message `message_id` was not decrypted, for `reason`, in the CPIM message
+/// `cpim_id`, with the Original-Message-ID `original_message_id` if it is
+/// of a Re-Sent Message, signed over what it tells of (RCC.16 sections
+/// 7.7.2.2, 10.2): the CPIM message, and the document
+fn failed_to_decrypt_by(
+    member: &MlsClient,
+    group: &mut MlsConversation,
+    from: &str,
+    cpim_id: &str,
+    message_id: &str,
+    original_message_id: Option<&str>,
+    reason: ClientFailureReason,
+) -> (Vec<u8>, String) {
+    let xml = negative_delivery(message_id, "2026-10-25T12:00:00.000+00:00", reason);
+    let content = VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+        DeliveryNotificationStatus::Failed,
+        message_id.as_bytes(),
+        original_message_id.unwrap_or_default().as_bytes(),
+        reason,
+    ));
+    let signature = group.sign(member, &derived(cpim_id, content)).unwrap();
+    let mut extra = format!(
+        "NS: mls <http://www.gsma.com/rcs/mls>\r\nmls.MLS-Derived-Content-Signature: {}\r\nmls.Era-ID: 0\r\n",
+        general_purpose::STANDARD.encode(signature)
+    );
+    if let Some(original_message_id) = original_message_id {
+        extra += &format!("mls.Original-Message-ID: {}\r\n", original_message_id);
+    }
+    (notification_cpim(from, cpim_id, &extra, &xml), xml)
+}
+
+/// What the device answers the notification `xml` in the CPIM message `cpim`
+fn ftd_answer(device: &E2eeDevice, cpim: &[u8], xml: &str) -> FtdAnswer {
+    device.answer_failed_to_decrypt(
+        CONVERSATION,
+        &cpim_message(cpim).get_info().unwrap(),
+        xml.as_bytes(),
+    )
+}
+
+/// The Re-Sent Message the device answers the notification `xml` in the
+/// CPIM message `cpim` with
+fn resent(device: &E2eeDevice, cpim: &[u8], xml: &str) -> Vec<u8> {
+    match ftd_answer(device, cpim, xml) {
+        FtdAnswer::Resend(resent) => resent,
+        other => panic!("not re-sent: {:?}", other),
+    }
+}
+
+/// What `member` decrypts of the Re-Sent Message `resent`: its Message-ID,
+/// and its Original Message if it is sealed to `member`
+fn resent_to(
+    member: &MlsClient,
+    group: &mut MlsConversation,
+    resent: &[u8],
+) -> (String, Option<Vec<u8>>) {
+    let message = cpim_message(resent);
+    let info = message.get_info().unwrap();
+    let (content_type, mls_message, _) = message.get_message_body().unwrap();
+    assert_eq!(content_type, Some(&b"message/mls"[..]));
+    let decrypted = group
+        .decrypt(member, mls_message, info.imdn_message_id)
+        .unwrap();
+    assert_eq!(decrypted.payload_type, SecretPayloadType::Hpke1To1Message);
+    assert_eq!(
+        Some(decrypted.original_message_id.as_slice()),
+        info.mls_original_message_id
+    );
+    (
+        String::from_utf8_lossy(info.imdn_message_id).into_owned(),
+        decrypted.payload,
+    )
+}
+
+#[test]
+fn a_message_a_member_could_not_decrypt_is_re_sent_to_it_and_keys_updated_after() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let sent = device
+        .encrypt_message(
+            CONVERSATION,
+            &plaintext("alice-1", Some("positive-delivery, display")),
+        )
+        .unwrap();
+    let original = received_by_bob(&bob, &mut bobs_group, &sent);
+    assert!(!device.key_update_due(CONVERSATION));
+
+    // Bob telling he could not decrypt it (RCC.16 section 10.3)
+    let (cpim, xml) = failed_to_decrypt_by(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "imdn-1",
+        "alice-1",
+        None,
+        ClientFailureReason::FailureToDecrypt,
+    );
+    let resent = resent(&device, &cpim, &xml);
+
+    // a new message of the user to the group, with the headers it was sent
+    // with unencrypted, telling of the Original Message (sections 7.2.3,
+    // 7.5.3)
+    let message = cpim_message(&resent);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    assert_ne!(info.imdn_message_id, b"alice-1");
+    assert_eq!(info.mls_original_message_id, Some(&b"alice-1"[..]));
+    assert_ne!(info.date, b"2026-10-25T12:00:00.000+00:00");
+    assert_eq!(
+        info.disposition_notification,
+        Some(&b"positive-delivery, display, negative-delivery"[..])
+    );
+    assert!(
+        header_names(&message).contains(&String::from("<http://www.gsma.com/rcs>.advised-action"))
+    );
+    assert!(!header_names(&message).contains(&String::from(
+        "<http://www.openmobilealliance.org/cpm/>.Payload-Type"
+    )));
+
+    // which Bob decrypts to the message he could not
+    let (_, payload) = resent_to(&bob, &mut bobs_group, &resent);
+    assert_eq!(payload, Some(original));
+
+    // then the keys of the device are to be updated
+    assert!(device.key_update_due(CONVERSATION));
+}
+
+#[test]
+fn only_negative_deliveries_of_messages_not_decrypted_are_answered() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    device
+        .encrypt_message(CONVERSATION, &plaintext("alice-1", None))
+        .unwrap();
+
+    // not other notifications (RCC.16 section 10.3)
+    let delivered = notification_xml("alice-1", "delivery-notification", "<delivered/>");
+    let cpim = signed_by_bob(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "imdn-1",
+        &delivered,
+        VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+            DeliveryNotificationStatus::Delivered,
+            b"alice-1",
+            b"",
+            ClientFailureReason::Unset,
+        )),
+    );
+    assert_eq!(ftd_answer(&device, &cpim, &delivered), FtdAnswer::NotOne);
+    for reason in [
+        ClientFailureReason::Unset,
+        ClientFailureReason::InvalidCommit,
+    ] {
+        let (cpim, xml) = failed_to_decrypt_by(
+            &bob,
+            &mut bobs_group,
+            BOB_TEL,
+            "imdn-2",
+            "alice-1",
+            None,
+            reason,
+        );
+        assert_eq!(ftd_answer(&device, &cpim, &xml), FtdAnswer::NotOne);
+    }
+
+    // nor those of a message the device did not send encrypted, or of a
+    // Re-Sent Message telling of no Original Message
+    for (message_id, reason) in [
+        ("bob-1", ClientFailureReason::FailureToDecrypt),
+        (
+            "alice-1",
+            ClientFailureReason::InnerResentMessageFailureToDecrypt,
+        ),
+    ] {
+        let (cpim, xml) = failed_to_decrypt_by(
+            &bob,
+            &mut bobs_group,
+            BOB_TEL,
+            "imdn-3",
+            message_id,
+            None,
+            reason,
+        );
+        assert_eq!(ftd_answer(&device, &cpim, &xml), FtdAnswer::Ignored);
+    }
+
+    // one not signed, or not by whom it is from, has the group healed
+    let (_, xml) = failed_to_decrypt_by(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "imdn-4",
+        "alice-1",
+        None,
+        ClientFailureReason::FailureToDecrypt,
+    );
+    let unsigned = notification_cpim(BOB_TEL, "imdn-4", "", &xml);
+    assert!(!groups.needs_healing(CONVERSATION));
+    assert_eq!(ftd_answer(&device, &unsigned, &xml), FtdAnswer::Heal);
+    assert!(groups.needs_healing(CONVERSATION));
+    let (cpim, xml) = failed_to_decrypt_by(
+        &bob,
+        &mut bobs_group,
+        CAROL_TEL,
+        "imdn-5",
+        "alice-1",
+        None,
+        ClientFailureReason::FailureToDecrypt,
+    );
+    assert_eq!(ftd_answer(&device, &cpim, &xml), FtdAnswer::Heal);
+
+    // re-sent 5 times at most
+    for n in 0..5 {
+        let (cpim, xml) = failed_to_decrypt_by(
+            &bob,
+            &mut bobs_group,
+            BOB_TEL,
+            &format!("imdn-1{}", n),
+            "alice-1",
+            None,
+            ClientFailureReason::FailureToDecrypt,
+        );
+        let (_, payload) = resent_to(&bob, &mut bobs_group, &resent(&device, &cpim, &xml));
+        assert!(payload.is_some());
+    }
+    let (cpim, xml) = failed_to_decrypt_by(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "imdn-20",
+        "alice-1",
+        None,
+        ClientFailureReason::FailureToDecrypt,
+    );
+    assert_eq!(ftd_answer(&device, &cpim, &xml), FtdAnswer::Ignored);
+
+    // none once the group is unencrypted
+    device
+        .encrypt_message(CONVERSATION, &plaintext("alice-2", None))
+        .unwrap();
+    let (cpim, xml) = failed_to_decrypt_by(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "imdn-21",
+        "alice-2",
+        None,
+        ClientFailureReason::FailureToDecrypt,
+    );
+    moved_to_unencrypted(&device, &groups, &bob, &mut bobs_group);
+    assert_eq!(ftd_answer(&device, &cpim, &xml), FtdAnswer::Ignored);
+    // nor unsigned, as notifications may be then (section 11.2)
+    let unsigned = notification_cpim(BOB_TEL, "imdn-22", "", &xml);
+    assert_eq!(ftd_answer(&device, &unsigned, &xml), FtdAnswer::Ignored);
+}
+
+#[test]
+fn a_message_is_re_sent_only_to_a_client_that_was_a_member_when_it_was_sent() {
+    let (device, phone, mut phones_group, bob) = group_to_add_bob_to();
+    device
+        .encrypt_message(CONVERSATION, &plaintext("alice-1", None))
+        .unwrap();
+    let cpim =
+        block_on(device.add_to_group(CONVERSATION, IMPU, GROUP_URI, vec![recipient(BOB_TEL)]))
+            .unwrap();
+    let bundle = bundle_of(&cpim);
+    device
+        .on_server_message(CONVERSATION, &forwarded(&bundle))
+        .unwrap();
+    let tree = device
+        .store()
+        .with_conversation(CONVERSATION.as_bytes(), |conversation, _| {
+            conversation.ratchet_tree()
+        })
+        .unwrap();
+    let mut bobs_group = bob.join_conversation(&bundle.welcome, &tree).unwrap();
+    phones_group
+        .process_commit_bundle(
+            &phone,
+            &ServerCommitBundle {
+                commit_list: bundle.commit_list.clone(),
+                ..ServerCommitBundle::default()
+            },
+        )
+        .unwrap();
+
+    // not to Bob, added since (RCC.16 section 10.3)
+    let (cpim, xml) = failed_to_decrypt_by(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "imdn-1",
+        "alice-1",
+        None,
+        ClientFailureReason::FailureToDecrypt,
+    );
+    assert_eq!(ftd_answer(&device, &cpim, &xml), FtdAnswer::Ignored);
+    // but to the other phone of the user, a member then, which alone can
+    // read it
+    let (cpim, xml) = failed_to_decrypt_by(
+        &phone,
+        &mut phones_group,
+        ALICE_TEL,
+        "imdn-2",
+        "alice-1",
+        None,
+        ClientFailureReason::FailureToDecrypt,
+    );
+    let resent_to_phone = resent(&device, &cpim, &xml);
+    assert!(resent_to(&phone, &mut phones_group, &resent_to_phone)
+        .1
+        .is_some());
+    assert_eq!(resent_to(&bob, &mut bobs_group, &resent_to_phone).1, None);
+
+    // a Re-Sent Message not decrypted is re-sent again to the Client it was
+    // sealed to, not to another
+    device
+        .encrypt_message(CONVERSATION, &plaintext("alice-2", None))
+        .unwrap();
+    let (cpim, xml) = failed_to_decrypt_by(
+        &phone,
+        &mut phones_group,
+        ALICE_TEL,
+        "imdn-3",
+        "alice-2",
+        None,
+        ClientFailureReason::FailureToDecrypt,
+    );
+    let (resent_id, _) = resent_to(&phone, &mut phones_group, &resent(&device, &cpim, &xml));
+    let (cpim, xml) = failed_to_decrypt_by(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "imdn-4",
+        &resent_id,
+        Some("alice-2"),
+        ClientFailureReason::InnerResentMessageFailureToDecrypt,
+    );
+    assert_eq!(ftd_answer(&device, &cpim, &xml), FtdAnswer::Ignored);
+    let (cpim, xml) = failed_to_decrypt_by(
+        &phone,
+        &mut phones_group,
+        ALICE_TEL,
+        "imdn-5",
+        &resent_id,
+        Some("alice-2"),
+        ClientFailureReason::InnerResentMessageFailureToDecrypt,
+    );
+    let (again, payload) = resent_to(&phone, &mut phones_group, &resent(&device, &cpim, &xml));
+    assert_ne!(again, resent_id);
+    assert!(payload.is_some());
+}
+
+#[test]
+fn a_message_sent_over_30_days_ago_is_not_re_sent() {
+    let (device, _kds, bob, mut bobs_group, clock) = alice_and_bob_in_time_with_kds();
+    device
+        .encrypt_message(CONVERSATION, &plaintext("alice-1", None))
+        .unwrap();
+    let telling = |bobs_group: &mut MlsConversation, cpim_id: &str| {
+        failed_to_decrypt_by(
+            &bob,
+            bobs_group,
+            BOB_TEL,
+            cpim_id,
+            "alice-1",
+            None,
+            ClientFailureReason::FailureToDecrypt,
+        )
+    };
+
+    clock.advance(29 * DAY);
+    let (cpim, xml) = telling(&mut bobs_group, "imdn-1");
+    assert!(matches!(
+        ftd_answer(&device, &cpim, &xml),
+        FtdAnswer::Resend(_)
+    ));
+    // RCC.16 section 10.3
+    clock.advance(2 * DAY);
+    let (cpim, xml) = telling(&mut bobs_group, "imdn-2");
+    assert_eq!(ftd_answer(&device, &cpim, &xml), FtdAnswer::Ignored);
+}
+
+#[test]
+fn a_message_sent_is_re_sent_after_the_device_restarted() {
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    let sent = device
+        .encrypt_message(CONVERSATION, &plaintext("alice-1", None))
+        .unwrap();
+    let original = received_by_bob(&bob, &mut bobs_group, &sent);
+
+    // re-sent after a restart, 5 times at most, through restarts too
+    let restarted = || Arc::new(alice(&app, &kds, TODAY, Some(&app.last().unwrap())));
+    for n in 0..6 {
+        let device = restarted();
+        let (cpim, xml) = failed_to_decrypt_by(
+            &bob,
+            &mut bobs_group,
+            BOB_TEL,
+            &format!("imdn-{}", n),
+            "alice-1",
+            None,
+            ClientFailureReason::FailureToDecrypt,
+        );
+        match ftd_answer(&device, &cpim, &xml) {
+            FtdAnswer::Resend(resent) if n < 5 => assert_eq!(
+                resent_to(&bob, &mut bobs_group, &resent).1.as_ref(),
+                Some(&original)
+            ),
+            FtdAnswer::Ignored if n == 5 => {}
+            other => panic!("{}: {:?}", n, other),
+        }
+    }
 }

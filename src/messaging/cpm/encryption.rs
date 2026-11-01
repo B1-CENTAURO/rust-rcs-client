@@ -114,6 +114,25 @@ pub struct FailedToDecrypt {
     pub original_message_id: Option<String>,
 }
 
+/// What a notification received in an encrypted group chat brings, as a
+/// negative delivery telling that a message of this client could not be
+/// decrypted (RCC.16 section 10.3)
+#[derive(Debug, PartialEq)]
+pub enum FtdAnswer {
+    /// It is no such negative delivery
+    NotOne,
+    /// It is answered with the CPIM message carrying a Re-Sent Message, to
+    /// send in the session, a key update of this client to follow; it is
+    /// not for the app
+    Resend(Vec<u8>),
+    /// It is not answered, as the message is not to be re-sent: it is for
+    /// the app, as any negative delivery
+    Ignored,
+    /// It is not signed, or not by whom it is from: the group is to be
+    /// self-healed, and it is not for the app
+    Heal,
+}
+
 /// Why a group chat moves to unencrypted (RCC.16 sections 7.11.2.2, 11.2)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EndReason {
@@ -440,6 +459,19 @@ pub trait GroupEncryption: Send + Sync {
     /// negative delivery, which may come unsigned (RCC.16 sections 7.6.2,
     /// 7.7), as any may once the group chat is unencrypted (section 11.2)
     fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> Verified;
+
+    /// What the notification `imdn` received in the group chat
+    /// `conversation_id`, in the CPIM message `cpim_info` tells of, brings as
+    /// a negative delivery telling that a message of this client could not
+    /// be decrypted: the message re-sent to whom it is from if it is to be,
+    /// else nothing for this client to do, or the group self-healed if it
+    /// is not signed by whom it is from (RCC.16 section 10.3)
+    fn answer_failed_to_decrypt(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        imdn: &[u8],
+    ) -> FtdAnswer;
 
     /// The negative deliveries to send in the group chat `conversation_id`,
     /// telling senders that messages of theirs could not be decrypted, once

@@ -14,7 +14,8 @@
 
 //! The MLS state of the device: the Participant Key of its user, one MLS
 //! client, and the groups it takes part in, kept by the app with the notes
-//! the device keeps besides, such as the messages it could not decrypt
+//! the device keeps besides: the messages it could not decrypt, and those
+//! it sent, to re-send
 //!
 //! The state holds the private keys of the device and the secrets of every
 //! group. A change to it has to be kept before anything it produced is sent:
@@ -326,6 +327,50 @@ impl MlsStore {
 
         let result = f(conversation, client);
         self.save(&mut state)?;
+        result.map_err(StoreError::Mls)
+    }
+
+    /// Calls `f` with the group `group_id` and the client, as
+    /// with_conversation() does, and keeps along with the state it leaves
+    /// the notes `notes` makes of its result, if any: both are kept, or
+    /// neither
+    pub fn with_conversation_and_notes<R, F, N>(
+        &self,
+        group_id: &[u8],
+        f: F,
+        notes: N,
+    ) -> Result<R, StoreError>
+    where
+        F: FnOnce(&mut MlsConversation, &MlsClient) -> mls::Result<R>,
+        N: FnOnce(&R) -> Option<Vec<u8>>,
+    {
+        let mut state = self.state.lock().unwrap();
+        let State {
+            client,
+            conversations,
+            ..
+        } = &mut *state;
+        let client = client.as_ref().ok_or(StoreError::NoClient)?;
+
+        if !conversations.contains_key(group_id) {
+            let conversation = client
+                .load_conversation(group_id)
+                .map_err(StoreError::Mls)?;
+            conversations.insert(group_id.to_vec(), conversation);
+        }
+        let conversation = conversations.get_mut(group_id).unwrap();
+
+        let result = f(conversation, client);
+        match result.as_ref().ok().and_then(notes) {
+            Some(notes) => {
+                let before = std::mem::replace(&mut state.notes, notes);
+                if let Err(e) = self.save(&mut state) {
+                    state.notes = before;
+                    return Err(e);
+                }
+            }
+            None => self.save(&mut state)?,
+        }
         result.map_err(StoreError::Mls)
     }
 

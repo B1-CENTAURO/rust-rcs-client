@@ -33,9 +33,10 @@ use rust_rcs_core::mls::rcs::{
     SecretPayloadType, CPIM_HEADER_DERIVED_CONTENT_SIGNATURE, CPIM_HEADER_EPOCH_AUTHENTICATOR,
     CPIM_HEADER_ERA_ID, CPIM_HEADER_ORIGINAL_MESSAGE_ID, CPIM_NAMESPACE, CPIM_NAMESPACE_PREFIX,
 };
-use rust_rcs_core::mls::ErrorKind;
+use rust_rcs_core::mls::{Credential, ErrorKind};
 
 use super::device::{is_of, participant_tel_uri, E2eeDevice};
+use super::sent::{members_besides, note_sent};
 use super::store::StoreError;
 
 const IMDN_NAMESPACE: &[u8] = b"urn:ietf:params:imdn";
@@ -104,6 +105,65 @@ fn with_negative_delivery(disposition: Option<&[u8]>) -> Vec<u8> {
         Some(disposition) => [disposition, b", negative-delivery"].concat(),
         None => b"negative-delivery".to_vec(),
     }
+}
+
+/// The CPIM message carrying the `message/mls` `mls_message`, of the CPIM
+/// headers `headers` left unencrypted, the name of each as they are sent,
+/// asking to be told as `disposition` tells, with the Original-Message-ID
+/// `original_message_id` if it is a Re-Sent Message, and the Epoch-Authenticator
+/// and Era-ID of the group (RCC.16 sections 7.2.3, 7.5.5 to 7.5.7)
+pub(super) fn outer_cpim(
+    headers: &[(Vec<u8>, Vec<u8>)],
+    disposition: &[u8],
+    original_message_id: Option<&[u8]>,
+    epoch_authenticator: &[u8],
+    era: u32,
+    mls_message: &[u8],
+) -> Vec<u8> {
+    let mut data = Vec::new();
+    let (core, prefixed): (Vec<_>, Vec<_>) =
+        headers.iter().partition(|(name, _)| !name.contains(&b'.'));
+    for (name, value) in core {
+        header_line(&mut data, name, value);
+    }
+    header_line(&mut data, b"NS", b"imdn <urn:ietf:params:imdn>");
+    if prefixed.iter().any(|(name, _)| name.starts_with(b"rcs.")) {
+        header_line(&mut data, b"NS", b"rcs <http://www.gsma.com/rcs>");
+    }
+    header_line(&mut data, b"NS", b"mls <http://www.gsma.com/rcs/mls>");
+    for (name, value) in prefixed {
+        header_line(&mut data, name, value);
+    }
+    header_line(&mut data, b"imdn.Disposition-Notification", disposition);
+    if let Some(original_message_id) = original_message_id {
+        header_line(
+            &mut data,
+            &[&b"mls."[..], CPIM_HEADER_ORIGINAL_MESSAGE_ID].concat(),
+            original_message_id,
+        );
+    }
+    header_line(
+        &mut data,
+        &[&b"mls."[..], CPIM_HEADER_EPOCH_AUTHENTICATOR].concat(),
+        general_purpose::STANDARD
+            .encode(epoch_authenticator)
+            .as_bytes(),
+    );
+    header_line(
+        &mut data,
+        &[&b"mls."[..], CPIM_HEADER_ERA_ID].concat(),
+        era.to_string().as_bytes(),
+    );
+    data.extend_from_slice(b"\r\n");
+    header_line(&mut data, b"Content-Type", b"message/mls");
+    header_line(
+        &mut data,
+        b"Content-Length",
+        mls_message.len().to_string().as_bytes(),
+    );
+    data.extend_from_slice(b"\r\n");
+    data.extend_from_slice(mls_message);
+    data
 }
 
 /// The tel URI of the participant the CPIM From of `cpim_info` gives, if any
@@ -266,61 +326,65 @@ impl E2eeDevice {
         if epoch == 0 {
             return Err(MessageError::NotCreated);
         }
-        let (mls_message, epoch_authenticator, era) = self
-            .store()
-            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
-                let era = conversation.era().ok_or(ErrorKind::InvalidState)?;
-                let mls_message = conversation.encrypt_cpim(client, &payload, &message_id, b"")?;
-                Ok((
-                    mls_message,
-                    conversation.epoch_authenticator().to_vec(),
-                    era,
-                ))
+        // kept along with the message, for it to be re-sent to a member that
+        // could not decrypt it (section 10.3)
+        let disposition = with_negative_delivery(disposition);
+        let kept_headers: Vec<(Vec<u8>, Vec<u8>)> = unencrypted
+            .iter()
+            .filter(|(name, _)| {
+                !name.eq_ignore_ascii_case(b"DateTime")
+                    && !name.eq_ignore_ascii_case(b"imdn.Message-ID")
             })
+            .map(|(name, value)| (name.clone(), value.to_vec()))
+            .collect();
+        let message_id_text = String::from_utf8_lossy(&message_id).into_owned();
+        let now = self.store().now();
+        let ((mls_message, epoch_authenticator, era), ()) = self
+            .notes()
+            .change_with_conversation(
+                self.store(),
+                conversation_id.as_bytes(),
+                |conversation, client| {
+                    let era = conversation.era().ok_or(ErrorKind::InvalidState)?;
+                    let mls_message =
+                        conversation.encrypt_cpim(client, &payload, &message_id, b"")?;
+                    Ok((
+                        (
+                            mls_message,
+                            conversation.epoch_authenticator().to_vec(),
+                            era,
+                        ),
+                        members_besides(conversation, client),
+                    ))
+                },
+                |data, (_, members)| {
+                    note_sent(
+                        data,
+                        conversation_id,
+                        &message_id_text,
+                        &payload,
+                        kept_headers,
+                        &disposition,
+                        members.clone(),
+                        now,
+                    )
+                },
+            )
+            .map(|((made, _), noted)| (made, noted))
             .map_err(MessageError::Store)?;
 
-        let mut data = Vec::new();
-        let (core, prefixed): (Vec<_>, Vec<_>) = unencrypted
-            .iter()
-            .partition(|(name, _)| !name.contains(&b'.'));
-        for (name, value) in core {
-            header_line(&mut data, name, value);
-        }
-        header_line(&mut data, b"NS", b"imdn <urn:ietf:params:imdn>");
-        if prefixed.iter().any(|(name, _)| name.starts_with(b"rcs.")) {
-            header_line(&mut data, b"NS", b"rcs <http://www.gsma.com/rcs>");
-        }
-        header_line(&mut data, b"NS", b"mls <http://www.gsma.com/rcs/mls>");
-        for (name, value) in prefixed {
-            header_line(&mut data, name, value);
-        }
-        header_line(
-            &mut data,
-            b"imdn.Disposition-Notification",
-            &with_negative_delivery(disposition),
-        );
-        header_line(
-            &mut data,
-            &[&b"mls."[..], CPIM_HEADER_EPOCH_AUTHENTICATOR].concat(),
-            general_purpose::STANDARD
-                .encode(epoch_authenticator)
-                .as_bytes(),
-        );
-        header_line(
-            &mut data,
-            &[&b"mls."[..], CPIM_HEADER_ERA_ID].concat(),
-            era.to_string().as_bytes(),
-        );
-        data.extend_from_slice(b"\r\n");
-        header_line(&mut data, b"Content-Type", b"message/mls");
-        header_line(
-            &mut data,
-            b"Content-Length",
-            mls_message.len().to_string().as_bytes(),
-        );
-        data.extend_from_slice(b"\r\n");
-        data.extend_from_slice(&mls_message);
-        Ok(data)
+        let unencrypted: Vec<(Vec<u8>, Vec<u8>)> = unencrypted
+            .into_iter()
+            .map(|(name, value)| (name, value.to_vec()))
+            .collect();
+        Ok(outer_cpim(
+            &unencrypted,
+            &disposition,
+            None,
+            &epoch_authenticator,
+            era,
+            &mls_message,
+        ))
     }
 
     /// The CPIM message the `message/mls` `mls_message` of the MLS group
@@ -524,12 +588,29 @@ impl E2eeDevice {
         if self.encryption_ended(conversation_id) {
             return Ok(());
         }
-        let Some(signature) = cpim_info.mls_derived_content_signature else {
+        if cpim_info.mls_derived_content_signature.is_none() {
             return match Imdn::from_xml(imdn) {
                 Some(notification) if notification.status == Status::Failed => Ok(()),
                 _ => Err(MessageError::NotSigned),
             };
-        };
+        }
+        self.notification_signer(conversation_id, cpim_info, imdn)
+            .map(|_| ())
+    }
+
+    /// The Client that signed the notification `imdn` received in the MLS
+    /// group `conversation_id`, in the CPIM message `cpim_info` tells of,
+    /// over what it tells of, if it is of the participant the notification
+    /// is from (RCC.16 sections 7.6.2, 9.1.3, 9.1.4)
+    pub(super) fn notification_signer(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        imdn: &[u8],
+    ) -> Result<Credential, MessageError> {
+        let signature = cpim_info
+            .mls_derived_content_signature
+            .ok_or(MessageError::NotSigned)?;
         let signature = general_purpose::STANDARD
             .decode(signature)
             .map_err(|_| MessageError::Store(StoreError::Mls(ErrorKind::BadFormat)))?;
@@ -549,7 +630,7 @@ impl E2eeDevice {
             })
             .map_err(MessageError::Store)?;
         match told_sender(cpim_info) {
-            Some(told) if is_of(&signer, &told) => Ok(()),
+            Some(told) if is_of(&signer, &told) => Ok(signer),
             _ => Err(MessageError::NotFromSigner),
         }
     }

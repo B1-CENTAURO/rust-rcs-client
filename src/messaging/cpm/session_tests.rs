@@ -43,8 +43,8 @@ use rust_rcs_core::sip::{
 use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{
-    EndReason, FailedToDecrypt, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken, Upgrade,
-    Verified,
+    EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull, ImdnTold, Sealed, Taken,
+    Upgrade, Verified,
 };
 use super::group_chat::GroupIds;
 use super::imdn::{
@@ -2202,6 +2202,14 @@ struct ScriptedEncryption {
     failing_to_decrypt: std::sync::Mutex<Vec<FailedToDecrypt>>,
     /// Whether it gives those only once a group was healed
     failing_once_healed: bool,
+    /// What it answers negative deliveries telling a message was not
+    /// decrypted with, if not NotOne
+    answering: std::sync::Mutex<Option<FtdAnswer>>,
+    /// The Conversation-ID and IMDN of each notification it is asked to
+    /// answer
+    answered: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    /// Whether it updates keys only once it answered a notification so
+    updating_once_answered: bool,
     /// The Conversation-ID each time it is asked for those
     asked_failed: std::sync::Mutex<Vec<String>>,
 }
@@ -2368,7 +2376,10 @@ impl GroupEncryption for ScriptedEncryption {
             .lock()
             .unwrap()
             .push((conversation_id, from, to));
-        let cpim = self.updating.clone();
+        let cpim = match self.updating_once_answered && self.answered.lock().unwrap().is_empty() {
+            true => None,
+            false => self.updating.clone(),
+        };
         Box::pin(async move { cpim })
     }
 
@@ -2532,6 +2543,23 @@ impl GroupEncryption for ScriptedEncryption {
             mls_message.to_vec(),
         ));
         self.plaintext.clone().map(String::into_bytes)
+    }
+
+    fn answer_failed_to_decrypt(
+        &self,
+        conversation_id: &str,
+        _cpim_info: &CPIMInfo,
+        imdn: &[u8],
+    ) -> FtdAnswer {
+        self.answered
+            .lock()
+            .unwrap()
+            .push((String::from(conversation_id), imdn.to_vec()));
+        self.answering
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(FtdAnswer::NotOne)
     }
 
     fn failed_to_decrypt(&self, conversation_id: &str) -> Vec<FailedToDecrypt> {
@@ -3285,6 +3313,16 @@ impl GroupEncryption for EncryptingPrepared {
     fn failed_to_decrypt(&self, conversation_id: &str) -> Vec<FailedToDecrypt> {
         self.0.failed_to_decrypt(conversation_id)
     }
+
+    fn answer_failed_to_decrypt(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        imdn: &[u8],
+    ) -> FtdAnswer {
+        self.0
+            .answer_failed_to_decrypt(conversation_id, cpim_info, imdn)
+    }
 }
 
 #[test]
@@ -3622,6 +3660,158 @@ fn a_notification_the_encryption_does_not_take_is_given_to_the_app() {
     assert_eq!(imdn.message_id, "peer-message-1");
     connection.respond(&rt, &send, "200 OK");
     assert!(encryption.signed.lock().unwrap().is_empty());
+}
+
+/// What the scripted encryption re-sends a message as
+const RESENT: &[u8] = b"From: <sip:+15551234@example.com>\r\nTo: <sip:conf1@conf.example.com>\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: resent-1\r\n\r\nContent-Type: message/mls\r\n\r\nresent";
+
+/// What the scripted encryption updates keys with
+const KEY_UPDATE: &[u8] = b"From: <sip:+15551234@example.com>\r\nTo: <sip:conf1@conf.example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\nupdate";
+
+/// The group chat joined with an encryption answering negative deliveries
+/// telling messages were not decrypted with `answer`
+fn answering_failed_to_decrypt(
+    client: &Client,
+    peer: &mut Peer,
+    call_id: &str,
+    answer: FtdAnswer,
+) -> (Arc<ScriptedEncryption>, MsrpConnection, String, String) {
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        verifying: true,
+        updating: Some(KEY_UPDATE.to_vec()),
+        updating_once_answered: true,
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (connection, focus_path, our_path) = joined_encrypted_group(client, peer, call_id);
+    *encryption.answering.lock().unwrap() = Some(answer);
+    (encryption, connection, focus_path, our_path)
+}
+
+#[test]
+fn a_negative_delivery_answered_with_a_message_re_sent_has_the_keys_updated_after() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (encryption, mut connection, focus_path, our_path) = answering_failed_to_decrypt(
+        &client,
+        &mut peer,
+        "group-resending",
+        FtdAnswer::Resend(RESENT.to_vec()),
+    );
+    let updates = encryption.updated.lock().unwrap().len();
+    let imdn = group_imdn_cpim("message-1", "<failed/>");
+    connection.send_cpim(&rt, &focus_path, &our_path, &imdn);
+
+    // the Re-Sent Message sent as it is, then the key update (RCC.16
+    // section 10.3), and the notification answered, which they may come
+    // before
+    let mut answered = false;
+    let mut sent = Vec::new();
+    while !answered || sent.len() < 2 {
+        let frame = connection.next(&rt);
+        if !frame.first_line.ends_with(" SEND") {
+            assert!(frame.first_line.contains(" 200"), "{}", frame.first_line);
+            answered = true;
+        } else if !frame.body.is_empty() {
+            assert_eq!(frame.header("Content-Type"), Some("message/cpim"));
+            connection.respond(&rt, &frame, "200 OK");
+            sent.push(frame.body);
+        } else {
+            connection.respond(&rt, &frame, "200 OK");
+        }
+    }
+    assert_eq!(sent, [RESENT.to_vec(), KEY_UPDATE.to_vec()]);
+    assert_eq!(encryption.updated.lock().unwrap().len(), updates + 1);
+    assert_eq!(encryption.answered.lock().unwrap().len(), 1);
+    assert_eq!(encryption.answered.lock().unwrap()[0].0, "conversation-1");
+
+    // the notification not for the app, nor checked as others are
+    assert!(client
+        .received
+        .recv_timeout(Duration::from_millis(500))
+        .is_err());
+    assert!(encryption.verified.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_negative_delivery_badly_signed_is_not_for_the_app_nor_one_not_answered_kept_from_it() {
+    // one not signed by whom it is from (RCC.16 section 10.3)
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (encryption, mut connection, focus_path, our_path) =
+        answering_failed_to_decrypt(&client, &mut peer, "group-badly-signed", FtdAnswer::Heal);
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &group_imdn_cpim("message-1", "<failed/>"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert!(client
+        .received
+        .recv_timeout(Duration::from_millis(500))
+        .is_err());
+    assert_eq!(encryption.answered.lock().unwrap().len(), 1);
+    connection.quiet(&rt);
+
+    // one not answered, as any negative delivery
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (encryption, mut connection, focus_path, our_path) =
+        answering_failed_to_decrypt(&client, &mut peer, "group-not-answered", FtdAnswer::Ignored);
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &group_imdn_cpim("message-1", "<failed/>"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let (_, content_type, _) = client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the notification given to the app");
+    assert!(content_type.starts_with("message/imdn+xml"));
+    assert_eq!(encryption.verified.lock().unwrap().len(), 1);
+    connection.quiet(&rt);
+}
+
+#[test]
+fn a_notification_of_a_re_sent_message_tells_the_app_of_its_original_message() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = verifying(&client, true);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-resent-told");
+    // of the Re-Sent Message resent-1 of message-1 (RCC.16 sections 7.7.1,
+    // 10.4)
+    let imdn = group_imdn_cpim("resent-1", "<displayed/>").replacen(
+        "imdn.Message-ID: focus-imdn-1\r\n",
+        "imdn.Message-ID: focus-imdn-1\r\nNS: mls <http://www.gsma.com/rcs/mls>\r\nmls.Original-Message-ID: message-1\r\n",
+        1,
+    );
+    connection.send_cpim(&rt, &focus_path, &our_path, &imdn);
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let (_, content_type, content) = client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the notification given to the app");
+    assert!(content_type.starts_with("message/imdn+xml"));
+    assert!(
+        content.contains("<message-id>message-1</message-id>"),
+        "{}",
+        content
+    );
+    assert!(!content.contains("resent-1"));
+    // checked as it came
+    assert!(
+        String::from_utf8_lossy(&encryption.verified.lock().unwrap()[0].2)
+            .contains("<message-id>resent-1</message-id>")
+    );
 }
 
 #[test]
