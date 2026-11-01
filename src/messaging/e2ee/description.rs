@@ -30,14 +30,27 @@ use std::sync::Mutex;
 use base64::{engine::general_purpose, Engine as _};
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::mls::rcs::file::decrypt_file;
-use rust_rcs_core::mls::rcs::proto::{FileInfo, FileMetadata};
+use rust_rcs_core::mls::rcs::metadata::{TARGET_ENCRYPTED_ICON, TARGET_ENCRYPTED_SUBJECT};
+use rust_rcs_core::mls::rcs::proto::{self, FileInfo, FileMetadata};
+use rust_rcs_core::mls::rcs::GROUP_ICON_FILE_NAME;
+use rust_rcs_core::mls::ErrorKind;
+use rust_rcs_core::util::rand::create_raw_alpha_numeric_string;
 
-use crate::messaging::cpm::encryption::{EncryptedMetadata, GroupMetadata};
+use crate::messaging::cpm::encryption::{
+    EncryptedMetadata, GroupMetadata, MetadataChange, SealedFile,
+};
 
 use super::device::E2eeDevice;
+use super::file::{file_urls, seal_file};
+use super::group::GroupError;
 use super::notes::{put, NotesData, Reader as NotesReader};
+use super::store::StoreError;
 
 const LOG_TAG: &str = "e2ee";
+
+/// Content-Type of the CPM Group Session Data Management requests (RCC.16
+/// section 7.13.1)
+pub const CONTENT_TYPE_GROUP_DATA: &[u8] = b"application/vnd.oma.cpm-groupdata+xml";
 
 /// The encrypted icon of a group chat, as kept in the notes of the device
 #[derive(Clone, Debug, PartialEq)]
@@ -324,6 +337,150 @@ impl E2eeDevice {
             platform_log(LOG_TAG, format!("encrypted icon not forgotten: {:?}", e));
         }
     }
+}
+
+impl E2eeDevice {
+    /// The icon `icon` of a group chat, of `content_type`, encrypted with a
+    /// key of its own under the name GROUP_ICON_FILE_NAME (RCC.16 section
+    /// 9.7.1.1, Annex C.2): the ciphertext to upload, and its key as the
+    /// FileMetadata of the icon (section 9.7.1.1.3)
+    pub fn seal_icon(&self, icon: &[u8], content_type: &str) -> Option<SealedFile> {
+        seal_file(icon, GROUP_ICON_FILE_NAME, content_type)
+    }
+
+    /// The control message changing the encrypted subject or icon of the
+    /// group chat `conversation_id` as `change` does, `from` and `to` its own
+    /// (RCC.16 sections 9.7.1.4 to 9.7.1.7): a CPIM message of a multipart
+    /// body, the `message/mls-rcs-client` of the Commit, then the CPM group
+    /// data request (section 7.13.1); None if the group is not encrypted,
+    /// out of step with its Conversation Focus, or if there is no icon or
+    /// subject to delete
+    ///
+    /// The Commit setting one is bundled with the PrivateMessage of its key,
+    /// whose Message-ID is that of the control message. An icon set is one
+    /// uploaded sealed with seal_icon(), the request telling its URL. Not
+    /// while a Commit of the device waits for the Focus to accept it.
+    pub fn change_metadata(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        change: &MetadataChange,
+    ) -> Result<Option<Vec<u8>>, GroupError> {
+        if self.encryption_ended(conversation_id)
+            || self.heals().ongoing(conversation_id)
+            || self.needs_healing(conversation_id)
+            || self.new_era_due(conversation_id)
+        {
+            return Ok(None);
+        }
+        // the icon as uploaded: its URL and its key
+        let icon = match change {
+            MetadataChange::Icon(Some(uploaded)) => {
+                let url = file_urls(&uploaded.xml).0;
+                let key = proto::decode::<FileMetadata>(&uploaded.metadata).ok();
+                let Some((url, key)) = url.zip(key.filter(|key| {
+                    key.file_name == GROUP_ICON_FILE_NAME && key.encryption_info.is_some()
+                })) else {
+                    platform_log(LOG_TAG, "icon not uploaded sealed as one");
+                    return Ok(None);
+                };
+                Some((url, key))
+            }
+            _ => None,
+        };
+
+        let message_id = super::group::new_message_id();
+        let made =
+            self.store()
+                .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                    if conversation.has_pending_commit() {
+                        return Ok(Err(GroupError::Pending));
+                    }
+                    let id = message_id.as_bytes();
+                    let (output, target, data) = match (change, &icon) {
+                        (MetadataChange::Subject(Some(subject)), _) => {
+                            let (output, encrypted) =
+                                conversation.set_group_subject(client, subject, id)?;
+                            let subject = general_purpose::STANDARD.encode(encrypted.ciphertext);
+                            (output, TARGET_ENCRYPTED_SUBJECT, Some(subject))
+                        }
+                        (MetadataChange::Subject(None), _) => (
+                            conversation.delete_group_subject(client)?,
+                            TARGET_ENCRYPTED_SUBJECT,
+                            None,
+                        ),
+                        (MetadataChange::Icon(Some(_)), Some((url, key))) => {
+                            let encryption_info = key.encryption_info.as_ref().unwrap();
+                            let output = conversation.commit_group_icon(
+                                client,
+                                encryption_info,
+                                &key.content_type,
+                                id,
+                            )?;
+                            (output, TARGET_ENCRYPTED_ICON, Some(url.clone()))
+                        }
+                        (MetadataChange::Icon(_), _) => (
+                            conversation.delete_group_icon(client)?,
+                            TARGET_ENCRYPTED_ICON,
+                            None,
+                        ),
+                    };
+                    match output.to_client_message() {
+                        Ok(client_message) => Ok(Ok((client_message, target, data))),
+                        Err(e) => {
+                            conversation.discard_pending_commit(client)?;
+                            Err(e)
+                        }
+                    }
+                });
+        let (client_message, target, data) = match made {
+            Ok(made) => made?,
+            // nothing to delete
+            Err(StoreError::Mls(ErrorKind::InvalidState)) => return Ok(None),
+            Err(e) => return Err(GroupError::Store(e)),
+        };
+        let request = group_data_request(target, data.as_deref());
+        Ok(Some(self.sent_with(
+            conversation_id,
+            from,
+            to,
+            message_id,
+            &client_message,
+            Some(request.as_bytes()),
+        )))
+    }
+}
+
+/// The CPM Group Session Data Management request setting the encrypted
+/// subject or icon `target` to `data`, or deleting it if None (RCC.16
+/// sections 7.13.1, 9.7.1.4 to 9.7.1.7)
+pub(super) fn group_data_request(target: &str, data: Option<&str>) -> String {
+    let (action, data) = match data {
+        Some(data) => (
+            "set",
+            format!(
+                "<data><{}>{}</{}></data>",
+                target,
+                quick_xml::escape::escape(data),
+                target
+            ),
+        ),
+        None => ("delete", String::new()),
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<cpm-group-management xmlns=\"urn:oma:xml:cpm:groupdata:1.0\" id=\"{}\">\n\
+<group-data>\n<request>\n<target>{}</target>\n<action>{}</action>\n{}\
+</request>\n</group-data>\n</cpm-group-management>\n",
+        String::from_utf8_lossy(&create_raw_alpha_numeric_string(10)),
+        target,
+        action,
+        match data.is_empty() {
+            true => data,
+            false => data + "\n",
+        }
+    )
 }
 
 /// The icon `data` keeps of the group chat `conversation_id`, if one

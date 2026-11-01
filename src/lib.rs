@@ -1491,6 +1491,82 @@ pub unsafe extern "C" fn rcs_client_remove_group_chat_participant(
     callback(403, String::from("Forbidden"));
 }
 
+/// Sets the encrypted subject of the group at `conference_uri` to `subject`,
+/// or deletes it if `subject` is null, in the session there is with it
+/// (RCC.16 sections 9.7.1.5, 9.7.1.7): 404 if there is no session, 488 if the
+/// group is not encrypted end to end, or if the change cannot be made; else
+/// how its focus answered. The focus may still refuse it; the subject set is
+/// told through the group chat listener (event 6) as the focus tells of it.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_group_subject(
+    client: *mut RcsClient,
+    conference_uri: *const c_char,
+    subject: *const c_char,
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_set_group_subject()");
+
+    let callback = message_result_closure(cb, cb_context);
+
+    if let Some(client) = client.as_ref() {
+        let conference_uri = CStr::from_ptr(conference_uri).to_string_lossy();
+        let subject = (!subject.is_null()).then(|| CStr::from_ptr(subject).to_string_lossy());
+        client
+            .engine
+            .set_group_subject(&conference_uri, subject.as_deref(), callback);
+        return;
+    }
+
+    callback(403, String::from("Forbidden"));
+}
+
+/// Sets the encrypted icon of the group at `conference_uri` to the file at
+/// `icon_path`, of `content_type`, or deletes it if `icon_path` is null, in
+/// the session there is with it (RCC.16 sections 9.7.1.4, 9.7.1.6), as
+/// rcs_client_set_group_subject() does: the icon is encrypted and uploaded
+/// to the content server first, an upload that fails told as
+/// rcs_client_upload_file() tells it. The icon set is told through the group
+/// chat listener (event 7) as the focus tells of it.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_group_icon(
+    rcs_runtime: *mut RcsRuntime,
+    client: *mut RcsClient,
+    conference_uri: *const c_char,
+    icon_path: *const c_char,
+    content_type: *const c_char,
+    cb: Option<MessageResultCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_set_group_icon()");
+
+    let callback = message_result_closure(cb, cb_context);
+
+    if let (Some(rcs_runtime), Some(client)) = (rcs_runtime.as_ref(), client.as_ref()) {
+        if let Some(gba_context) = &client.engine_gba_context {
+            let conference_uri = CStr::from_ptr(conference_uri).to_string_lossy();
+            let icon_path =
+                (!icon_path.is_null()).then(|| CStr::from_ptr(icon_path).to_string_lossy());
+            let content_type = (!content_type.is_null())
+                .then(|| CStr::from_ptr(content_type).to_string_lossy())
+                .unwrap_or_default();
+            client.engine.set_group_icon(
+                &conference_uri,
+                icon_path.as_deref().map(|path| (path, &*content_type)),
+                client.msisdn.as_deref(),
+                client.context.get_http_client(),
+                Arc::clone(gba_context),
+                client.context.get_security_context(),
+                &rcs_runtime.rt,
+                callback,
+            );
+            return;
+        }
+    }
+
+    callback(403, String::from("Forbidden"));
+}
+
 /// Tells `recipient`, in the chat session there is with it, that the user is
 /// composing a message if `active` is not 0, or no longer is. No session is
 /// started for it: 404 if there is none.

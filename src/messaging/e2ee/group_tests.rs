@@ -47,7 +47,8 @@ use rust_rcs_core::mls::{
 use crate::capability::{Capabilities, CapabilityQuery};
 use crate::messaging::cpm::encryption::{
     EncryptedMetadata, EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull,
-    GroupMetadata, ImdnTold, Sealed, SealedFile, Taken, Upgrade, Verified,
+    GroupMetadata, ImdnTold, MetadataChange, Sealed, SealedFile, Taken, Upgrade, UploadedIcon,
+    Verified,
 };
 use crate::messaging::cpm::make_cpim_imdn_body;
 
@@ -8766,5 +8767,352 @@ fn an_icon_that_does_not_open_has_the_metadata_keys_checked() {
     assert_eq!(
         device.take_metadata(CONVERSATION, None, described(url, None)),
         [icon_told(Some(url), None, None)]
+    );
+}
+
+/// What a control message changing the encrypted subject or icon carries
+/// (RCC.16 sections 9.7.1.4 to 9.7.1.7): its CPIM message, then from its
+/// multipart body, in that order, the CommitBundle of its
+/// `message/mls-rcs-client` and its CPM group data request
+fn metadata_parts(cpim: &[u8]) -> (CPIMMessage, CommitBundle, String) {
+    let message = cpim_message(cpim);
+    let (content_type, content, _) = message.get_message_body().unwrap();
+    let content_type = String::from_utf8_lossy(content_type.unwrap()).into_owned();
+    let boundary = content_type
+        .strip_prefix("multipart/mixed; boundary=")
+        .expect("a multipart body");
+    let multipart = rust_rcs_core::internet::body::multipart_body::MultipartBody::construct(
+        content,
+        boundary.as_bytes(),
+    )
+    .unwrap();
+    let parts: Vec<(Vec<u8>, Vec<u8>)> = multipart
+        .parts
+        .iter()
+        .map(|part| match part.as_ref() {
+            Body::Message(part) => {
+                let content_type =
+                    rust_rcs_core::internet::header::search(&part.headers, b"Content-Type", true)
+                        .unwrap()
+                        .get_value()
+                        .to_vec();
+                match part.body.as_ref() {
+                    Body::Raw(body) => (content_type, body.clone()),
+                    _ => panic!("a part not raw"),
+                }
+            }
+            _ => panic!("a part not a message"),
+        })
+        .collect();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].0, CONTENT_TYPE_MLS_RCS_CLIENT);
+    assert_eq!(parts[1].0, b"application/vnd.oma.cpm-groupdata+xml");
+    let bundle = match proto::decode::<ClientMlsRcsMessage>(&parts[0].1)
+        .unwrap()
+        .payload
+    {
+        Some(client_mls_rcs_message::Payload::CommitBundle(bundle)) => bundle,
+        _ => panic!("not a CommitBundle"),
+    };
+    let request = String::from_utf8(parts[1].1.clone()).unwrap();
+    (message, bundle, request)
+}
+
+/// What the Conversation Focus forwards of the CommitBundle `bundle`
+fn forwarded_of(bundle: &CommitBundle) -> Vec<u8> {
+    proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: bundle.commit_list.clone(),
+                private_message: bundle.private_message.clone(),
+                ..ServerCommitBundle::default()
+            },
+        )),
+    })
+}
+
+/// The value of the element `name` of the XML `xml`, unescaped
+fn xml_value(xml: &str, name: &str) -> Option<String> {
+    let start = xml.find(&format!("<{}>", name))? + name.len() + 2;
+    let end = start + xml[start..].find(&format!("</{}>", name))?;
+    Some(
+        quick_xml::escape::unescape(&xml[start..end])
+            .unwrap()
+            .into_owned(),
+    )
+}
+
+fn change_metadata(device: &E2eeDevice, change: MetadataChange) -> Option<Vec<u8>> {
+    device
+        .change_metadata(CONVERSATION, IMPU, GROUP_URI, &change)
+        .unwrap()
+}
+
+#[test]
+fn the_subject_is_set_with_a_commit_and_the_request_the_focus_takes() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+
+    // a multipart CPIM message: the Commit, bundled with the PrivateMessage
+    // of the key, then the request (RCC.16 sections 7.13.1, 9.7.1.5)
+    let cpim = change_metadata(
+        &device,
+        MetadataChange::Subject(Some(String::from("Team <1>"))),
+    )
+    .expect("the subject set");
+    let (message, bundle, request) = metadata_parts(&cpim);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", GROUP_URI).as_bytes());
+    let message_id = String::from_utf8_lossy(info.imdn_message_id).into_owned();
+    assert!(
+        String::from_utf8_lossy(&cpim).contains("imdn.Disposition-Notification: negative-delivery")
+    );
+    assert!(!bundle.private_message.is_empty());
+    assert!(request.contains("<cpm-group-management xmlns=\"urn:oma:xml:cpm:groupdata:1.0\" id=\""));
+    assert_eq!(
+        xml_value(&request, "target").as_deref(),
+        Some("encrypted-subject")
+    );
+    assert_eq!(xml_value(&request, "action").as_deref(), Some("set"));
+    let subject = xml_value(&request, "encrypted-subject").unwrap();
+
+    // not another while it waits for the Focus
+    assert!(matches!(
+        device.change_metadata(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            &MetadataChange::Subject(Some(String::from("Other")))
+        ),
+        Err(GroupError::Pending)
+    ));
+
+    // Bob takes its key, from the PrivateMessage of the Message-ID of the
+    // control message, and opens the subject with it
+    match bobs_group
+        .process_server_message(&bob, &forwarded_of(&bundle))
+        .unwrap()
+        .as_slice()
+    {
+        [IncomingMessage::Commit { .. }, IncomingMessage::GroupMetadataKeys { subject: true, .. }] =>
+            {}
+        _ => panic!("not the Commit with the key of the subject"),
+    }
+    let key = bob
+        .group_metadata(CONVERSATION.as_bytes())
+        .unwrap()
+        .group_subject_icon_keys
+        .unwrap()
+        .subject
+        .unwrap();
+    assert_eq!(
+        rust_rcs_core::mls::rcs::file::decrypt_file(
+            &general_purpose::STANDARD.decode(&subject).unwrap(),
+            &key.file_name,
+            key.encryption_info.as_ref().unwrap()
+        )
+        .unwrap(),
+        b"Team <1>"
+    );
+    let _ = message_id;
+
+    // the device keeps it once the Focus accepts the Commit, and tells it
+    // as the Focus does
+    accepted_from_device(&device);
+    assert!(metadata_in_sync(&device));
+    assert_eq!(
+        device.take_metadata(CONVERSATION, described(&subject, Some(IMPU)), None),
+        [subject_told(Some("Team <1>"), Some(IMPU))]
+    );
+
+    // deleted with a Commit removing it, and the request alone
+    let cpim = change_metadata(&device, MetadataChange::Subject(None)).expect("deleted");
+    let (_, bundle, request) = metadata_parts(&cpim);
+    assert!(bundle.private_message.is_empty());
+    assert_eq!(
+        xml_value(&request, "target").as_deref(),
+        Some("encrypted-subject")
+    );
+    assert_eq!(xml_value(&request, "action").as_deref(), Some("delete"));
+    assert!(!request.contains("<data>"));
+    bobs_group
+        .process_server_message(&bob, &forwarded_of(&bundle))
+        .unwrap();
+    assert!(bobs_group.group_metadata_in_sync(&bob).unwrap());
+    accepted_from_device(&device);
+    assert!(metadata(&device)
+        .group_subject_icon_keys
+        .map_or(true, |keys| keys.subject.is_none()));
+    // none to delete then
+    assert_eq!(
+        change_metadata(&device, MetadataChange::Subject(None)),
+        None
+    );
+}
+
+#[test]
+fn the_icon_is_set_as_uploaded_sealed_with_its_url() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let url = "https://ftcs.example.com/i/1?a=1&b=2";
+
+    // sealed as the icon of a group (RCC.16 sections 9.7.1.1, Annex C.2)
+    let sealed = device.seal_icon(b"the icon", "image/png").unwrap();
+    let key: proto::FileMetadata = proto::decode(&sealed.metadata).unwrap();
+    assert_eq!(key.file_name, "group_icon");
+    assert_eq!(key.content_type, "image/png");
+
+    // its URL in the request (section 9.7.1.4)
+    let uploaded = UploadedIcon {
+        xml: super::file::upload_xml("https://ftcs.example.com/i/1?a=1&amp;b=2").into_bytes(),
+        metadata: sealed.metadata.clone(),
+    };
+    let cpim = change_metadata(&device, MetadataChange::Icon(Some(uploaded))).expect("set");
+    let (_, bundle, request) = metadata_parts(&cpim);
+    assert!(!bundle.private_message.is_empty());
+    assert_eq!(
+        xml_value(&request, "target").as_deref(),
+        Some("encrypted-icon")
+    );
+    assert_eq!(xml_value(&request, "action").as_deref(), Some("set"));
+    assert_eq!(xml_value(&request, "encrypted-icon").as_deref(), Some(url));
+    assert!(request.contains("a=1&amp;b=2"));
+
+    // Bob opens it with the key he takes
+    bobs_group
+        .process_server_message(&bob, &forwarded_of(&bundle))
+        .unwrap();
+    let bobs_key = bob
+        .group_metadata(CONVERSATION.as_bytes())
+        .unwrap()
+        .group_subject_icon_keys
+        .unwrap()
+        .icon
+        .unwrap();
+    assert_eq!(bobs_key, key);
+    assert_eq!(
+        rust_rcs_core::mls::rcs::file::decrypt_file(
+            &sealed.ciphertext,
+            &bobs_key.file_name,
+            bobs_key.encryption_info.as_ref().unwrap()
+        )
+        .unwrap(),
+        b"the icon"
+    );
+    accepted_from_device(&device);
+    device.take_metadata(CONVERSATION, None, described(url, None));
+    assert_eq!(
+        device.open_file(url, &sealed.ciphertext).as_deref(),
+        Some(&b"the icon"[..])
+    );
+
+    // deleted with a Commit removing it, and the request alone
+    let cpim = change_metadata(&device, MetadataChange::Icon(None)).expect("deleted");
+    let (_, bundle, request) = metadata_parts(&cpim);
+    assert_eq!(
+        xml_value(&request, "target").as_deref(),
+        Some("encrypted-icon")
+    );
+    assert_eq!(xml_value(&request, "action").as_deref(), Some("delete"));
+    bobs_group
+        .process_server_message(&bob, &forwarded_of(&bundle))
+        .unwrap();
+    accepted_from_device(&device);
+    assert_eq!(change_metadata(&device, MetadataChange::Icon(None)), None);
+}
+
+#[test]
+fn the_icon_is_not_set_unless_uploaded_sealed_as_one() {
+    let (device, _bob, _bobs_group) = alice_and_bob();
+    let url = "https://ftcs.example.com/i/1";
+    let sealed = device.seal_icon(b"the icon", "image/png").unwrap();
+    let before = epoch(&device, CONVERSATION);
+
+    // a file sealed as a file, not as an icon
+    let file = super::file::seal_file(b"the icon", "icon.png", "image/png").unwrap();
+    // the key of no encryption
+    let mut unencrypted: proto::FileMetadata = proto::decode(&sealed.metadata).unwrap();
+    unencrypted.encryption_info = None;
+    // an XML telling no file, a key not one
+    for (xml, metadata) in [
+        (super::file::upload_xml(url), file.metadata),
+        (super::file::upload_xml(url), proto::encode(&unencrypted)),
+        (String::from("<file/>"), sealed.metadata.clone()),
+        (super::file::upload_xml(url), b"not a key".to_vec()),
+    ] {
+        let uploaded = UploadedIcon {
+            xml: xml.into_bytes(),
+            metadata,
+        };
+        assert_eq!(
+            change_metadata(&device, MetadataChange::Icon(Some(uploaded))),
+            None
+        );
+        assert_eq!(epoch(&device, CONVERSATION), before);
+    }
+}
+
+#[test]
+fn the_subject_and_icon_are_not_changed_while_the_group_is_out_of_step_or_unencrypted() {
+    let subject = MetadataChange::Subject(Some(String::from("Team")));
+
+    // to be healed (RCC.16 section 10.1)
+    let (device, _, _) = alice_and_bob();
+    let before = epoch(&device, CONVERSATION);
+    device.heals().want(CONVERSATION);
+    assert_eq!(change_metadata(&device, subject.clone()), None);
+    assert_eq!(epoch(&device, CONVERSATION), before);
+
+    // to be made anew in a new Era, or being so (section 8.3)
+    let (device, _, _) = alice_and_bob();
+    device.heals().want_new_era(CONVERSATION);
+    assert_eq!(change_metadata(&device, subject.clone()), None);
+    assert!(device.heals().begin_new_era(CONVERSATION).is_some());
+    assert!(!device.new_era_due(CONVERSATION) && !device.needs_healing(CONVERSATION));
+    assert_eq!(change_metadata(&device, subject.clone()), None);
+    assert_eq!(epoch(&device, CONVERSATION), before);
+
+    // unencrypted (section 11.2)
+    let (device, _, _) = alice_and_bob();
+    device
+        .end_encryption(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            EndMlsReason::ClientFailureEncryptionNotAvailable,
+        )
+        .unwrap()
+        .expect("a control message");
+    accepted_from_device(&device);
+    assert!(device.encryption_ended(CONVERSATION));
+    assert_eq!(change_metadata(&device, subject.clone()), None);
+    assert_eq!(change_metadata(&device, MetadataChange::Icon(None)), None);
+
+    // nor in a group the device has not
+    let (device, _, _) = alice_and_bob();
+    assert!(device
+        .change_metadata("another-group", IMPU, GROUP_URI, &subject)
+        .is_err());
+}
+
+#[test]
+fn a_change_of_the_subject_the_focus_refuses_is_let_go_of() {
+    let (device, _bob, _bobs_group) = alice_and_bob();
+    let cpim =
+        change_metadata(&device, MetadataChange::Subject(Some(String::from("Team")))).unwrap();
+    let (message, _, _) = metadata_parts(&cpim);
+    let message_id =
+        String::from_utf8_lossy(message.get_info().unwrap().imdn_message_id).into_owned();
+
+    // as any control message of the device (RCC.16 sections 6.2.5, 7.7.2.1)
+    let (before, _) = epoch(&device, CONVERSATION).unwrap();
+    assert!(device
+        .on_imdn(CONVERSATION, &refusal(&message_id, "transient-error"))
+        .unwrap()
+        .is_some());
+    assert_eq!(epoch(&device, CONVERSATION), Ok((before, false)));
+    assert!(metadata(&device).group_subject_icon_keys.is_none());
+    // and another made then
+    assert!(
+        change_metadata(&device, MetadataChange::Subject(Some(String::from("Team")))).is_some()
     );
 }

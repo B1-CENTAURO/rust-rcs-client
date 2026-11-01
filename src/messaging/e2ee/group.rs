@@ -26,9 +26,10 @@ use rust_rcs_core::cpim::{CPIMInfo, CPIMMessage};
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::imdn::notification::{Imdn, Status};
 use rust_rcs_core::internet::body::message_body::MessageBody;
+use rust_rcs_core::internet::body::multipart_body::MultipartBody;
 use rust_rcs_core::internet::parameter::ParameterParser;
 use rust_rcs_core::internet::{Body, Header};
-use rust_rcs_core::io::DynamicChain;
+use rust_rcs_core::io::{DynamicChain, Serializable};
 use rust_rcs_core::mls::rcs::imdn::{failure_reason, FailureReason};
 use rust_rcs_core::mls::rcs::proto::{
     self, server_mls_rcs_message, EndMlsReason, ServerMlsRcsMessage,
@@ -37,15 +38,17 @@ use rust_rcs_core::mls::rcs::{
     MlsCapability, ServerFailureReason, CONTENT_TYPE_MLS_RCS_CLIENT, MLS_VERSION_V1,
 };
 use rust_rcs_core::mls::{CredentialValidator, ErrorKind, IncomingMessage};
+use rust_rcs_core::util::rand::create_raw_alpha_numeric_string;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::capability::CapabilityQuery;
 use crate::messaging::cpm::encryption::{
     EncryptedMetadata, EndReason, FailedToDecrypt, FtdAnswer, GroupEncryption, GroupInfoPull,
-    GroupMetadata, ImdnTold, Sealed, SealedFile, Taken, Upgrade, Verified,
+    GroupMetadata, ImdnTold, MetadataChange, Sealed, SealedFile, Taken, Upgrade, Verified,
 };
 
+use super::description::CONTENT_TYPE_GROUP_DATA;
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice, CIPHERSUITE};
 use super::file::seal_file;
 use super::heal::heal_once;
@@ -361,7 +364,23 @@ impl E2eeDevice {
         message_id: String,
         client_message: &[u8],
     ) -> Vec<u8> {
-        let cpim = control_message(from, to, &message_id, client_message);
+        self.sent_with(conversation_id, from, to, message_id, client_message, None)
+    }
+
+    /// The control message carrying `client_message` in the group chat
+    /// `conversation_id`, as sent_as() makes it, in a multipart body with the
+    /// CPM group data request `group_data` if there is one (RCC.16 sections
+    /// 9.7.1.4 to 9.7.1.7)
+    pub(super) fn sent_with(
+        &self,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        message_id: String,
+        client_message: &[u8],
+        group_data: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let cpim = control_message(from, to, &message_id, client_message, group_data);
         self.control_messages()
             .lock()
             .unwrap()
@@ -784,7 +803,53 @@ pub(super) fn new_message_id() -> String {
 /// its Message-ID `message_id`, with only the headers left unencrypted,
 /// asking to be told if it is refused (RCC.16 sections 6.2.5, 7.5.6, 7.5.7,
 /// 7.9)
-fn control_message(from: &str, to: &str, message_id: &str, client_message: &[u8]) -> Vec<u8> {
+fn control_message(
+    from: &str,
+    to: &str,
+    message_id: &str,
+    client_message: &[u8],
+    group_data: Option<&[u8]>,
+) -> Vec<u8> {
+    let client_part = MessageBody {
+        headers: vec![
+            Header::new(b"Content-Type", CONTENT_TYPE_MLS_RCS_CLIENT),
+            Header::new(b"Content-Length", format!("{}", client_message.len())),
+        ],
+        body: Arc::new(Body::Raw(client_message.to_vec())),
+    };
+    let body = match group_data {
+        None => client_part,
+        // the Commit, then the request (RCC.16 sections 9.7.1.4 to 9.7.1.7)
+        Some(group_data) => {
+            let boundary = create_raw_alpha_numeric_string(16);
+            let multipart = Body::Multipart(MultipartBody {
+                boundary: boundary.clone(),
+                parts: vec![
+                    Arc::new(Body::Message(client_part)),
+                    Arc::new(Body::Message(MessageBody {
+                        headers: vec![
+                            Header::new(b"Content-Type", CONTENT_TYPE_GROUP_DATA),
+                            Header::new(b"Content-Length", format!("{}", group_data.len())),
+                        ],
+                        body: Arc::new(Body::Raw(group_data.to_vec())),
+                    })),
+                ],
+            });
+            MessageBody {
+                headers: vec![
+                    Header::new(
+                        b"Content-Type",
+                        format!(
+                            "multipart/mixed; boundary={}",
+                            String::from_utf8_lossy(&boundary)
+                        ),
+                    ),
+                    Header::new(b"Content-Length", format!("{}", multipart.estimated_size())),
+                ],
+                body: Arc::new(multipart),
+            }
+        }
+    };
     let message = CPIMMessage::new(
         &[(b"imdn", b"urn:ietf:params:imdn")],
         vec![
@@ -797,13 +862,7 @@ fn control_message(from: &str, to: &str, message_id: &str, client_message: &[u8]
             Header::new(b"imdn.Message-ID", String::from(message_id)),
             Header::new(b"imdn.Disposition-Notification", b"negative-delivery"),
         ],
-        Body::Message(MessageBody {
-            headers: vec![
-                Header::new(b"Content-Type", CONTENT_TYPE_MLS_RCS_CLIENT),
-                Header::new(b"Content-Length", format!("{}", client_message.len())),
-            ],
-            body: Arc::new(Body::Raw(client_message.to_vec())),
-        }),
+        Body::Message(body),
     );
     let mut readers = Vec::new();
     let mut data = Vec::new();
@@ -1264,6 +1323,23 @@ impl GroupEncryption for DeviceGroups {
         self.device
             .upgrade()
             .is_some_and(|device| device.metadata_keys_due(conversation_id))
+    }
+
+    fn seal_icon(&self, icon: &[u8], content_type: &str) -> Option<SealedFile> {
+        self.device.upgrade()?.seal_icon(icon, content_type)
+    }
+
+    fn change_metadata(
+        &self,
+        conversation_id: String,
+        from: String,
+        to: String,
+        change: MetadataChange,
+    ) -> BoxFuture<'static, Option<Vec<u8>>> {
+        self.once_settled(
+            move |device| device.change_metadata(&conversation_id, &from, &to, &change),
+            "subject or icon not changed",
+        )
     }
 
     fn take_metadata(

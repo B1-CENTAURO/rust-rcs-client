@@ -82,8 +82,8 @@ use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
 use super::encryption::{
-    EncryptedMetadata, EndReason, FtdAnswer, GroupEncryption, GroupMetadata, ImdnTold, Sealed,
-    Upgrade, Verified, CONTENT_TYPE_MLS, CONTENT_TYPE_MLS_RCS_SERVER,
+    EncryptedMetadata, EndReason, FtdAnswer, GroupEncryption, GroupMetadata, ImdnTold,
+    MetadataChange, Sealed, Upgrade, Verified, CONTENT_TYPE_MLS, CONTENT_TYPE_MLS_RCS_SERVER,
 };
 use super::group_chat::{
     focus_answer, group_info_pull, refer_participants, refer_removal, GroupChats, GroupIds,
@@ -1214,6 +1214,44 @@ impl SessionEnd {
             String,
         ) -> BoxFuture<'static, Option<Vec<u8>>>,
     {
+        self.commit_told(prepare, |_, _| {});
+    }
+
+    /// Changes the encrypted subject or icon of the group of the session as
+    /// `change` does, with the control message the encryption makes sent in
+    /// the session (RCC.16 sections 9.7.1.4 to 9.7.1.7), `callback` told how
+    /// the Conversation Focus answered it; 488 if the session is not with an
+    /// encrypted group, or if the change cannot be made
+    ///
+    /// The Focus may still refuse the Commit, with a negative delivery, which
+    /// lets it go (section 7.7.2.1). The subject or icon set is told to the
+    /// app as the Focus tells of it (section 7.13.2).
+    pub(crate) fn change_metadata<F>(&self, change: MetadataChange, callback: F)
+    where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        self.commit_told(
+            move |encryption, conversation_id, from, to| {
+                encryption.change_metadata(conversation_id, from, to, change)
+            },
+            callback,
+        );
+    }
+
+    /// Sends in the session the control message `prepare` makes, as commit()
+    /// does, `told` how the Conversation Focus answered the message; told 488
+    /// if the session is not with an encrypted group, or if no control
+    /// message is made
+    fn commit_told<P, T>(&self, prepare: P, told: T)
+    where
+        P: FnOnce(
+            &dyn GroupEncryption,
+            String,
+            String,
+            String,
+        ) -> BoxFuture<'static, Option<Vec<u8>>>,
+        T: FnOnce(u16, String) + Send + Sync + 'static,
+    {
         let (encrypted, conference_uri) = {
             let inner = self.sip_session.get_inner();
             let session_info = inner.get_session_info();
@@ -1234,6 +1272,7 @@ impl SessionEnd {
         let Some(((encryption, conversation_id), public_user_identity)) =
             encrypted.zip(public_user_identity)
         else {
+            told(488, String::from("Not Acceptable Here"));
             return;
         };
 
@@ -1245,8 +1284,15 @@ impl SessionEnd {
         );
         let session_end = self.clone();
         self.rt.spawn(async move {
-            if let Some(cpim) = preparing.await {
-                session_end.send_in_session(encryption, conversation_id, conference_uri, cpim);
+            match preparing.await {
+                Some(cpim) => session_end.send_in_session_told(
+                    encryption,
+                    conversation_id,
+                    conference_uri,
+                    cpim,
+                    told,
+                ),
+                None => told(488, String::from("Not Acceptable Here")),
             }
         });
     }
@@ -1261,6 +1307,20 @@ impl SessionEnd {
         conference_uri: String,
         cpim: Vec<u8>,
     ) {
+        self.send_in_session_told(encryption, conversation_id, conference_uri, cpim, |_, _| {});
+    }
+
+    /// Sends the control message `cpim` as send_in_session() does, `told`
+    /// how the Conversation Focus answered it
+    fn send_in_session_told(
+        &self,
+        encryption: Arc<dyn GroupEncryption>,
+        conversation_id: String,
+        conference_uri: String,
+        cpim: Vec<u8>,
+        told: impl FnOnce(u16, String) + Send + Sync + 'static,
+    ) {
+        let told = Mutex::new(Some(told));
         let message = CPMMessageParam::new(
             String::from("message/cpim"),
             String::new(),
@@ -1268,10 +1328,13 @@ impl SessionEnd {
             &conference_uri,
             &RecipientType::Group,
             &conference_uri,
-            move |status_code, _| {
+            move |status_code, reason_phrase| {
                 // not reaching the focus, it is not refused either
                 if !(200..300).contains(&status_code) {
                     encryption.discard(&conversation_id, false);
+                }
+                if let Some(told) = told.lock().unwrap().take() {
+                    told(status_code, reason_phrase);
                 }
             },
         )
@@ -2488,6 +2551,48 @@ impl CPMSessionService {
                 answered(0, String::from("Not Sent"), false);
             }
         });
+        true
+    }
+
+    /// The encryption of the group at `conference_uri` and its
+    /// Conversation-ID, in the session there is with it: None if there is no
+    /// such session, Some(None) if the group is not encrypted end to end
+    pub fn group_session_encryption(
+        &self,
+        conference_uri: &str,
+    ) -> Option<Option<(Arc<dyn GroupEncryption>, String)>> {
+        let session_end =
+            group_session_end(&self.ongoing_sessions.lock().unwrap(), conference_uri)?;
+        let inner = session_end.sip_session.get_inner();
+        let session_info = inner.get_session_info();
+        Some(
+            session_info
+                .encryption
+                .clone()
+                .zip(session_info.conversation_id.clone()),
+        )
+    }
+
+    /// Changes the encrypted subject or icon of the group at
+    /// `conference_uri` as `change` does, in the session there is with it
+    /// (RCC.16 sections 9.7.1.4 to 9.7.1.7), `callback` told how its focus
+    /// answered, see `SessionEnd::change_metadata()`; false, and nothing
+    /// sent, if there is no such session
+    pub fn change_group_metadata<F>(
+        &self,
+        conference_uri: &str,
+        change: MetadataChange,
+        callback: F,
+    ) -> bool
+    where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        let Some(session_end) =
+            group_session_end(&self.ongoing_sessions.lock().unwrap(), conference_uri)
+        else {
+            return false;
+        };
+        session_end.change_metadata(change, callback);
         true
     }
 

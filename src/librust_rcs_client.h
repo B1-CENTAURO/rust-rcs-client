@@ -252,6 +252,18 @@ extern void rcs_client_add_group_chat_participants(struct rcs_client *client, co
 extern void rcs_client_remove_group_chat_participant(struct rcs_client *client, const char *conference_uri,
                                 const char *participant, message_result_callback cb, void *context);
 
+// sets the encrypted subject of the group, in the session there is with it, or deletes it if subject is NULL (RCC.16 sections 9.7.1.5, 9.7.1.7):
+// 404 if there is no session, 488 if the group is not encrypted end to end or the change cannot be made, else how its focus answered;
+// the focus may still refuse it, and the subject set is told through the group chat listener (event 6) as the focus tells of it
+extern void rcs_client_set_group_subject(struct rcs_client *client, const char *conference_uri,
+                                const char *subject, message_result_callback cb, void *context);
+
+// sets the encrypted icon of the group to the file at icon_path, of content_type, or deletes it if icon_path is NULL (RCC.16 sections 9.7.1.4, 9.7.1.6),
+// as rcs_client_set_group_subject() does: the icon is encrypted and uploaded to the content server first,
+// an upload that fails told as rcs_client_upload_file() tells it; the icon set is told through the group chat listener (event 7)
+extern void rcs_client_set_group_icon(struct rcs_runtime *runtime, struct rcs_client *client, const char *conference_uri,
+                                const char *icon_path, const char *content_type, message_result_callback cb, void *context);
+
 // leaves the group chat for good, where ending its session leaves it only until the next; its session is restarted first if there is none;
 // a restart refused with 404 or 403 means the user already takes no part in the group
 extern void rcs_client_leave_group_chat(struct rcs_runtime *runtime, struct rcs_client *client, const char *conference_uri,
