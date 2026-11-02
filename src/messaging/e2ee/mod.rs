@@ -14,6 +14,7 @@
 
 //! End-to-end encryption of chats (GSMA RCC.16), on the MLS of rust-rcs-core
 
+pub mod chat;
 pub mod description;
 pub mod device;
 pub mod era;

@@ -29,6 +29,7 @@ use crate::provisioning::ims_application::ImsApplication;
 use crate::provisioning::rcs_application::RcsApplication;
 use crate::rcs_engine::RcsEngine;
 
+use super::chat::Unencrypted;
 use super::description::Descriptions;
 use super::file::Uploads;
 use super::heal::Heals;
@@ -95,6 +96,8 @@ pub struct E2eeDevice {
     uploads: Uploads,
     /// The subjects and icons of groups that did not open yet
     descriptions: Descriptions,
+    /// The contacts found not to take an encrypted 1-to-1 chat lately
+    unencrypted_chats: Unencrypted,
 }
 
 impl E2eeDevice {
@@ -131,6 +134,7 @@ impl E2eeDevice {
             recoveries: Recoveries::default(),
             uploads: Uploads::default(),
             descriptions: Descriptions::default(),
+            unencrypted_chats: Unencrypted::default(),
         })
     }
 
@@ -168,6 +172,10 @@ impl E2eeDevice {
 
     pub(super) fn descriptions(&self) -> &Descriptions {
         &self.descriptions
+    }
+
+    pub(super) fn unencrypted_chats(&self) -> &Unencrypted {
+        &self.unencrypted_chats
     }
 
     pub(super) fn home_kds(&self) -> u32 {

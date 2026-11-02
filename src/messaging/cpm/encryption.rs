@@ -522,6 +522,31 @@ pub trait GroupEncryption: Send + Sync {
         change: MetadataChange,
     ) -> BoxFuture<'static, Option<Vec<u8>>>;
 
+    /// The ID of the MLS group of the encrypted 1-to-1 chat kept with
+    /// `contact`, and the MLS-Opaque-Token its Conversation Focus gave if it
+    /// did (RCC.16 sections 6.1.3, 8.1.1)
+    fn chat_group(&self, contact: &str) -> Option<(String, Option<String>)>;
+
+    /// A new MLS group for an encrypted 1-to-1 chat of the user `from` with
+    /// `contact`, if the contact advertises E2EE v1 and the Home KDS has its
+    /// KeyPackages (RCC.16 sections 5.2, 8.1): its ID, a random GUID (section
+    /// 6.1.1), and the CPIM message of its initial Commit, GroupInfo and
+    /// Welcome, which the INVITE starting the chat is to carry (section
+    /// 8.1.1); None if not, or if this client cannot be added to groups
+    ///
+    /// A contact found not to take an encrypted chat is not asked again for
+    /// a while, None given meanwhile.
+    fn prepare_chat(
+        &self,
+        contact: String,
+        from: String,
+    ) -> BoxFuture<'static, Option<(String, Vec<u8>)>>;
+
+    /// Takes note of the MLS group `group_id` as that of the encrypted 1-to-1
+    /// chat with `contact`, its Conversation Focus having given
+    /// `mls_opaque_token` if it did, in place of any other
+    fn keep_chat(&self, contact: &str, group_id: &str, mls_opaque_token: Option<String>);
+
     /// Lets go of the MLS group `conversation_id`, as its chat did not start,
     /// its invitation was not accepted, or the user left it
     fn abandon(&self, conversation_id: &str);

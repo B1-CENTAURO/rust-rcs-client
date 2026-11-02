@@ -48,6 +48,7 @@ use crate::messaging::cpm::encryption::{
     GroupMetadata, ImdnTold, MetadataChange, Sealed, SealedFile, Taken, Upgrade, Verified,
 };
 
+use super::chat::contact_tel_uri;
 use super::description::CONTENT_TYPE_GROUP_DATA;
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice, CIPHERSUITE};
 use super::file::seal_file;
@@ -787,6 +788,7 @@ impl E2eeDevice {
             .remove(conversation_id);
         self.recoveries().forget(conversation_id);
         self.forget_metadata(conversation_id);
+        self.forget_chat(conversation_id);
         self.store().delete_conversation(conversation_id.as_bytes())
     }
 }
@@ -1323,6 +1325,62 @@ impl GroupEncryption for DeviceGroups {
         self.device
             .upgrade()
             .is_some_and(|device| device.metadata_keys_due(conversation_id))
+    }
+
+    fn chat_group(&self, contact: &str) -> Option<(String, Option<String>)> {
+        self.device.upgrade()?.chat_group(contact)
+    }
+
+    fn prepare_chat(
+        &self,
+        contact: String,
+        from: String,
+    ) -> BoxFuture<'static, Option<(String, Vec<u8>)>> {
+        let device = self.device.clone();
+        let capabilities = Arc::clone(&self.capabilities);
+        Box::pin(async move {
+            let device = device.upgrade()?;
+            // only while others can add it
+            device.mls_feature_tags()?;
+            let tel_uri = contact_tel_uri(&contact)?;
+            if device
+                .unencrypted_chats()
+                .lately(&tel_uri, device.store().now())
+            {
+                return None;
+            }
+            let Some(recipients) = recipients(&[contact.clone()], &capabilities).await else {
+                device
+                    .unencrypted_chats()
+                    .found(&tel_uri, device.store().now());
+                return None;
+            };
+            let group_id = new_message_id();
+            match device
+                .create_group(&group_id, &from, &contact, recipients)
+                .await
+            {
+                Ok(cpim) => Some((group_id, cpim)),
+                Err(e) => {
+                    platform_log(LOG_TAG, format!("chat started unencrypted: {:?}", e));
+                    // not again for a while unless it may do later
+                    if let GroupError::NotEncryptable(..) = e {
+                        device
+                            .unencrypted_chats()
+                            .found(&tel_uri, device.store().now());
+                    }
+                    None
+                }
+            }
+        })
+    }
+
+    fn keep_chat(&self, contact: &str, group_id: &str, mls_opaque_token: Option<String>) {
+        if let Some(device) = self.device.upgrade() {
+            if let Err(e) = device.keep_chat(contact, group_id, mls_opaque_token.as_deref()) {
+                platform_log(LOG_TAG, format!("chat not kept: {:?}", e));
+            }
+        }
     }
 
     fn seal_icon(&self, icon: &[u8], content_type: &str) -> Option<SealedFile> {
