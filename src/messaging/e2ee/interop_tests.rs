@@ -49,6 +49,17 @@ use crate::messaging::cpm::encryption::{
 };
 use crate::messaging::cpm::make_cpim_imdn_body;
 
+use rust_rcs_core::internet::body::multipart_body::MultipartBody;
+use rust_rcs_core::internet::{header, Body};
+use rust_rcs_core::sip::SipMessage;
+use tokio::runtime::Runtime;
+
+use crate::messaging::cpm::session_tests::{
+    ack, answer, body_data, header_value, invite as invite_from, sdp_attribute, start_as,
+    status_code, MsrpConnection, MsrpFrame, MsrpPeer,
+};
+use crate::messaging::ffi::RecipientType;
+
 use super::chat::contact_tel_uri;
 use super::device::{E2eeDevice, Enrolled};
 use super::device_tests::provision;
@@ -172,7 +183,7 @@ impl Clock {
 /// The device of a Participant, with the groups of its session service
 struct Party {
     device: Arc<E2eeDevice>,
-    groups: DeviceGroups,
+    groups: Arc<DeviceGroups>,
     impu: &'static str,
 }
 
@@ -206,7 +217,7 @@ fn alice_and_bob() -> (Party, Party, Clock) {
             .lock()
             .unwrap()
             .push((String::from(tel_uri), Arc::downgrade(&device)));
-        let groups = DeviceGroups::new(&device, options(&network));
+        let groups = Arc::new(DeviceGroups::new(&device, options(&network)));
         Party {
             device,
             groups,
@@ -1121,4 +1132,243 @@ fn a_device_whose_keys_went_stale_is_replaced_by_the_other_and_rejoins() {
         "still there?",
     );
     said(&bob, &alice, CONVERSATION, GROUP_URI, "bob-2", "anew");
+}
+
+/// The parts of the multipart body of `message`, each its Content-Type and
+/// content
+fn parts_of(message: &SipMessage) -> Vec<(String, Vec<u8>)> {
+    let content_type = header_value(message, "Content-Type");
+    let boundary = content_type
+        .split("boundary=")
+        .nth(1)
+        .expect("a multipart body")
+        .trim_matches('"');
+    let body = body_data(message);
+    MultipartBody::construct(&body, boundary.as_bytes())
+        .unwrap()
+        .parts
+        .iter()
+        .map(|part| match part.as_ref() {
+            Body::Message(part) => {
+                let content_type = header::search(&part.headers, b"Content-Type", true)
+                    .map(|header| String::from_utf8_lossy(header.get_value()).into_owned())
+                    .unwrap_or_default();
+                let mut content = Vec::new();
+                part.body
+                    .reader()
+                    .unwrap()
+                    .read_to_end(&mut content)
+                    .unwrap();
+                (content_type, content)
+            }
+            _ => panic!("a part not a message"),
+        })
+        .collect()
+}
+
+/// A CPIM message from the Focus carrying the `message/mls-rcs-server`
+/// `server_message` (RCC.16 sections 7.9.1, 7.9.3)
+fn from_the_focus(to: &str, server_message: &[u8]) -> Vec<u8> {
+    let mut cpim = format!(
+        "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:01.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: focus-1\r\n\r\nContent-Type: message/mls-rcs-server\r\n\r\n",
+        FOCUS_URI, to
+    )
+    .into_bytes();
+    cpim.extend_from_slice(server_message);
+    cpim
+}
+
+const FOCUS_URI: &str = "sip:focus@conf.example.com";
+
+/// What a session service takes, through the Focus relaying `send`, an
+/// MSRP SEND of the other's session, over `connection` from `focus_path`
+/// to `path`: answered, and given to the app as `received` tells
+fn relayed(
+    connection: &mut MsrpConnection,
+    rt: &Runtime,
+    focus_path: &str,
+    path: &str,
+    send: &MsrpFrame,
+) {
+    connection.send_data(
+        rt,
+        focus_path,
+        path,
+        send.header("Content-Type").unwrap_or("message/cpim"),
+        &send.body,
+    );
+    let response = connection.next_response(rt);
+    assert!(
+        response.first_line.contains(" 200"),
+        "{}",
+        response.first_line
+    );
+}
+
+#[test]
+fn an_encrypted_chat_runs_between_two_session_services_through_the_focus() {
+    let (alice, bob, _) = alice_and_bob();
+    let (alice_client, mut alice_sip) = start_as(true, ALICE_IMPU);
+    let (bob_client, mut bob_sip) = start_as(true, BOB_IMPU);
+    let (alice_rt, bob_rt) = (Arc::clone(&alice_client.rt), Arc::clone(&bob_client.rt));
+    alice_client
+        .sessions
+        .set_group_encryption(Arc::clone(&alice.groups) as Arc<dyn GroupEncryption>);
+    bob_client
+        .sessions
+        .set_group_encryption(Arc::clone(&bob.groups) as Arc<dyn GroupEncryption>);
+
+    // Alice's session service starts the chat with the INVITE carrying its
+    // MLS group, as the engine has it do (RCC.16 sections 8.1, 8.1.1)
+    let (group_id, bundle) = block_on(
+        alice
+            .groups
+            .prepare_chat(String::from(BOB_IMPU), String::from(ALICE_IMPU)),
+    )
+    .expect("an encrypted chat");
+    let sent = alice_client.send_starting_chat(BOB_IMPU, "hi Bob", &group_id, &bundle, false);
+    let invite = alice_sip.next_request("INVITE");
+    let parts = parts_of(&invite);
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].0, "application/sdp");
+    let alice_path =
+        sdp_attribute(&String::from_utf8_lossy(&parts[0].1), "path").expect("Alice's a=path");
+    let welcome_bundle = bundle_of(&parts[1].1);
+
+    // the Focus answers it, then fans it out to Bob, the Welcome in a
+    // message/mls-rcs-server (section 8.2.1)
+    let alice_msrp = MsrpPeer::listen(&alice_rt);
+    let ok = answer(&invite, "200 OK", Some(&alice_msrp.sdp("sendrecv"))).replacen(
+        "Contact:",
+        &format!("MLS-Opaque-Token: {}\r\nContact:", TOKEN),
+        1,
+    );
+    alice_sip.send(&ok);
+    alice_sip.next_request("ACK");
+    let mut to_alice = alice_msrp.accept(&alice_rt);
+
+    let bob_msrp = MsrpPeer::listen(&bob_rt);
+    let welcome = format!(
+        "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: welcome-1\r\n\r\nContent-Type: message/mls-rcs-server\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
+        ALICE_IMPU,
+        BOB_IMPU,
+        general_purpose::STANDARD.encode(welcomed(&welcome_bundle))
+    );
+    let body = format!(
+        "--part-1\r\nContent-Type: application/sdp\r\n\r\n{}\r\n--part-1\r\nContent-Type: message/cpim\r\n\r\n{}\r\n--part-1--\r\n",
+        bob_msrp.sdp("sendrecv"),
+        welcome
+    );
+    bob_sip.send(&invite_from(
+        "chat-to-bob",
+        "<sip:+491701234567@192.0.2.1:5060;transport=tcp>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+        ALICE_IMPU,
+        "cpm.session",
+        &format!("MLS-Opaque-Token: {}\r\n", TOKEN),
+        "multipart/mixed; boundary=part-1",
+        &body,
+    ));
+    let bobs_ok = bob_sip.next_response();
+    assert_eq!(status_code(&bobs_ok), 200);
+    bob_sip.send(&ack(&bobs_ok, "chat-to-bob"));
+    let bob_path = sdp_attribute(&super::super::cpm::session_tests::body(&bobs_ok), "path")
+        .expect("Bob's a=path");
+    let mut to_bob = bob_msrp.accept(&bob_rt);
+    assert_eq!(
+        bob.groups.chat_group(ALICE_IMPU).map(|(id, _)| id),
+        Some(group_id.clone())
+    );
+
+    // Alice's message waits for the Focus to accept her Commit, then goes
+    // encrypted, which Bob's session service gives his app decrypted
+    // (sections 6.2.4, 9.1.1)
+    let previous = epoch_of(&alice, &group_id);
+    to_alice.send_data(
+        &alice_rt,
+        &alice_msrp.path,
+        &alice_path,
+        "message/cpim",
+        &from_the_focus(ALICE_IMPU, &accepted(previous)),
+    );
+    let response = to_alice.next_response(&alice_rt);
+    assert!(
+        response.first_line.contains(" 200"),
+        "{}",
+        response.first_line
+    );
+    let send = to_alice.next_message(&alice_rt);
+    to_alice.respond(&alice_rt, &send, "200 OK");
+    assert_eq!(
+        sent.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    relayed(&mut to_bob, &bob_rt, &bob_msrp.path, &bob_path, &send);
+    let (contact, content_type, content) = bob_client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Alice's message given to Bob's app");
+    assert_eq!(
+        (contact.as_str(), content_type.as_str(), content.as_str()),
+        (ALICE_IMPU, "text/plain", "hi Bob")
+    );
+
+    // its delivery, signed in Bob's session, verified by Alice's (sections
+    // 9.1.3, 7.6.2)
+    let delivery = to_bob.next_message(&bob_rt);
+    to_bob.respond(&bob_rt, &delivery, "200 OK");
+    relayed(
+        &mut to_alice,
+        &alice_rt,
+        &alice_msrp.path,
+        &alice_path,
+        &delivery,
+    );
+    // from the Focus's Contact, as the session tells of its contact
+    let (_, content_type, content) = alice_client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the delivery given to Alice's app");
+    assert!(
+        content_type.starts_with("message/imdn+xml"),
+        "{}",
+        content_type
+    );
+    assert!(content.contains("<delivered/>"), "{}", content);
+
+    // and the same the other way
+    let reply = bob_client.send(ALICE_IMPU, RecipientType::Contact, "hi Alice");
+    let send = to_bob.next_message(&bob_rt);
+    to_bob.respond(&bob_rt, &send, "200 OK");
+    assert_eq!(
+        reply.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    relayed(
+        &mut to_alice,
+        &alice_rt,
+        &alice_msrp.path,
+        &alice_path,
+        &send,
+    );
+    let (_, content_type, content) = alice_client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Bob's message given to Alice's app");
+    assert_eq!(
+        (content_type.as_str(), content.as_str()),
+        ("text/plain", "hi Alice")
+    );
+    let delivery = to_alice.next_message(&alice_rt);
+    to_alice.respond(&alice_rt, &delivery, "200 OK");
+    relayed(&mut to_bob, &bob_rt, &bob_msrp.path, &bob_path, &delivery);
+    let (_, content_type, content) = bob_client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the delivery given to Bob's app");
+    assert!(
+        content_type.starts_with("message/imdn+xml"),
+        "{}",
+        content_type
+    );
+    assert!(content.contains("<delivered/>"), "{}", content);
 }

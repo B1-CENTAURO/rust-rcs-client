@@ -2272,12 +2272,11 @@ impl CPMSessionService {
                     );
                     return;
                 }
+                // of the MLS group of the session: that of its chat for a
+                // 1-to-1 chat, the Conversation-ID for a group (RCC.16 section
+                // 6.1.1)
                 let encryption = encryption.lock().unwrap().clone();
-                let conversation_id = session
-                    .get_inner()
-                    .get_session_info()
-                    .conversation_id
-                    .clone();
+                let conversation_id = session.get_inner().get_session_info().mls_group().cloned();
                 if let (Some(encryption), Some(conversation_id)) = (encryption, conversation_id) {
                     let taken = encryption.on_server_message(&conversation_id, content_body);
                     // a member's leave for this client to commit (RCC.16
