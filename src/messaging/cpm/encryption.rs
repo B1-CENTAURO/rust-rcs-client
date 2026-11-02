@@ -102,7 +102,8 @@ pub enum Upgrade {
 }
 
 /// A negative delivery telling the sender of a message that it could not be
-/// decrypted (RCC.16 sections 7.7.2.2, 10.2, 10.4)
+/// decrypted, or was not as a member's credential expired (RCC.16 sections
+/// 7.7.2.2, 9.1.1, 10.2, 10.4)
 #[derive(Clone, Debug, PartialEq)]
 pub struct FailedToDecrypt {
     /// The `message/imdn+xml` document

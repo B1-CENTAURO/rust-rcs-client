@@ -16,6 +16,9 @@
 //! senders told so once the group is healed, and the messages taken when they
 //! are re-sent (RCC.16 sections 10.2, 10.4)
 //!
+//! So too those not decrypted as a member's credential expired, their
+//! senders told why (section 9.1.1).
+//!
 //! They are kept with the MLS state, in the notes of the device, for a
 //! message to be taken when it is re-sent after the device restarted.
 
@@ -91,15 +94,15 @@ impl Notes {
     }
 
     /// Takes note of the message `message_id` of the group `conversation_id`
-    /// not being decrypted, sent at `datetime` by `sender_uri`, its sender to
-    /// be told so; once only
+    /// not being decrypted, sent by `sender_uri`, its sender to be told so
+    /// with the negative delivery `imdn`; once only
     pub(super) fn lose(
         &self,
         store: &MlsStore,
         conversation_id: &str,
         message_id: &str,
         sender_uri: &str,
-        datetime: &str,
+        imdn: String,
         now: SystemTime,
     ) -> Result<(), StoreError> {
         self.change(store, |data| {
@@ -122,11 +125,7 @@ impl Notes {
                 sender_uri: String::from(sender_uri),
                 taken: now,
                 to_tell: Some(FailedToDecrypt {
-                    imdn: negative_delivery(
-                        message_id,
-                        datetime,
-                        ClientFailureReason::FailureToDecrypt,
-                    ),
+                    imdn,
                     sender_uri: String::from(sender_uri),
                     original_message_id: None,
                 }),
@@ -306,21 +305,32 @@ fn sender_uri(cpim_info: &CPIMInfo) -> Option<String> {
 impl E2eeDevice {
     /// Takes note of the message of the group `conversation_id` that
     /// `cpim_info` tells of not being decrypted, its sender to be told so
-    /// once the group is healed, if it asked to be told of a negative
-    /// delivery (RCC.16 sections 7.5.6, 10.2)
-    pub(super) fn lose_message(&self, conversation_id: &str, cpim_info: &CPIMInfo) {
+    /// for `reason` once the group is in step, if it asked to be told of a
+    /// negative delivery (RCC.16 sections 7.5.6, 9.1.1, 10.2)
+    pub(super) fn lose_message(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        reason: ClientFailureReason,
+    ) {
         let asks = cpim_info.disposition_notification.is_some_and(|value| {
             Dispositions::parse(value).ask_for(Notification::Delivery, Status::Failed)
         });
         let Some(sender_uri) = sender_uri(cpim_info).filter(|_| asks) else {
             return;
         };
+        let message_id = String::from_utf8_lossy(cpim_info.imdn_message_id);
+        let imdn = negative_delivery(
+            &message_id,
+            &String::from_utf8_lossy(cpim_info.date),
+            reason,
+        );
         if let Err(e) = self.notes().lose(
             self.store(),
             conversation_id,
-            &String::from_utf8_lossy(cpim_info.imdn_message_id),
+            &message_id,
             &sender_uri,
-            &String::from_utf8_lossy(cpim_info.date),
+            imdn,
             self.store().now(),
         ) {
             platform_log(LOG_TAG, format!("message not decrypted not kept: {:?}", e));
@@ -426,6 +436,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
+    use rust_rcs_core::mls::rcs::imdn::negative_delivery;
+    use rust_rcs_core::mls::rcs::ClientFailureReason;
     use rust_rcs_core::mls::{Credential, CredentialValidator, MlsConfig};
 
     use super::super::notes::Notes;
@@ -475,6 +487,12 @@ mod tests {
 
     const THEN: Duration = Duration::from_secs(1_000_000_000);
 
+    /// The negative delivery of the message `message_id` sent at `datetime`
+    /// not being decrypted
+    fn ftd(message_id: &str, datetime: &str) -> String {
+        negative_delivery(message_id, datetime, ClientFailureReason::FailureToDecrypt)
+    }
+
     #[test]
     fn a_message_lost_is_told_of_once_and_taken_once_re_sent() {
         let app = Arc::new(App::default());
@@ -488,7 +506,7 @@ mod tests {
                     conversation_id,
                     "m1",
                     BOB,
-                    "2026-10-25T12:00:00Z",
+                    ftd("m1", "2026-10-25T12:00:00Z"),
                     now,
                 )
                 .unwrap();
@@ -519,14 +537,16 @@ mod tests {
         let store = store(&app);
         let notes = Notes::kept_by(&store);
         let then = SystemTime::UNIX_EPOCH + THEN;
-        notes.lose(&store, "group-1", "old", BOB, "", then).unwrap();
+        notes
+            .lose(&store, "group-1", "old", BOB, ftd("old", ""), then)
+            .unwrap();
         notes
             .lose(
                 &store,
                 "group-1",
                 "recent",
                 BOB,
-                "",
+                ftd("recent", ""),
                 then + Duration::from_secs(60),
             )
             .unwrap();
@@ -539,7 +559,7 @@ mod tests {
                 "group-1",
                 "new",
                 BOB,
-                "",
+                ftd("new", ""),
                 then + LOST_FOR + Duration::from_secs(1),
             )
             .unwrap();
@@ -550,7 +570,14 @@ mod tests {
         notes.forget_lost(&store, "group-1").unwrap();
         for n in 0..=LOST_MOST {
             notes
-                .lose(&store, "group-1", &format!("m{}", n), BOB, "", then)
+                .lose(
+                    &store,
+                    "group-1",
+                    &format!("m{}", n),
+                    BOB,
+                    ftd(&format!("m{}", n), ""),
+                    then,
+                )
                 .unwrap();
         }
         assert_eq!(told(&notes, &store, "group-1").len(), LOST_MOST);
@@ -565,10 +592,24 @@ mod tests {
         let notes = Notes::kept_by(&store);
         let then = SystemTime::UNIX_EPOCH + THEN;
         notes
-            .lose(&store, "group-1", "m1", BOB, "2026-10-25T12:00:00Z", then)
+            .lose(
+                &store,
+                "group-1",
+                "m1",
+                BOB,
+                ftd("m1", "2026-10-25T12:00:00Z"),
+                then,
+            )
             .unwrap();
         notes
-            .lose(&store, "group-1", "m2", BOB, "2026-10-25T12:00:01Z", then)
+            .lose(
+                &store,
+                "group-1",
+                "m2",
+                BOB,
+                ftd("m2", "2026-10-25T12:00:01Z"),
+                then,
+            )
             .unwrap();
         assert_eq!(told(&notes, &store, "group-1").len(), 2);
         assert_eq!(
@@ -603,7 +644,7 @@ mod tests {
             Err(StoreError::NotSaved)
         );
         assert_eq!(
-            restored.lose(&again, "group-1", "m4", BOB, "", then),
+            restored.lose(&again, "group-1", "m4", BOB, ftd("m4", ""), then),
             Err(StoreError::NotSaved)
         );
         app.refusing.store(false, Ordering::SeqCst);

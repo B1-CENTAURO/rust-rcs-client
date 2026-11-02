@@ -72,6 +72,18 @@ enum Unavailable {
 }
 
 impl E2eeDevice {
+    /// Whether the credential of a member of the group chat
+    /// `conversation_id` expired, or no longer passes otherwise, that of the
+    /// device too, those leaving left out: no message of it is decrypted
+    /// then (RCC.16 section 9.1.1)
+    pub fn has_expired_member(&self, conversation_id: &str) -> bool {
+        self.store()
+            .peek_conversation(conversation_id.as_bytes(), |conversation, client| {
+                conversation.has_expired_member(client)
+            })
+            .unwrap_or(false)
+    }
+
     /// Whether the device is to replace the leaves of Clients of other
     /// members of the group chat `conversation_id` with a KeyPackage Update,
     /// as replace_members() does (RCC.16 section 9.5.4): for a certificate

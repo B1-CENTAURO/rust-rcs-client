@@ -83,6 +83,11 @@ pub enum MessageError {
     /// telling of the file the XML tells where it is (RCC.16 sections 7.8,
     /// 9.1.2.2)
     NotFileTransfer,
+    /// A message not decrypted as the credential of a member of the group
+    /// expired, or no longer passes otherwise, this client's own too, its
+    /// sender told so and the group to be fixed with a KeyPackage Update
+    /// (RCC.16 section 9.1.1)
+    ExpiredMember,
     Store(StoreError),
 }
 
@@ -512,7 +517,11 @@ impl E2eeDevice {
     /// 7.5.3.1, 9.1.1)
     ///
     /// A message not decrypted has its sender told so once the group is
-    /// healed (section 10.2). A Re-Sent Message of it to this client gives
+    /// healed (section 10.2). None is decrypted while a member's credential
+    /// expired, the device's own too: its sender is told why, with the
+    /// `<expired-credential>` reason, and the KeyPackage Update fixing the
+    /// group is due as GroupEncryption::key_update_due() tells (section
+    /// 9.1.1). A Re-Sent Message of it to this client gives
     /// the Original Message, with the Message-ID of the Re-Sent Message and
     /// the Original-Message-ID of the other, if this client asked for it from
     /// its sender (section 10.4); one that could not be decrypted has its
@@ -523,6 +532,14 @@ impl E2eeDevice {
         cpim_info: &CPIMInfo,
         mls_message: &[u8],
     ) -> Result<Vec<u8>, MessageError> {
+        if self.has_expired_member(conversation_id) {
+            self.lose_message(
+                conversation_id,
+                cpim_info,
+                ClientFailureReason::ExpiredCredential,
+            );
+            return Err(MessageError::ExpiredMember);
+        }
         let decrypted = self
             .store()
             .with_conversation(conversation_id.as_bytes(), |conversation, client| {
@@ -532,7 +549,11 @@ impl E2eeDevice {
                 // as when the group missed a Commit (RCC.16 section 10.1)
                 if e == StoreError::Mls(ErrorKind::Rejected) {
                     self.heals().want(conversation_id);
-                    self.lose_message(conversation_id, cpim_info);
+                    self.lose_message(
+                        conversation_id,
+                        cpim_info,
+                        ClientFailureReason::FailureToDecrypt,
+                    );
                 }
                 MessageError::Store(e)
             })?;
