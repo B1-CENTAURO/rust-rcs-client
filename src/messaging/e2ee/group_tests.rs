@@ -9670,3 +9670,50 @@ fn the_next_era_of_a_chat_is_not_made_unless_the_contact_takes_one() {
     assert_eq!(epoch(&device, BOBS_CHAT), Ok((1, false)));
     assert!(device.chat_era_due(BOB_TEL));
 }
+
+#[test]
+fn a_chat_of_no_activity_noted_is_due_once_unused_from_its_next_message_on() {
+    let clock = Clock::new();
+    let (device, kds, _) = enrolled_in_time(None, Some(&clock));
+    let bob = bob();
+    let (mut bobs_chat, server_message) =
+        focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 0), |_| {
+            Vec::new()
+        });
+    device.join_chat(BOB_IMPU, &server_message, None).unwrap();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+
+    // as kept by a device before it noted when chats were used: not due, as
+    // that is not known
+    device
+        .notes()
+        .change(device.store(), |data| data.chats[0].active = None)
+        .unwrap();
+    clock.advance(31 * DAY);
+    assert!(!device.chat_era_due(BOB_TEL));
+
+    // noted from its next message on (RCC.16 section 8.3)
+    let mls_message = bobs_chat
+        .encrypt_cpim(&bob, b"Content-Type: text/plain\r\n\r\nhi", b"bob-1", b"")
+        .unwrap();
+    let mut outer = format!(
+        "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:01.000+00:00\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: bob-1\r\n\r\nContent-Type: message/mls\r\n\r\n",
+        BOB_IMPU, IMPU
+    )
+    .into_bytes();
+    outer.extend_from_slice(&mls_message);
+    let outer = cpim_message(&outer);
+    assert!(groups
+        .decrypt(BOBS_CHAT, &outer.get_info().unwrap(), &mls_message)
+        .is_some());
+    assert!(!device.chat_era_due(BOB_TEL));
+    clock.advance(31 * DAY);
+    assert!(device.chat_era_due(BOB_TEL));
+
+    // nor is one whose MLS group is not kept
+    device
+        .keep_chat(CAROL_TEL, "not-a-group", Some("token"))
+        .unwrap();
+    clock.advance(31 * DAY);
+    assert!(!device.chat_era_due(CAROL_TEL));
+}
