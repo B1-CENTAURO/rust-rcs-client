@@ -9177,9 +9177,10 @@ fn a_new_chat_is_prepared_with_an_mls_group_of_its_own_for_the_contact() {
         Some((group_id.clone(), None))
     );
 
-    // let go of with its MLS group
+    // let go of with its MLS group, nothing of it left in the notes
     restored.abandon(&group_id).unwrap();
     assert_eq!(restored.chat_group(BOB_TEL), None);
+    assert!(restored.notes().read(|data| data.chats.is_empty()));
 }
 
 #[test]
