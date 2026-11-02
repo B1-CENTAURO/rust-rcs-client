@@ -10199,3 +10199,35 @@ fn an_unencrypted_group_used_lately_is_moved_back_on_schedule() {
         [(String::from("never-encrypted"), participants.clone())]
     );
 }
+
+#[test]
+fn the_use_of_groups_is_noted_once_a_day_and_let_go_of_unused() {
+    let clock = Clock::new();
+    let (device, _, _, _, _) = alice_and_bob_kept(&clock);
+    let used = |group: &str| {
+        device
+            .notes()
+            .read(|data| data.groups.get(group).and_then(|group| group.used))
+    };
+    let first = clock.now();
+    device.group_used("old");
+    device.group_used(CONVERSATION);
+    assert_eq!(used(CONVERSATION), Some(first));
+
+    // once a day at most
+    clock.advance(DAY - MINUTE);
+    device.group_used(CONVERSATION);
+    assert_eq!(used(CONVERSATION), Some(first));
+    clock.advance(2 * MINUTE);
+    device.group_used(CONVERSATION);
+    assert_eq!(used(CONVERSATION), Some(clock.now()));
+
+    // one unused for 30 days let go of as another is used
+    clock.advance(29 * DAY - 2 * MINUTE);
+    device.group_used(CONVERSATION);
+    assert!(used("old").is_some());
+    clock.advance(2 * DAY);
+    device.group_used(CONVERSATION);
+    assert_eq!(used("old"), None);
+    assert_eq!(used(CONVERSATION), Some(clock.now()));
+}

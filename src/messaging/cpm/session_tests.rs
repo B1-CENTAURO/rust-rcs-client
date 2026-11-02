@@ -8724,6 +8724,8 @@ fn the_notifications_of_an_encrypted_chat_are_sent_signed_in_its_session() {
             .map(|r| r.2),
         Ok(String::from("hi"))
     );
+    // no group used by it
+    assert!(encryption.used.lock().unwrap().is_empty());
     let send = connection.next_message(&rt);
     assert_eq!(send.header("Content-Type"), Some("message/cpim"));
     assert_eq!(String::from_utf8_lossy(&send.body), CHAT_SIGNED);
@@ -9227,6 +9229,15 @@ fn an_unencrypted_group_is_moved_back_on_schedule_in_a_session_started_for_it() 
     assert_eq!(header_value(&restart, "Conversation-ID"), "conversation-1");
     assert_eq!(header_value(&restart, "Content-Type"), "application/sdp");
     assert_eq!(*encryption.upgraded.lock().unwrap(), upgraded_on_schedule());
+    // not tried again while its invitation is on its way
+    encryption.upgrade_wanted.store(true, Ordering::SeqCst);
+    *encryption.scheduled.lock().unwrap() = vec![(
+        String::from("conversation-1"),
+        vec![String::from(IMPU), String::from(BOB)],
+    )];
+    client.sessions.upgrade_on_schedule(&client.core, &rt);
+    assert_eq!(encryption.upgraded.lock().unwrap().len(), 1);
+    encryption.upgrade_wanted.store(false, Ordering::SeqCst);
     peer.send(&answer_from(
         &restart,
         "200 OK",
