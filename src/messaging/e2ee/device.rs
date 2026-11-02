@@ -190,6 +190,15 @@ impl E2eeDevice {
         &self.validator
     }
 
+    /// The tel URI of the user provisioned, if one was
+    pub(super) fn provisioned_tel_uri(&self) -> Option<String> {
+        self.provisioned
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(tel_uri, _)| tel_uri.clone())
+    }
+
     /// The parameters of the configuration request for ACS to sign the
     /// encryption identity of the device (RCC.16 section 4.1)
     pub fn acs_parameters(&self) -> Result<Vec<(String, String)>, StoreError> {

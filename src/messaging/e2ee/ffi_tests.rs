@@ -31,8 +31,9 @@ use uuid::Uuid;
 use crate::capability::FEATURE_TAGS;
 use crate::messaging::ffi::{MessageResultCallbackContext, MessageResultCallbackContextWrapper};
 use crate::{
-    destroy_rcs_client, new_rcs_client, rcs_client_e2ee_enrol, rcs_client_query_capabilities,
-    rcs_client_set_e2ee, rcs_client_setup, RcsRuntime,
+    destroy_rcs_client, new_rcs_client, rcs_client_e2ee_enrol,
+    rcs_client_identity_verification_code, rcs_client_query_capabilities, rcs_client_set_e2ee,
+    rcs_client_setup, RcsRuntime,
 };
 
 use super::device::{DeviceError, Enrolled};
@@ -42,6 +43,7 @@ use super::ffi::{
     app_save_state, enrolment_status, rcs_kds_request_add_key_packages, rcs_kds_request_enrolled,
     rcs_kds_request_failed, rcs_kds_request_fetched, rcs_kds_request_uploaded, AppKds, KdsRequest,
 };
+use super::group_tests::{alice_and_bob, code_bob_is_shown, CONVERSATION};
 use super::kds::{Enrolment, EnrolmentError, Fetched, KdsError, KeyDistribution, Recipient};
 use super::kds_tests::certificates::*;
 use super::kds_tests::{bytes, App as Keeping, Kds, ALICE_TEL, TODAY};
@@ -771,4 +773,52 @@ fn capabilities_are_asked_through_the_client() {
         *app.capabilities.lock().unwrap(),
         vec![(403, String::new()), (400, String::new())]
     );
+}
+
+#[test]
+fn an_identity_verification_code_is_asked_through_the_client() {
+    let app = App::default();
+    let client = Client::new();
+    let raw = client.client;
+    let bob_tel = CString::new("tel:+491707654321").unwrap();
+    let conversation = CString::new(CONVERSATION).unwrap();
+    let ask = move |contact: *const c_char, conversation_id: *const c_char, code: *mut c_char| unsafe {
+        rcs_client_identity_verification_code(raw, contact, conversation_id, code)
+    };
+    let mut code = [1 as c_char; 81];
+    let untouched = |code: &[c_char; 81]| code.iter().all(|&c| c == 1);
+
+    // E2EE not set, then arguments missing
+    assert_eq!(ask(bob_tel.as_ptr(), ptr::null(), code.as_mut_ptr()), -1);
+    assert_eq!(client.set_e2ee(&app, &[bytes(ROOT)], None), 0);
+    assert_eq!(ask(ptr::null(), ptr::null(), code.as_mut_ptr()), -1);
+    assert_eq!(ask(bob_tel.as_ptr(), ptr::null(), ptr::null_mut()), -1);
+    assert_eq!(
+        unsafe {
+            rcs_client_identity_verification_code(
+                ptr::null_mut(),
+                bob_tel.as_ptr(),
+                ptr::null(),
+                code.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+
+    // not enrolled
+    assert_eq!(ask(bob_tel.as_ptr(), ptr::null(), code.as_mut_ptr()), -2);
+    assert!(untouched(&code));
+
+    // enrolled, in a group with Bob, which is to be named
+    let (device, bob, _) = alice_and_bob();
+    unsafe { (*raw).e2ee = Some(Arc::clone(&device)) };
+    assert_eq!(ask(bob_tel.as_ptr(), ptr::null(), code.as_mut_ptr()), -3);
+    assert!(untouched(&code));
+    assert_eq!(
+        ask(bob_tel.as_ptr(), conversation.as_ptr(), code.as_mut_ptr()),
+        0
+    );
+    let written = unsafe { CStr::from_ptr(code.as_ptr()) };
+    assert_eq!(written.to_str().unwrap(), code_bob_is_shown(&device, &bob));
+    assert_eq!(written.to_bytes().len(), 80);
 }

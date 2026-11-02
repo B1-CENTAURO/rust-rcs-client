@@ -164,6 +164,15 @@ typedef void (*rcs_e2ee_enrol_result_callback) (int32_t status, void *context);
 extern void rcs_client_e2ee_enrol(struct rcs_runtime *runtime, struct rcs_client *client, rcs_e2ee_enrol_result_callback cb,
                                 void *context);
 
+// writes into code, which has room for 81 chars, the identity verification code of the user and contact, a tel or SIP
+// URI, for both to compare: 80 decimal digits then a NUL, the same whichever of the two asks (RCC.16 section 5.5);
+// the contact's Participant Key is taken from the certificates of its Clients, valid now, in the encrypted 1-to-1 chat
+// with it, and in the group chat of Conversation-ID conversation_id if not NULL: of those, the one issued last; 0 if
+// written, -1 if E2EE is not set or contact or code is NULL, -2 if the device holds no certificate valid now of the
+// user configured, -3 if no certificate of the contact valid now is known there; nothing is written but for 0
+extern int32_t rcs_client_identity_verification_code(struct rcs_client *client, const char *contact,
+                                const char *conversation_id, char *code);
+
 extern void rcs_client_disconnect(struct rcs_runtime *runtime, struct rcs_client *client);
 
 // messaging
