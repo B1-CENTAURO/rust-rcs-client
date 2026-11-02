@@ -15,8 +15,7 @@
 //! Moving the MLS group of a group chat that was moved to unencrypted back
 //! to encrypted (RCC.16 section 11.1)
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use rust_rcs_core::ffi::log::platform_log;
@@ -30,7 +29,8 @@ use crate::messaging::cpm::encryption::Upgrade;
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice};
 use super::group::{recipients, GroupError};
 use super::kds::Recipient;
-use super::store::StoreError;
+use super::notes::{put, put_time, Notes, Reader};
+use super::store::{MlsStore, StoreError};
 
 const LOG_TAG: &str = "e2ee";
 
@@ -42,127 +42,207 @@ const UPGRADE_BACKOFF: Duration = Duration::from_secs(2 * 60 * 60);
 /// again after one was found not to advertise E2EE (RCC.16 section 11.1.1)
 const CAPABILITY_REFRESH: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Where moving a group back to encrypted stands
-#[derive(Default)]
-struct UpgradeState {
+/// Where moving a group back to encrypted stands, kept in the notes of the
+/// device
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct UpgradeState {
     /// When the device saw it moved to unencrypted
-    ended: Option<SystemTime>,
+    pub(super) ended: Option<SystemTime>,
     /// When the device last tried to move it back
-    attempted: Option<SystemTime>,
+    pub(super) attempted: Option<SystemTime>,
     /// When a Participant was last found not to advertise E2EE
-    incapable: Option<SystemTime>,
+    pub(super) incapable: Option<SystemTime>,
     /// The Conversation Focus has no MLS group for it: unencrypted, though
     /// the device may keep one (RCC.16 section 10.1)
-    without_group: bool,
+    pub(super) without_group: bool,
     /// An Era moving it back to encrypted waits for the Focus to accept the
     /// INVITE restarting the group with it
-    restarting: bool,
+    pub(super) restarting: bool,
 }
 
-/// The groups moved to unencrypted and moved back, by Conversation-ID
-#[derive(Default)]
-pub(super) struct Upgrades(Mutex<HashMap<String, UpgradeState>>);
+/// The groups moved to unencrypted and moved back, by Conversation-ID, as
+/// the notes of the device keep them for it to restart with
+pub(super) struct Upgrades<'a> {
+    pub(super) notes: &'a Notes,
+    pub(super) store: &'a MlsStore,
+}
 
-impl Upgrades {
+impl Upgrades<'_> {
+    /// What `read` reads of the group `conversation_id`, if it has an
+    /// UpgradeState
+    fn read<R>(&self, conversation_id: &str, read: impl FnOnce(&UpgradeState) -> R) -> Option<R> {
+        self.notes
+            .read(|data| data.upgrades.get(conversation_id).map(read))
+    }
+
+    /// Changes the UpgradeState of the group `conversation_id` as `change`
+    /// does, one made for it if `make` and it has none, kept as the notes
+    /// are; one left as a new one is let go of
+    fn change(&self, conversation_id: &str, make: bool, change: impl FnOnce(&mut UpgradeState)) {
+        self.notes.hold(self.store, |data| {
+            if make && !data.upgrades.contains_key(conversation_id) {
+                data.upgrades
+                    .insert(String::from(conversation_id), UpgradeState::default());
+            }
+            if let Some(upgrade) = data.upgrades.get_mut(conversation_id) {
+                change(upgrade);
+                if *upgrade == UpgradeState::default() {
+                    data.upgrades.remove(conversation_id);
+                }
+            }
+        });
+    }
+
     /// Takes note of the device seeing the group `conversation_id` moved to
     /// unencrypted at `now`
     pub(super) fn ended(&self, conversation_id: &str, now: SystemTime) {
-        let mut upgrades = self.0.lock().unwrap();
-        upgrades
-            .entry(String::from(conversation_id))
-            .or_default()
-            .ended = Some(now);
+        self.change(conversation_id, true, |upgrade| upgrade.ended = Some(now));
     }
 
     /// Takes note of the membership of the group `conversation_id` changing,
     /// which lifts the waits but that between two tries (RCC.16 sections
     /// 11.1.1, 11.2)
     fn membership_changed(&self, conversation_id: &str) {
-        if let Some(upgrade) = self.0.lock().unwrap().get_mut(conversation_id) {
+        self.change(conversation_id, false, |upgrade| {
             upgrade.ended = None;
             upgrade.incapable = None;
-        }
+        });
     }
 
     /// Whether the group `conversation_id` may be moved back to encrypted
     /// at `now`, as far as the time tells
     fn due(&self, conversation_id: &str, now: SystemTime) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .get(conversation_id)
-            .is_none_or(|upgrade| due(upgrade, now))
+        self.read(conversation_id, |upgrade| due(upgrade, now))
+            .unwrap_or(true)
     }
 
     /// Starts moving the group `conversation_id` back to encrypted at `now`,
     /// after which it is not due for two hours; false if it is not due
     fn begin(&self, conversation_id: &str, now: SystemTime) -> bool {
-        let mut upgrades = self.0.lock().unwrap();
-        let upgrade = upgrades.entry(String::from(conversation_id)).or_default();
-        if !due(upgrade, now) {
+        if !self.due(conversation_id, now) {
             return false;
         }
-        upgrade.attempted = Some(now);
+        self.change(conversation_id, true, |upgrade| {
+            upgrade.attempted = Some(now)
+        });
         true
     }
 
     /// Takes note of a Participant of the group `conversation_id` found not
     /// to advertise E2EE at `now`
     fn incapable(&self, conversation_id: &str, now: SystemTime) {
-        if let Some(upgrade) = self.0.lock().unwrap().get_mut(conversation_id) {
-            upgrade.incapable = Some(now);
-        }
+        self.change(conversation_id, false, |upgrade| {
+            upgrade.incapable = Some(now)
+        });
     }
 
     /// Takes note of the Conversation Focus having no MLS group for the
     /// group `conversation_id`, found at `now`
     fn lost_group(&self, conversation_id: &str, now: SystemTime) {
-        let mut upgrades = self.0.lock().unwrap();
-        let upgrade = upgrades.entry(String::from(conversation_id)).or_default();
-        upgrade.without_group = true;
-        upgrade.ended = Some(now);
+        self.change(conversation_id, true, |upgrade| {
+            upgrade.without_group = true;
+            upgrade.ended = Some(now);
+        });
     }
 
     /// Whether the Conversation Focus has no MLS group for the group
     /// `conversation_id`, an Era moving it back to encrypted being made or not
     pub(super) fn without_group(&self, conversation_id: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .get(conversation_id)
-            .is_some_and(|upgrade| upgrade.without_group)
+        self.read(conversation_id, |upgrade| upgrade.without_group)
+            .unwrap_or(false)
     }
 
     /// Whether an Era moving the group `conversation_id` back to encrypted
     /// waits for the Conversation Focus
     pub(super) fn restarting(&self, conversation_id: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .get(conversation_id)
-            .is_some_and(|upgrade| upgrade.restarting)
+        self.read(conversation_id, |upgrade| upgrade.restarting)
+            .unwrap_or(false)
+    }
+
+    /// The groups an Era moving them back to encrypted waits for the
+    /// Conversation Focus of
+    pub(super) fn all_restarting(&self) -> Vec<String> {
+        self.notes.read(|data| {
+            data.upgrades
+                .iter()
+                .filter(|(_, upgrade)| upgrade.restarting)
+                .map(|(conversation_id, _)| conversation_id.clone())
+                .collect()
+        })
     }
 
     /// Takes note of an Era moving the group `conversation_id` back to
     /// encrypted made, unencrypted until the Conversation Focus accepts it
     fn restart(&self, conversation_id: &str) {
-        let mut upgrades = self.0.lock().unwrap();
-        let upgrade = upgrades.entry(String::from(conversation_id)).or_default();
-        upgrade.without_group = true;
-        upgrade.restarting = true;
+        self.change(conversation_id, true, |upgrade| {
+            upgrade.without_group = true;
+            upgrade.restarting = true;
+        });
     }
 
     /// Takes note of the Era moving the group `conversation_id` back to
     /// encrypted being accepted by the Conversation Focus, or let go of if
     /// not `accepted`
     pub(super) fn restart_ended(&self, conversation_id: &str, accepted: bool) {
-        if let Some(upgrade) = self.0.lock().unwrap().get_mut(conversation_id) {
-            if upgrade.restarting {
-                upgrade.restarting = false;
-                upgrade.without_group &= !accepted;
+        if !self.restarting(conversation_id) {
+            return;
+        }
+        self.change(conversation_id, false, |upgrade| {
+            upgrade.restarting = false;
+            upgrade.without_group &= !accepted;
+        });
+    }
+
+    /// Lets go of what stands for the group `conversation_id`
+    pub(super) fn forget(&self, conversation_id: &str) {
+        self.notes
+            .hold(self.store, |data| data.upgrades.remove(conversation_id));
+    }
+}
+
+/// The UpgradeStates `upgrades`, as the notes of the device hold them
+pub(super) fn encode(upgrades: &BTreeMap<String, UpgradeState>) -> Vec<u8> {
+    let mut data = Vec::new();
+    for (conversation_id, upgrade) in upgrades {
+        put(&mut data, conversation_id.as_bytes());
+        for time in [upgrade.ended, upgrade.attempted, upgrade.incapable] {
+            match time {
+                None => data.push(0),
+                Some(time) => {
+                    data.push(1);
+                    put_time(&mut data, time);
+                }
             }
         }
+        data.push(u8::from(upgrade.without_group));
+        data.push(u8::from(upgrade.restarting));
     }
+    data
+}
+
+/// The UpgradeStates `reader` reads to its end, as encode() puts them;
+/// None if they cannot be read
+pub(super) fn decode(reader: &mut Reader) -> Option<BTreeMap<String, UpgradeState>> {
+    let mut upgrades = BTreeMap::new();
+    while !reader.is_empty() {
+        let conversation_id = reader.string()?;
+        let mut time = || match reader.flag()? {
+            false => Some(None),
+            true => Some(Some(reader.time()?)),
+        };
+        let (ended, attempted, incapable) = (time()?, time()?, time()?);
+        upgrades.insert(
+            conversation_id,
+            UpgradeState {
+                ended,
+                attempted,
+                incapable,
+                without_group: reader.flag()?,
+                restarting: reader.flag()?,
+            },
+        );
+    }
+    Some(upgrades)
 }
 
 /// Whether `upgrade` may be tried at `now`

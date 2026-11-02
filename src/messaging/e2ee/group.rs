@@ -382,10 +382,7 @@ impl E2eeDevice {
         group_data: Option<&[u8]>,
     ) -> Vec<u8> {
         let cpim = control_message(from, to, &message_id, client_message, group_data);
-        self.control_messages()
-            .lock()
-            .unwrap()
-            .insert(String::from(conversation_id), message_id);
+        self.control_messages().insert(conversation_id, message_id);
         cpim
     }
 
@@ -544,10 +541,7 @@ impl E2eeDevice {
             },
         )?;
         if !pending {
-            self.control_messages()
-                .lock()
-                .unwrap()
-                .remove(conversation_id);
+            self.control_messages().remove(conversation_id);
             // the Era moving it back to encrypted accepted (RCC.16 section
             // 11.1)
             self.upgrades().restart_ended(conversation_id, true);
@@ -600,12 +594,11 @@ impl E2eeDevice {
             ),
             _ => {}
         }
+        if !self
+            .control_messages()
+            .take(conversation_id, &refused.message_id)
         {
-            let mut control_messages = self.control_messages().lock().unwrap();
-            if control_messages.get(conversation_id) != Some(&refused.message_id) {
-                return Ok(None);
-            }
-            control_messages.remove(conversation_id);
+            return Ok(None);
         }
 
         let ending = self
@@ -635,10 +628,7 @@ impl E2eeDevice {
         refusal_follows: bool,
     ) -> Result<(), StoreError> {
         if !refusal_follows {
-            self.control_messages()
-                .lock()
-                .unwrap()
-                .remove(conversation_id);
+            self.control_messages().remove(conversation_id);
         }
         self.drop_pending(conversation_id)
     }
@@ -782,10 +772,9 @@ impl E2eeDevice {
 
     /// Lets go of the MLS group `conversation_id`
     pub fn abandon(&self, conversation_id: &str) -> Result<(), StoreError> {
-        self.control_messages()
-            .lock()
-            .unwrap()
-            .remove(conversation_id);
+        self.control_messages().remove(conversation_id);
+        self.heals().forget(conversation_id);
+        self.upgrades().forget(conversation_id);
         self.recoveries().forget(conversation_id);
         self.forget_metadata(conversation_id);
         self.forget_chat(conversation_id);

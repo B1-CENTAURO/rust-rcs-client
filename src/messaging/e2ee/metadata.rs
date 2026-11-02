@@ -180,11 +180,7 @@ impl E2eeDevice {
             || self.heals().ongoing(conversation_id)
             || self.needs_healing(conversation_id)
             || self.new_era_due(conversation_id)
-            || self
-                .control_messages()
-                .lock()
-                .unwrap()
-                .contains_key(conversation_id)
+            || self.control_messages().contains(conversation_id)
         {
             return None;
         }
