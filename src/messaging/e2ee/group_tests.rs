@@ -9496,3 +9496,224 @@ fn the_identity_verification_code_is_not_given_without_a_certificate_of_the_user
         Err(VerificationError::NotEnrolled)
     );
 }
+
+#[test]
+fn a_chat_long_unused_is_due_a_new_era_of_its_mls_group() {
+    let clock = Clock::new();
+    let (device, kds, app) = enrolled_in_time(None, Some(&clock));
+    let bob = bob();
+    let (mut bobs_chat, server_message) =
+        focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 0), |_| {
+            Vec::new()
+        });
+    device
+        .join_chat(BOB_IMPU, &server_message, Some("token-1"))
+        .unwrap();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+    let taken = |message_id: &str, bobs_chat: &mut MlsConversation| {
+        let mls_message = bobs_chat
+            .encrypt_cpim(
+                &bob,
+                b"Content-Type: text/plain\r\n\r\nhi Alice",
+                message_id.as_bytes(),
+                b"",
+            )
+            .unwrap();
+        let mut outer = format!(
+            "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:01.000+00:00\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: {}\r\n\r\nContent-Type: message/mls\r\n\r\n",
+            BOB_IMPU, IMPU, message_id
+        )
+        .into_bytes();
+        outer.extend_from_slice(&mls_message);
+        let outer = cpim_message(&outer);
+        groups
+            .decrypt(BOBS_CHAT, &outer.get_info().unwrap(), &mls_message)
+            .is_some()
+    };
+
+    // not within 30 days of the chat kept (RCC.16 sections 6.1.2, 8.3)
+    clock.advance(30 * DAY);
+    assert!(!device.chat_era_due(BOB_TEL));
+
+    // nor of its last message, taken in it, noted once a day at most
+    assert!(taken("bob-1", &mut bobs_chat));
+    clock.advance(DAY / 2);
+    assert!(taken("bob-2", &mut bobs_chat));
+    clock.advance(30 * DAY - DAY / 2);
+    assert!(!device.chat_era_due(BOB_TEL));
+    clock.advance(Duration::from_secs(60));
+    assert!(device.chat_era_due(BOB_TEL));
+    assert!(device.chat_era_due(BOB_IMPU));
+    assert!(!device.chat_era_due(CAROL_TEL));
+    assert!(!device.chat_era_due("sip:bob@example.com"));
+
+    // through a restart too
+    let restored = {
+        let clock = clock.clone();
+        alice(&app, &kds, TODAY, Some(&app.last().unwrap())).with_clock(move || clock.now())
+    };
+    assert!(restored.chat_era_due(BOB_TEL));
+
+    // nor once a message is sent in it
+    assert!(matches!(
+        block_on(groups.encrypt(BOBS_CHAT, &plaintext("message-1", None))),
+        Sealed::Encrypted(_)
+    ));
+    assert!(!device.chat_era_due(BOB_TEL));
+
+    // nor once it is moved to unencrypted
+    clock.advance(31 * DAY);
+    assert!(device.chat_era_due(BOB_TEL));
+    let output = bobs_chat
+        .set_encryption_ended(&bob, Some(EndMlsReason::GroupMemberFailsCapabilitiesCheck))
+        .unwrap();
+    bobs_chat.merge_pending_commit(&bob).unwrap();
+    device
+        .on_server_message(BOBS_CHAT, &focus_commit(&[&output.commit]))
+        .unwrap();
+    assert!(device.encryption_ended(BOBS_CHAT));
+    assert!(!device.chat_era_due(BOB_TEL));
+}
+
+#[test]
+fn the_next_era_of_a_chat_long_unused_is_made_with_the_contact() {
+    let clock = Clock::new();
+    // Bob, in another client of his than the one that started the chat
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, _) = enrolled_in_time(
+        Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]),
+        Some(&clock),
+    );
+    let (_, server_message) = focus_welcome(
+        &super::kds_tests::bob(),
+        BOBS_CHAT,
+        &uploaded_key_package(&kds, 0),
+        |_| Vec::new(),
+    );
+    device
+        .join_chat(BOB_IMPU, &server_message, Some("token-1"))
+        .unwrap();
+    let (query, asked) = answering(&[(BOB_TEL, mls(&HOME_KDS.to_string()))]);
+    let groups = DeviceGroups::new(&device, query);
+    let prepare = || block_on(groups.prepare_chat_era(String::from(BOB_TEL), String::from(IMPU)));
+
+    // none before it is due
+    assert_eq!(prepare(), None);
+    assert!(asked.lock().unwrap().is_empty());
+    assert!(kds.queries.lock().unwrap().is_empty());
+
+    // the next Era of the same MLS group, of Bob's Clients as the Home KDS
+    // gives them, from the user to him (RCC.16 sections 7.9.2, 8.1.1, 8.3.1)
+    clock.advance(31 * DAY);
+    assert!(groups.chat_era_due(BOB_TEL));
+    let (group_id, cpim) = prepare().expect("a new Era");
+    assert_eq!(group_id, BOBS_CHAT);
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+    assert_eq!(
+        *kds.queries.lock().unwrap(),
+        vec![(vec![CIPHERSUITE], vec![recipient(BOB_TEL)])]
+    );
+    let message = cpim_message(&cpim);
+    let info = message.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", BOB_TEL).as_bytes());
+    let bobs_era = joined(&bob, &bundle_of(&cpim));
+    assert_eq!(bobs_era.group_id(), BOBS_CHAT.as_bytes());
+    assert_eq!(bobs_era.era(), Some(1));
+    assert_eq!(epoch(&device, BOBS_CHAT), Ok((0, true)));
+
+    // due no longer once the chat is kept as its session starts
+    device
+        .keep_chat(BOB_TEL, BOBS_CHAT, Some("token-2"))
+        .unwrap();
+    assert!(!device.chat_era_due(BOB_TEL));
+}
+
+#[test]
+fn the_next_era_of_a_chat_is_not_made_unless_the_contact_takes_one() {
+    let clock = Clock::new();
+    let (device, kds, _) = enrolled_in_time(None, Some(&clock));
+    let (_, server_message) =
+        focus_welcome(&bob(), BOBS_CHAT, &uploaded_key_package(&kds, 0), |_| {
+            Vec::new()
+        });
+    device
+        .join_chat(BOB_IMPU, &server_message, Some("token-1"))
+        .unwrap();
+    clock.advance(31 * DAY);
+    let prepare = |query| {
+        let groups = DeviceGroups::new(&device, query);
+        block_on(groups.prepare_chat_era(String::from(BOB_TEL), String::from(IMPU)))
+    };
+
+    // not advertising E2EE v1 (RCC.16 section 5.2)
+    let (query, _) = answering(&[(
+        BOB_TEL,
+        answered(
+            200,
+            "+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+        ),
+    )]);
+    assert_eq!(prepare(query), None);
+    assert!(kds.queries.lock().unwrap().is_empty());
+
+    // advertising it, the Home KDS having none of its KeyPackages
+    let (query, _) = answering(&[(BOB_TEL, mls(&HOME_KDS.to_string()))]);
+    assert_eq!(prepare(query), None);
+    assert_eq!(kds.queries.lock().unwrap().len(), 1);
+
+    // the chat kept as it was, still due
+    assert_eq!(
+        device.chat_group(BOB_TEL),
+        Some((String::from(BOBS_CHAT), Some(String::from("token-1"))))
+    );
+    assert_eq!(epoch(&device, BOBS_CHAT), Ok((1, false)));
+    assert!(device.chat_era_due(BOB_TEL));
+}
+
+#[test]
+fn a_chat_of_no_activity_noted_is_due_once_unused_from_its_next_message_on() {
+    let clock = Clock::new();
+    let (device, kds, _) = enrolled_in_time(None, Some(&clock));
+    let bob = bob();
+    let (mut bobs_chat, server_message) =
+        focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 0), |_| {
+            Vec::new()
+        });
+    device.join_chat(BOB_IMPU, &server_message, None).unwrap();
+    let groups = DeviceGroups::new(&device, answering(&[]).0);
+
+    // as kept by a device before it noted when chats were used: not due, as
+    // that is not known
+    device
+        .notes()
+        .change(device.store(), |data| data.chats[0].active = None)
+        .unwrap();
+    clock.advance(31 * DAY);
+    assert!(!device.chat_era_due(BOB_TEL));
+
+    // noted from its next message on (RCC.16 section 8.3)
+    let mls_message = bobs_chat
+        .encrypt_cpim(&bob, b"Content-Type: text/plain\r\n\r\nhi", b"bob-1", b"")
+        .unwrap();
+    let mut outer = format!(
+        "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:01.000+00:00\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: bob-1\r\n\r\nContent-Type: message/mls\r\n\r\n",
+        BOB_IMPU, IMPU
+    )
+    .into_bytes();
+    outer.extend_from_slice(&mls_message);
+    let outer = cpim_message(&outer);
+    assert!(groups
+        .decrypt(BOBS_CHAT, &outer.get_info().unwrap(), &mls_message)
+        .is_some());
+    assert!(!device.chat_era_due(BOB_TEL));
+    clock.advance(31 * DAY);
+    assert!(device.chat_era_due(BOB_TEL));
+
+    // nor is one whose MLS group is not kept
+    device
+        .keep_chat(CAROL_TEL, "not-a-group", Some("token"))
+        .unwrap();
+    clock.advance(31 * DAY);
+    assert!(!device.chat_era_due(CAROL_TEL));
+}

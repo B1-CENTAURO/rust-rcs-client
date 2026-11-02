@@ -147,6 +147,19 @@ impl Client {
         group_id: &str,
         bundle: &[u8],
     ) -> Receiver<(u16, String)> {
+        self.send_starting_chat(recipient, content, group_id, bundle, false)
+    }
+
+    /// As send_in_new_chat(), in the next Era of the MLS group of the chat
+    /// kept with `recipient` if `new_era`
+    pub fn send_starting_chat(
+        &self,
+        recipient: &str,
+        content: &str,
+        group_id: &str,
+        bundle: &[u8],
+        new_era: bool,
+    ) -> Receiver<(u16, String)> {
         let (result_tx, result_rx) = mpsc::channel();
         let (returned_tx, returned_rx) = mpsc::channel();
 
@@ -165,6 +178,7 @@ impl Client {
                 &recipient,
                 &group_id,
                 &bundle,
+                new_era,
                 move |status_code, reason_phrase| {
                     let _ = result_tx.send((status_code, reason_phrase));
                 },
@@ -2811,6 +2825,10 @@ struct ScriptedEncryption {
     /// The contact, server message and token of each chat it is asked to
     /// join
     chats_joined: std::sync::Mutex<Vec<(String, Vec<u8>, Option<String>)>>,
+    /// The contacts whose kept chat is to start in a new Era
+    chat_eras_due: Vec<String>,
+    /// The contact and from each time a new Era of a chat is asked for
+    chat_eras_prepared: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl GroupEncryption for ScriptedEncryption {
@@ -3092,6 +3110,23 @@ impl GroupEncryption for ScriptedEncryption {
             }
             prepared
         })
+    }
+
+    fn chat_era_due(&self, contact: &str) -> bool {
+        self.chat_eras_due.iter().any(|due| due == contact)
+    }
+
+    fn prepare_chat_era(
+        &self,
+        contact: String,
+        from: String,
+    ) -> BoxFuture<'static, Option<(String, Vec<u8>)>> {
+        self.chat_eras_prepared
+            .lock()
+            .unwrap()
+            .push((contact, from));
+        let prepared = self.chatting.clone();
+        Box::pin(async move { prepared })
     }
 
     fn join_chat(
@@ -4064,6 +4099,18 @@ impl GroupEncryption for EncryptingPrepared {
         from: String,
     ) -> BoxFuture<'static, Option<(String, Vec<u8>)>> {
         self.0.prepare_chat(contact, from)
+    }
+
+    fn chat_era_due(&self, contact: &str) -> bool {
+        self.0.chat_era_due(contact)
+    }
+
+    fn prepare_chat_era(
+        &self,
+        contact: String,
+        from: String,
+    ) -> BoxFuture<'static, Option<(String, Vec<u8>)>> {
+        self.0.prepare_chat_era(contact, from)
     }
 
     fn join_chat(
@@ -8733,5 +8780,117 @@ fn a_notification_of_an_encrypted_chat_is_not_sent_by_a_client_not_registered() 
         &client.rt,
     ));
     assert!(encryption.signed.lock().unwrap().is_empty());
+    peer.silence();
+}
+
+/// The client with the encrypted 1-to-1 chat `chat-1` kept with the peer,
+/// and the token given for it
+fn keeping_chat_in(client: &Client) -> Arc<ScriptedEncryption> {
+    let encryption = chatting_in(client);
+    encryption.chats.lock().unwrap().push((
+        String::from(PEER),
+        String::from("chat-1"),
+        Some(String::from(TOKEN)),
+    ));
+    encryption
+}
+
+#[test]
+fn a_kept_chat_long_unused_starts_again_in_the_new_era_its_invite_carries() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = keeping_chat_in(&client);
+    let msrp = MsrpPeer::listen(&rt);
+
+    // the SDP, then the CPIM message of the Era, with the token kept for the
+    // Focus of the Era before (RCC.16 sections 6.1.3, 8.1.1, 8.3.1)
+    let again = client.send_starting_chat(PEER, "again", "chat-1", CHAT_BUNDLE, true);
+    let invite = peer.next_request("INVITE");
+    assert!(header_value(&invite, "Content-Type").starts_with("multipart/mixed; boundary="));
+    assert_eq!(header_value(&invite, "MLS-Opaque-Token"), TOKEN);
+    let body = body_data(&invite);
+    assert!(body.windows(CHAT_BUNDLE.len()).any(|w| w == CHAT_BUNDLE));
+
+    // encrypted with its MLS group once answered, the chat kept with its
+    // token
+    peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
+    peer.next_request("ACK");
+    let mut connection = msrp.accept(&rt);
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, b"ciphertext");
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        again.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    assert_eq!(encryption.encrypted.lock().unwrap()[0].0, "chat-1");
+    assert_eq!(
+        *encryption.chats.lock().unwrap(),
+        [(
+            String::from(PEER),
+            String::from("chat-1"),
+            Some(String::from(TOKEN))
+        )]
+    );
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+    assert!(encryption.discarded.lock().unwrap().is_empty());
+    peer.silence();
+}
+
+#[test]
+fn a_new_era_of_a_kept_chat_refused_discards_its_commit_the_chat_kept() {
+    let (client, mut peer) = start(true);
+    let encryption = keeping_chat_in(&client);
+
+    let again = client.send_starting_chat(PEER, "again", "chat-1", CHAT_BUNDLE, true);
+    let invite = peer.next_request("INVITE");
+    peer.send(&answer(&invite, "409 Conflict", None));
+    assert_eq!(
+        again.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(409)
+    );
+    assert_eq!(
+        *encryption.discarded.lock().unwrap(),
+        [(String::from("chat-1"), false)]
+    );
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+    assert_eq!(encryption.chats.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_new_era_of_a_kept_chat_goes_unused_in_the_session_there_is_by_then() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let msrp = MsrpPeer::listen(&rt);
+
+    // a chat not encrypted started before
+    let first = client.send(PEER, RecipientType::Contact, "first");
+    let invite = peer.next_request("INVITE");
+    peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
+    peer.next_request("ACK");
+    let mut connection = msrp.accept(&rt);
+    let send = connection.next_message(&rt);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        first.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+
+    // the Era made meanwhile discarded, the chat kept
+    let encryption = keeping_chat_in(&client);
+    let second = client.send_starting_chat(PEER, "second", "chat-1", CHAT_BUNDLE, true);
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_text(&send.body), "second");
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        second.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    assert_eq!(
+        *encryption.discarded.lock().unwrap(),
+        [(String::from("chat-1"), false)]
+    );
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+    assert_eq!(encryption.chats.lock().unwrap().len(), 1);
     peer.silence();
 }

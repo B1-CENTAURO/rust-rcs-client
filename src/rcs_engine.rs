@@ -3253,6 +3253,10 @@ type PreparingChats = Arc<Mutex<HashMap<String, Vec<PendingMessage>>>>;
 /// kept with it, or else of one with a new MLS group, if the contact
 /// advertises E2EE v1 and the Home KDS has its KeyPackages
 ///
+/// The new session of a chat kept that went unused for 30 days starts in the
+/// next Era of its MLS group, as its Conversation Focus lets go of the group
+/// by then (section 8.3); if that Era cannot be made, as it is.
+///
 /// Messages sent while the new MLS group is made wait for it, in the order
 /// they were sent. If the contact does not take an encrypted chat, they are
 /// sent as they would be without E2EE, standalone or in a chat not
@@ -3268,11 +3272,13 @@ fn send_to_contact(
     let Some(message) = wait_after_others(preparing, message) else {
         return;
     };
-    // in the chat there is, or a new session of the one kept
+    // in the chat there is, or a new session of the one kept, in a new Era
+    // of its MLS group if it went unused for long (RCC.16 section 8.3)
     let has_session = route
         .cpm_session_service
         .has_session_with(&message.recipient);
-    if has_session || encryption.chat_group(&message.recipient).is_some() {
+    let era_due = !has_session && encryption.chat_era_due(&message.recipient);
+    if has_session || (!era_due && encryption.chat_group(&message.recipient).is_some()) {
         send_in_chat(route, message, rt);
         return;
     }
@@ -3291,7 +3297,10 @@ fn send_to_contact(
         }
         waiting.insert(recipient.clone(), vec![message]);
     }
-    let preparing_chat = encryption.prepare_chat(recipient.clone(), public_user_identity);
+    let preparing_chat = match era_due {
+        true => encryption.prepare_chat_era(recipient.clone(), public_user_identity),
+        false => encryption.prepare_chat(recipient.clone(), public_user_identity),
+    };
     let route = route.clone();
     let preparing = Arc::clone(preparing);
     let rt_ = Arc::clone(rt);
@@ -3311,6 +3320,7 @@ fn send_to_contact(
                         &message.recipient,
                         group_id,
                         bundle,
+                        era_due,
                         message.callback,
                         &route.core,
                         &rt_,
@@ -3319,7 +3329,13 @@ fn send_to_contact(
             },
             // in its invitation, or its session
             |message| send_in_chat(&route, message, &rt_),
+            // as before E2EE; or, the Era of a chat not made, in a new
+            // session of the chat as it is
             |message| {
+                if era_due {
+                    send_in_chat(&route, message, &rt_);
+                    return;
+                }
                 route_message(
                     &route,
                     &message.message_type,

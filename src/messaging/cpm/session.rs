@@ -3028,6 +3028,11 @@ impl CPMSessionService {
     /// The MLS group is let go of if the INVITE is not answered with a 200,
     /// or if there is a session or an invitation with the contact by then,
     /// which the message goes in.
+    ///
+    /// If `new_era`, `bundle` is of the next Era of the MLS group of the chat
+    /// kept with the contact, which restarts it, its INVITE carrying the
+    /// MLS-Opaque-Token kept (sections 6.1.3, 8.3.1); the Commit of the Era
+    /// is then discarded in place of the group let go of, the chat kept.
     pub fn send_in_new_chat<F>(
         &self,
         message_type: &str,
@@ -3036,6 +3041,7 @@ impl CPMSessionService {
         recipient: &str,
         group_id: &str,
         bundle: &[u8],
+        new_era: bool,
         message_result_callback: F,
         core: &Arc<SipCore>,
         rt: &Arc<Runtime>,
@@ -3055,7 +3061,10 @@ impl CPMSessionService {
             drop(invitations);
             drop(sessions);
             if let Some(encryption) = &encryption {
-                encryption.abandon(group_id);
+                match new_era {
+                    true => encryption.discard(group_id, false),
+                    false => encryption.abandon(group_id),
+                }
             }
             self.send_message(
                 message_type,
@@ -3086,11 +3095,21 @@ impl CPMSessionService {
                 }
             },
         );
+        let kept_token = match new_era {
+            true => encryption
+                .as_ref()
+                .and_then(|encryption| encryption.chat_group(recipient))
+                .and_then(|(_, mls_opaque_token)| mls_opaque_token),
+            false => None,
+        };
         let abandoned = String::from(group_id);
         let started: Started = Box::new(move |status_code, _, _| {
             if status_code != 200 {
                 if let Some(encryption) = encryption {
-                    encryption.abandon(&abandoned);
+                    match new_era {
+                        true => encryption.discard(&abandoned, false),
+                        false => encryption.abandon(&abandoned),
+                    }
                 }
             }
         });
@@ -3106,7 +3125,7 @@ impl CPMSessionService {
                 new_era: None,
                 chat: Some(EncryptedChat {
                     group_id,
-                    mls_opaque_token: None,
+                    mls_opaque_token: kept_token.as_deref(),
                     new_group: Some(bundle),
                 }),
             },

@@ -542,6 +542,24 @@ pub trait GroupEncryption: Send + Sync {
         from: String,
     ) -> BoxFuture<'static, Option<(String, Vec<u8>)>>;
 
+    /// Whether the encrypted 1-to-1 chat kept with `contact` is to start its
+    /// next session in a new Era of its MLS group, no message having been
+    /// sent or taken in it for 30 days, as its Conversation Focus lets go of
+    /// the group by then (RCC.16 sections 6.1.2, 8.3)
+    fn chat_era_due(&self, contact: &str) -> bool;
+
+    /// Makes that new Era of the chat kept with `contact`, the user `from`,
+    /// as chat_era_due() tells it is due: the ID of its MLS group, and the
+    /// CPIM message of its Commit, GroupInfo and Welcome, which the INVITE
+    /// starting the chat's session is to carry, as a new chat's does (RCC.16
+    /// sections 8.1.1, 8.3.1); None if it cannot be made. Its Commit is
+    /// discarded with discard() if the session does not start.
+    fn prepare_chat_era(
+        &self,
+        contact: String,
+        from: String,
+    ) -> BoxFuture<'static, Option<(String, Vec<u8>)>>;
+
     /// Joins the MLS group of the encrypted 1-to-1 chat `contact` started,
     /// with the Welcome its Conversation Focus sent in `server_message`, as
     /// the INVITE starting it carried (RCC.16 sections 8.1, 8.1.1): its ID,
