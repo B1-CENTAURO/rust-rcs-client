@@ -22,6 +22,7 @@ use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::mls::rcs::era::EraBase;
 use rust_rcs_core::mls::rcs::same_tel_uri;
 use rust_rcs_core::mls::{Credential, ErrorKind};
+use uuid::Uuid;
 
 use crate::capability::CapabilityQuery;
 use crate::messaging::cpm::encryption::Upgrade;
@@ -41,6 +42,21 @@ const UPGRADE_BACKOFF: Duration = Duration::from_secs(2 * 60 * 60);
 /// How long the capabilities of the Participants of a group are not asked
 /// again after one was found not to advertise E2EE (RCC.16 section 11.1.1)
 const CAPABILITY_REFRESH: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How long a group is active after a user message was sent or received in
+/// it last: its Participants' capabilities are refreshed meanwhile only
+/// (RCC.16 sections 1.3, 11.1.1)
+const ACTIVE_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How often the use of a group is noted at most
+const USE_NOTED_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long after the capabilities of the Participants of an active group
+/// were refreshed they are refreshed again on schedule, a random backoff of
+/// up to REFRESH_BACKOFF added (RCC.16 section 11.1.1: at least once a
+/// month, once a week recommended)
+const REFRESH_EVERY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const REFRESH_BACKOFF: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where moving a group back to encrypted stands, kept in the notes of the
 /// device
@@ -195,9 +211,91 @@ impl Upgrades<'_> {
 
     /// Lets go of what stands for the group `conversation_id`
     pub(super) fn forget(&self, conversation_id: &str) {
-        self.notes
-            .hold(self.store, |data| data.upgrades.remove(conversation_id));
+        self.notes.hold(self.store, |data| {
+            data.upgrades.remove(conversation_id);
+            data.groups.remove(conversation_id);
+        });
     }
+}
+
+/// When a group was last used, and what its Conversation Focus last told of
+/// its Participants, kept in the notes of the device for its capabilities
+/// to be refreshed on schedule (RCC.16 section 11.1.1)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct GroupUse {
+    /// When a user message was last sent or received in it, at most a day
+    /// late
+    pub(super) used: Option<SystemTime>,
+    /// The URIs of its Participants, the user among them, as its Focus last
+    /// told them
+    pub(super) participants: Vec<String>,
+    /// When the capabilities of its Participants are to be refreshed next;
+    /// at once if never
+    pub(super) refresh_at: Option<SystemTime>,
+}
+
+/// Whether `group` was used within ACTIVE_FOR of `now`
+fn active(group: &GroupUse, now: SystemTime) -> bool {
+    group.used.is_some_and(|used| {
+        now.duration_since(used)
+            .map_or(true, |since| since < ACTIVE_FOR)
+    })
+}
+
+/// When the capabilities refreshed at `now` are to be refreshed next: after
+/// REFRESH_EVERY, and a random backoff of up to REFRESH_BACKOFF
+fn next_refresh(now: SystemTime) -> SystemTime {
+    let random = u64::from_be_bytes(Uuid::new_v4().as_bytes()[..8].try_into().unwrap());
+    now + REFRESH_EVERY + Duration::from_secs(random % REFRESH_BACKOFF.as_secs())
+}
+
+/// The GroupUses `groups`, as the notes of the device hold them
+pub(super) fn encode_groups(groups: &BTreeMap<String, GroupUse>) -> Vec<u8> {
+    let mut data = Vec::new();
+    for (conversation_id, group) in groups {
+        put(&mut data, conversation_id.as_bytes());
+        for time in [group.used, group.refresh_at] {
+            match time {
+                None => data.push(0),
+                Some(time) => {
+                    data.push(1);
+                    put_time(&mut data, time);
+                }
+            }
+        }
+        data.extend_from_slice(&(group.participants.len() as u32).to_be_bytes());
+        for participant in &group.participants {
+            put(&mut data, participant.as_bytes());
+        }
+    }
+    data
+}
+
+/// The GroupUses `reader` reads to its end, as encode_groups() puts them;
+/// None if they cannot be read
+pub(super) fn decode_groups(reader: &mut Reader) -> Option<BTreeMap<String, GroupUse>> {
+    let mut groups = BTreeMap::new();
+    while !reader.is_empty() {
+        let conversation_id = reader.string()?;
+        let mut time = || match reader.flag()? {
+            false => Some(None),
+            true => Some(Some(reader.time()?)),
+        };
+        let (used, refresh_at) = (time()?, time()?);
+        let count = reader.u32()?;
+        let participants = (0..count)
+            .map(|_| reader.string())
+            .collect::<Option<Vec<_>>>()?;
+        groups.insert(
+            conversation_id,
+            GroupUse {
+                used,
+                participants,
+                refresh_at,
+            },
+        );
+    }
+    Some(groups)
 }
 
 /// The UpgradeStates `upgrades`, as the notes of the device hold them
@@ -374,6 +472,9 @@ impl E2eeDevice {
         if !self.upgrades().begin(conversation_id, self.store().now()) {
             return None;
         }
+        // its Participants' capabilities refreshed, as on schedule (section
+        // 11.1.1)
+        self.refreshed(conversation_id);
         let moved = match resurrectable {
             true => self
                 .resurrect(conversation_id, from, to, participants, capabilities)
@@ -535,5 +636,94 @@ impl E2eeDevice {
             })
             .map_err(|e| NotMoved::Group(GroupError::Store(e)))?;
         Ok(self.sent_in(conversation_id, from, to, &client_message))
+    }
+}
+
+impl E2eeDevice {
+    /// Takes note of a user message sent or received in the group chat
+    /// `conversation_id`, which keeps it active for 30 days (RCC.16 sections
+    /// 1.3, 11.1.1); once a day at most. Groups no longer active are let go
+    /// of then.
+    pub fn group_used(&self, conversation_id: &str) {
+        let now = self.store().now();
+        let noted = self.notes().read(|data| {
+            data.groups
+                .get(conversation_id)
+                .and_then(|group| group.used)
+                .is_some_and(|used| {
+                    now.duration_since(used)
+                        .is_ok_and(|since| since < USE_NOTED_EVERY)
+                })
+        });
+        if noted {
+            return;
+        }
+        self.notes().hold(self.store(), |data| {
+            data.groups
+                .retain(|group_id, group| group_id == conversation_id || active(group, now));
+            data.groups
+                .entry(String::from(conversation_id))
+                .or_default()
+                .used = Some(now);
+        });
+    }
+
+    /// Takes note of `participants` as the URIs of the Participants of the
+    /// group chat `conversation_id`, as its Conversation Focus tells them,
+    /// for their capabilities to be refreshed while there is no session of
+    /// it (RCC.16 section 11.1.1)
+    pub fn participants_told(&self, conversation_id: &str, participants: &[String]) {
+        let known = self.notes().read(|data| {
+            data.groups
+                .get(conversation_id)
+                .is_some_and(|group| group.participants == participants)
+        });
+        if !known {
+            self.notes().hold(self.store(), |data| {
+                data.groups
+                    .entry(String::from(conversation_id))
+                    .or_default()
+                    .participants = participants.to_vec();
+            });
+        }
+    }
+
+    /// Takes note of the capabilities of the Participants of the group chat
+    /// `conversation_id` refreshed now, the next refresh due a week on and a
+    /// random backoff after (RCC.16 section 11.1.1)
+    fn refreshed(&self, conversation_id: &str) {
+        let refresh_at = next_refresh(self.store().now());
+        self.notes().hold(self.store(), |data| {
+            if let Some(group) = data.groups.get_mut(conversation_id) {
+                group.refresh_at = Some(refresh_at);
+            }
+        });
+    }
+
+    /// The group chats whose Participants' capabilities are to be refreshed
+    /// now on schedule, each with the URIs of its Participants as last told,
+    /// taken as refreshed (RCC.16 section 11.1.1): those used in the last 30
+    /// days, whose last refresh was a week and a random backoff ago, and
+    /// that are to be moved back to encrypted as upgrade_due() tells, as
+    /// upgrade_group() does then
+    pub fn scheduled_upgrades(&self) -> Vec<(String, Vec<String>)> {
+        let now = self.store().now();
+        let due: Vec<(String, Vec<String>)> = self.notes().read(|data| {
+            data.groups
+                .iter()
+                .filter(|(_, group)| {
+                    active(group, now)
+                        && !group.participants.is_empty()
+                        && group.refresh_at.is_none_or(|refresh_at| refresh_at <= now)
+                })
+                .map(|(conversation_id, group)| {
+                    (conversation_id.clone(), group.participants.clone())
+                })
+                .collect()
+        });
+        due.into_iter()
+            .filter(|(conversation_id, _)| self.upgrade_due(conversation_id))
+            .inspect(|(conversation_id, _)| self.refreshed(conversation_id))
+            .collect()
     }
 }

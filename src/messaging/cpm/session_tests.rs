@@ -2775,6 +2775,13 @@ struct ScriptedEncryption {
     upgraded: std::sync::Mutex<Vec<(String, String, String, Vec<String>)>>,
     /// The Conversation-ID of each group whose membership changed
     memberships_changed: std::sync::Mutex<Vec<String>>,
+    /// The Conversation-ID of each group a user message was sent or
+    /// received in
+    used: std::sync::Mutex<Vec<String>>,
+    /// The Conversation-ID and participants of each group told of
+    told_participants: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    /// The groups to move back to encrypted on schedule, given once
+    scheduled: std::sync::Mutex<Vec<(String, Vec<String>)>>,
     /// The Conversation-ID, from and to of each leave
     left: std::sync::Mutex<Vec<(String, String, String)>>,
     server_messages: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
@@ -3310,6 +3317,24 @@ impl GroupEncryption for ScriptedEncryption {
 
     fn upgrade_due(&self, _: &str) -> bool {
         self.upgrade_wanted.load(Ordering::SeqCst)
+    }
+
+    fn group_used(&self, conversation_id: &str) {
+        self.used
+            .lock()
+            .unwrap()
+            .push(String::from(conversation_id));
+    }
+
+    fn participants_told(&self, conversation_id: &str, participants: &[String]) {
+        self.told_participants
+            .lock()
+            .unwrap()
+            .push((String::from(conversation_id), participants.to_vec()));
+    }
+
+    fn scheduled_upgrades(&self) -> Vec<(String, Vec<String>)> {
+        std::mem::take(&mut *self.scheduled.lock().unwrap())
     }
 
     fn membership_changed(&self, conversation_id: &str) {
@@ -4233,6 +4258,18 @@ impl GroupEncryption for EncryptingPrepared {
 
     fn membership_changed(&self, conversation_id: &str) {
         self.0.membership_changed(conversation_id)
+    }
+
+    fn group_used(&self, conversation_id: &str) {
+        self.0.group_used(conversation_id)
+    }
+
+    fn participants_told(&self, conversation_id: &str, participants: &[String]) {
+        self.0.participants_told(conversation_id, participants)
+    }
+
+    fn scheduled_upgrades(&self) -> Vec<(String, Vec<String>)> {
+        self.0.scheduled_upgrades()
     }
 
     fn upgrade(
@@ -7875,6 +7912,8 @@ fn the_keys_are_updated_after_a_message_received_once_due() {
             "due {}",
             due
         );
+        // and the group noted used (RCC.16 sections 1.3, 11.1.1)
+        assert_eq!(*encryption.used.lock().unwrap(), ["conversation-1"]);
     }
 }
 
@@ -9076,4 +9115,252 @@ fn what_the_focus_sends_of_an_encrypted_chat_goes_to_the_encryption_with_its_mls
         [(String::from("chat-1"), b"from the focus".to_vec())]
     );
     peer.silence();
+}
+
+#[test]
+fn the_use_of_a_group_is_noted_as_its_messages_go_and_come() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (mut connection, invite, _subscribe, focus_path) = new_group(&client, &mut peer);
+    let our_path = sdp_attribute(&String::from_utf8_lossy(&body_data(&invite)), "path").unwrap();
+    let conversation_id = header_value(&invite, "Conversation-ID");
+    // a group never encrypted, its session none, the service one (RCC.16
+    // section 11.1)
+    let encryption = Arc::new(ScriptedEncryption::default());
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+
+    // a message sent (RCC.16 sections 1.3, 11.1.1)
+    let result = client.send(GROUP, RecipientType::Group, "hello all");
+    let send = connection.next_message(&rt);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    assert_eq!(*encryption.used.lock().unwrap(), [conversation_id.clone()]);
+
+    // nor a notification or an is-composing taken
+    for (content_type, content) in [
+        ("message/cpim", group_imdn_cpim("message-1", "<delivered/>")),
+        (
+            "application/im-iscomposing+xml",
+            super::is_composing_document(true),
+        ),
+    ] {
+        connection.send_content(&rt, &focus_path, &our_path, content_type, &content);
+        assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(encryption.used.lock().unwrap().len(), 1);
+    let _given: Vec<_> = client.received.try_iter().collect();
+
+    // a message taken
+    connection.send_cpim(&rt, &focus_path, &our_path, &group_cpim(ALICE, "", "plain"));
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| r.2),
+        Ok(String::from("plain"))
+    );
+    assert_eq!(
+        *encryption.used.lock().unwrap(),
+        [conversation_id.clone(), conversation_id]
+    );
+}
+
+/// The client knowing the group `conversation-1` from before, the scripted
+/// encryption moving it back to encrypted on schedule, with UPGRADING_CPIM,
+/// or NEXT_ERA_CPIM `by_restart`
+fn upgrading_on_schedule(client: &Client, by_restart: bool) -> Arc<ScriptedEncryption> {
+    client.sessions.remember_group_ids(GroupIds {
+        conference_uri: String::from(GROUP),
+        conversation_id: String::from("conversation-1"),
+        contribution_id: String::from("contribution-1"),
+        mls_opaque_token: None,
+    });
+    let encryption = Arc::new(ScriptedEncryption {
+        upgrade_wanted: std::sync::atomic::AtomicBool::new(true),
+        upgrading: Some(match by_restart {
+            true => NEXT_ERA_CPIM.to_vec(),
+            false => UPGRADING_CPIM.to_vec(),
+        }),
+        upgrading_by_restart: by_restart,
+        scheduled: std::sync::Mutex::new(vec![(
+            String::from("conversation-1"),
+            vec![String::from(IMPU), String::from(BOB)],
+        )]),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+/// What moving the group `conversation-1` back to encrypted on schedule was
+/// asked of the scripted encryption
+fn upgraded_on_schedule() -> [(String, String, String, Vec<String>); 1] {
+    [(
+        String::from("conversation-1"),
+        String::from(IMPU),
+        String::from(GROUP),
+        vec![String::from(IMPU), String::from(BOB)],
+    )]
+}
+
+#[test]
+fn an_unencrypted_group_is_moved_back_on_schedule_in_a_session_started_for_it() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = upgrading_on_schedule(&client, false);
+    let msrp = MsrpPeer::listen(&rt);
+    client.sessions.upgrade_on_schedule(&client.core, &rt);
+
+    // its session started with the SDP alone, the Commit resurrecting its
+    // MLS group sent in it first (RCC.16 sections 11.1.1, 11.1.2)
+    let restart = peer.next_request("INVITE");
+    assert_eq!(request_uri(&restart), GROUP);
+    assert_eq!(header_value(&restart, "Conversation-ID"), "conversation-1");
+    assert_eq!(header_value(&restart, "Content-Type"), "application/sdp");
+    assert_eq!(*encryption.upgraded.lock().unwrap(), upgraded_on_schedule());
+    peer.send(&answer_from(
+        &restart,
+        "200 OK",
+        &focus_contact(),
+        Some(&msrp.sdp("sendrecv")),
+    ));
+    next_requests(&mut peer, &["ACK", "SUBSCRIBE"]);
+    let mut connection = msrp.accept(&rt);
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    assert_eq!(send.body, UPGRADING_CPIM);
+    connection.respond(&rt, &send, "200 OK");
+    connection.quiet(&rt);
+    assert!(encryption.discarded.lock().unwrap().is_empty());
+
+    // and once only
+    client.sessions.upgrade_on_schedule(&client.core, &rt);
+    connection.quiet(&rt);
+    assert_eq!(encryption.upgraded.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_group_moved_back_on_schedule_whose_session_is_refused_has_its_commit_discarded() {
+    let (client, mut peer) = start(true);
+    let encryption = upgrading_on_schedule(&client, false);
+    client
+        .sessions
+        .upgrade_on_schedule(&client.core, &client.rt);
+    let restart = peer.next_request("INVITE");
+    peer.send(&answer(&restart, "403 Forbidden", None));
+    peer.next_request("ACK");
+    let discarded = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.discarded.lock().unwrap().is_empty()
+    });
+    assert!(discarded);
+    assert_eq!(
+        *encryption.discarded.lock().unwrap(),
+        [(String::from("conversation-1"), false)]
+    );
+}
+
+#[test]
+fn a_group_the_focus_has_no_mls_group_for_is_moved_back_on_schedule_with_an_era() {
+    let (client, mut peer) = start(true);
+    let encryption = upgrading_on_schedule(&client, true);
+    client
+        .sessions
+        .upgrade_on_schedule(&client.core, &client.rt);
+
+    // the INVITE restarting the group carrying the Era (RCC.16 sections
+    // 8.3.1, 11.1)
+    let restart = peer.next_request("INVITE");
+    assert_eq!(request_uri(&restart), GROUP);
+    assert_eq!(header_value(&restart, "Conversation-ID"), "conversation-1");
+    let parts = parts_of(&restart);
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].0, "application/sdp");
+    assert_eq!(
+        parts[1],
+        (String::from("message/cpim"), NEXT_ERA_CPIM.to_vec())
+    );
+    assert_eq!(*encryption.upgraded.lock().unwrap(), upgraded_on_schedule());
+}
+
+#[test]
+fn an_unencrypted_group_in_a_session_is_moved_back_on_schedule_there() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = upgrading_in(&client, false);
+    let (mut connection, subscribe) =
+        subscribed_to_encrypted_group(&client, &mut peer, "group-on-schedule");
+
+    // its participants noted as the focus tells them (RCC.16 section 11.1.1)
+    peer.send(&conference_notify(
+        &subscribe,
+        1,
+        &conference_info(
+            1,
+            "full",
+            &[(IMPU, "connected", ""), (BOB, "connected", "")],
+        ),
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    let told = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.told_participants.lock().unwrap().is_empty()
+    });
+    assert!(told);
+    assert_eq!(
+        *encryption.told_participants.lock().unwrap(),
+        [(
+            String::from("conversation-1"),
+            vec![String::from(IMPU), String::from(BOB)]
+        )]
+    );
+    connection.quiet(&rt);
+    assert!(encryption.upgraded.lock().unwrap().is_empty());
+
+    // due on schedule, the Commit sent in the session, no other started
+    encryption.upgrade_wanted.store(true, Ordering::SeqCst);
+    *encryption.scheduled.lock().unwrap() = vec![(
+        String::from("conversation-1"),
+        vec![String::from(IMPU), String::from(BOB)],
+    )];
+    client.sessions.upgrade_on_schedule(&client.core, &rt);
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, UPGRADING_CPIM);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(*encryption.upgraded.lock().unwrap(), upgraded_on_schedule());
+    peer.silence();
+}
+
+#[test]
+fn nothing_is_moved_back_on_schedule_for_a_group_not_known_or_not_registered() {
+    // a group whose URI is not known
+    let (client, mut peer) = start(true);
+    let encryption = upgrading_on_schedule(&client, false);
+    *encryption.scheduled.lock().unwrap() = vec![(
+        String::from("conversation-9"),
+        vec![String::from(IMPU), String::from(BOB)],
+    )];
+    client
+        .sessions
+        .upgrade_on_schedule(&client.core, &client.rt);
+    peer.silence();
+    assert!(encryption.upgraded.lock().unwrap().is_empty());
+
+    // a client not registered
+    let (client, mut peer) = start(false);
+    let encryption = upgrading_on_schedule(&client, false);
+    client
+        .sessions
+        .upgrade_on_schedule(&client.core, &client.rt);
+    peer.silence();
+    assert!(encryption.upgraded.lock().unwrap().is_empty());
 }

@@ -39,7 +39,7 @@ use super::heal::{self, Heal};
 use super::lost::{self, Lost};
 use super::sent::{self, Membership, Sent};
 use super::store::{MlsStore, StoreError};
-use super::upgrade::{self, UpgradeState};
+use super::upgrade::{self, GroupUse, UpgradeState};
 
 const LOG_TAG: &str = "e2ee";
 
@@ -60,6 +60,7 @@ const SECTION_CHAT_ACTIVITY: u8 = 7;
 const SECTION_CONTROL_MESSAGES: u8 = 8;
 const SECTION_HEALS: u8 = 9;
 const SECTION_UPGRADES: u8 = 10;
+const SECTION_GROUPS: u8 = 11;
 
 /// What the device keeps besides MLS
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -83,6 +84,8 @@ pub(super) struct NotesData {
     pub(super) heals: BTreeMap<String, Heal>,
     /// By group, where moving it back to encrypted stands
     pub(super) upgrades: BTreeMap<String, UpgradeState>,
+    /// By group, when it was last used and who takes part in it
+    pub(super) groups: BTreeMap<String, GroupUse>,
 }
 
 /// What the device keeps besides MLS, as the store keeps it
@@ -252,6 +255,7 @@ fn encode(data: &NotesData) -> Vec<u8> {
     );
     section(SECTION_HEALS, heal::encode(&data.heals));
     section(SECTION_UPGRADES, upgrade::encode(&data.upgrades));
+    section(SECTION_GROUPS, upgrade::encode_groups(&data.groups));
     notes
 }
 
@@ -284,6 +288,7 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
                     }
                     SECTION_HEALS => data.heals = heal::decode(&mut body)?,
                     SECTION_UPGRADES => data.upgrades = upgrade::decode(&mut body)?,
+                    SECTION_GROUPS => data.groups = upgrade::decode_groups(&mut body)?,
                     _ => {}
                 }
             }
@@ -314,7 +319,7 @@ mod tests {
     use super::super::heal::{Heal, NextEra, Ongoing};
     use super::super::lost::Lost;
     use super::super::sent::{Membership, Sent};
-    use super::super::upgrade::UpgradeState;
+    use super::super::upgrade::{GroupUse, UpgradeState};
     use super::{decode, encode, NotesData, NOTES_VERSION_LOST};
 
     const BOB: &str = "tel:+491707654321";
@@ -422,6 +427,27 @@ mod tests {
                         attempted: Some(then),
                         restarting: true,
                         ..UpgradeState::default()
+                    },
+                ),
+            ]),
+            groups: BTreeMap::from([
+                (
+                    String::from("group-1"),
+                    GroupUse {
+                        used: Some(then),
+                        participants: vec![
+                            String::from("sip:alice@example.com"),
+                            String::from(BOB),
+                        ],
+                        refresh_at: None,
+                    },
+                ),
+                (
+                    String::from("group-2"),
+                    GroupUse {
+                        used: None,
+                        participants: Vec::new(),
+                        refresh_at: Some(then),
                     },
                 ),
             ]),

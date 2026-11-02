@@ -10121,3 +10121,81 @@ fn the_self_healing_tried_lately_is_counted_through_restarts() {
     clock.advance(DAY);
     assert_eq!(healed(&device), 1);
 }
+
+#[test]
+fn an_unencrypted_group_used_lately_is_moved_back_on_schedule() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let clock = Clock::new();
+    let (device, kds, app, bob, mut bobs_group) = alice_and_bob_kept(&clock);
+    let groups_of = |device: &Arc<E2eeDevice>, capabilities: Capabilities| {
+        let (query, _) = answering(&[(BOB_TEL, capabilities)]);
+        DeviceGroups::new(device, query)
+    };
+    let participants = vec![String::from(IMPU), String::from(BOB_SIP)];
+    let scheduled = vec![(String::from(CONVERSATION), participants.clone())];
+    let upgrade = |groups: &DeviceGroups| {
+        rt.block_on(groups.upgrade(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            participants.clone(),
+        ))
+    };
+
+    // not while it is encrypted
+    device.participants_told(CONVERSATION, &participants);
+    device.group_used(CONVERSATION);
+    clock.advance(3 * HOUR);
+    assert_eq!(device.scheduled_upgrades(), []);
+
+    // moved to unencrypted: not for two hours (RCC.16 section 11.2), then
+    // once, with its Participants as the Focus last told them (section
+    // 11.1.1)
+    let groups = groups_of(&device, mls("42"));
+    moved_to_unencrypted(&device, &groups, &bob, &mut bobs_group);
+    assert_eq!(device.scheduled_upgrades(), []);
+    clock.advance(2 * HOUR);
+    assert_eq!(device.scheduled_upgrades(), scheduled);
+    assert_eq!(device.scheduled_upgrades(), []);
+    // not moved back, Bob not advertising E2EE
+    assert!(upgrade(&groups_of(&device, answered(200, ""))).is_none());
+
+    // again a week on, up to a day after at random, through a restart too
+    clock.advance(7 * DAY - MINUTE);
+    assert_eq!(device.scheduled_upgrades(), []);
+    drop(groups);
+    drop(device);
+    let device = alice_restarted(&app, &kds, &clock);
+    clock.advance(DAY + 2 * MINUTE);
+    assert_eq!(device.scheduled_upgrades(), scheduled);
+
+    // not once unused for 30 days (section 1.3), until used again
+    clock.advance(31 * DAY);
+    assert_eq!(device.scheduled_upgrades(), []);
+    device.group_used(CONVERSATION);
+    assert_eq!(device.scheduled_upgrades(), scheduled);
+
+    // a try as a session of it starts counting as a refresh: none on
+    // schedule for a week after
+    clock.advance(8 * DAY);
+    assert!(upgrade(&groups_of(&device, mls("42"))).is_some());
+    device.discard_pending(CONVERSATION, false).unwrap();
+    clock.advance(3 * HOUR);
+    assert!(device.upgrade_due(CONVERSATION));
+    assert_eq!(device.scheduled_upgrades(), []);
+
+    // nor for a group let go of
+    clock.advance(8 * DAY);
+    device.abandon(CONVERSATION).unwrap();
+    assert_eq!(device.scheduled_upgrades(), []);
+
+    // a group never encrypted is, as soon as it is used, its Participants
+    // told (section 11.1)
+    device.group_used("never-encrypted");
+    assert_eq!(device.scheduled_upgrades(), []);
+    device.participants_told("never-encrypted", &participants);
+    assert_eq!(
+        device.scheduled_upgrades(),
+        [(String::from("never-encrypted"), participants.clone())]
+    );
+}

@@ -1527,6 +1527,25 @@ impl GroupEncryption for DeviceGroups {
         }
     }
 
+    fn group_used(&self, conversation_id: &str) {
+        if let Some(device) = self.device.upgrade() {
+            device.group_used(conversation_id);
+        }
+    }
+
+    fn participants_told(&self, conversation_id: &str, participants: &[String]) {
+        if let Some(device) = self.device.upgrade() {
+            device.participants_told(conversation_id, participants);
+        }
+    }
+
+    fn scheduled_upgrades(&self) -> Vec<(String, Vec<String>)> {
+        self.device
+            .upgrade()
+            .map(|device| device.scheduled_upgrades())
+            .unwrap_or_default()
+    }
+
     fn upgrade(
         &self,
         conversation_id: String,
