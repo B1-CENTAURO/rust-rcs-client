@@ -48,7 +48,7 @@ use super::encryption::{
 };
 use super::group_chat::GroupIds;
 use super::imdn::{
-    acknowledge_delivery, acknowledge_group_delivery, ImdnService, ReceivedMessages,
+    acknowledge_delivery, acknowledge_session_delivery, ImdnService, ReceivedMessages,
 };
 use super::new_message_id;
 use super::session::{CPMGroupEvent, CPMSessionService, CPMSessionServiceWrapper};
@@ -321,35 +321,18 @@ pub fn start(registered: bool) -> (Client, Peer) {
                 String::from_utf8_lossy(content_type).into_owned(),
                 String::from_utf8_lossy(content).into_owned(),
             ));
-            if let Some(service) = ImdnService::of_chat(
-                &session
-                    .get_inner()
-                    .get_session_info()
-                    .cpm_contact
-                    .service_type,
-            ) {
-                acknowledge_delivery(
-                    &received_messages_1,
-                    service,
-                    &String::from_utf8_lossy(contact),
-                    cpim_info,
-                    content_type,
-                    registered_identity.clone(),
-                    &tm_1,
-                    &rt_1,
-                );
-            } else {
-                // in a group's session, the contact its focus
-                acknowledge_group_delivery(
-                    &received_messages_1,
-                    session,
-                    &String::from_utf8_lossy(contact),
-                    cpim_info,
-                    content_type,
-                    || registered_identity().map(|(_, impu)| impu),
-                    &rt_1,
-                );
-            }
+            // as the engine does: in the session of a group, or of an
+            // encrypted 1-to-1 chat
+            acknowledge_session_delivery(
+                &received_messages_1,
+                session,
+                &String::from_utf8_lossy(contact),
+                cpim_info,
+                content_type,
+                registered_identity.clone(),
+                &tm_1,
+                &rt_1,
+            );
         },
         |_msrp_info| allocate_msrp_socket(),
         |sock, raddr, rport, _tls| connect_msrp_socket(sock, raddr, rport),
@@ -8426,4 +8409,229 @@ fn a_group_moved_back_to_encrypted_is_told_to_the_app() {
     assert!(!events.contains(&format!("unencrypted {}", GROUP)));
     assert_eq!(encryption.server_messages.lock().unwrap().len(), 1);
     connection.quiet(&rt);
+}
+
+/// The message `message_id` the peer sends encrypted in an encrypted 1-to-1
+/// chat, asking to be told of its delivery and display
+fn encrypted_chat_cpim(message_id: &str) -> String {
+    format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+NS: mls <http://www.gsma.com/rcs/mls>\r\n\
+imdn.Message-ID: {}\r\n\
+{}\
+mls.Epoch-Authenticator: YXV0aA==\r\n\
+mls.Era-ID: 0\r\n\
+\r\n\
+Content-Type: message/mls\r\n\
+\r\n\
+ciphertext",
+        PEER, IMPU, message_id, ASKING
+    )
+}
+
+/// What the scripted encryption makes of a notification it signs in a chat
+const CHAT_SIGNED: &str = "From: <sip:+15551234@example.com>\r\nTo: <sip:+15559876@example.com>\r\nNS: mls <http://www.gsma.com/rcs/mls>\r\nmls.MLS-Derived-Content-Signature: c2lnbmVk\r\n\r\nContent-Type: message/imdn+xml\r\n\r\n<imdn/>";
+
+/// The client joining encrypted 1-to-1 chats in the MLS group `chat-1`,
+/// decrypting what comes in them as `plaintext` and signing notifications
+fn signing_chats_in(client: &Client, plaintext: &str) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        encrypting: vec![String::from("chat-1")],
+        joining_chat: Some(String::from("chat-1")),
+        plaintext: Some(String::from(plaintext)),
+        signature: Some(String::from(CHAT_SIGNED)),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+/// The CPIM message signed, and the IMDN document it carries
+fn signed_notification(cpim: &[u8]) -> (CPIMMessage, Imdn) {
+    let message = CPIMMessage::try_from(&Body::construct_message(cpim).unwrap()).unwrap();
+    let text = String::from_utf8_lossy(cpim).into_owned();
+    let xml = text.rsplit("\r\n\r\n").next().unwrap();
+    let imdn = Imdn::from_xml(xml.as_bytes()).expect("an IMDN document");
+    (message, imdn)
+}
+
+#[test]
+fn the_notifications_of_an_encrypted_chat_are_sent_signed_in_its_session() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let plaintext = format!(
+        "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: peer-message-1\r\n{}\r\nContent-Type: text/plain\r\n\r\nhi",
+        PEER, IMPU, ASKING
+    );
+    let encryption = signing_chats_in(&client, &plaintext);
+    let msrp = encrypted_chat_invitation(&client, &mut peer, "chat-signing", "");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    let our_path = sdp_attribute(&body(&ok), "path").expect("an a=path in the answer");
+    peer.send(&ack(&ok, "chat-signing"));
+    let mut connection = msrp.accept(&rt);
+
+    // its delivery, in the session, signed with its MLS group (RCC.16
+    // section 9.1.3), to the contact
+    connection.send_cpim(
+        &rt,
+        &msrp.path,
+        &our_path,
+        &encrypted_chat_cpim("peer-message-1"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| r.2),
+        Ok(String::from("hi"))
+    );
+    let send = connection.next_message(&rt);
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    assert_eq!(String::from_utf8_lossy(&send.body), CHAT_SIGNED);
+    connection.respond(&rt, &send, "200 OK");
+    {
+        let signed = encryption.signed.lock().unwrap();
+        assert_eq!(signed.len(), 1);
+        assert_eq!(signed[0].0, "chat-1");
+        let (cpim, imdn) = signed_notification(&signed[0].1);
+        assert_eq!(
+            cpim.get_info().unwrap().to,
+            format!("<{}>", PEER).as_bytes()
+        );
+        assert_eq!(
+            (imdn.message_id.as_str(), imdn.notification, imdn.status),
+            ("peer-message-1", Notification::Delivery, Status::Delivered)
+        );
+    }
+
+    // and its display, the same way, by what was noted of it (section
+    // 9.1.4)
+    let notice = client
+        .received_messages
+        .displayed("peer-message-1")
+        .unwrap();
+    assert_eq!(
+        (
+            notice.chat.as_deref(),
+            notice.group.as_deref(),
+            notice.sender_uri.as_str()
+        ),
+        (Some(PEER), None, PEER)
+    );
+    let (result_tx, result) = mpsc::channel();
+    let result_tx = std::sync::Mutex::new(result_tx);
+    assert!(client.sessions.send_chat_imdn(
+        PEER,
+        &notice.xml,
+        notice.original_message_id.as_deref(),
+        move |status_code, _| {
+            let _ = result_tx.lock().unwrap().send(status_code);
+        },
+        &client.core,
+        &rt,
+    ));
+    let send = connection.next_message(&rt);
+    assert_eq!(String::from_utf8_lossy(&send.body), CHAT_SIGNED);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
+    {
+        let signed = encryption.signed.lock().unwrap();
+        assert_eq!(signed.len(), 2);
+        assert_eq!(signed[1].0, "chat-1");
+        let (cpim, imdn) = signed_notification(&signed[1].1);
+        assert_eq!(
+            cpim.get_info().unwrap().to,
+            format!("<{}>", PEER).as_bytes()
+        );
+        assert_eq!(
+            (imdn.message_id.as_str(), imdn.notification, imdn.status),
+            ("peer-message-1", Notification::Display, Status::Displayed)
+        );
+    }
+
+    // neither in a SIP MESSAGE
+    peer.silence();
+}
+
+#[test]
+fn a_display_notification_of_an_encrypted_chat_starts_a_session_of_it_if_there_is_none() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = signing_chats_in(&client, "");
+    encryption.chats.lock().unwrap().push((
+        String::from(PEER),
+        String::from("chat-1"),
+        Some(String::from(TOKEN)),
+    ));
+    let imdn = Imdn {
+        message_id: String::from("peer-message-1"),
+        datetime: String::from("2026-10-25T12:00:00.000Z"),
+        recipient_uri: None,
+        original_recipient_uri: None,
+        notification: Notification::Display,
+        status: Status::Displayed,
+    }
+    .to_xml()
+    .unwrap();
+
+    // a session of the chat kept, the SDP alone with its token, the
+    // notification signed in it (RCC.16 sections 8.1.1, 9.1.4)
+    let msrp = MsrpPeer::listen(&rt);
+    let (result_tx, result) = mpsc::channel();
+    let result_tx = std::sync::Mutex::new(result_tx);
+    assert!(client.sessions.send_chat_imdn(
+        PEER,
+        &imdn,
+        Some("original-1"),
+        move |status_code, _| {
+            let _ = result_tx.lock().unwrap().send(status_code);
+        },
+        &client.core,
+        &rt,
+    ));
+    let invite = peer.next_request("INVITE");
+    assert_eq!(header_value(&invite, "Content-Type"), "application/sdp");
+    assert_eq!(header_value(&invite, "MLS-Opaque-Token"), TOKEN);
+    peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
+    peer.next_request("ACK");
+    let mut connection = msrp.accept(&rt);
+    let send = connection.next_message(&rt);
+    assert_eq!(String::from_utf8_lossy(&send.body), CHAT_SIGNED);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
+    {
+        let signed = encryption.signed.lock().unwrap();
+        assert_eq!(signed.len(), 1);
+        assert_eq!(signed[0].0, "chat-1");
+        let (cpim, told) = signed_notification(&signed[0].1);
+        let info = cpim.get_info().unwrap();
+        assert_eq!(info.to, format!("<{}>", PEER).as_bytes());
+        assert_eq!(info.mls_original_message_id, Some(&b"original-1"[..]));
+        assert_eq!(
+            (told.message_id.as_str(), told.notification),
+            ("peer-message-1", Notification::Display)
+        );
+    }
+    assert!(
+        encryption.encrypted.lock().unwrap().is_empty(),
+        "not encrypted"
+    );
+
+    // none started for a contact of no chat kept, which is given back
+    assert!(!client.sessions.send_chat_imdn(
+        "tel:+15550009",
+        &imdn,
+        None,
+        |_, _| {},
+        &client.core,
+        &rt,
+    ));
+    peer.silence();
 }

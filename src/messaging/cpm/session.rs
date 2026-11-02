@@ -89,7 +89,7 @@ use super::group_chat::{
     focus_answer, group_info_pull, refer_participants, refer_removal, GroupChats, GroupIds,
     GroupInvitation, Participant,
 };
-use super::imdn::{send_group_imdn, telling_of};
+use super::imdn::{imdn_notification, send_imdn_in_session, telling_of};
 use super::session_invitation::{
     decline_hanging_invitation, end_cancelled_invitation, try_accept_hanging_invitation,
     try_accept_invitation, CPMSessionInvitation, CPMSessionInvitationResponse,
@@ -1561,8 +1561,9 @@ impl SessionEnd {
             return;
         };
         for failed in encryption.failed_to_decrypt(&conversation_id) {
-            send_group_imdn(
+            send_imdn_in_session(
                 &self.sip_session.get_inner(),
+                &RecipientType::Group,
                 &failed.imdn,
                 &failed.sender_uri,
                 failed.original_message_id.as_deref(),
@@ -2734,8 +2735,9 @@ impl CPMSessionService {
             .map(|sip_session| sip_session.get_inner());
         match session {
             Some(session) => {
-                send_group_imdn(
+                send_imdn_in_session(
                     &session,
+                    &RecipientType::Group,
                     imdn_xml,
                     recipient_uri,
                     original_message_id,
@@ -2868,35 +2870,98 @@ impl CPMSessionService {
     ) where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
+        let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
+        let message = CPMMessageParam::new(
+            String::from(message_type),
+            String::from(message_content),
+            String::from(message_id),
+            recipient,
+            recipient_type,
+            recipient_uri,
+            move |status_code, reason_phrase| {
+                let mut guard = message_result_callback.lock().unwrap();
+                if let Some(message_result_callback) = guard.take() {
+                    message_result_callback(status_code, reason_phrase);
+                }
+            },
+        );
+        let _ = self.deliver(
+            message,
+            recipient,
+            recipient_type,
+            recipient_uri,
+            true,
+            core,
+            rt,
+        );
+    }
+
+    /// Sends the IMDN document `imdn_xml` to the contact `contact`, of a
+    /// message taken in the encrypted 1-to-1 chat with it, signed in a
+    /// session of the chat (RCC.16 section 9.1.4): in the session or the
+    /// invitation there is with the contact, else in a new session of the
+    /// chat kept with it; with the Original-Message-ID `original_message_id`
+    /// if it tells of a Re-Sent Message (section 7.7.3). False, and nothing
+    /// sent, if there is no identity registered, or none of those.
+    pub fn send_chat_imdn<F>(
+        &self,
+        contact: &str,
+        imdn_xml: &str,
+        original_message_id: Option<&str>,
+        callback: F,
+        core: &Arc<SipCore>,
+        rt: &Arc<Runtime>,
+    ) -> bool
+    where
+        F: Fn(u16, String) + Send + Sync + 'static,
+    {
+        let public_user_identity = match &*self.registered_public_identity.lock().unwrap() {
+            Some((_, public_user_identity, _)) => public_user_identity.clone(),
+            None => return false,
+        };
+        let message = imdn_notification(
+            imdn_xml,
+            &RecipientType::Contact,
+            contact,
+            original_message_id,
+            &public_user_identity,
+            callback,
+        );
+        self.deliver(
+            message,
+            contact,
+            &RecipientType::Contact,
+            contact,
+            false,
+            core,
+            rt,
+        )
+        .is_ok()
+    }
+
+    /// Sends `message` to `recipient`, of `recipient_type`, at
+    /// `recipient_uri`: in the session there is with it, else in the
+    /// invitation there is, else in a new session, of the encrypted 1-to-1
+    /// chat kept with the contact if there is one (RCC.16 section 8.1.1); a
+    /// new session not of such a chat is started only if `start_unencrypted`,
+    /// else `message` is given back
+    fn deliver(
+        &self,
+        message: CPMMessageParam,
+        recipient: &str,
+        recipient_type: &RecipientType,
+        recipient_uri: &str,
+        start_unencrypted: bool,
+        core: &Arc<SipCore>,
+        rt: &Arc<Runtime>,
+    ) -> Result<(), CPMMessageParam> {
         let sessions = self.ongoing_sessions.lock().unwrap();
 
         for (known_identities, sip_session) in &*sessions {
             if known_identities == recipient {
                 sip_session.mark_session_active();
-
-                let cpm_session = sip_session.get_inner();
-
-                let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
-                let message_result_callback = move |status_code, reason_phrase| {
-                    let mut guard = message_result_callback.lock().unwrap();
-                    if let Some(message_result_callback) = guard.take() {
-                        message_result_callback(status_code, reason_phrase);
-                    }
-                };
-
-                let message = CPMMessageParam::new(
-                    String::from(message_type),
-                    String::from(message_content),
-                    String::from(message_id),
-                    recipient,
-                    recipient_type,
-                    recipient_uri,
-                    message_result_callback,
-                );
-
-                cpm_session.send_message(message, rt);
-
-                return;
+                sip_session.get_inner().send_message(message, rt);
+                return Ok(());
             }
         }
 
@@ -2905,23 +2970,6 @@ impl CPMSessionService {
         for invitation in &*invitations {
             let (known_identities, message_tx) = invitation.as_ref();
             if known_identities == recipient {
-                let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
-                let message_result_callback = move |status_code, reason_phrase| {
-                    let mut guard = message_result_callback.lock().unwrap();
-                    if let Some(message_result_callback) = guard.take() {
-                        message_result_callback(status_code, reason_phrase);
-                    }
-                };
-
-                let message = CPMMessageParam::new(
-                    String::from(message_type),
-                    String::from(message_content),
-                    String::from(message_id),
-                    recipient,
-                    recipient_type,
-                    recipient_uri,
-                    message_result_callback,
-                );
                 let message_tx = message_tx.clone();
                 rt.spawn(async move {
                     match message_tx.send(message).await {
@@ -2931,27 +2979,9 @@ impl CPMSessionService {
                         }
                     }
                 });
-                return;
+                return Ok(());
             }
         }
-
-        let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
-        let message_result_callback = move |status_code, reason_phrase| {
-            let mut guard = message_result_callback.lock().unwrap();
-            if let Some(message_result_callback) = guard.take() {
-                message_result_callback(status_code, reason_phrase);
-            }
-        };
-
-        let message = CPMMessageParam::new(
-            String::from(message_type),
-            String::from(message_content),
-            String::from(message_id),
-            recipient,
-            recipient_type,
-            recipient_uri,
-            message_result_callback,
-        );
 
         // a new session of the encrypted 1-to-1 chat kept with the contact
         // (RCC.16 section 8.1.1)
@@ -2961,6 +2991,9 @@ impl CPMSessionService {
                 .and_then(|encryption| encryption.chat_group(recipient)),
             _ => None,
         };
+        if chat.is_none() && !start_unencrypted {
+            return Err(message);
+        }
         self.invite(
             sessions,
             invitations,
@@ -2984,6 +3017,7 @@ impl CPMSessionService {
             core,
             rt,
         );
+        Ok(())
     }
 
     /// Sends a message to the contact `recipient` as send_message() does, in

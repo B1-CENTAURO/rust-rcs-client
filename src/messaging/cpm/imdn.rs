@@ -13,7 +13,10 @@
 // limitations under the License.
 
 //! Delivery and display notifications (RFC 5438) of the messages taken, sent
-//! to their sender in SIP MESSAGEs of the service the message came by
+//! to their sender in SIP MESSAGEs of the service the message came by; those
+//! of a message taken in a group chat, or in an encrypted 1-to-1 chat, in its
+//! session, where they are signed if it is encrypted (RCC.16 sections 9.1.3,
+//! 9.1.4)
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -217,8 +220,9 @@ pub fn acknowledge_group_delivery<P>(
             let original_message_id = cpim_info
                 .mls_original_message_id
                 .map(|id| String::from_utf8_lossy(id).into_owned());
-            send_group_imdn(
+            send_imdn_in_session(
                 &sip_session.get_inner(),
+                &RecipientType::Group,
                 &imdn_xml,
                 &sender_uri,
                 original_message_id.as_deref(),
@@ -238,12 +242,123 @@ pub fn acknowledge_group_delivery<P>(
     }
 }
 
-/// Sends the IMDN document `imdn_xml` in the session `session` with a group,
-/// for its focus to send on to the participant `recipient_uri`, the CPIM To
-/// (RFC 5438 section 9), with the Original-Message-ID `original_message_id`
-/// if it tells of a Re-Sent Message (RCC.16 sections 7.7.1, 7.7.3)
-pub fn send_group_imdn<F>(
+/// Notes a message taken in `sip_session`, the encrypted 1-to-1 chat with
+/// `contact_uri`, and tells the contact it was delivered, in the session,
+/// where it is signed (RCC.16 section 9.1.3), as `public_user_identity`
+/// gives us, if it asked to be told; a Re-Sent Message, by its Message-ID
+/// and the Original-Message-ID of its Original Message (section 7.7.1)
+pub fn acknowledge_chat_delivery<P>(
+    received_messages: &ReceivedMessages,
+    sip_session: &Arc<SipSession<CPMSession>>,
+    contact_uri: &str,
+    cpim_info: &CPIMInfo,
+    content_type: &[u8],
+    public_user_identity: P,
+    rt: &Arc<Runtime>,
+) where
+    P: FnOnce() -> Option<String>,
+{
+    if let Some(imdn_xml) =
+        received_messages.on_received_in_chat(contact_uri, cpim_info, content_type)
+    {
+        if let Some(public_user_identity) = public_user_identity() {
+            let original_message_id = cpim_info
+                .mls_original_message_id
+                .map(|id| String::from_utf8_lossy(id).into_owned());
+            send_imdn_in_session(
+                &sip_session.get_inner(),
+                &RecipientType::Contact,
+                &imdn_xml,
+                contact_uri,
+                original_message_id.as_deref(),
+                &public_user_identity,
+                |status_code, reason_phrase| {
+                    platform_log(
+                        LOG_TAG,
+                        format!(
+                            "chat delivery notification answered with {} {}",
+                            status_code, reason_phrase
+                        ),
+                    );
+                },
+                rt,
+            );
+        }
+    }
+}
+
+/// Notes a message taken from `contact_uri` in `sip_session`, and tells its
+/// sender it was delivered, if it asked to be told, as `registered` gives
+/// us: in the session if it is a group chat's, or an encrypted 1-to-1 chat's
+/// (RCC.16 section 9.1.3), else in a SIP MESSAGE of the chat service
+pub fn acknowledge_session_delivery<R>(
+    received_messages: &ReceivedMessages,
+    sip_session: &Arc<SipSession<CPMSession>>,
+    contact_uri: &str,
+    cpim_info: &CPIMInfo,
+    content_type: &[u8],
+    registered: R,
+    tm: &Arc<SipTransactionManager>,
+    rt: &Arc<Runtime>,
+) where
+    R: FnOnce() -> Option<(Arc<SipTransport>, String)>,
+{
+    let (in_group, in_encrypted_chat, service) = {
+        let session = sip_session.get_inner();
+        let session_info = session.get_session_info();
+        let service_type = &session_info.cpm_contact.service_type;
+        (
+            matches!(service_type, CPMServiceType::Group),
+            matches!(service_type, CPMServiceType::OneToOne)
+                && session_info.encryption.is_some()
+                && session_info.mls_group().is_some(),
+            ImdnService::of_chat(service_type),
+        )
+    };
+    if in_group {
+        // the contact the group's focus
+        acknowledge_group_delivery(
+            received_messages,
+            sip_session,
+            contact_uri,
+            cpim_info,
+            content_type,
+            || registered().map(|(_, impu)| impu),
+            rt,
+        );
+    } else if in_encrypted_chat {
+        acknowledge_chat_delivery(
+            received_messages,
+            sip_session,
+            contact_uri,
+            cpim_info,
+            content_type,
+            || registered().map(|(_, impu)| impu),
+            rt,
+        );
+    } else if let Some(service) = service {
+        acknowledge_delivery(
+            received_messages,
+            service,
+            contact_uri,
+            cpim_info,
+            content_type,
+            registered,
+            tm,
+            rt,
+        );
+    }
+}
+
+/// Sends the IMDN document `imdn_xml` in the session `session`, of a group
+/// or an encrypted 1-to-1 chat as `recipient_type` says, to `recipient_uri`,
+/// the CPIM To: the participant its focus sends it on to, or the contact
+/// (RFC 5438 section 9); with the Original-Message-ID `original_message_id`
+/// if it tells of a Re-Sent Message (RCC.16 sections 7.7.1, 7.7.3). It is
+/// signed if the session is encrypted.
+pub fn send_imdn_in_session<F>(
     session: &CPMSession,
+    recipient_type: &RecipientType,
     imdn_xml: &str,
     recipient_uri: &str,
     original_message_id: Option<&str>,
@@ -251,6 +366,34 @@ pub fn send_group_imdn<F>(
     callback: F,
     rt: &Arc<Runtime>,
 ) where
+    F: Fn(u16, String) + Send + Sync + 'static,
+{
+    session.send_message(
+        imdn_notification(
+            imdn_xml,
+            recipient_type,
+            recipient_uri,
+            original_message_id,
+            public_user_identity,
+            callback,
+        ),
+        rt,
+    );
+}
+
+/// The CPIM message carrying the IMDN document `imdn_xml` to
+/// `recipient_uri`, the CPIM To, from `public_user_identity`, with the
+/// Original-Message-ID `original_message_id` if given, as a notification
+/// the session signs if it is encrypted
+pub fn imdn_notification<F>(
+    imdn_xml: &str,
+    recipient_type: &RecipientType,
+    recipient_uri: &str,
+    original_message_id: Option<&str>,
+    public_user_identity: &str,
+    callback: F,
+) -> CPMMessageParam
+where
     F: Fn(u16, String) + Send + Sync + 'static,
 {
     let body = make_cpim_imdn_body(
@@ -264,18 +407,16 @@ pub fn send_group_imdn<F>(
         let _ = reader.read_to_end(&mut data);
     }
 
-    let message = CPMMessageParam::new(
+    CPMMessageParam::new(
         String::from("message/cpim"),
         String::from_utf8_lossy(&data).into_owned(),
         new_message_id(),
         recipient_uri,
-        &RecipientType::Group,
+        recipient_type,
         recipient_uri,
         callback,
     )
-    .notification();
-
-    session.send_message(message, rt);
+    .notification()
 }
 
 /// The Message-ID the app knows the message `cpim_info` tells of by, of
@@ -339,10 +480,13 @@ struct Received {
     dispositions: Dispositions,
     /// The URI of the group it was taken in, if in one
     group: Option<String>,
+    /// The contact of the encrypted 1-to-1 chat it was taken in, if in one
+    chat: Option<String>,
 }
 
 /// A notification to send to `sender_uri`: in the session with `group` if
-/// the message was taken in one, else by `service`
+/// the message was taken in one, in one of the encrypted 1-to-1 chat with
+/// `chat` if in one (RCC.16 section 9.1.4), else by `service`
 #[derive(Debug, PartialEq, Eq)]
 pub struct Notice {
     pub xml: String,
@@ -352,6 +496,7 @@ pub struct Notice {
     pub original_message_id: Option<String>,
     pub service: ImdnService,
     pub group: Option<String>,
+    pub chat: Option<String>,
 }
 
 /// What became of a notification asked for
@@ -386,7 +531,7 @@ impl ReceivedMessages {
         cpim_info: &CPIMInfo,
         content_type: &[u8],
     ) -> Option<String> {
-        self.note(service, sender_uri, None, cpim_info, content_type)
+        self.note(service, sender_uri, None, None, cpim_info, content_type)
     }
 
     /// As on_received(), for a message taken in the session with the group
@@ -402,6 +547,25 @@ impl ReceivedMessages {
             ImdnService::Chat,
             sender_uri,
             Some(conference_uri),
+            None,
+            cpim_info,
+            content_type,
+        )
+    }
+
+    /// As on_received(), for a message taken in a session of the encrypted
+    /// 1-to-1 chat with `contact_uri`
+    pub fn on_received_in_chat(
+        &self,
+        contact_uri: &str,
+        cpim_info: &CPIMInfo,
+        content_type: &[u8],
+    ) -> Option<String> {
+        self.note(
+            ImdnService::Chat,
+            contact_uri,
+            None,
+            Some(contact_uri),
             cpim_info,
             content_type,
         )
@@ -412,6 +576,7 @@ impl ReceivedMessages {
         service: ImdnService,
         sender_uri: &str,
         group: Option<&str>,
+        chat: Option<&str>,
         cpim_info: &CPIMInfo,
         content_type: &[u8],
     ) -> Option<String> {
@@ -446,6 +611,7 @@ impl ReceivedMessages {
                 datetime: datetime.clone(),
                 dispositions,
                 group: group.map(String::from),
+                chat: chat.map(String::from),
             });
         }
 
@@ -499,6 +665,7 @@ impl ReceivedMessages {
             original_message_id: message.original_message_id.clone(),
             service: message.service,
             group: message.group.clone(),
+            chat: message.chat.clone(),
         })
     }
 }
@@ -617,6 +784,47 @@ again",
     }
 
     #[test]
+    fn a_message_of_an_encrypted_chat_is_noted_with_its_contact() {
+        let received = ReceivedMessages::new();
+        let message = resent("Rs78", "Kn8");
+        let info = message.get_info().unwrap();
+
+        // its delivery told, of the Re-Sent Message (RCC.16 section 7.7.1)
+        let xml = received
+            .on_received_in_chat(SENDER, &info, b"text/plain")
+            .unwrap();
+        assert_eq!(Imdn::from_xml(xml.as_bytes()).unwrap().message_id, "Rs78");
+
+        // and its display, for a session of the chat with its contact
+        // (section 9.1.4)
+        let notice = received.displayed("Kn8").unwrap();
+        assert_eq!(
+            (
+                notice.chat.as_deref(),
+                notice.group.as_deref(),
+                notice.sender_uri.as_str(),
+                notice.service
+            ),
+            (Some(SENDER), None, SENDER, ImdnService::Chat)
+        );
+        assert_eq!(notice.original_message_id.as_deref(), Some("Kn8"));
+
+        // a group's is not of a chat
+        let group_message = resent("Rs79", "Kn9");
+        received.on_received_in_group(
+            GROUP,
+            SENDER,
+            &group_message.get_info().unwrap(),
+            b"text/plain",
+        );
+        let notice = received.displayed("Kn9").unwrap();
+        assert_eq!(
+            (notice.chat.as_deref(), notice.group.as_deref()),
+            (None, Some(GROUP))
+        );
+    }
+
+    #[test]
     fn a_notification_is_made_to_tell_of_another_message() {
         let xml = b"<imdn><message-id>Rs77</message-id><datetime>t</datetime><delivery-notification><status><delivered/></status></delivery-notification></imdn>";
         assert_eq!(
@@ -704,6 +912,7 @@ again",
         assert_eq!(notice.sender_uri, SENDER);
         assert_eq!(notice.service, ImdnService::Standalone);
         assert_eq!(notice.group, None);
+        assert_eq!(notice.chat, None);
         let imdn = Imdn::from_xml(notice.xml.as_bytes()).unwrap();
         assert_eq!(imdn.message_id, "Kn31");
         assert_eq!(imdn.datetime, "2023-04-04T12:16:49.000+08:00");
