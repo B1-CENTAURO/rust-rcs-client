@@ -640,6 +640,24 @@ pub trait GroupEncryption: Send + Sync {
     /// (RCC.16 sections 11.1.1, 11.2)
     fn membership_changed(&self, conversation_id: &str);
 
+    /// Takes note of a user message sent or received in the group
+    /// `conversation_id`, which keeps it active for 30 days, its
+    /// Participants' capabilities refreshed meanwhile (RCC.16 sections 1.3,
+    /// 11.1.1)
+    fn group_used(&self, conversation_id: &str);
+
+    /// Takes note of `participants`, the URIs of those taking part in the
+    /// group `conversation_id` as its focus tells them, for their
+    /// capabilities to be refreshed on schedule (RCC.16 section 11.1.1)
+    fn participants_told(&self, conversation_id: &str, participants: &[String]);
+
+    /// The groups to be moved back to encrypted with upgrade() now on
+    /// schedule, their Participants' capabilities refreshed then, each with
+    /// the URIs of its Participants as last told (RCC.16 section 11.1.1):
+    /// those active, whose Participants' capabilities were last refreshed a
+    /// week and a random backoff ago, and for which upgrade_due() holds
+    fn scheduled_upgrades(&self) -> Vec<(String, Vec<String>)>;
+
     /// Moves the group `conversation_id` back to encrypted, if that is due,
     /// `participants` the URIs of those taking part in it as its Conversation
     /// Focus tells them (RCC.16 section 11.1): the CPIM message carrying a

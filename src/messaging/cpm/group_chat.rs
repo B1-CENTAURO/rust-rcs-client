@@ -502,6 +502,17 @@ impl GroupChats {
         self.ids.lock().unwrap().get(conference_uri).cloned()
     }
 
+    /// The URI of the group of Conversation-ID `conversation_id`, as its last
+    /// session had it, if there was one
+    pub(crate) fn uri_of(&self, conversation_id: &str) -> Option<String> {
+        self.ids
+            .lock()
+            .unwrap()
+            .values()
+            .find(|ids| ids.conversation_id == conversation_id)
+            .map(|ids| ids.conference_uri.clone())
+    }
+
     /// Takes note of the identifiers of a group the app kept, to restart it
     /// with as if a session with it had been had
     pub(crate) fn remember(&self, mut ids: GroupIds) {

@@ -1093,6 +1093,10 @@ impl CPMSession {
 /// one of another cause leaves it only until the session is restarted
 const LEAVING_REASON: &[u8] = b"SIP;cause=200;text=\"Call completed\"";
 
+/// How often the unencrypted groups are looked at for their Participants'
+/// capabilities to be refreshed on schedule (RCC.16 section 11.1.1)
+const UPGRADE_TICK: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// What ending a chat session takes
 #[derive(Clone)]
 pub(crate) struct SessionEnd {
@@ -1604,6 +1608,9 @@ impl SessionEnd {
         let Some((encryption, conversation_id)) = encryption.zip(conversation_id) else {
             return;
         };
+        // for its Participants' capabilities to be refreshed while there is
+        // no session of it (section 11.1.1)
+        encryption.participants_told(&conversation_id, &participants);
         if membership_changed {
             encryption.membership_changed(&conversation_id);
         }
@@ -2177,6 +2184,7 @@ impl CPMSessionService {
                         if taken.is_none() {
                             platform_log(LOG_TAG, "message decrypted not a CPIM message");
                         }
+                        note_group_used(session, &encryption);
                     }
                     // the group healed if it could not be decrypted (RCC.16
                     // section 10.1), and the sender told so once it is
@@ -2248,6 +2256,7 @@ impl CPMSessionService {
                         }
                     }
                 } else if is_plaintext_message(content_type) {
+                    note_group_used(session, &encryption);
                     // as does a message sent unencrypted in an encrypted
                     // group (RCC.16 section 11.2), which the app takes all
                     // the same
@@ -2385,11 +2394,123 @@ impl CPMSessionService {
         let service = Arc::downgrade(self);
         let core = Arc::downgrade(core);
         let rt = Arc::clone(rt);
+        let restarting = (service.clone(), core.clone(), Arc::clone(&rt));
         *self.restarter.lock().unwrap() = Some(Arc::new(move |conference_uri, cpim| {
             if let (Some(service), Some(core)) = (service.upgrade(), core.upgrade()) {
                 service.restart_in_new_era(&conference_uri, &cpim, &core, &rt);
             }
         }));
+
+        // and for the unencrypted groups to be moved back to encrypted on
+        // schedule (RCC.16 section 11.1.1)
+        let (service, core, rt) = restarting;
+        let ticking = Arc::clone(&rt);
+        ticking.spawn(async move {
+            let mut ticks = tokio::time::interval(UPGRADE_TICK);
+            ticks.tick().await;
+            loop {
+                ticks.tick().await;
+                let (Some(service), Some(core)) = (service.upgrade(), core.upgrade()) else {
+                    return;
+                };
+                service.upgrade_on_schedule(&core, &rt);
+            }
+        });
+    }
+
+    /// Moves back to encrypted the unencrypted groups due to be on schedule,
+    /// their Participants' capabilities refreshed (RCC.16 sections 11.1,
+    /// 11.1.1), as GroupEncryption::scheduled_upgrades() tells: in the
+    /// session there is with a group, else in a new session started with
+    /// the Commit resurrecting its MLS group, or with the INVITE restarting
+    /// the group in an Era of its own (sections 8.3.1, 11.1.2). Nothing is
+    /// done while there is no identity registered, nor for a group whose URI
+    /// is not known, nor while an invitation of it is on its way.
+    pub(crate) fn upgrade_on_schedule(self: &Arc<Self>, core: &Arc<SipCore>, rt: &Arc<Runtime>) {
+        let Some(encryption) = self.group_encryption() else {
+            return;
+        };
+        let Some(public_user_identity) = self
+            .registered_public_identity
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, public_user_identity, _)| public_user_identity.clone())
+        else {
+            return;
+        };
+        for (conversation_id, participants) in encryption.scheduled_upgrades() {
+            let Some(conference_uri) = self.group_chats.uri_of(&conversation_id) else {
+                continue;
+            };
+            let session_end =
+                group_session_end(&self.ongoing_sessions.lock().unwrap(), &conference_uri);
+            if let Some(session_end) = session_end {
+                session_end.upgrade_if_due(participants, false);
+                continue;
+            }
+            if self.has_session_with(&conference_uri) {
+                continue;
+            }
+
+            let preparing = encryption.upgrade(
+                conversation_id.clone(),
+                public_user_identity.clone(),
+                conference_uri.clone(),
+                participants,
+            );
+            let service = Arc::downgrade(self);
+            let core = Arc::downgrade(core);
+            let rt_ = Arc::clone(rt);
+            let encryption = Arc::clone(&encryption);
+            rt.spawn(async move {
+                let upgrade = preparing.await;
+                let (Some(service), Some(core)) = (service.upgrade(), core.upgrade()) else {
+                    return;
+                };
+                match upgrade {
+                    Some(Upgrade::Restart(cpim)) => {
+                        service.restart_in_new_era(&conference_uri, &cpim, &core, &rt_)
+                    }
+                    Some(Upgrade::InSession(cpim)) => {
+                        let discarding = Arc::clone(&encryption);
+                        let message = CPMMessageParam::new(
+                            String::from("message/cpim"),
+                            String::new(),
+                            new_message_id(),
+                            &conference_uri,
+                            &RecipientType::Group,
+                            &conference_uri,
+                            move |status_code, reason_phrase| {
+                                platform_log(
+                                    LOG_TAG,
+                                    format!(
+                                        "group moved back answered with {} {}",
+                                        status_code, reason_phrase
+                                    ),
+                                );
+                                // not reaching the focus, it is not refused
+                                // either
+                                if !(200..300).contains(&status_code) {
+                                    discarding.discard(&conversation_id, false);
+                                }
+                            },
+                        )
+                        .raw_data(cpim);
+                        let _ = service.deliver(
+                            message,
+                            &conference_uri,
+                            &RecipientType::Group,
+                            &conference_uri,
+                            true,
+                            &core,
+                            &rt_,
+                        );
+                    }
+                    None => {}
+                }
+            });
+        }
     }
 
     /// Restarts the group at `conference_uri` with an INVITE carrying `cpim`,
@@ -2875,6 +2996,16 @@ impl CPMSessionService {
     ) where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
+        // a group used, as long as which its Participants' capabilities are
+        // refreshed if it is unencrypted (RCC.16 sections 1.3, 11.1.1)
+        if matches!(recipient_type, RecipientType::Group) {
+            if let Some((encryption, conversation_id)) = self
+                .group_encryption()
+                .zip(self.group_conversation_id(recipient))
+            {
+                encryption.group_used(&conversation_id);
+            }
+        }
         let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
         let message = CPMMessageParam::new(
             String::from(message_type),
@@ -3951,6 +4082,31 @@ fn group_session<'s>(
 
 /// Self-heals the MLS group of `session` if it needs to be, as
 /// SessionEnd::heal_if_needed() does
+/// Takes note of a user message sent or received in the group chat of
+/// `session`, if it is one, with the encryption of the session, else
+/// `encryption`, that of the service, as for a group never encrypted (RCC.16
+/// sections 1.3, 11.1.1)
+fn note_group_used(
+    session: &Arc<SipSession<CPMSession>>,
+    encryption: &Mutex<Option<Arc<dyn GroupEncryption>>>,
+) {
+    let used = {
+        let inner = session.get_inner();
+        let session_info = inner.get_session_info();
+        match session_info.cpm_contact.service_type {
+            CPMServiceType::Group => session_info
+                .encryption
+                .clone()
+                .or_else(|| encryption.lock().unwrap().clone())
+                .zip(session_info.conversation_id.clone()),
+            _ => None,
+        }
+    };
+    if let Some((encryption, conversation_id)) = used {
+        encryption.group_used(&conversation_id);
+    }
+}
+
 fn heal_if_needed(session: &Arc<SipSession<CPMSession>>) {
     if let Some(session_end) = session.get_inner().session_end() {
         session_end.heal_if_needed();
