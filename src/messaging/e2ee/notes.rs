@@ -47,6 +47,7 @@ const SECTION_MEMBERSHIPS: u8 = 3;
 const SECTION_RECEIVED: u8 = 4;
 const SECTION_ICONS: u8 = 5;
 const SECTION_CHATS: u8 = 6;
+const SECTION_CHAT_ACTIVITY: u8 = 7;
 
 /// What the device keeps besides MLS
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -209,6 +210,7 @@ fn encode(data: &NotesData) -> Vec<u8> {
     section(SECTION_RECEIVED, file::encode(&data.received));
     section(SECTION_ICONS, description::encode(&data.icons));
     section(SECTION_CHATS, chat::encode(&data.chats));
+    section(SECTION_CHAT_ACTIVITY, chat::encode_activity(&data.chats));
     notes
 }
 
@@ -222,6 +224,7 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
     match *version {
         NOTES_VERSION_LOST => data.lost = lost::decode(&mut Reader(rest))?,
         NOTES_VERSION => {
+            let mut activity = Vec::new();
             let mut reader = Reader(rest);
             while !reader.is_empty() {
                 let tag = reader.byte()?;
@@ -234,8 +237,15 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
                     SECTION_RECEIVED => data.received = file::decode(&mut body)?,
                     SECTION_ICONS => data.icons = description::decode(&mut body)?,
                     SECTION_CHATS => data.chats = chat::decode(&mut body)?,
+                    SECTION_CHAT_ACTIVITY => activity = chat::decode_activity(&mut body)?,
                     _ => {}
                 }
+            }
+            for chat in data.chats.iter_mut() {
+                chat.active = activity
+                    .iter()
+                    .find(|(group_id, _)| *group_id == chat.group_id)
+                    .map(|(_, active)| *active);
             }
         }
         _ => return None,
@@ -310,11 +320,13 @@ mod tests {
                     contact: String::from(BOB),
                     group_id: String::from("chat-1"),
                     mls_opaque_token: Some(String::from("token-1")),
+                    active: Some(then),
                 },
                 Chat {
                     contact: String::from("tel:+491701111111"),
                     group_id: String::from("chat-2"),
                     mls_opaque_token: None,
+                    active: None,
                 },
             ],
         }
@@ -337,6 +349,28 @@ mod tests {
                 ..NotesData::default()
             })
         );
+
+        // those kept before the activity of chats was, their chats of none
+        let mut before = vec![super::NOTES_VERSION];
+        before.push(super::SECTION_CHATS);
+        super::put(&mut before, &super::super::chat::encode(&data.chats));
+        let mut chats = data.chats.clone();
+        chats[0].active = None;
+        assert_eq!(
+            decode(&before),
+            Some(NotesData {
+                chats,
+                ..NotesData::default()
+            })
+        );
+        // and the activity of a chat not kept passed over
+        let mut stray = before.clone();
+        stray.push(super::SECTION_CHAT_ACTIVITY);
+        let mut activity = Vec::new();
+        super::put(&mut activity, b"chat-9");
+        super::put_time(&mut activity, SystemTime::UNIX_EPOCH);
+        super::put(&mut stray, &activity);
+        assert_eq!(decode(&stray), decode(&before));
 
         // a section of a kind not known passed over
         let mut later = encode(&data);

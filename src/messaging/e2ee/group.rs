@@ -1375,6 +1375,25 @@ impl GroupEncryption for DeviceGroups {
         })
     }
 
+    fn chat_era_due(&self, contact: &str) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.chat_era_due(contact))
+    }
+
+    fn prepare_chat_era(
+        &self,
+        contact: String,
+        from: String,
+    ) -> BoxFuture<'static, Option<(String, Vec<u8>)>> {
+        let device = self.device.clone();
+        let capabilities = Arc::clone(&self.capabilities);
+        Box::pin(async move {
+            let device = device.upgrade()?;
+            device.make_chat_era(&contact, &from, &capabilities).await
+        })
+    }
+
     fn join_chat(
         &self,
         contact: &str,
@@ -1555,9 +1574,17 @@ impl GroupEncryption for DeviceGroups {
             E2eeDevice::encrypt_message,
             "message not encrypted",
         );
+        // the message the last of its chat, if of one (RCC.16 section 8.3)
+        let device = self.device.clone();
+        let group_id = String::from(conversation_id);
         Box::pin(async move {
             match encrypting.await {
-                Ok(encrypted) => Sealed::Encrypted(encrypted),
+                Ok(encrypted) => {
+                    if let Some(device) = device.upgrade() {
+                        device.chat_used(&group_id);
+                    }
+                    Sealed::Encrypted(encrypted)
+                }
                 Err(MessageError::NotEncrypted) => Sealed::Unencrypted,
                 Err(_) => Sealed::Failed,
             }
@@ -1614,7 +1641,10 @@ impl GroupEncryption for DeviceGroups {
     ) -> Option<Vec<u8>> {
         let device = self.device.upgrade()?;
         match device.decrypt_message(conversation_id, cpim_info, mls_message) {
-            Ok(cpim) => Some(cpim),
+            Ok(cpim) => {
+                device.chat_used(conversation_id);
+                Some(cpim)
+            }
             Err(e) => {
                 platform_log(LOG_TAG, format!("message not decrypted: {:?}", e));
                 None

@@ -22,24 +22,41 @@
 //! A contact found not to take an encrypted chat, as it does not advertise
 //! E2EE v1 or the Home KDS has no KeyPackages of it, is not asked again for
 //! UNENCRYPTED_FOR (section 8.1).
+//!
+//! A chat with no message sent or taken in it for CHAT_INACTIVE_FOR starts
+//! its next session in a new Era of its MLS group, as its Conversation Focus
+//! lets go of the group by then (sections 6.1.2, 8.3).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use rust_rcs_core::ffi::log::platform_log;
+use rust_rcs_core::mls::rcs::era::EraBase;
 use rust_rcs_core::mls::rcs::proto::{self, server_mls_rcs_message, ServerMlsRcsMessage};
 use rust_rcs_core::mls::rcs::same_tel_uri;
 use rust_rcs_core::mls::ErrorKind;
 
+use crate::capability::CapabilityQuery;
+
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice};
-use super::notes::{put, Reader as NotesReader};
+use super::group::recipients;
+use super::notes::{put, put_time, Reader as NotesReader};
 use super::store::StoreError;
 
 const LOG_TAG: &str = "e2ee";
 
 /// How long a contact found not to take an encrypted chat is not asked again
 pub(super) const UNENCRYPTED_FOR: Duration = Duration::from_secs(60 * 60);
+
+/// How long a chat may go with no message sent or taken in it before its
+/// next session starts in a new Era, as its Conversation Focus lets go of
+/// its MLS group by then (RCC.16 sections 6.1.2, 8.3)
+pub(super) const CHAT_INACTIVE_FOR: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How often the last message of a chat is noted, at most, so that the MLS
+/// state is not kept again for each
+const ACTIVITY_NOTED_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// An encrypted 1-to-1 chat, as kept in the notes of the device
 #[derive(Clone, Debug, PartialEq)]
@@ -50,6 +67,10 @@ pub(super) struct Chat {
     pub(super) group_id: String,
     /// The MLS-Opaque-Token its Conversation Focus gave, if it did
     pub(super) mls_opaque_token: Option<String>,
+    /// When a message was last sent or taken in it, or it was kept, as noted
+    /// at most every ACTIVITY_NOTED_EVERY; None if not noted, as by a device
+    /// before it noted it
+    pub(super) active: Option<SystemTime>,
 }
 
 /// The contacts found not to take an encrypted chat, by tel URI, and when,
@@ -114,6 +135,7 @@ impl E2eeDevice {
             contact,
             group_id: String::from(group_id),
             mls_opaque_token: mls_opaque_token.map(String::from),
+            active: Some(self.store().now()),
         };
         self.notes().change(self.store(), |data| {
             data.chats
@@ -204,6 +226,115 @@ impl E2eeDevice {
         Ok(group_id)
     }
 
+    /// Takes note of a message sent or taken in the MLS group `group_id`, if
+    /// it is that of a chat, as the last of the chat, every
+    /// ACTIVITY_NOTED_EVERY at most
+    pub(super) fn chat_used(&self, group_id: &str) {
+        let now = self.store().now();
+        let due = self.notes().read(|data| {
+            data.chats.iter().any(|chat| {
+                chat.group_id == group_id
+                    && chat.active.map_or(true, |active| {
+                        now.duration_since(active)
+                            .is_ok_and(|since| since >= ACTIVITY_NOTED_EVERY)
+                    })
+            })
+        });
+        if !due {
+            return;
+        }
+        let noted = self.notes().change(self.store(), |data| {
+            for chat in data.chats.iter_mut() {
+                if chat.group_id == group_id {
+                    chat.active = Some(now);
+                }
+            }
+        });
+        if let Err(e) = noted {
+            platform_log(LOG_TAG, format!("chat activity not noted: {:?}", e));
+        }
+    }
+
+    /// Whether the encrypted 1-to-1 chat kept with `contact` is to start its
+    /// next session in a new Era of its MLS group, no message having been
+    /// sent or taken in it for CHAT_INACTIVE_FOR, as its Conversation Focus
+    /// lets go of the group by then (RCC.16 sections 6.1.2, 8.3); not if its
+    /// MLS group was moved to unencrypted
+    pub fn chat_era_due(&self, contact: &str) -> bool {
+        let Some(contact) = contact_tel_uri(contact) else {
+            return false;
+        };
+        let now = self.store().now();
+        let chat = self.notes().read(|data| {
+            data.chats
+                .iter()
+                .find(|chat| same_tel_uri(&chat.contact, &contact))
+                .cloned()
+        });
+        let Some(chat) = chat else {
+            return false;
+        };
+        let inactive = chat.active.is_some_and(|active| {
+            now.duration_since(active)
+                .is_ok_and(|since| since > CHAT_INACTIVE_FOR)
+        });
+        inactive
+            && self.store().has_conversation(chat.group_id.as_bytes())
+            && !self.encryption_ended(&chat.group_id)
+    }
+
+    /// Makes the next Era of the MLS group of the chat kept with `contact`,
+    /// if one is due as chat_era_due() tells, with the contact's Clients, as
+    /// the Home KDS gives their KeyPackages, the contact asked for its
+    /// capabilities with `capabilities` (RCC.16 sections 5.2, 8.3.1): the ID
+    /// of the group, and the CPIM message, from `from` to `contact`, of its
+    /// Commit, GroupInfo and Welcome that the INVITE starting the chat's
+    /// session is to carry (sections 7.9.2, 8.1.1)
+    ///
+    /// The Era follows that of the group the device has, whose GroupContext
+    /// extensions it copies: a chat not started has no session to ask its
+    /// Conversation Focus for the GroupInfo in, which the Focus no longer has
+    /// by then. Its Participant is the contact, whatever the group of the
+    /// device has left of it. None if the Era cannot be made, as when the
+    /// contact no longer advertises E2EE, or its KeyPackages cannot be had.
+    /// The Commit is applied once the Focus accepts it.
+    pub async fn make_chat_era(
+        &self,
+        contact: &str,
+        from: &str,
+        capabilities: &CapabilityQuery,
+    ) -> Option<(String, Vec<u8>)> {
+        if !self.chat_era_due(contact) {
+            return None;
+        }
+        let (group_id, _) = self.chat_group(contact)?;
+        let base = match self
+            .store()
+            .peek_conversation(group_id.as_bytes(), |conversation, _| {
+                EraBase::of_conversation(conversation)
+            }) {
+            Ok(base) => base,
+            Err(e) => {
+                platform_log(LOG_TAG, format!("chat Era not made: {:?}", e));
+                return None;
+            }
+        };
+        let Some(recipients) = recipients(&[String::from(contact)], capabilities).await else {
+            platform_log(LOG_TAG, "chat Era not made, the contact not E2EE capable");
+            return None;
+        };
+        match self
+            .next_era(&group_id, from, contact, recipients, &base)
+            .await
+        {
+            Ok(cpim) => Some((group_id, cpim)),
+            Err(e) => {
+                platform_log(LOG_TAG, format!("chat Era not made: {:?}", e));
+                None
+            }
+        }
+    }
+
     /// Lets go of the 1-to-1 chat whose MLS group is `group_id`, if one's is
     pub(super) fn forget_chat(&self, group_id: &str) {
         let forgotten = self.notes().change(self.store(), |data| {
@@ -246,9 +377,36 @@ pub(super) fn decode(reader: &mut NotesReader) -> Option<Vec<Chat>> {
             contact,
             group_id,
             mls_opaque_token,
+            active: None,
         });
     }
     Some(chats)
+}
+
+/// When the chats `chats` were last active, by the ID of their MLS group, as
+/// the notes of the device hold it apart from them: notes kept before it was
+/// noted are read as they were, and a device before it was noted reads the
+/// chats all the same
+pub(super) fn encode_activity(chats: &[Chat]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for chat in chats {
+        if let Some(active) = chat.active {
+            put(&mut data, chat.group_id.as_bytes());
+            put_time(&mut data, active);
+        }
+    }
+    data
+}
+
+/// When each chat `reader` reads of was last active, by the ID of its MLS
+/// group, as encode_activity() puts it
+pub(super) fn decode_activity(reader: &mut NotesReader) -> Option<Vec<(String, SystemTime)>> {
+    let mut activity = Vec::new();
+    while !reader.is_empty() {
+        let group_id = reader.string()?;
+        activity.push((group_id, reader.time()?));
+    }
+    Some(activity)
 }
 
 #[cfg(test)]
