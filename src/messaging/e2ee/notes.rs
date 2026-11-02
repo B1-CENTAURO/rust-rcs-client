@@ -399,6 +399,7 @@ mod tests {
                 (
                     String::from("group-2"),
                     Heal {
+                        failed: true,
                         eras: vec![then],
                         ..Heal::default()
                     },
@@ -419,6 +420,7 @@ mod tests {
                     String::from("group-2"),
                     UpgradeState {
                         attempted: Some(then),
+                        restarting: true,
                         ..UpgradeState::default()
                     },
                 ),
