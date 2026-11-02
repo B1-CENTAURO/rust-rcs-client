@@ -282,6 +282,12 @@ impl Peer {
 /// A client with the chat and standalone messaging services, `registered`
 /// or not on its connection, accepting invitations at once
 pub fn start(registered: bool) -> (Client, Peer) {
+    start_as(registered, IMPU)
+}
+
+/// As start(), the client registered as `impu`
+pub fn start_as(registered: bool, impu: &str) -> (Client, Peer) {
+    let impu = String::from(impu);
     let rt = Arc::new(Runtime::new().unwrap());
     let (tm, tm_events) = SipTransactionManager::new(&rt);
     let tm = Arc::new(tm);
@@ -308,12 +314,13 @@ pub fn start(registered: bool) -> (Client, Peer) {
         Arc::new(std::sync::Mutex::new(None));
     let registered_identity = {
         let registered_transport = Arc::clone(&registered_transport);
+        let impu = impu.clone();
         move || {
             registered_transport
                 .lock()
                 .unwrap()
                 .clone()
-                .map(|transport| (transport, String::from(IMPU)))
+                .map(|transport| (transport, impu.clone()))
         }
     };
     let registered_identity_ = registered_identity.clone();
@@ -479,17 +486,17 @@ pub fn start(registered: bool) -> (Client, Peer) {
 
     if registered {
         core.set_default_public_identity(
-            String::from(IMPU),
+            impu.clone(),
             String::from(INSTANCE),
             Arc::clone(&transport),
         );
         sessions.set_registered_public_identity(
-            String::from(IMPU),
+            impu.clone(),
             String::from(INSTANCE),
             Arc::clone(&transport),
         );
         standalone.set_registered_public_identity(
-            String::from(IMPU),
+            impu.clone(),
             String::from(INSTANCE),
             Arc::clone(&transport),
         );
@@ -730,30 +737,35 @@ impl MsrpConnection {
     }
 
     fn take_frame(&mut self) -> Option<MsrpFrame> {
-        let text = String::from_utf8_lossy(&self.buffer).into_owned();
-        let first_end = text.find("\r\n")?;
-        let first_line = String::from(&text[..first_end]);
+        // as bytes, as a body may not be text
+        let find = |data: &[u8], what: &[u8], from: usize| {
+            data.get(from..)?
+                .windows(what.len())
+                .position(|window| window == what)
+                .map(|at| at + from)
+        };
+        let buffer = &self.buffer;
+        let first_end = find(buffer, b"\r\n", 0)?;
+        let first_line = String::from_utf8_lossy(&buffer[..first_end]).into_owned();
         let transaction_id = String::from(first_line.split(' ').nth(1)?);
         let end_line = format!("-------{}", transaction_id);
-        let end = text.find(&end_line)?;
+        let end = find(buffer, end_line.as_bytes(), first_end)?;
         let after_flag = end + end_line.len() + 1;
-        let frame_end = text[after_flag..].find("\r\n")? + after_flag + 2;
+        let frame_end = find(buffer, b"\r\n", after_flag)? + 2;
 
-        let head_and_body = &text[first_end + 2..end];
-        let (head, body) = match head_and_body.find("\r\n\r\n") {
+        let head_and_body = &buffer[first_end + 2..end];
+        let (head, body) = match find(head_and_body, b"\r\n\r\n", 0) {
             Some(i) => (&head_and_body[..i], &head_and_body[i + 4..]),
-            None => (head_and_body.trim_end_matches("\r\n"), ""),
+            None => (head_and_body, &b""[..]),
         };
+        let head = String::from_utf8_lossy(head).into_owned();
         let headers = head
+            .trim_end_matches("\r\n")
             .split("\r\n")
             .filter_map(|line| line.split_once(':'))
             .map(|(n, v)| (String::from(n.trim()), String::from(v.trim())))
             .collect();
-        let body = body
-            .strip_suffix("\r\n")
-            .unwrap_or(body)
-            .as_bytes()
-            .to_vec();
+        let body = body.strip_suffix(b"\r\n").unwrap_or(body).to_vec();
 
         self.buffer.drain(..frame_end);
         Some(MsrpFrame {
@@ -785,6 +797,40 @@ impl MsrpConnection {
     /// Sends the CPIM message `cpim`
     pub fn send_cpim(&mut self, rt: &Runtime, from_path: &str, to_path: &str, cpim: &str) {
         self.send_content(rt, from_path, to_path, "message/cpim", cpim);
+    }
+
+    /// Sends `data` of `content_type`, as it is, which may not be text, in a
+    /// transaction of its own
+    pub fn send_data(
+        &mut self,
+        rt: &Runtime,
+        from_path: &str,
+        to_path: &str,
+        content_type: &str,
+        data: &[u8],
+    ) {
+        static SENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SENT.fetch_add(1, Ordering::SeqCst);
+        let mut frame = format!(
+            "MSRP relay-t{} SEND\r\n\
+To-Path: {}\r\n\
+From-Path: {}\r\n\
+Message-ID: relay-m{}\r\n\
+Byte-Range: 1-{}/{}\r\n\
+Content-Type: {}\r\n\
+\r\n",
+            n,
+            to_path,
+            from_path,
+            n,
+            data.len(),
+            data.len(),
+            content_type
+        )
+        .into_bytes();
+        frame.extend_from_slice(data);
+        frame.extend_from_slice(format!("\r\n-------relay-t{}$\r\n", n).as_bytes());
+        rt.block_on(self.stream.write_all(&frame)).unwrap();
     }
 
     /// Sends `content` of `content_type`
@@ -972,7 +1018,7 @@ Content-Length: {}\r\n\
 }
 
 /// The value of `a=name:` in an SDP
-fn sdp_attribute(sdp: &str, name: &str) -> Option<String> {
+pub fn sdp_attribute(sdp: &str, name: &str) -> Option<String> {
     let prefix = format!("a={}:", name);
     sdp.split("\r\n")
         .find_map(|line| line.strip_prefix(&prefix))
@@ -1014,7 +1060,7 @@ fn header_value_uri(message: &SipMessage, name: &str) -> String {
 }
 
 /// The peer's answer to the client's `request`
-fn answer(request: &SipMessage, status: &str, sdp: Option<&str>) -> String {
+pub fn answer(request: &SipMessage, status: &str, sdp: Option<&str>) -> String {
     answer_from(
         request,
         status,
@@ -2080,7 +2126,7 @@ fn an_outgoing_chat_ended_by_a_bye_is_started_again() {
 }
 
 /// The body of `message`, as sent
-fn body_data(message: &SipMessage) -> Vec<u8> {
+pub fn body_data(message: &SipMessage) -> Vec<u8> {
     use std::io::Read;
 
     let mut data = Vec::new();
@@ -8892,5 +8938,42 @@ fn a_new_era_of_a_kept_chat_goes_unused_in_the_session_there_is_by_then() {
     );
     assert!(encryption.abandoned.lock().unwrap().is_empty());
     assert_eq!(encryption.chats.lock().unwrap().len(), 1);
+    peer.silence();
+}
+
+#[test]
+fn what_the_focus_sends_of_an_encrypted_chat_goes_to_the_encryption_with_its_mls_group() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = joining_chats_in(&client);
+    let msrp = encrypted_chat_invitation(&client, &mut peer, "chat-focus", "");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    let our_path = sdp_attribute(&body(&ok), "path").expect("an a=path in the answer");
+    peer.send(&ack(&ok, "chat-focus"));
+    let mut connection = msrp.accept(&rt);
+
+    // of the MLS group of the chat, not of the Conversation-ID of the
+    // session (RCC.16 sections 6.1.1, 6.2.4)
+    connection.send_content(
+        &rt,
+        &msrp.path,
+        &our_path,
+        "message/cpim",
+        &format!(
+            "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:01.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: focus-1\r\n\r\nContent-Type: message/mls-rcs-server\r\n\r\nfrom the focus",
+            PEER, IMPU
+        ),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let taken = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.server_messages.lock().unwrap().is_empty()
+    });
+    assert!(taken);
+    assert_eq!(
+        *encryption.server_messages.lock().unwrap(),
+        [(String::from("chat-1"), b"from the focus".to_vec())]
+    );
     peer.silence();
 }
