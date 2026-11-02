@@ -3802,6 +3802,12 @@ impl CPMSessionService {
                             }
 
                             Err((error_code, error_reason)) => {
+                                // what the session was to start let go of
+                                // before the app is told, as the MLS group
+                                // of a new encrypted chat is
+                                if let Some(started) = started {
+                                    started(error_code, error_reason.clone(), None);
+                                }
                                 fail_invitation(
                                     &ongoing_outgoing_invitations,
                                     outgoing_invitation_,
@@ -3810,16 +3816,16 @@ impl CPMSessionService {
                                     &error_reason,
                                 );
                                 if let Some(message) = message {
-                                    (message.message_result_callback)(error_code, error_reason.clone());
-                                }
-                                if let Some(started) = started {
-                                    started(error_code, error_reason, None);
+                                    (message.message_result_callback)(error_code, error_reason);
                                 }
                                 return;
                             }
                         }
                     }
 
+                    if let Some(started) = started {
+                        started(500, String::from("Internal Error"), None);
+                    }
                     fail_invitation(
                         &ongoing_outgoing_invitations,
                         outgoing_invitation_,
@@ -3829,9 +3835,6 @@ impl CPMSessionService {
                     );
                     if let Some(message) = message {
                         (message.message_result_callback)(500, String::from("Internal Error"));
-                    }
-                    if let Some(started) = started {
-                        started(500, String::from("Internal Error"), None);
                     }
                 });
 
@@ -3858,11 +3861,11 @@ impl CPMSessionService {
         drop(invitations);
         drop(sessions);
 
-        if let Some(message) = message {
-            (message.message_result_callback)(500, String::from("Internal Error"));
-        }
         if let Some(started) = started {
             started(500, String::from("Internal Error"), None);
+        }
+        if let Some(message) = message {
+            (message.message_result_callback)(500, String::from("Internal Error"));
         }
     }
 }
