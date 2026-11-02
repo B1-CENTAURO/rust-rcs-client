@@ -51,6 +51,13 @@ RUSTFLAGS='-C link-arg=-Wl,-soname,librust_rcs_client.so' cargo build --target a
 ```
 
 
+### End-to-end encryption 端到端加密
+
+Built with the `e2ee` feature, the library encrypts chats end to end as GSMA RCC.16 specifies. See [docs/e2ee.md](docs/e2ee.md) for what the app provides and the order of the calls.
+
+使用 `e2ee` 特性编译时，本库按照 GSMA RCC.16 对聊天进行端到端加密，使用方法见 [docs/e2ee.md](docs/e2ee.md)。
+
+
 ### What's missing 缺失部分
 
 Although this library will work under most RCS network, I do have to point out there are features missing　that might cause problems under a different network coniguration.
