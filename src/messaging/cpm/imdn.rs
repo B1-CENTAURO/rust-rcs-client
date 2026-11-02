@@ -309,9 +309,8 @@ pub fn acknowledge_session_delivery<R>(
         let service_type = &session_info.cpm_contact.service_type;
         (
             matches!(service_type, CPMServiceType::Group),
-            matches!(service_type, CPMServiceType::OneToOne)
-                && session_info.encryption.is_some()
-                && session_info.mls_group().is_some(),
+            // a 1-to-1 session encrypted with the MLS group of its chat
+            matches!(service_type, CPMServiceType::OneToOne) && session_info.encryption.is_some(),
             ImdnService::of_chat(service_type),
         )
     };

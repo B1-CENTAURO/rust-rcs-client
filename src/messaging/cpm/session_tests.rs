@@ -8635,3 +8635,103 @@ fn a_display_notification_of_an_encrypted_chat_starts_a_session_of_it_if_there_i
     ));
     peer.silence();
 }
+
+#[test]
+fn the_notifications_of_a_re_sent_message_of_an_encrypted_chat_tell_of_its_original_message() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    // as the encryption decrypts a Re-Sent Message (RCC.16 section 10.4)
+    let plaintext = format!(
+        "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:05:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: peer-message-5\r\n{}NS: mls <http://www.gsma.com/rcs/mls>\r\nmls.Original-Message-ID: peer-message-1\r\n\r\nContent-Type: text/plain\r\n\r\nhi again",
+        PEER, IMPU, ASKING
+    );
+    let encryption = signing_chats_in(&client, &plaintext);
+    let msrp = encrypted_chat_invitation(&client, &mut peer, "chat-resent", "");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    let our_path = sdp_attribute(&body(&ok), "path").expect("an a=path in the answer");
+    peer.send(&ack(&ok, "chat-resent"));
+    let mut connection = msrp.accept(&rt);
+
+    connection.send_cpim(
+        &rt,
+        &msrp.path,
+        &our_path,
+        &encrypted_chat_cpim("peer-message-5"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(
+        client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .map(|r| r.2),
+        Ok(String::from("hi again"))
+    );
+    let send = connection.next_message(&rt);
+    connection.respond(&rt, &send, "200 OK");
+
+    // its delivery of the Re-Sent Message, with the Original-Message-ID
+    // (section 7.7.1)
+    {
+        let signed = encryption.signed.lock().unwrap();
+        assert_eq!(signed.len(), 1);
+        let (cpim, imdn) = signed_notification(&signed[0].1);
+        assert_eq!(
+            cpim.get_info().unwrap().mls_original_message_id,
+            Some(&b"peer-message-1"[..])
+        );
+        assert_eq!(imdn.message_id, "peer-message-5");
+    }
+
+    // and its display, asked for by the Message-ID of its Original Message,
+    // which the app knows it by (sections 7.7.3, 10.4)
+    let notice = client
+        .received_messages
+        .displayed("peer-message-1")
+        .unwrap();
+    assert!(client.sessions.send_chat_imdn(
+        &notice.sender_uri,
+        &notice.xml,
+        notice.original_message_id.as_deref(),
+        |_, _| {},
+        &client.core,
+        &rt,
+    ));
+    let send = connection.next_message(&rt);
+    connection.respond(&rt, &send, "200 OK");
+    {
+        let signed = encryption.signed.lock().unwrap();
+        assert_eq!(signed.len(), 2);
+        let (cpim, imdn) = signed_notification(&signed[1].1);
+        assert_eq!(
+            cpim.get_info().unwrap().mls_original_message_id,
+            Some(&b"peer-message-1"[..])
+        );
+        assert_eq!(
+            (imdn.message_id.as_str(), imdn.notification),
+            ("peer-message-5", Notification::Display)
+        );
+    }
+    peer.silence();
+}
+
+#[test]
+fn a_notification_of_an_encrypted_chat_is_not_sent_by_a_client_not_registered() {
+    let (client, mut peer) = start(false);
+    let encryption = signing_chats_in(&client, "");
+    encryption.chats.lock().unwrap().push((
+        String::from(PEER),
+        String::from("chat-1"),
+        Some(String::from(TOKEN)),
+    ));
+    assert!(!client.sessions.send_chat_imdn(
+        PEER,
+        "<imdn/>",
+        None,
+        |_, _| {},
+        &client.core,
+        &client.rt,
+    ));
+    assert!(encryption.signed.lock().unwrap().is_empty());
+    peer.silence();
+}
