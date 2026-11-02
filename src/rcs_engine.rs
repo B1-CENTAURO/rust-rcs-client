@@ -2973,11 +2973,31 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use super::{download_uri, reconnect_delay, DownloadOrigin};
+    use super::{download_uri, is_file_transfer, reconnect_delay, DownloadOrigin};
     use crate::connectivity::retry::Reconnect;
 
     fn no_group(_: &str) -> Option<String> {
         None
+    }
+
+    #[test]
+    fn a_file_transfer_message_is_known_by_its_type() {
+        for message_type in [
+            "application/vnd.gsma.rcs-ft-http+xml",
+            "Application/VND.GSMA.RCS-FT-HTTP+XML",
+            "application/vnd.gsma.rcs-ft-http+xml; charset=utf-8",
+            " application/vnd.gsma.rcs-ft-http+xml ",
+        ] {
+            assert!(is_file_transfer(message_type), "{}", message_type);
+        }
+        for message_type in [
+            "text/plain",
+            "application/vnd.gsma.rcs-ft-http",
+            "application/vnd.gsma.rcs-ft-http+xmlx",
+            "",
+        ] {
+            assert!(!is_file_transfer(message_type), "{}", message_type);
+        }
     }
 
     #[test]
