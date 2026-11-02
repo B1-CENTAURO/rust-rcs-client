@@ -41,6 +41,8 @@ mod ffi_tests;
 #[cfg(test)]
 mod group_tests;
 #[cfg(test)]
+mod interop_tests;
+#[cfg(test)]
 mod kds_tests;
 #[cfg(test)]
 mod provisioning_tests;
