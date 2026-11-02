@@ -21,6 +21,7 @@ use futures::executor::block_on;
 use rust_rcs_core::cpim::{CPIMHeaders, CPIMMessage};
 use rust_rcs_core::imdn::notification::{Imdn, Notification, Status};
 use rust_rcs_core::internet::Body;
+use rust_rcs_core::mls::rcs::certificate::participant_keys;
 use rust_rcs_core::mls::rcs::certificate::CertificateError;
 use rust_rcs_core::mls::rcs::era::EraBase;
 use rust_rcs_core::mls::rcs::imdn::{failure_reason, negative_delivery, FailureReason};
@@ -30,6 +31,7 @@ use rust_rcs_core::mls::rcs::proto::{
     MlsEnhancedGroupInfo, MlsGroupInfo, ServerCommitBundle, ServerMlsRcsMessage,
     WelcomeCommitBundle,
 };
+use rust_rcs_core::mls::rcs::verification::{identity_verification_code, VerifiedParticipant};
 use rust_rcs_core::mls::rcs::wire::{
     self, encode_message_list, AuthenticatedData, DeliveryNotificationStatus,
     DisplayNotificationStatus, VerifiableDeliveryImdn, VerifiableDerivedContent,
@@ -63,8 +65,9 @@ use super::kds_tests::{
 };
 use super::message::MessageError;
 use super::store::StoreError;
+use super::verification::VerificationError;
 
-const CONVERSATION: &str = "4f0e8b9c-3a71-4d2e-9b6a-2c5d8e1f7a30";
+pub(super) const CONVERSATION: &str = "4f0e8b9c-3a71-4d2e-9b6a-2c5d8e1f7a30";
 const IMPU: &str = "sip:+491701234567@ims.example.com";
 const FACTORY: &str = "sip:conference-factory@conf.example.com";
 /// A Participant the Home KDS has no Client of
@@ -835,7 +838,7 @@ fn the_groups_of_the_device_are_joined_while_it_is_kept() {
 
 /// Alice's device and Bob in the group of the conversation, the Commit
 /// making it accepted, both in epoch 1
-fn alice_and_bob() -> (Arc<E2eeDevice>, MlsClient, MlsConversation) {
+pub(super) fn alice_and_bob() -> (Arc<E2eeDevice>, MlsClient, MlsConversation) {
     let (bob, bobs) = bob_with_key_package();
     let (device, _) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
     let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
@@ -9372,5 +9375,124 @@ fn a_chat_is_not_joined_unless_of_the_contact_and_the_user_only() {
     assert_eq!(
         device.join_chat(BOB_TEL, &server_message, None),
         Ok(String::from(BOBS_CHAT))
+    );
+}
+
+/// The code of Alice, the user of `device`, and Bob, as Bob is shown it: his
+/// Participant first, each as its certificate tells it (RCC.16 Annex C.5)
+pub(super) fn code_bob_is_shown(device: &E2eeDevice, bob: &MlsClient) -> String {
+    let alices = participant_keys(&device.store().credential().unwrap()).unwrap();
+    let bobs = participant_keys(bob.credential()).unwrap();
+    identity_verification_code(
+        &VerifiedParticipant {
+            msisdn: "+491707654321",
+            participant_key: &bobs[0],
+        },
+        &VerifiedParticipant {
+            msisdn: "+491701234567",
+            participant_key: &alices[0],
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_identity_verification_code_is_of_the_user_and_a_contact_of_a_group() {
+    let (device, bob, _) = alice_and_bob();
+    let code = code_bob_is_shown(&device, &bob);
+    assert_ne!(
+        participant_keys(&device.store().credential().unwrap()).unwrap(),
+        participant_keys(bob.credential()).unwrap()
+    );
+
+    // the same as Bob is shown, whether he is told as tel or SIP URI
+    // (RCC.16 section 5.5)
+    assert_eq!(
+        device.identity_verification_code(BOB_TEL, Some(CONVERSATION)),
+        Ok(code.clone())
+    );
+    assert_eq!(
+        device.identity_verification_code(BOB_IMPU, Some(CONVERSATION)),
+        Ok(code)
+    );
+
+    // not without a group with him, nor for another contact, nor in a group
+    // not kept, nor for a contact of no number
+    for (contact, conversation_id) in [
+        (BOB_TEL, None),
+        (CAROL_TEL, Some(CONVERSATION)),
+        (BOB_TEL, Some("not-a-group")),
+        ("sip:bob@example.com", Some(CONVERSATION)),
+    ] {
+        assert_eq!(
+            device.identity_verification_code(contact, conversation_id),
+            Err(VerificationError::ContactUnknown),
+            "{} {:?}",
+            contact,
+            conversation_id
+        );
+    }
+}
+
+#[test]
+fn the_identity_verification_code_is_of_the_contact_of_the_encrypted_chat() {
+    let (device, kds) = enrolled(None);
+    let bob = bob();
+    let (_, server_message) =
+        focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 0), |_| {
+            Vec::new()
+        });
+    device.join_chat(BOB_IMPU, &server_message, None).unwrap();
+
+    let code = code_bob_is_shown(&device, &bob);
+    assert_eq!(
+        device.identity_verification_code(BOB_TEL, None),
+        Ok(code.clone())
+    );
+    // and with a group named that is none
+    assert_eq!(
+        device.identity_verification_code(BOB_IMPU, Some("not-a-group")),
+        Ok(code)
+    );
+}
+
+#[test]
+fn the_identity_verification_code_is_not_given_without_a_certificate_of_the_user() {
+    let (_, bobs) = bob_with_key_package();
+    let (device, kds, app) =
+        enrolled_with_app(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let bob = bob();
+    let (_, server_message) =
+        focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 0), |_| {
+            Vec::new()
+        });
+    device.join_chat(BOB_TEL, &server_message, None).unwrap();
+    let code = code_bob_is_shown(&device, &bob);
+    let kept = app.last().unwrap();
+
+    // not enrolled
+    let never = alice(&app, &kds, TODAY, None);
+    provision(&never, &[ALICE_TEL], None);
+    assert_eq!(
+        never.identity_verification_code(BOB_TEL, Some(BOBS_CHAT)),
+        Err(VerificationError::NotEnrolled)
+    );
+
+    // provisioned since with another number than its certificate's
+    provision(&device, &[CAROL_TEL], None);
+    assert_eq!(
+        device.identity_verification_code(BOB_TEL, None),
+        Err(VerificationError::NotEnrolled)
+    );
+
+    // restored and not provisioned yet, its certificate's number taken
+    let restored = alice(&app, &kds, TODAY, Some(&kept));
+    assert_eq!(restored.identity_verification_code(BOB_TEL, None), Ok(code));
+
+    // once its certificate expired
+    let expired = alice(&app, &kds, "2026-11-15", Some(&kept));
+    assert_eq!(
+        expired.identity_verification_code(BOB_TEL, None),
+        Err(VerificationError::NotEnrolled)
     );
 }

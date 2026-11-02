@@ -32,6 +32,7 @@ pub mod replace;
 pub mod sent;
 pub mod store;
 pub mod upgrade;
+pub mod verification;
 
 #[cfg(test)]
 mod device_tests;

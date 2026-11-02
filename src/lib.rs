@@ -90,6 +90,8 @@ use messaging::e2ee::ffi::{
 #[cfg(feature = "e2ee")]
 use messaging::e2ee::group::DeviceGroups;
 #[cfg(feature = "e2ee")]
+use messaging::e2ee::verification::VerificationError;
+#[cfg(feature = "e2ee")]
 use provisioning::characteristic::Characteristic;
 #[cfg(feature = "e2ee")]
 use provisioning::ims_application::ImsApplication;
@@ -760,6 +762,48 @@ pub unsafe extern "C" fn rcs_client_e2ee_enrol(
             });
         }
         _ => tell(-1),
+    }
+}
+
+/// Writes into `code`, which has room for 81 bytes, the identity
+/// verification code of the user and `contact`, a tel or SIP URI, for both
+/// to compare: 80 decimal digits then a NUL, the same whichever of the two
+/// asks (RCC.16 section 5.5, Annex C.5). The contact's Participant Key is
+/// taken from the certificates of its Clients, valid now, in the encrypted
+/// 1-to-1 chat with it, and in the group chat of Conversation-ID
+/// `conversation_id` if not null: of those, the one issued last. 0 if
+/// written; -1 if E2EE is not set or `contact` or `code` is null; -2 if the
+/// device holds no certificate valid now of the user configured; -3 if no
+/// certificate of the contact valid now is known there. Nothing is written
+/// but for 0.
+#[cfg(feature = "e2ee")]
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_identity_verification_code(
+    client: *mut RcsClient,
+    contact: *const c_char,
+    conversation_id: *const c_char,
+    code: *mut c_char,
+) -> i32 {
+    platform_log(LOG_TAG, "calling rcs_client_identity_verification_code()");
+
+    let Some(device) = client.as_ref().and_then(|client| client.e2ee.as_ref()) else {
+        return -1;
+    };
+    if contact.is_null() || code.is_null() {
+        return -1;
+    }
+    let contact = CStr::from_ptr(contact).to_string_lossy();
+    let conversation_id =
+        (!conversation_id.is_null()).then(|| CStr::from_ptr(conversation_id).to_string_lossy());
+    match device.identity_verification_code(&contact, conversation_id.as_deref()) {
+        Ok(digits) => {
+            for (i, byte) in digits.bytes().chain(std::iter::once(0)).enumerate() {
+                *code.add(i) = byte as c_char;
+            }
+            0
+        }
+        Err(VerificationError::NotEnrolled) => -2,
+        Err(VerificationError::ContactUnknown) => -3,
     }
 }
 
