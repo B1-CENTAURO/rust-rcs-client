@@ -103,13 +103,12 @@ use crate::messaging::config::MessagingConfigs;
 use crate::messaging::cpm::encryption::{GroupEncryption, MetadataChange, UploadedIcon};
 use crate::messaging::cpm::group_chat::{GroupIds, GroupInvitation};
 use crate::messaging::cpm::imdn::{
-    acknowledge_delivery, acknowledge_group_delivery, app_message_id, send_imdn, ImdnService,
+    acknowledge_delivery, acknowledge_session_delivery, app_message_id, send_imdn, ImdnService,
     ReceivedMessages, Refusal,
 };
 use crate::messaging::cpm::new_message_id;
 use crate::messaging::cpm::session::CPMSessionServiceWrapper;
 use crate::messaging::cpm::session::{CPMGroupEvent, CPMSessionService};
-use crate::messaging::cpm::sip::cpm_contact::CPMServiceType;
 use crate::messaging::cpm::standalone_messaging::StandaloneMessagingServiceWrapper;
 use crate::messaging::cpm::standalone_messaging::{self, StandaloneMessagingService};
 use crate::messaging::cpm::MessagingSessionHandle;
@@ -649,31 +648,18 @@ impl RcsEngine {
                             cpim_date,
                             cpim_from.as_deref(),
                         );
-                        let cpm_session = session.get_inner();
-                        let service_type = &cpm_session.get_session_info().cpm_contact.service_type;
-                        if let Some(service) = ImdnService::of_chat(service_type) {
-                            acknowledge_delivery(
-                                &received_messages_2,
-                                service,
-                                contact_uri,
-                                cpim_info,
-                                content_type.as_bytes(),
-                                || registered_identity(&state_2),
-                                &tm_2,
-                                &rt_2,
-                            );
-                        } else if let CPMServiceType::Group = *service_type {
-                            // the contact is the group's focus
-                            acknowledge_group_delivery(
-                                &received_messages_2,
-                                session,
-                                contact_uri,
-                                cpim_info,
-                                content_type.as_bytes(),
-                                || registered_identity(&state_2).map(|(_, impu)| impu),
-                                &rt_2,
-                            );
-                        }
+                        // in the session of a group, or of an encrypted
+                        // 1-to-1 chat, signed (RCC.16 section 9.1.3)
+                        acknowledge_session_delivery(
+                            &received_messages_2,
+                            session,
+                            contact_uri,
+                            cpim_info,
+                            content_type.as_bytes(),
+                            || registered_identity(&state_2),
+                            &tm_2,
+                            &rt_2,
+                        );
                     } else {
                         platform_log(LOG_TAG, "failed to decode cpim info as utf-8 string");
                     }
@@ -1553,9 +1539,12 @@ impl RcsEngine {
 
     /// Tells the sender of the message `message_id` that it was displayed, if
     /// it asked to be told: in the session with the group if the message was
-    /// taken in one, else by the service it came by. A message not among
-    /// those last taken is answered with 404, one that did not ask with 403,
-    /// and one of a group there is no session with any longer with 480.
+    /// taken in one; in a session of the encrypted 1-to-1 chat if taken in
+    /// one, signed, a new session of the chat started if there is none
+    /// (RCC.16 section 9.1.4); else, or if no chat is kept with the contact
+    /// any longer, by the service it came by. A message not among those last
+    /// taken is answered with 404, one that did not ask with 403, and one of
+    /// a group there is no session with any longer with 480.
     pub fn send_display_notification<F>(
         &self,
         message_id: &str,
@@ -1600,6 +1589,31 @@ impl RcsEngine {
             }
             return;
         }
+
+        // signed in a session of the encrypted 1-to-1 chat it was taken in,
+        // one started if there is none (RCC.16 section 9.1.4)
+        let result_callback = Arc::new(Mutex::new(Some(result_callback)));
+        if let Some(contact) = &notice.chat {
+            let result_callback_ = Arc::clone(&result_callback);
+            if self.cpm_session_service.send_chat_imdn(
+                contact,
+                &notice.xml,
+                notice.original_message_id.as_deref(),
+                move |status_code, reason_phrase| {
+                    let result_callback = result_callback_.lock().unwrap().take();
+                    if let Some(result_callback) = result_callback {
+                        result_callback(status_code, reason_phrase);
+                    }
+                },
+                &self.core,
+                &rt,
+            ) {
+                return;
+            }
+        }
+        let Some(result_callback) = result_callback.lock().unwrap().take() else {
+            return;
+        };
 
         match registered_identity(&self.state) {
             Some((transport, public_user_identity)) => send_imdn(
