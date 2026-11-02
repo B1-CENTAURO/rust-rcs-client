@@ -1442,6 +1442,325 @@ fn a_new_encrypted_chat_goes_in_the_session_there_is_by_then() {
     peer.silence();
 }
 
+/// An INVITE from the peer starting an encrypted 1-to-1 chat, as its
+/// Conversation Focus fans it out: the SDP, then the CPIM message of its MLS
+/// group (RCC.16 sections 8.1.1, 8.2.1), with the headers `extra`
+fn encrypted_chat_invitation(
+    client: &Client,
+    peer: &mut Peer,
+    call_id: &str,
+    extra: &str,
+) -> MsrpPeer {
+    let msrp = MsrpPeer::listen(&client.rt);
+    let cpim = format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:00.000Z\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: welcome-1\r\n\
+\r\n\
+Content-Type: message/mls-rcs-server\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+{}",
+        PEER,
+        IMPU,
+        general_purpose::STANDARD.encode(WELCOME)
+    );
+    let body = format!(
+        "--part-1\r\nContent-Type: application/sdp\r\n\r\n{}\r\n--part-1\r\nContent-Type: message/cpim\r\n\r\n{}\r\n--part-1--\r\n",
+        msrp.sdp("sendrecv"),
+        cpim
+    );
+    peer.send(&invite(
+        call_id,
+        "<sip:+15559876@192.0.2.1:5060;transport=tcp>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+        PEER,
+        "cpm.session",
+        extra,
+        "multipart/mixed; boundary=part-1",
+        &body,
+    ));
+    msrp
+}
+
+/// The client joining encrypted 1-to-1 chats in the MLS group `chat-1`
+fn joining_chats_in(client: &Client) -> Arc<ScriptedEncryption> {
+    let encryption = Arc::new(ScriptedEncryption {
+        encrypting: vec![String::from("chat-1")],
+        ciphertext: Some(String::from("ciphertext")),
+        joining_chat: Some(String::from("chat-1")),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    encryption
+}
+
+#[test]
+fn an_encrypted_chat_invitation_is_joined_with_the_mls_group_it_carries() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = joining_chats_in(&client);
+
+    // joined, kept with the token the INVITE carried (RCC.16 sections 6.1.3,
+    // 8.1.1), and taking what the Focus sends of it
+    let msrp = encrypted_chat_invitation(
+        &client,
+        &mut peer,
+        "chat-joined",
+        &format!("MLS-Opaque-Token: {}\r\n", TOKEN),
+    );
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert_eq!(
+        *encryption.chats_joined.lock().unwrap(),
+        [(
+            String::from(PEER),
+            WELCOME.to_vec(),
+            Some(String::from(TOKEN))
+        )]
+    );
+    assert_eq!(
+        sdp_attribute(&body(&ok), "accept-wrapped-types").as_deref(),
+        Some("multipart/mixed text/plain application/vnd.gsma.rcs-ft-http+xml application/vnd.gsma.rcspushlocation+xml message/imdn+xml message/mls message/mls-rcs-server")
+    );
+    peer.send(&ack(&ok, "chat-joined"));
+    let mut connection = msrp.accept(&rt);
+
+    // its messages encrypted with its MLS group
+    let sent = client.send(PEER, RecipientType::Contact, "hi");
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, b"ciphertext");
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        sent.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    assert_eq!(encryption.encrypted.lock().unwrap()[0].0, "chat-1");
+    assert_eq!(
+        *encryption.chats.lock().unwrap(),
+        [(
+            String::from(PEER),
+            String::from("chat-1"),
+            Some(String::from(TOKEN))
+        )]
+    );
+    assert!(encryption.abandoned.lock().unwrap().is_empty());
+    peer.silence();
+}
+
+#[test]
+fn the_requests_of_an_encrypted_chat_joined_carry_its_mls_opaque_token() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        encrypting: vec![String::from("chat-1")],
+        joining_chat: Some(String::from("chat-1")),
+        out_of_step: std::sync::atomic::AtomicBool::new(true),
+        pulling: vec![(
+            &b"MLS-Enhanced-Group-Info-Pull"[..],
+            Some(b"epoch 1".to_vec()),
+        )],
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let msrp = encrypted_chat_invitation(
+        &client,
+        &mut peer,
+        "chat-healed",
+        &format!("MLS-Opaque-Token: {}\r\n", TOKEN),
+    );
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "chat-healed"));
+    let mut connection = msrp.accept(&rt);
+    let our_path = sdp_attribute(&body(&ok), "path").expect("an a=path in the answer");
+
+    // self-healed as the group of the chat, with the token (RCC.16 sections
+    // 6.1.3, 10.1)
+    connection.send_content(
+        &rt,
+        &msrp.path,
+        &our_path,
+        "message/cpim",
+        &encrypted_group_cpim(PEER, "", "not to be decrypted"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let info = peer.next_request("INFO");
+    assert_eq!(header_value(&info, "MLS-Opaque-Token"), TOKEN);
+    peer.send(&answer(&info, "469 Bad Info Package", None));
+    let healed = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.healed.lock().unwrap().is_empty()
+    });
+    assert!(healed);
+    assert_eq!(encryption.healed.lock().unwrap()[0].0, "chat-1");
+}
+
+#[test]
+fn the_requests_of_a_kept_chat_carry_its_token_kept() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        encrypting: vec![String::from("chat-1")],
+        out_of_step: std::sync::atomic::AtomicBool::new(true),
+        pulling: vec![(
+            &b"MLS-Enhanced-Group-Info-Pull"[..],
+            Some(b"epoch 1".to_vec()),
+        )],
+        ..ScriptedEncryption::default()
+    });
+    encryption.chats.lock().unwrap().push((
+        String::from(PEER),
+        String::from("chat-1"),
+        Some(String::from(TOKEN)),
+    ));
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+
+    // an INVITE carrying none, the token kept carried (RCC.16 section 6.1.3)
+    let msrp = MsrpPeer::listen(&rt);
+    peer.send(&chat_invite("chat-kept-token", &msrp.sdp("sendrecv")));
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    peer.send(&ack(&ok, "chat-kept-token"));
+    let mut connection = msrp.accept(&rt);
+    let our_path = sdp_attribute(&body(&ok), "path").expect("an a=path in the answer");
+    connection.send_content(
+        &rt,
+        &msrp.path,
+        &our_path,
+        "message/cpim",
+        &encrypted_group_cpim(PEER, "", "not to be decrypted"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let info = peer.next_request("INFO");
+    assert_eq!(header_value(&info, "MLS-Opaque-Token"), TOKEN);
+    peer.send(&answer(&info, "469 Bad Info Package", None));
+    assert_eq!(
+        *encryption.chats.lock().unwrap(),
+        [(
+            String::from(PEER),
+            String::from("chat-1"),
+            Some(String::from(TOKEN))
+        )]
+    );
+}
+
+#[test]
+fn an_encrypted_chat_invitation_not_joined_is_refused() {
+    let (client, mut peer) = start(true);
+    let encryption = Arc::new(ScriptedEncryption::default());
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let _msrp = encrypted_chat_invitation(&client, &mut peer, "chat-not-joined", "");
+    assert_eq!(status_code(&peer.next_response()), 488);
+    assert_eq!(encryption.chats_joined.lock().unwrap().len(), 1);
+    assert!(encryption.chats.lock().unwrap().is_empty());
+    // answered so alone
+    peer.silence();
+}
+
+#[test]
+fn an_encrypted_chat_invitation_declined_lets_its_mls_group_go() {
+    let (client, mut peer) = start(true);
+    let encryption = joining_chats_in(&client);
+    client.chat_answer.store(486, Ordering::SeqCst);
+    let _msrp = encrypted_chat_invitation(&client, &mut peer, "chat-declined", "");
+    assert_ne!(status_code(&peer.next_response()), 200);
+    let abandoned = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.abandoned.lock().unwrap().is_empty()
+    });
+    assert!(abandoned);
+    assert_eq!(*encryption.abandoned.lock().unwrap(), ["chat-1"]);
+}
+
+#[test]
+fn an_invitation_of_a_kept_chat_is_encrypted_with_its_mls_group() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = joining_chats_in(&client);
+    encryption.chats.lock().unwrap().push((
+        String::from(PEER),
+        String::from("chat-1"),
+        Some(String::from("old")),
+    ));
+
+    // the SDP alone, a new token kept in place of the old one (RCC.16
+    // section 6.1.3)
+    let msrp = MsrpPeer::listen(&rt);
+    peer.send(&invite(
+        "chat-kept",
+        "<sip:+15559876@192.0.2.1:5060;transport=tcp>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+        PEER,
+        "cpm.session",
+        &format!("MLS-Opaque-Token: {}\r\n", TOKEN),
+        "application/sdp",
+        &msrp.sdp("sendrecv"),
+    ));
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert!(encryption.chats_joined.lock().unwrap().is_empty());
+    assert!(String::from_utf8_lossy(&body_data(&ok)).contains("message/mls-rcs-server"));
+    peer.send(&ack(&ok, "chat-kept"));
+    let mut connection = msrp.accept(&rt);
+    let sent = client.send(PEER, RecipientType::Contact, "hi again");
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, b"ciphertext");
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        sent.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    assert_eq!(encryption.encrypted.lock().unwrap()[0].0, "chat-1");
+    assert_eq!(
+        *encryption.chats.lock().unwrap(),
+        [(
+            String::from(PEER),
+            String::from("chat-1"),
+            Some(String::from(TOKEN))
+        )]
+    );
+    peer.silence();
+}
+
+#[test]
+fn an_invitation_from_a_contact_of_no_kept_chat_is_not_encrypted() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = joining_chats_in(&client);
+    // nor of one whose MLS group was moved to unencrypted
+    encryption.chats.lock().unwrap().push((
+        String::from(PEER),
+        String::from("chat-unencrypted"),
+        None,
+    ));
+    let msrp = MsrpPeer::listen(&rt);
+    peer.send(&chat_invite("chat-plain", &msrp.sdp("sendrecv")));
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert!(!String::from_utf8_lossy(&body_data(&ok)).contains("message/mls"));
+    peer.send(&ack(&ok, "chat-plain"));
+    let mut connection = msrp.accept(&rt);
+    let sent = client.send(PEER, RecipientType::Contact, "hi");
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_text(&send.body), "hi");
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        sent.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    assert!(encryption.encrypted.lock().unwrap().is_empty());
+    peer.silence();
+}
+
 #[test]
 fn a_refused_chat_fails_its_messages_and_the_next_starts_another() {
     let (client, mut peer) = start(true);
@@ -2503,6 +2822,12 @@ struct ScriptedEncryption {
     chatting: Option<(String, Vec<u8>)>,
     /// What it waits for before giving them, if anything
     chat_held: Option<Arc<tokio::sync::Notify>>,
+    /// The MLS group of each encrypted 1-to-1 chat joined, if it joins
+    /// them
+    joining_chat: Option<String>,
+    /// The contact, server message and token of each chat it is asked to
+    /// join
+    chats_joined: std::sync::Mutex<Vec<(String, Vec<u8>, Option<String>)>>,
 }
 
 impl GroupEncryption for ScriptedEncryption {
@@ -2784,6 +3109,22 @@ impl GroupEncryption for ScriptedEncryption {
             }
             prepared
         })
+    }
+
+    fn join_chat(
+        &self,
+        contact: &str,
+        server_message: &[u8],
+        mls_opaque_token: Option<String>,
+    ) -> Option<String> {
+        self.chats_joined.lock().unwrap().push((
+            String::from(contact),
+            server_message.to_vec(),
+            mls_opaque_token.clone(),
+        ));
+        let group_id = self.joining_chat.clone()?;
+        self.keep_chat(contact, &group_id, mls_opaque_token);
+        Some(group_id)
     }
 
     fn keep_chat(&self, contact: &str, group_id: &str, mls_opaque_token: Option<String>) {
@@ -3740,6 +4081,15 @@ impl GroupEncryption for EncryptingPrepared {
         from: String,
     ) -> BoxFuture<'static, Option<(String, Vec<u8>)>> {
         self.0.prepare_chat(contact, from)
+    }
+
+    fn join_chat(
+        &self,
+        contact: &str,
+        server_message: &[u8],
+        mls_opaque_token: Option<String>,
+    ) -> Option<String> {
+        self.0.join_chat(contact, server_message, mls_opaque_token)
     }
 
     fn keep_chat(&self, contact: &str, group_id: &str, mls_opaque_token: Option<String>) {

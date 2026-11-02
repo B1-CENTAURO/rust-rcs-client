@@ -9239,3 +9239,138 @@ fn a_contact_not_taking_an_encrypted_chat_is_not_asked_again_for_an_hour() {
     assert_eq!(prepare("sip:dave@example.com"), None);
     assert_eq!(asked.lock().unwrap().len(), 3);
 }
+
+const BOBS_CHAT: &str = "9d1c0a52-7b0e-4f3a-8e6d-2b4c5a6d7e8f";
+
+#[test]
+fn a_chat_another_starts_is_joined_with_the_welcome_its_invite_carries() {
+    let (device, kds) = enrolled(None);
+    let bob = bob();
+    let (mut bobs_chat, server_message) =
+        focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 0), |_| {
+            Vec::new()
+        });
+
+    // whatever the ID of its MLS group, kept by the tel URI of the contact
+    // with the token the INVITE carried (RCC.16 sections 6.1.1, 6.1.3,
+    // 8.1.1)
+    assert_eq!(
+        device.join_chat(BOB_IMPU, &server_message, Some("token-1")),
+        Ok(String::from(BOBS_CHAT))
+    );
+    assert_eq!(
+        device.chat_group(BOB_TEL),
+        Some((String::from(BOBS_CHAT), Some(String::from("token-1"))))
+    );
+    assert_eq!(epoch(&device, BOBS_CHAT), Ok((1, false)));
+
+    // in it with Bob
+    let sent = bobs_chat.encrypt(&bob, b"hello Alice").unwrap();
+    let received = device
+        .store()
+        .with_conversation(BOBS_CHAT.as_bytes(), |conversation, client| {
+            conversation.process(client, &sent)
+        });
+    match received {
+        Ok(IncomingMessage::Application { data, .. }) => assert_eq!(data, b"hello Alice"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+
+    // a new Era of it joined in its place, the chat kept on, as Bob makes
+    // one from another state
+    let bob = super::kds_tests::bob();
+    let mut next = bob
+        .create_conversation(Some(BOBS_CHAT.as_bytes()), 1)
+        .unwrap();
+    let output = next
+        .add_members(&bob, &[&uploaded_key_package(&kds, 1)])
+        .unwrap();
+    next.merge_pending_commit(&bob).unwrap();
+    let next_era = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: encode_message_list(&[&output.commit]).unwrap(),
+                welcome: output.welcome.unwrap(),
+                ratchet_tree: output.ratchet_tree.unwrap(),
+                ..ServerCommitBundle::default()
+            },
+        )),
+    });
+    assert_eq!(
+        device.join_chat(BOB_TEL, &next_era, None),
+        Ok(String::from(BOBS_CHAT))
+    );
+    assert_eq!(
+        device.chat_group(BOB_TEL),
+        Some((String::from(BOBS_CHAT), None))
+    );
+    assert!(device.store().has_conversation(BOBS_CHAT.as_bytes()));
+}
+
+#[test]
+fn a_chat_joined_anew_lets_the_one_kept_go() {
+    let (device, kds) = enrolled(None);
+    let bob = bob();
+    let (_, first) = focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 0), |_| {
+        Vec::new()
+    });
+    device.join_chat(BOB_TEL, &first, None).unwrap();
+
+    // Bob, having lost his, starts another
+    let other = "0f1e2d3c-4b5a-4968-8776-655443322110";
+    let (_, second) = focus_welcome(&bob, other, &uploaded_key_package(&kds, 1), |_| Vec::new());
+    assert_eq!(
+        device.join_chat(BOB_TEL, &second, None),
+        Ok(String::from(other))
+    );
+    assert_eq!(
+        device.chat_group(BOB_TEL),
+        Some((String::from(other), None))
+    );
+    assert!(!device.store().has_conversation(BOBS_CHAT.as_bytes()));
+    assert!(device.notes().read(|data| data.chats.len() == 1));
+}
+
+#[test]
+fn a_chat_is_not_joined_unless_of_the_contact_and_the_user_only() {
+    let (device, kds) = enrolled(None);
+    let bob = bob();
+    let (_, server_message) =
+        focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 0), |_| {
+            Vec::new()
+        });
+
+    // Bob's, told as another contact's, a Participant of the chat being
+    // neither the contact nor the user
+    assert!(device.join_chat(CAROL_TEL, &server_message, None).is_err());
+    assert_eq!(device.chat_group(CAROL_TEL), None);
+    assert!(!device.store().has_conversation(BOBS_CHAT.as_bytes()));
+    // nor of a contact of no number, nor what is no Welcome
+    assert!(device
+        .join_chat("sip:bob@example.com", &server_message, None)
+        .is_err());
+    assert!(device
+        .join_chat(BOB_TEL, &focus_commit(&[b"not a commit"]), None)
+        .is_err());
+    assert!(device.join_chat(BOB_TEL, b"not a message", None).is_err());
+    assert_eq!(device.chat_group(BOB_TEL), None);
+    // nor one whose bundled message is not one of the group, as joining a
+    // group does
+    let bob = super::kds_tests::bob();
+    let (_, bundled_wrong) = focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 2), |_| {
+        b"not a message".to_vec()
+    });
+    assert!(device.join_chat(BOB_TEL, &bundled_wrong, None).is_err());
+    assert!(!device.store().has_conversation(BOBS_CHAT.as_bytes()));
+
+    // Bob's own then, with a KeyPackage of the device not used yet
+    let bob = super::kds_tests::bob();
+    let (_, server_message) =
+        focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 1), |_| {
+            Vec::new()
+        });
+    assert_eq!(
+        device.join_chat(BOB_TEL, &server_message, None),
+        Ok(String::from(BOBS_CHAT))
+    );
+}

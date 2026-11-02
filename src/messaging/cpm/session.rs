@@ -566,9 +566,15 @@ pub struct CPMSession {
 
 impl CPMSession {
     pub fn new(session_info: CPMSessionInfo) -> CPMSession {
+        // that of an encrypted 1-to-1 chat, which its requests carry (RCC.16
+        // section 6.1.3); a group's is taken once it starts
+        let mls_opaque_token = session_info
+            .mls_group_id
+            .as_ref()
+            .and(session_info.mls_opaque_token.clone());
         CPMSession {
             session_info,
-            mls_opaque_token: Arc::new(Mutex::new(None)),
+            mls_opaque_token: Arc::new(Mutex::new(mls_opaque_token)),
             session_state: Arc::new(Mutex::new(CPMSessionState::Negotiating(
                 CPMSessionNegotiationState::NoneSet,
             ))),
@@ -3796,6 +3802,12 @@ impl CPMSessionService {
                             }
 
                             Err((error_code, error_reason)) => {
+                                // what the session was to start let go of
+                                // before the app is told, as the MLS group
+                                // of a new encrypted chat is
+                                if let Some(started) = started {
+                                    started(error_code, error_reason.clone(), None);
+                                }
                                 fail_invitation(
                                     &ongoing_outgoing_invitations,
                                     outgoing_invitation_,
@@ -3804,16 +3816,16 @@ impl CPMSessionService {
                                     &error_reason,
                                 );
                                 if let Some(message) = message {
-                                    (message.message_result_callback)(error_code, error_reason.clone());
-                                }
-                                if let Some(started) = started {
-                                    started(error_code, error_reason, None);
+                                    (message.message_result_callback)(error_code, error_reason);
                                 }
                                 return;
                             }
                         }
                     }
 
+                    if let Some(started) = started {
+                        started(500, String::from("Internal Error"), None);
+                    }
                     fail_invitation(
                         &ongoing_outgoing_invitations,
                         outgoing_invitation_,
@@ -3823,9 +3835,6 @@ impl CPMSessionService {
                     );
                     if let Some(message) = message {
                         (message.message_result_callback)(500, String::from("Internal Error"));
-                    }
-                    if let Some(started) = started {
-                        started(500, String::from("Internal Error"), None);
                     }
                 });
 
@@ -3852,11 +3861,11 @@ impl CPMSessionService {
         drop(invitations);
         drop(sessions);
 
-        if let Some(message) = message {
-            (message.message_result_callback)(500, String::from("Internal Error"));
-        }
         if let Some(started) = started {
             started(500, String::from("Internal Error"), None);
+        }
+        if let Some(message) = message {
+            (message.message_result_callback)(500, String::from("Internal Error"));
         }
     }
 }
@@ -4697,6 +4706,79 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                     },
 
                                     _ => {
+                                        // an encrypted 1-to-1 chat: joined
+                                        // with the MLS group its INVITE
+                                        // carries, or a new session of the
+                                        // chat kept with the contact, with
+                                        // the token given anew if one is
+                                        // (RCC.16 sections 6.1.3, 8.1.1)
+                                        let group_encryption =
+                                            self.service.group_encryption.lock().unwrap().clone();
+                                        if let (CPMServiceType::OneToOne, Some(encryption)) = (
+                                            &session_info.cpm_contact.service_type,
+                                            group_encryption,
+                                        ) {
+                                            let contact = session_info.asserted_contact_uri.clone();
+                                            match &mls_group {
+                                                Some(server_message) => {
+                                                    let Some(group_id) = encryption.join_chat(
+                                                        &contact,
+                                                        server_message,
+                                                        session_info.mls_opaque_token.clone(),
+                                                    ) else {
+                                                        if let Some(resp_message) =
+                                                            server_transaction::make_response(
+                                                                message,
+                                                                transaction.to_tag(),
+                                                                488,
+                                                                b"Not Acceptable Here",
+                                                            )
+                                                        {
+                                                            if let Some((tx, _)) = channels.take() {
+                                                                server_transaction::send_response(
+                                                                    Arc::clone(transaction),
+                                                                    resp_message,
+                                                                    tx,
+                                                                    rt,
+                                                                );
+                                                            }
+                                                        }
+                                                        return true;
+                                                    };
+                                                    session_info.mls_group_id =
+                                                        Some(group_id.clone());
+                                                    session_info.encryption =
+                                                        Some(Arc::clone(&encryption));
+                                                    joined = Some((encryption, group_id));
+                                                }
+                                                None => {
+                                                    let kept = encryption
+                                                        .chat_group(&contact)
+                                                        .filter(|(group_id, _)| {
+                                                            encryption.encrypts(group_id)
+                                                        });
+                                                    if let Some((group_id, kept_token)) = kept {
+                                                        if let Some(token) =
+                                                            &session_info.mls_opaque_token
+                                                        {
+                                                            encryption.keep_chat(
+                                                                &contact,
+                                                                &group_id,
+                                                                Some(token.clone()),
+                                                            );
+                                                        }
+                                                        session_info.mls_opaque_token =
+                                                            session_info
+                                                                .mls_opaque_token
+                                                                .clone()
+                                                                .or(kept_token);
+                                                        session_info.mls_group_id = Some(group_id);
+                                                        session_info.encryption = Some(encryption);
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         let mut is_chatbot_session = false;
 
                                         for header in req_headers {

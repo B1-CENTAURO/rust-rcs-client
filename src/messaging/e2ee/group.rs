@@ -506,7 +506,7 @@ impl E2eeDevice {
 
     /// The Era of the group `conversation_id` the device has, and the
     /// continuity token it keeps for it
-    fn era_and_token(&self, conversation_id: &str) -> Option<(u32, Vec<u8>)> {
+    pub(super) fn era_and_token(&self, conversation_id: &str) -> Option<(u32, Vec<u8>)> {
         self.store()
             .peek_conversation(conversation_id.as_bytes(), |conversation, client| {
                 let token = continuity_token(client, conversation.group_id()).ok()?;
@@ -1373,6 +1373,22 @@ impl GroupEncryption for DeviceGroups {
                 }
             }
         })
+    }
+
+    fn join_chat(
+        &self,
+        contact: &str,
+        server_message: &[u8],
+        mls_opaque_token: Option<String>,
+    ) -> Option<String> {
+        let device = self.device.upgrade()?;
+        match device.join_chat(contact, server_message, mls_opaque_token.as_deref()) {
+            Ok(group_id) => Some(group_id),
+            Err(e) => {
+                platform_log(LOG_TAG, format!("chat not joined: {:?}", e));
+                None
+            }
+        }
     }
 
     fn keep_chat(&self, contact: &str, group_id: &str, mls_opaque_token: Option<String>) {

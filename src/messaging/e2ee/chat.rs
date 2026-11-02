@@ -28,9 +28,11 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use rust_rcs_core::ffi::log::platform_log;
+use rust_rcs_core::mls::rcs::proto::{self, server_mls_rcs_message, ServerMlsRcsMessage};
 use rust_rcs_core::mls::rcs::same_tel_uri;
+use rust_rcs_core::mls::ErrorKind;
 
-use super::device::{participant_tel_uri, E2eeDevice};
+use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice};
 use super::notes::{put, Reader as NotesReader};
 use super::store::StoreError;
 
@@ -118,6 +120,88 @@ impl E2eeDevice {
                 .retain(|kept| !same_tel_uri(&kept.contact, &chat.contact));
             data.chats.push(chat);
         })
+    }
+
+    /// Joins the MLS group of the encrypted 1-to-1 chat `contact` started,
+    /// with the Welcome its Conversation Focus sent in `server_message`, the
+    /// group of whatever ID (RCC.16 sections 6.1.1, 8.1, 8.1.1): its ID; kept
+    /// as the chat with `contact`, with the MLS-Opaque-Token the INVITE
+    /// carried if it did (section 6.1.3), in place of any other, whose MLS
+    /// group is let go of
+    ///
+    /// Not joined if a member is a Client of a Participant other than the
+    /// contact and the user, as a 1-to-1 chat has no other; nor if the
+    /// contact has no number. A message bundled with the Welcome is
+    /// decrypted, as joining a group does.
+    pub fn join_chat(
+        &self,
+        contact: &str,
+        server_message: &[u8],
+        mls_opaque_token: Option<&str>,
+    ) -> Result<String, StoreError> {
+        let contact_tel = contact_tel_uri(contact).ok_or(StoreError::Mls(ErrorKind::Rejected))?;
+        let message: ServerMlsRcsMessage =
+            proto::decode(server_message).map_err(StoreError::Mls)?;
+        let bundle = match message.payload {
+            Some(server_mls_rcs_message::Payload::ServerCommitBundle(bundle))
+                if !bundle.welcome.is_empty() =>
+            {
+                bundle
+            }
+            _ => return Err(StoreError::Mls(ErrorKind::UnexpectedMessage)),
+        };
+
+        let previous = self.chat_group(contact).map(|(group_id, _)| group_id);
+        let had = previous
+            .as_deref()
+            .and_then(|group_id| self.era_and_token(group_id));
+        let (group_id, ()) = self.store().add_conversation(|client| {
+            let mut conversation =
+                client.join_conversation(&bundle.welcome, &bundle.ratchet_tree)?;
+            // of the contact's Clients and the user's only
+            let of_the_chat = conversation.members().iter().all(|member| {
+                is_of(member, &contact_tel) || same_participant(member, client.credential())
+            });
+            let joined = if !of_the_chat || std::str::from_utf8(conversation.group_id()).is_err() {
+                Err(ErrorKind::Rejected)
+            } else if bundle.private_message.is_empty() {
+                Ok(())
+            } else {
+                conversation
+                    .process(client, &bundle.private_message)
+                    .map(|_| ())
+            };
+            match joined {
+                Ok(()) => Ok((conversation, ())),
+                Err(e) => {
+                    let _ = conversation.delete(client);
+                    Err(e)
+                }
+            }
+        })?;
+        let group_id = String::from_utf8_lossy(&group_id).into_owned();
+
+        // a new Era of the chat kept has its keys checked, as a group's has
+        // (section 10.5.1); another chat in its place, the one kept let go of
+        match previous {
+            Some(previous) if previous == group_id => {
+                if let (Some((era, token)), Some((new_era, new_token))) =
+                    (had, self.era_and_token(&group_id))
+                {
+                    if new_era > era {
+                        self.recoveries().check(&group_id, token != new_token);
+                    }
+                }
+            }
+            Some(previous) => {
+                if let Err(e) = self.abandon(&previous) {
+                    platform_log(LOG_TAG, format!("chat replaced not let go of: {:?}", e));
+                }
+            }
+            None => {}
+        }
+        self.keep_chat(contact, &group_id, mls_opaque_token)?;
+        Ok(group_id)
     }
 
     /// Lets go of the 1-to-1 chat whose MLS group is `group_id`, if one's is
