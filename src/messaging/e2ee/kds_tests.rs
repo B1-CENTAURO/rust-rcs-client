@@ -97,6 +97,9 @@ pub(super) fn signer(key: &str, public_key: &str) -> SignatureKeyPair {
 #[derive(Default)]
 pub(super) struct App {
     pub(super) kept: Mutex<Vec<Vec<u8>>>,
+    /// Whether it refuses to keep the state of a device, as when out of
+    /// space
+    pub(super) refusing: AtomicBool,
 }
 
 impl App {

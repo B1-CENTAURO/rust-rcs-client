@@ -10001,6 +10001,18 @@ fn groups_to_heal_or_make_anew_are_so_after_the_device_restarted() {
         Some(NextEra::Encrypted)
     );
 
+    // taken all the same if it cannot be kept, until the device stops
+    device.heals().start_over(CONVERSATION);
+    app.refusing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    device.heals().want(CONVERSATION);
+    assert!(device.needs_healing(CONVERSATION));
+    app.refusing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    drop(device);
+    let device = restarted();
+    assert!(!device.needs_healing(CONVERSATION));
+
     // nothing for a group let go of
     device.heals().want(CONVERSATION);
     device.abandon(CONVERSATION).unwrap();
@@ -10058,4 +10070,54 @@ fn a_group_whose_focus_has_no_mls_group_is_so_after_the_device_restarted() {
     assert!(!groups.upgrade_due(CONVERSATION));
     clock.advance(2 * HOUR);
     assert!(groups.upgrade_due(CONVERSATION));
+
+    // nothing for a group let go of
+    device.abandon(CONVERSATION).unwrap();
+    drop(groups);
+    drop(device);
+    let device = restarted();
+    assert!(!device.upgrades().without_group(CONVERSATION));
+}
+
+#[test]
+fn the_self_healing_tried_lately_is_counted_through_restarts() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let clock = Clock::new();
+    let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
+    // how often the Focus is asked for the GroupInfo, the group out of step
+    let healed = |device: &Arc<E2eeDevice>| {
+        let (query, _) = answering(&[]);
+        let groups = DeviceGroups::new(device, query);
+        device.heals().want(CONVERSATION);
+        let up_to_date = proto::encode(&MlsEnhancedGroupInfo {
+            latest_epoch_identifier: Some(epoch_identifier(device, CONVERSATION)),
+            ..MlsEnhancedGroupInfo::default()
+        });
+        let (pull, asked) = focus_answering(vec![Some((200, up_to_date))]);
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        ));
+        let asked = asked.lock().unwrap().len();
+        asked
+    };
+    for _ in 0..3 {
+        assert_eq!(healed(&device), 1);
+    }
+    drop(device);
+
+    // five times in a day at most (RCC.16 section 10.1), those before the
+    // restart counted; its next Era due then
+    let device = alice_restarted(&app, &kds, &clock);
+    for _ in 0..2 {
+        assert_eq!(healed(&device), 1);
+    }
+    assert_eq!(healed(&device), 0);
+    assert!(device.new_era_due(CONVERSATION));
+
+    // and again the next day
+    clock.advance(DAY);
+    assert_eq!(healed(&device), 1);
 }

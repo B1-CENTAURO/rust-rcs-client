@@ -84,6 +84,9 @@ pub(super) fn alice(
         HOME_KDS,
         Arc::clone(kds) as Arc<dyn KeyDistribution>,
         Box::new(move |state| {
+            if keeping.refusing.load(Ordering::SeqCst) {
+                return false;
+            }
             keeping.kept.lock().unwrap().push(state.to_vec());
             true
         }),
