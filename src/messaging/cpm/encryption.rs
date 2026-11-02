@@ -542,6 +542,19 @@ pub trait GroupEncryption: Send + Sync {
         from: String,
     ) -> BoxFuture<'static, Option<(String, Vec<u8>)>>;
 
+    /// Joins the MLS group of the encrypted 1-to-1 chat `contact` started,
+    /// with the Welcome its Conversation Focus sent in `server_message`, as
+    /// the INVITE starting it carried (RCC.16 sections 8.1, 8.1.1): its ID,
+    /// the group kept as the chat with `contact`, with the MLS-Opaque-Token
+    /// the INVITE carried, in place of any other; None if it is not joined,
+    /// as when one of its members is of another Participant
+    fn join_chat(
+        &self,
+        contact: &str,
+        server_message: &[u8],
+        mls_opaque_token: Option<String>,
+    ) -> Option<String>;
+
     /// Takes note of the MLS group `group_id` as that of the encrypted 1-to-1
     /// chat with `contact`, its Conversation Focus having given
     /// `mls_opaque_token` if it did, in place of any other
