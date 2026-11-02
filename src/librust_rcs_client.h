@@ -323,6 +323,18 @@ extern void rcs_client_upload_group_file(struct rcs_runtime *runtime, struct rcs
                                 upload_file_progress_callback progress_cb, void* progress_cb_context,
                                 upload_file_result_callback result_cb, void *result_cb_context);
 
+// as rcs_client_upload_file(), for a file to send to contact, a tel or SIP URI: the file and thumbnail encrypted
+// before they are uploaded when the message sending them goes in an encrypted 1-to-1 chat (RCC.16 sections 8.1.1,
+// 9.1.2.1): the one kept with the contact while it is encrypted, else a new one if the device is enrolled and the
+// contact advertises E2EE, asked over OPTIONS; as rcs_client_upload_file() if contact is NULL; a message sending a
+// file encrypted so is refused with 488 if it goes unencrypted after all, the file then to be uploaded again with
+// rcs_client_upload_file()
+extern void rcs_client_upload_chat_file(struct rcs_runtime *runtime, struct rcs_client *client, const char *tid, const char *contact,
+                                const char *file_path, const char *file_name, const char *file_mime, const char *file_hash,
+                                const char *thumbnail_path, const char *thumbnail_name, const char *thumbnail_mime, const char *thumbnail_hash,
+                                upload_file_progress_callback progress_cb, void* progress_cb_context,
+                                upload_file_result_callback result_cb, void *result_cb_context);
+
 typedef void (*download_file_progress_callback) (uint32_t current, int32_t total, void *context);
 
 void download_file_progress_callback_context_release(void *context);

@@ -1655,7 +1655,7 @@ impl RcsEngine {
     pub fn upload_file<PF, RF>(
         &self,
         tid: &str,
-        conversation_id: Option<&str>,
+        upload_for: &UploadFor,
         file_path: &str,
         file_name: &str,
         file_mime: &str,
@@ -1682,13 +1682,18 @@ impl RcsEngine {
                 if ft_auth == 1 {
                     if let Some(ft_http_cs_uri) = &self.ft_http_configs.ft_http_cs_uri {
                         let ft_http_service = Arc::clone(&self.ft_http_service);
-                        // that of an encrypted group chat, sealed
-                        let sealing = conversation_id.and_then(|conversation_id| {
-                            self.cpm_session_service
-                                .group_encryption()
+                        // that of an encrypted group chat, sealed; that of a
+                        // 1-to-1 chat, if it goes encrypted, as found below
+                        let encryption = self.cpm_session_service.group_encryption();
+                        let sealing = match upload_for {
+                            UploadFor::Anyone => None,
+                            UploadFor::Group(conversation_id) => encryption
                                 .filter(|encryption| encryption.encrypts_files(conversation_id))
-                                .map(|encryption| (String::from(conversation_id), encryption))
-                        });
+                                .map(|encryption| (upload_for.clone(), encryption)),
+                            UploadFor::Chat(_) => {
+                                encryption.map(|encryption| (upload_for.clone(), encryption))
+                            }
+                        };
 
                         let ft_http_cs_uri = String::from(ft_http_cs_uri);
                         let credentials = self.ft_http_cs_credentials();
@@ -1726,6 +1731,19 @@ impl RcsEngine {
                         };
 
                         rt.spawn(async move {
+                            // a file to a contact sealed if the message sending
+                            // it goes in an encrypted 1-to-1 chat (RCC.16
+                            // sections 8.1.1, 9.1.2.1)
+                            let sealing = match sealing {
+                                Some((UploadFor::Chat(contact), encryption)) => {
+                                    match encryption.seals_chat_files(&contact).await {
+                                        true => Some((UploadFor::Chat(contact), encryption)),
+                                        false => None,
+                                    }
+                                }
+                                sealing => sealing,
+                            };
+
                             let file: FileInfo<'_> = FileInfo {
                                 path: &file_path,
                                 name: &file_name,
@@ -1770,7 +1788,7 @@ impl RcsEngine {
                             };
 
                             let uploaded = match &sealing {
-                                Some((conversation_id, encryption)) => {
+                                Some((upload_for, encryption)) => {
                                     let seal = |content: &[u8], name: &str, mime: &str| {
                                         encryption.seal_file(content, name, mime)
                                     };
@@ -1787,12 +1805,24 @@ impl RcsEngine {
                                     .await
                                     .map(
                                         |(xml, file, thumbnail)| {
-                                            if !encryption.uploaded(
-                                                conversation_id,
-                                                xml.as_bytes(),
-                                                &file,
-                                                thumbnail.as_deref(),
-                                            ) {
+                                            let kept = match upload_for {
+                                                UploadFor::Chat(contact) => encryption
+                                                    .uploaded_for_chat(
+                                                        contact,
+                                                        xml.as_bytes(),
+                                                        &file,
+                                                        thumbnail.as_deref(),
+                                                    ),
+                                                UploadFor::Group(conversation_id) => encryption
+                                                    .uploaded(
+                                                        conversation_id,
+                                                        xml.as_bytes(),
+                                                        &file,
+                                                        thumbnail.as_deref(),
+                                                    ),
+                                                UploadFor::Anyone => false,
+                                            };
+                                            if !kept {
                                                 platform_log(
                                                     LOG_TAG,
                                                     "the keys of the file uploaded not kept",
@@ -3232,6 +3262,19 @@ struct MessageRoute {
     core: Arc<SipCore>,
 }
 
+/// What a file is uploaded for, which tells whether it is encrypted before
+/// (RCC.16 section 9.1.2.1)
+#[derive(Clone, Debug, PartialEq)]
+pub enum UploadFor {
+    /// No conversation in particular: as it is
+    Anyone,
+    /// The group chat of a Conversation-ID: sealed while it is encrypted
+    Group(String),
+    /// The 1-to-1 chat with a contact: sealed if the message sending it goes
+    /// in an encrypted chat
+    Chat(String),
+}
+
 /// A message to a contact waiting for the MLS group of the encrypted 1-to-1
 /// chat it is to go in, or for the contact found not to take one
 struct PendingMessage {
@@ -3304,6 +3347,7 @@ fn send_to_contact(
     let route = route.clone();
     let preparing = Arc::clone(preparing);
     let rt_ = Arc::clone(rt);
+    let unsealing = Arc::clone(&encryption);
     rt.spawn(async move {
         let prepared = preparing_chat.await;
         let (group_id, bundle) = prepared.unzip();
@@ -3334,6 +3378,14 @@ fn send_to_contact(
             |message| {
                 if era_due {
                     send_in_chat(&route, message, &rt_);
+                    return;
+                }
+                // not a file sealed for the chat, which could not be opened
+                if is_file_transfer(&message.message_type)
+                    && unsealing
+                        .sealed_for_chat(&message.recipient, message.message_content.as_bytes())
+                {
+                    (message.callback)(488, String::from("Not Acceptable Here"));
                     return;
                 }
                 route_message(
@@ -3406,6 +3458,16 @@ fn wait_after_others(
         }
         None => Some(message),
     }
+}
+
+/// Whether a message of `message_type` is a file transfer message (RCC.07
+/// section 3.2.5)
+fn is_file_transfer(message_type: &str) -> bool {
+    message_type.split(';').next().is_some_and(|media_type| {
+        media_type
+            .trim()
+            .eq_ignore_ascii_case("application/vnd.gsma.rcs-ft-http+xml")
+    })
 }
 
 /// Sends `message` to its contact through the 1-to-1 chat service

@@ -102,6 +102,33 @@ pub(super) fn contact_tel_uri(contact: &str) -> Option<String> {
 }
 
 impl E2eeDevice {
+    /// Whether a file to send to `contact` is to be encrypted before it is
+    /// uploaded, as the message sending it goes in an encrypted 1-to-1 chat
+    /// (RCC.16 sections 8.1.1, 9.1.2.1): in the one kept with the contact,
+    /// while it is encrypted; else in a new one, if the device is enrolled
+    /// and the contact advertises E2EE v1, asked with `capabilities`, unless
+    /// it was found lately not to take one
+    pub async fn seals_chat_files(&self, contact: &str, capabilities: &CapabilityQuery) -> bool {
+        let Some(tel_uri) = contact_tel_uri(contact) else {
+            return false;
+        };
+        if self.mls_feature_tags().is_none() {
+            return false;
+        }
+        if let Some((group_id, _)) = self.chat_group(contact) {
+            return self.encrypts_files(&group_id);
+        }
+        if self
+            .unencrypted_chats()
+            .lately(&tel_uri, self.store().now())
+        {
+            return false;
+        }
+        recipients(&[String::from(contact)], capabilities)
+            .await
+            .is_some()
+    }
+
     /// The ID of the MLS group of the encrypted 1-to-1 chat with `contact`,
     /// and the MLS-Opaque-Token given for it if one was (RCC.16 sections
     /// 6.1.3, 8.1.1); None if none is kept, or if its MLS group no longer is

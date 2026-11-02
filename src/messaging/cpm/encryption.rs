@@ -461,6 +461,30 @@ pub trait GroupEncryption: Send + Sync {
         thumbnail: Option<&[u8]>,
     ) -> bool;
 
+    /// Whether a file to send to `contact` is to be encrypted with
+    /// seal_file() before it is uploaded, as the message sending it goes in
+    /// an encrypted 1-to-1 chat: the one kept with the contact while it is
+    /// encrypted, or a new one the contact takes, as its capabilities tell
+    /// (RCC.16 sections 8.1.1, 9.1.2.1)
+    fn seals_chat_files(&self, contact: &str) -> BoxFuture<'static, bool>;
+
+    /// Keeps, as uploaded() does, what the FileInfo of the files sealed for
+    /// the encrypted 1-to-1 chat with `contact` is to tell, for the message
+    /// sending them to the contact to carry, whichever MLS group of the chat
+    /// it goes in; false if the XML tells no file, or `contact` has no number
+    fn uploaded_for_chat(
+        &self,
+        contact: &str,
+        xml: &[u8],
+        file: &[u8],
+        thumbnail: Option<&[u8]>,
+    ) -> bool;
+
+    /// Whether the file the FT HTTP XML `xml` tells of was uploaded sealed
+    /// for the encrypted 1-to-1 chat with `contact`: a message sending it
+    /// unencrypted could not be opened
+    fn sealed_for_chat(&self, contact: &str, xml: &[u8]) -> bool;
+
     /// The CPIM message the file transfer message of the group chat
     /// `conversation_id`, delivered in the CPIM message `cpim_info` tells of
     /// with the XML `xml` and its mls-file, carries decrypted: the XML with

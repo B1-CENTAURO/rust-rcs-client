@@ -14,7 +14,7 @@ The declarations are in [`src/librust_rcs_client.h`](../src/librust_rcs_client.h
 - **1-to-1 chats** (RCC.16 section 8.1.1), with a contact who advertises E2EE and whose KeyPackages the Home KDS has.
 - **Group chats** (section 8.1), when every participant advertises E2EE when the group is created.
 - **Delivery and display notifications** in those chats are signed (sections 9.1.3, 9.1.4). Those that come are checked, and a forged one is dropped.
-- **Files sent in group chats**: they are encrypted before upload, and decrypted as they are downloaded (section 9.1.2).
+- **Files sent in those chats**: they are encrypted before upload, and decrypted as they are downloaded (section 9.1.2).
 - **The subject and icon of encrypted groups** (section 9.7.1).
 
 Not encrypted:
@@ -127,7 +127,11 @@ The client advertises E2EE in its capabilities only once enrolled. If enrolling 
   - events 6 and 7: the encrypted subject and icon, decrypted, as they are set or deleted.
 - **Adding and removing participants** goes through the Focus as before, along with the MLS Commits they need. A participant who cannot be removed from the MLS group is refused with 488.
 - **Notifications:** the client sends delivery notifications itself as messages are taken. Send display notifications with `rcs_client_send_display_notification`: in an encrypted chat it signs them in the chat's session (section 9.1.4). `rcs_client_send_imdn_report` sends what it is given by SIP MESSAGE, unsigned, so don't use it for encrypted chats.
-- **Files in group chats:** upload with `rcs_client_upload_group_file`, giving the group's Conversation-ID. The file and thumbnail are encrypted before upload while the group is encrypted. A file received encrypted is decrypted as `rcs_client_download_file` or `rcs_client_download_message_file` downloads it:
+- **Files:** upload a file for a chat with the function for it, then send the XML the result callback gives as the message, within a day. The file and thumbnail are encrypted before upload when the message goes encrypted:
+  - to a group, `rcs_client_upload_group_file`, giving the group's Conversation-ID: while the group is encrypted;
+  - to a contact, `rcs_client_upload_chat_file`, giving the contact: when the message goes in an encrypted 1-to-1 chat. That is the one kept with the contact while it is encrypted, or a new one if the contact advertises E2EE, which the upload asks over OPTIONS. If the message goes unencrypted after all, as when the Home KDS has no KeyPackages of the contact, it is refused with 488: upload the file again with `rcs_client_upload_file` and send that.
+
+  A file uploaded otherwise, as with `rcs_client_upload_file`, is not sent in an encrypted chat: its message fails with 500. A file received encrypted is decrypted as `rcs_client_download_file` or `rcs_client_download_message_file` downloads it:
   - the whole file is downloaded, whatever `start` is;
   - its key is used once, so download it once.
 - **Keeping groups in step:**
@@ -168,7 +172,6 @@ Nothing is written unless it returns 0.
 
 ## Not covered yet
 
-- **Files in encrypted 1-to-1 chats cannot be sent:** there is no way yet to upload a file encrypted for a chat. A file transfer message in one fails with 500.
 - **Encrypted user aliases** of other clients are not decrypted (section 9.1.5).
 - **Some state that is found again on its own is lost on restart:**
   - the hour a KeyPackage Update is put off for;

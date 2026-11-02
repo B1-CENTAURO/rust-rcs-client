@@ -1284,6 +1284,36 @@ impl GroupEncryption for DeviceGroups {
             .is_some_and(|device| device.uploaded(conversation_id, xml, file, thumbnail))
     }
 
+    fn seals_chat_files(&self, contact: &str) -> BoxFuture<'static, bool> {
+        let device = self.device.clone();
+        let capabilities = Arc::clone(&self.capabilities);
+        let contact = String::from(contact);
+        Box::pin(async move {
+            let Some(device) = device.upgrade() else {
+                return false;
+            };
+            device.seals_chat_files(&contact, &capabilities).await
+        })
+    }
+
+    fn uploaded_for_chat(
+        &self,
+        contact: &str,
+        xml: &[u8],
+        file: &[u8],
+        thumbnail: Option<&[u8]>,
+    ) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.uploaded_for_chat(contact, xml, file, thumbnail))
+    }
+
+    fn sealed_for_chat(&self, contact: &str, xml: &[u8]) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.sealed_for_chat(contact, xml))
+    }
+
     fn decrypt_file_transfer(
         &self,
         conversation_id: &str,

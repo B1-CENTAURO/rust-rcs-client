@@ -10235,3 +10235,143 @@ fn the_use_of_groups_is_noted_once_a_day_and_let_go_of_unused() {
     assert_eq!(used("old"), None);
     assert_eq!(used(CONVERSATION), Some(clock.now()));
 }
+
+/// The file transfer message `message_id` of the XML `xml`, from the user
+/// to `to`
+fn file_transfer_to(to: &str, message_id: &str, xml: &str) -> Vec<u8> {
+    String::from_utf8(file_transfer(message_id, xml))
+        .unwrap()
+        .replacen(&format!("To: <{}>", GROUP_URI), &format!("To: <{}>", to), 1)
+        .into_bytes()
+}
+
+/// The device, enrolled, in an encrypted 1-to-1 chat with Bob it started,
+/// kept and accepted: the device, its groups, Bob, his chat, and its group
+/// ID; Bob advertising E2EE
+fn alice_chatting_with_bob() -> (
+    Arc<E2eeDevice>,
+    DeviceGroups,
+    Arc<Mutex<Vec<String>>>,
+    MlsClient,
+    MlsConversation,
+    String,
+) {
+    let (bob, bobs) = bob_with_key_package();
+    let (device, _) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    let (query, asked) = answering(&[(BOB_IMPU, mls(&HOME_KDS.to_string()))]);
+    let groups = DeviceGroups::new(&device, query);
+    let (group_id, cpim) =
+        block_on(groups.prepare_chat(String::from(BOB_IMPU), String::from(IMPU)))
+            .expect("an encrypted chat");
+    let bobs_chat = joined(&bob, &bundle_of(&cpim));
+    device.keep_chat(BOB_IMPU, &group_id, None).unwrap();
+    let previous = epoch_identifier(&device, &group_id);
+    device
+        .on_server_message(&group_id, &accepted(previous))
+        .unwrap();
+    asked.lock().unwrap().clear();
+    (device, groups, asked, bob, bobs_chat, group_id)
+}
+
+#[test]
+fn the_files_to_a_contact_are_sealed_as_messages_to_it_go_encrypted() {
+    // a device not enrolled seals none (RCC.16 section 9.1.2.1)
+    let app = Arc::new(App::default());
+    let kds = Arc::new(Kds::issuing(&[ALICE, CA], &app));
+    let device = Arc::new(alice(&app, &kds, TODAY, None));
+    let (query, asked) = answering(&[(BOB_IMPU, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    assert!(!block_on(groups.seals_chat_files(BOB_IMPU)));
+    assert!(asked.lock().unwrap().is_empty());
+
+    // one enrolled seals those to a contact advertising E2EE, asked over
+    // OPTIONS, as a new chat with it goes encrypted (section 8.1.1)
+    let (device, _) = enrolled(None);
+    let (query, asked) = answering(&[(BOB_IMPU, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    assert!(block_on(groups.seals_chat_files(BOB_IMPU)));
+    assert_eq!(*asked.lock().unwrap(), [BOB_IMPU]);
+    // not to one not advertising it, nor to one of no number
+    let (query, _) = answering(&[(BOB_IMPU, answered(200, ""))]);
+    assert!(!block_on(
+        DeviceGroups::new(&device, query).seals_chat_files(BOB_IMPU)
+    ));
+    asked.lock().unwrap().clear();
+    assert!(!block_on(groups.seals_chat_files("sip:bob@example.com")));
+    assert!(asked.lock().unwrap().is_empty());
+    // nor to one found lately not to take an encrypted chat, not asked again
+    device
+        .unencrypted_chats()
+        .found(BOB_TEL, device.store().now());
+    assert!(!block_on(groups.seals_chat_files(BOB_IMPU)));
+    assert!(asked.lock().unwrap().is_empty());
+
+    // with a chat kept, as long as it is encrypted, not asked
+    let (device, groups, asked, bob, mut bobs_chat, group_id) = alice_chatting_with_bob();
+    assert!(block_on(groups.seals_chat_files(BOB_TEL)));
+    assert!(asked.lock().unwrap().is_empty());
+    let cpim = device
+        .end_encryption(
+            &group_id,
+            IMPU,
+            BOB_IMPU,
+            EndMlsReason::ClientFailureEncryptionNotAvailable,
+        )
+        .unwrap()
+        .unwrap();
+    groups.on_server_message(&group_id, &forwarded_commit(&cpim));
+    bobs_chat
+        .process_server_message(&bob, &forwarded_commit(&cpim))
+        .unwrap();
+    assert!(groups.encryption_ended(&group_id));
+    assert!(!block_on(groups.seals_chat_files(BOB_TEL)));
+    assert!(asked.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_file_sealed_for_a_chat_is_carried_by_messages_to_its_contact_only() {
+    let (device, groups, _, bob, mut bobs_chat, group_id) = alice_chatting_with_bob();
+    let file = groups
+        .seal_file(b"the picture", "picture.jpg", "image/jpeg")
+        .unwrap();
+    let xml = super::file::upload_xml("https://ftcs.example.com/f/9");
+    // kept by the contact's number, whichever URI tells it
+    assert!(!groups.uploaded_for_chat("sip:bob@example.com", xml.as_bytes(), &file.metadata, None));
+    assert!(groups.uploaded_for_chat(BOB_TEL, xml.as_bytes(), &file.metadata, None));
+    assert!(groups.sealed_for_chat(BOB_IMPU, xml.as_bytes()));
+    assert!(!groups.sealed_for_chat("tel:+491701111111", xml.as_bytes()));
+    let other = super::file::upload_xml("https://ftcs.example.com/f/10");
+    assert!(!groups.sealed_for_chat(BOB_TEL, other.as_bytes()));
+
+    // not in a message to another (RCC.16 section 9.1.2.1)
+    assert_eq!(
+        device.encrypt_message(
+            &group_id,
+            &file_transfer_to("tel:+491701111111", "ft-0", &xml)
+        ),
+        Err(MessageError::FileNotFit)
+    );
+
+    // in one to the contact, in the chat, its keys in the mls-file (section
+    // 7.8.2), with which Bob opens the file
+    let sent = device
+        .encrypt_message(&group_id, &file_transfer_to(BOB_IMPU, "ft-1", &xml))
+        .unwrap();
+    let outer = cpim_message(&sent);
+    let (_, body, _) = outer.get_message_body().unwrap();
+    let decrypted = bobs_chat.decrypt(&bob, &mls_file(body), b"ft-1").unwrap();
+    let (content_type, file_info) = mime_body(&decrypted.payload.unwrap());
+    assert_eq!(content_type, "message/mls-rcs-file-info");
+    let file_info: proto::FileInfo = proto::decode(&file_info).unwrap();
+    let metadata = file_info.file.unwrap();
+    assert_eq!(metadata.file_name, "picture.jpg");
+    assert_eq!(
+        rust_rcs_core::mls::rcs::file::decrypt_file(
+            &file.ciphertext,
+            "picture.jpg",
+            &metadata.encryption_info.unwrap()
+        )
+        .unwrap(),
+        b"the picture"
+    );
+}
