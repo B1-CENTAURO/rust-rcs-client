@@ -9899,3 +9899,225 @@ fn the_client_of_a_credential_not_passing_is_replaced_once_a_message_is_refused(
     );
     assert!(decrypted(&device, &outer, &mls_message).is_ok());
 }
+
+/// Alice's device as `app` kept it, telling the time of `clock`, as after
+/// it restarted
+fn alice_restarted(app: &Arc<App>, kds: &Arc<Kds>, clock: &Clock) -> Arc<E2eeDevice> {
+    let clock = clock.clone();
+    Arc::new(alice(app, kds, TODAY, Some(&app.last().unwrap())).with_clock(move || clock.now()))
+}
+
+#[test]
+fn a_refusal_of_a_commit_sent_before_the_device_restarted_is_taken() {
+    let clock = Clock::new();
+    let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
+    clock.advance(31 * DAY);
+    let cpim = device
+        .update_keys(CONVERSATION, IMPU, GROUP_URI)
+        .unwrap()
+        .expect("a key update");
+    let message_id = String::from_utf8(
+        cpim_message(&cpim)
+            .get_info()
+            .unwrap()
+            .imdn_message_id
+            .to_vec(),
+    )
+    .unwrap();
+    drop(device);
+
+    // its Commit still waiting for the Focus, which refuses it (RCC.16
+    // sections 6.2.5, 7.7.2.1)
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal("another", "transient-error")),
+        Ok(None)
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&message_id, "transient-error")),
+        Ok(Some(ServerFailureReason::TransientError))
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+
+    // and once only, through another restart
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(
+        device.on_imdn(CONVERSATION, &refusal(&message_id, "transient-error")),
+        Ok(None)
+    );
+}
+
+#[test]
+fn groups_to_heal_or_make_anew_are_so_after_the_device_restarted() {
+    let clock = Clock::new();
+    let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
+    let restarted = || alice_restarted(&app, &kds, &clock);
+
+    // out of step with the Focus (RCC.16 section 10.1)
+    device.heals().want(CONVERSATION);
+    drop(device);
+    let device = restarted();
+    assert!(device.needs_healing(CONVERSATION));
+    assert!(!device.new_era_due(CONVERSATION));
+
+    // its next Era due, with the Eras made lately counted (sections 8.3,
+    // 11.2.3)
+    for _ in 0..30 {
+        device.heals().era_made(CONVERSATION);
+    }
+    device.heals().want_new_era(CONVERSATION);
+    drop(device);
+    let device = restarted();
+    assert!(device.new_era_due(CONVERSATION));
+    assert_eq!(
+        device.heals().begin_new_era(CONVERSATION),
+        Some(NextEra::Singleton(
+            EndMlsReason::ServerFailureEraAdvancementQuotaReached
+        ))
+    );
+
+    // being made as the device stopped, due again as it was
+    drop(device);
+    let device = restarted();
+    assert!(!device.heals().ongoing(CONVERSATION));
+    assert!(!device.needs_healing(CONVERSATION));
+    assert_eq!(
+        device.heals().begin_new_era(CONVERSATION),
+        Some(NextEra::Singleton(
+            EndMlsReason::ServerFailureEraAdvancementQuotaReached
+        ))
+    );
+
+    // the Eras made counted for a day only
+    device.heals().start_over(CONVERSATION);
+    device.heals().want_new_era(CONVERSATION);
+    clock.advance(DAY);
+    drop(device);
+    let device = restarted();
+    assert_eq!(
+        device.heals().begin_new_era(CONVERSATION),
+        Some(NextEra::Encrypted)
+    );
+
+    // taken all the same if it cannot be kept, until the device stops
+    device.heals().start_over(CONVERSATION);
+    app.refusing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    device.heals().want(CONVERSATION);
+    assert!(device.needs_healing(CONVERSATION));
+    app.refusing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    drop(device);
+    let device = restarted();
+    assert!(!device.needs_healing(CONVERSATION));
+
+    // nothing for a group let go of
+    device.heals().want(CONVERSATION);
+    device.abandon(CONVERSATION).unwrap();
+    drop(device);
+    let device = restarted();
+    assert!(!device.needs_healing(CONVERSATION));
+    assert!(!device.new_era_due(CONVERSATION));
+}
+
+#[test]
+fn a_group_whose_focus_has_no_mls_group_is_so_after_the_device_restarted() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let clock = Clock::new();
+    let (device, kds, app, bob, _) = alice_and_bob_kept(&clock);
+    let restarted = || alice_restarted(&app, &kds, &clock);
+    let groups_of = |device: &Arc<E2eeDevice>| {
+        let (query, _) = answering(&[(BOB_TEL, mls("42"))]);
+        DeviceGroups::new(device, query)
+    };
+
+    // unencrypted, and not moved back for two hours (RCC.16 sections 10.1,
+    // 11.2)
+    device.lost_group(CONVERSATION);
+    drop(device);
+    let device = restarted();
+    let groups = groups_of(&device);
+    assert!(groups.encryption_ended(CONVERSATION));
+    assert!(!groups.upgrade_due(CONVERSATION));
+    clock.advance(2 * HOUR);
+    assert!(groups.upgrade_due(CONVERSATION));
+
+    // the Era moving it back made, the device stopping before the Focus
+    // accepted the INVITE carrying it: let go of with the INVITE, the group
+    // unencrypted, and not moved back for two hours from the try (section
+    // 11.1)
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    upgrade_by_restart(&groups, &rt, &[IMPU, BOB_SIP]).expect("an Era");
+    assert_eq!(
+        epoch(&device, CONVERSATION).map(|(_, pending)| pending),
+        Ok(true)
+    );
+    drop(groups);
+    drop(device);
+    let device = restarted();
+    let groups = groups_of(&device);
+    assert_eq!(
+        epoch(&device, CONVERSATION).map(|(_, pending)| pending),
+        Ok(false)
+    );
+    assert!(!device.upgrades().restarting(CONVERSATION));
+    assert!(groups.encryption_ended(CONVERSATION));
+    assert!(!groups.upgrade_due(CONVERSATION));
+    clock.advance(2 * HOUR);
+    assert!(groups.upgrade_due(CONVERSATION));
+
+    // nothing for a group let go of
+    device.abandon(CONVERSATION).unwrap();
+    drop(groups);
+    drop(device);
+    let device = restarted();
+    assert!(!device.upgrades().without_group(CONVERSATION));
+}
+
+#[test]
+fn the_self_healing_tried_lately_is_counted_through_restarts() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let clock = Clock::new();
+    let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
+    // how often the Focus is asked for the GroupInfo, the group out of step
+    let healed = |device: &Arc<E2eeDevice>| {
+        let (query, _) = answering(&[]);
+        let groups = DeviceGroups::new(device, query);
+        device.heals().want(CONVERSATION);
+        let up_to_date = proto::encode(&MlsEnhancedGroupInfo {
+            latest_epoch_identifier: Some(epoch_identifier(device, CONVERSATION)),
+            ..MlsEnhancedGroupInfo::default()
+        });
+        let (pull, asked) = focus_answering(vec![Some((200, up_to_date))]);
+        rt.block_on(groups.heal(
+            String::from(CONVERSATION),
+            String::from(IMPU),
+            String::from(GROUP_URI),
+            pull,
+        ));
+        let asked = asked.lock().unwrap().len();
+        asked
+    };
+    for _ in 0..3 {
+        assert_eq!(healed(&device), 1);
+    }
+    drop(device);
+
+    // five times in a day at most (RCC.16 section 10.1), those before the
+    // restart counted; its next Era due then
+    let device = alice_restarted(&app, &kds, &clock);
+    for _ in 0..2 {
+        assert_eq!(healed(&device), 1);
+    }
+    assert_eq!(healed(&device), 0);
+    assert!(device.new_era_due(CONVERSATION));
+
+    // and again the next day
+    clock.advance(DAY);
+    assert_eq!(healed(&device), 1);
+}

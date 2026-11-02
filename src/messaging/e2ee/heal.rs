@@ -16,9 +16,9 @@
 //! with that of its Conversation Focus, and making it anew in its next Era
 //! when that fails (RCC.16 sections 6.3, 7.10, 8.3, 10.1, 11.2)
 
-use std::collections::HashMap;
-use std::sync::{Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use std::sync::Weak;
+use std::time::{Duration, SystemTime};
 
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::mls::rcs::heal::SelfHealProgress;
@@ -35,7 +35,8 @@ use crate::messaging::cpm::encryption::GroupInfoPull;
 use super::device::E2eeDevice;
 use super::era::NO_MLS_GROUP;
 use super::group::GroupError;
-use super::store::StoreError;
+use super::notes::{put, put_time, Notes, Reader};
+use super::store::{MlsStore, StoreError};
 
 const LOG_TAG: &str = "e2ee";
 
@@ -59,85 +60,127 @@ pub(super) enum NextEra {
     Singleton(EndMlsReason),
 }
 
-/// Where self-healing a group stands, and making it anew in its next Era
-#[derive(Default)]
-struct Heal {
+/// What is being done to a group
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Ongoing {
+    /// It is being self-healed
+    Healing,
+    /// Its next Era is being made
+    MakingEra(NextEra),
+}
+
+/// Where self-healing a group stands, and making it anew in its next Era,
+/// kept in the notes of the device
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Heal {
     /// Its state is out of step with that of its Conversation Focus; never
     /// while it is being self-healed
-    wanted: bool,
-    ongoing: bool,
+    pub(super) wanted: bool,
+    pub(super) ongoing: Option<Ongoing>,
     /// When it was self-healed, within HEAL_PERIOD
-    attempts: Vec<Instant>,
+    pub(super) attempts: Vec<SystemTime>,
     /// Self-healing it failed, tried too often lately, or its Focus asks
     /// for it: it is to be made anew in its next Era (RCC.16 sections 8.3,
     /// 10.1, 11.2.2)
-    failed: bool,
+    pub(super) failed: bool,
     /// It is to move to an Unencrypted Singleton Era, for the reason given,
     /// rather than to one of all its Participants (sections 10.1, 11.2,
     /// 11.2.1)
-    singleton: Option<EndMlsReason>,
+    pub(super) singleton: Option<EndMlsReason>,
     /// When an Era of it was made, besides Unencrypted Singleton ones, within
     /// ERA_PERIOD (section 11.2.3)
-    eras: Vec<Instant>,
+    pub(super) eras: Vec<SystemTime>,
 }
 
-/// The groups to self-heal and those being self-healed, by Conversation-ID
-#[derive(Default)]
-pub(super) struct Heals(Mutex<HashMap<String, Heal>>);
+/// Whether `then` is within `period` of `now`, as a time to come is
+fn within(then: SystemTime, period: Duration, now: SystemTime) -> bool {
+    now.duration_since(then)
+        .map_or(true, |passed| passed < period)
+}
 
-impl Heals {
+/// The groups to self-heal and those being self-healed, by Conversation-ID,
+/// as the notes of the device keep them for it to restart with
+pub(super) struct Heals<'a> {
+    pub(super) notes: &'a Notes,
+    pub(super) store: &'a MlsStore,
+}
+
+impl Heals<'_> {
+    /// What `read` reads of the group `conversation_id`, if it has a Heal
+    fn read<R>(&self, conversation_id: &str, read: impl FnOnce(&Heal) -> R) -> Option<R> {
+        self.notes
+            .read(|data| data.heals.get(conversation_id).map(read))
+    }
+
+    /// Changes the Heal of the group `conversation_id` as `change` does, one
+    /// made for it if `make` and it has none, kept as the notes are; one
+    /// left as a new one is let go of
+    fn change<R>(
+        &self,
+        conversation_id: &str,
+        make: bool,
+        change: impl FnOnce(&mut Heal) -> R,
+    ) -> Option<R> {
+        self.notes.hold(self.store, |data| {
+            if make && !data.heals.contains_key(conversation_id) {
+                data.heals
+                    .insert(String::from(conversation_id), Heal::default());
+            }
+            let heal = data.heals.get_mut(conversation_id)?;
+            let changed = change(heal);
+            if *heal == Heal::default() {
+                data.heals.remove(conversation_id);
+            }
+            Some(changed)
+        })
+    }
+
     /// Takes note of the group `conversation_id` falling out of step with
     /// its Conversation Focus, unless it is being self-healed, which what
     /// fails meanwhile may be of
     pub(super) fn want(&self, conversation_id: &str) {
-        let mut heals = self.0.lock().unwrap();
-        let heal = heals.entry(String::from(conversation_id)).or_default();
-        if !heal.ongoing {
-            heal.wanted = true;
-        }
+        self.change(conversation_id, true, |heal| {
+            if heal.ongoing.is_none() {
+                heal.wanted = true;
+            }
+        });
     }
 
     /// Whether the group `conversation_id` is to be self-healed, which it is
     /// not while it is being
     fn wanted(&self, conversation_id: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .get(conversation_id)
-            .is_some_and(|heal| heal.wanted)
+        self.read(conversation_id, |heal| heal.wanted)
+            .unwrap_or(false)
     }
 
-    /// Whether the group `conversation_id` is being self-healed
+    /// Whether the group `conversation_id` is being self-healed, or made
+    /// anew in its next Era
     pub(super) fn ongoing(&self, conversation_id: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .get(conversation_id)
-            .is_some_and(|heal| heal.ongoing)
+        self.read(conversation_id, |heal| heal.ongoing.is_some())
+            .unwrap_or(false)
     }
 
     /// Starts self-healing the group `conversation_id`; false if it is not
     /// to be, if it is being already, or if it was too often lately
     fn begin(&self, conversation_id: &str) -> bool {
-        let mut heals = self.0.lock().unwrap();
-        let Some(heal) = heals.get_mut(conversation_id) else {
-            return false;
-        };
-        if !heal.wanted {
-            return false;
-        }
-        heal.wanted = false;
-        let now = Instant::now();
-        heal.attempts
-            .retain(|attempt| now.duration_since(*attempt) < HEAL_PERIOD);
-        if heal.attempts.len() >= HEAL_ATTEMPTS {
-            platform_log(LOG_TAG, "self-healing failed, tried too often");
-            heal.failed = true;
-            return false;
-        }
-        heal.attempts.push(now);
-        heal.ongoing = true;
-        true
+        let now = self.store.now();
+        self.change(conversation_id, false, |heal| {
+            if !heal.wanted {
+                return false;
+            }
+            heal.wanted = false;
+            heal.attempts
+                .retain(|attempt| within(*attempt, HEAL_PERIOD, now));
+            if heal.attempts.len() >= HEAL_ATTEMPTS {
+                platform_log(LOG_TAG, "self-healing failed, tried too often");
+                heal.failed = true;
+                return false;
+            }
+            heal.attempts.push(now);
+            heal.ongoing = Some(Ongoing::Healing);
+            true
+        })
+        .unwrap_or(false)
     }
 
     /// Takes note of the group `conversation_id` to be made anew in its next
@@ -145,31 +188,22 @@ impl Heals {
     /// following the latest, or once the device moved its epoch on too often
     /// (RCC.16 sections 6.2.5, 8.3.1, 11.2.2)
     pub(super) fn want_new_era(&self, conversation_id: &str) {
-        let mut heals = self.0.lock().unwrap();
-        heals
-            .entry(String::from(conversation_id))
-            .or_default()
-            .failed = true;
+        self.change(conversation_id, true, |heal| heal.failed = true);
     }
 
     /// Takes note of the group `conversation_id` to move to an Unencrypted
     /// Singleton Era for `reason` (RCC.16 sections 10.1, 11.2, 11.2.1)
     pub(super) fn want_singleton(&self, conversation_id: &str, reason: EndMlsReason) {
-        let mut heals = self.0.lock().unwrap();
-        heals
-            .entry(String::from(conversation_id))
-            .or_default()
-            .singleton = Some(reason);
+        self.change(conversation_id, true, |heal| heal.singleton = Some(reason));
     }
 
     /// Whether a next Era of the group `conversation_id` is to be made
     /// (RCC.16 sections 8.3, 10.1, 11.2.1)
     pub(super) fn era_due(&self, conversation_id: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .get(conversation_id)
-            .is_some_and(|heal| heal.failed || heal.singleton.is_some())
+        self.read(conversation_id, |heal| {
+            heal.failed || heal.singleton.is_some()
+        })
+        .unwrap_or(false)
     }
 
     /// Starts making the next Era of the group `conversation_id`, during
@@ -178,69 +212,165 @@ impl Heals {
     /// lately (RCC.16 section 11.2.3); None if none is due, or while the
     /// group is being self-healed or made anew
     pub(super) fn begin_new_era(&self, conversation_id: &str) -> Option<NextEra> {
-        let mut heals = self.0.lock().unwrap();
-        let heal = heals.get_mut(conversation_id)?;
-        if heal.ongoing {
-            return None;
-        }
-        let next = match heal.singleton {
-            Some(reason) => NextEra::Singleton(reason),
-            None if heal.failed => {
-                let now = Instant::now();
-                heal.eras
-                    .retain(|era| now.duration_since(*era) < ERA_PERIOD);
-                if heal.eras.len() >= ERA_QUOTA {
-                    platform_log(LOG_TAG, "too many Eras made lately");
-                    NextEra::Singleton(EndMlsReason::ServerFailureEraAdvancementQuotaReached)
-                } else {
-                    NextEra::Encrypted
-                }
+        let now = self.store.now();
+        self.change(conversation_id, false, |heal| {
+            if heal.ongoing.is_some() {
+                return None;
             }
-            None => return None,
-        };
-        heal.singleton = None;
-        heal.failed = false;
-        heal.wanted = false;
-        heal.ongoing = true;
-        Some(next)
+            let next = match heal.singleton {
+                Some(reason) => NextEra::Singleton(reason),
+                None if heal.failed => {
+                    heal.eras.retain(|era| within(*era, ERA_PERIOD, now));
+                    if heal.eras.len() >= ERA_QUOTA {
+                        platform_log(LOG_TAG, "too many Eras made lately");
+                        NextEra::Singleton(EndMlsReason::ServerFailureEraAdvancementQuotaReached)
+                    } else {
+                        NextEra::Encrypted
+                    }
+                }
+                None => return None,
+            };
+            heal.singleton = None;
+            heal.failed = false;
+            heal.wanted = false;
+            heal.ongoing = Some(Ongoing::MakingEra(next));
+            Some(next)
+        })
+        .flatten()
     }
 
     /// Takes note of the Era `next` of the group `conversation_id` that
     /// could not be begun for now, to be tried again
     pub(super) fn put_off_new_era(&self, conversation_id: &str, next: NextEra) {
-        if let Some(heal) = self.0.lock().unwrap().get_mut(conversation_id) {
-            match next {
-                NextEra::Encrypted => heal.failed = true,
-                NextEra::Singleton(reason) => heal.singleton = Some(reason),
-            }
-            heal.ongoing = false;
-        }
+        self.change(conversation_id, false, |heal| {
+            put_back(heal, next);
+            heal.ongoing = None;
+        });
     }
 
     /// Takes note of an Era of the group `conversation_id` made, besides an
     /// Unencrypted Singleton one, which ERA_QUOTA counts
     pub(super) fn era_made(&self, conversation_id: &str) {
-        let mut heals = self.0.lock().unwrap();
-        let heal = heals.entry(String::from(conversation_id)).or_default();
-        heal.eras.push(Instant::now());
+        let now = self.store.now();
+        self.change(conversation_id, true, |heal| heal.eras.push(now));
     }
 
     /// Self-heals the group `conversation_id` from scratch from now on, as
     /// once a new Era of it was tried, the Eras made of it still counted
     pub(super) fn start_over(&self, conversation_id: &str) {
-        if let Some(heal) = self.0.lock().unwrap().get_mut(conversation_id) {
+        self.change(conversation_id, false, |heal| {
             *heal = Heal {
                 eras: std::mem::take(&mut heal.eras),
                 ..Heal::default()
             };
-        }
+        });
     }
 
     fn end(&self, conversation_id: &str) {
-        if let Some(heal) = self.0.lock().unwrap().get_mut(conversation_id) {
-            heal.ongoing = false;
+        self.change(conversation_id, false, |heal| heal.ongoing = None);
+    }
+
+    /// Lets go of what stands for the group `conversation_id`
+    pub(super) fn forget(&self, conversation_id: &str) {
+        self.notes
+            .hold(self.store, |data| data.heals.remove(conversation_id));
+    }
+}
+
+/// `heal` to make the Era `next` again
+fn put_back(heal: &mut Heal, next: NextEra) {
+    match next {
+        NextEra::Encrypted => heal.failed = true,
+        NextEra::Singleton(reason) => heal.singleton = Some(reason),
+    }
+}
+
+/// The Heals `heals`, as the notes of the device hold them
+pub(super) fn encode(heals: &BTreeMap<String, Heal>) -> Vec<u8> {
+    let mut data = Vec::new();
+    for (conversation_id, heal) in heals {
+        put(&mut data, conversation_id.as_bytes());
+        data.push(u8::from(heal.wanted));
+        data.push(u8::from(heal.failed));
+        put_reason(&mut data, heal.singleton);
+        match heal.ongoing {
+            None => data.push(0),
+            Some(Ongoing::Healing) => data.push(1),
+            Some(Ongoing::MakingEra(NextEra::Encrypted)) => data.push(2),
+            Some(Ongoing::MakingEra(NextEra::Singleton(reason))) => {
+                data.push(3);
+                data.extend_from_slice(&(reason as i32).to_be_bytes());
+            }
+        }
+        put_times(&mut data, &heal.attempts);
+        put_times(&mut data, &heal.eras);
+    }
+    data
+}
+
+/// The Heals `reader` reads to its end, as encode() puts them; None if they
+/// cannot be read
+///
+/// What was being done when the device stopped is to be done again: a group
+/// being self-healed is to be self-healed, and one being made anew is to
+/// be made anew.
+pub(super) fn decode(reader: &mut Reader) -> Option<BTreeMap<String, Heal>> {
+    let mut heals = BTreeMap::new();
+    while !reader.is_empty() {
+        let conversation_id = reader.string()?;
+        let mut heal = Heal {
+            wanted: reader.flag()?,
+            failed: reader.flag()?,
+            singleton: read_reason(reader)?,
+            ..Heal::default()
+        };
+        match reader.byte()? {
+            0 => {}
+            1 => heal.wanted = true,
+            2 => put_back(&mut heal, NextEra::Encrypted),
+            3 => put_back(&mut heal, NextEra::Singleton(reason(reader.u32()?)?)),
+            _ => return None,
+        }
+        heal.attempts = read_times(reader)?;
+        heal.eras = read_times(reader)?;
+        heals.insert(conversation_id, heal);
+    }
+    Some(heals)
+}
+
+/// `reason` if there is one, as read_reason() reads it
+fn put_reason(data: &mut Vec<u8>, reason: Option<EndMlsReason>) {
+    match reason {
+        None => data.push(0),
+        Some(reason) => {
+            data.push(1);
+            data.extend_from_slice(&(reason as i32).to_be_bytes());
         }
     }
+}
+
+fn read_reason(reader: &mut Reader) -> Option<Option<EndMlsReason>> {
+    match reader.flag()? {
+        false => Some(None),
+        true => Some(Some(reason(reader.u32()?)?)),
+    }
+}
+
+fn reason(value: u32) -> Option<EndMlsReason> {
+    EndMlsReason::try_from(value as i32).ok()
+}
+
+/// `times`, their count first on four bytes
+fn put_times(data: &mut Vec<u8>, times: &[SystemTime]) {
+    data.extend_from_slice(&(times.len() as u32).to_be_bytes());
+    for time in times {
+        put_time(data, *time);
+    }
+}
+
+fn read_times(reader: &mut Reader) -> Option<Vec<SystemTime>> {
+    let count = reader.u32()?;
+    (0..count).map(|_| reader.time()).collect()
 }
 
 impl E2eeDevice {
@@ -285,10 +415,7 @@ impl E2eeDevice {
         )?;
         // a Commit of the device among those applied
         if !pending {
-            self.control_messages()
-                .lock()
-                .unwrap()
-                .remove(conversation_id);
+            self.control_messages().remove(conversation_id);
         }
         let healed = healed.map_err(StoreError::Mls)?;
         for (_, taken) in &healed.applied {

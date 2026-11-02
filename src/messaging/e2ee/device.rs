@@ -15,10 +15,11 @@
 //! The E2EE of the device: its MLS state, its Home KDS, and its enrolment
 //! once provisioned (RCC.16 sections 4, 5.1)
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::mls::rcs::certificate::RcsCredentialValidator;
 use rust_rcs_core::mls::rcs::{credential_tel_uris, same_tel_uri, MlsCapability, MLS_VERSION_V1};
 use rust_rcs_core::mls::{
@@ -35,7 +36,7 @@ use super::file::Uploads;
 use super::heal::Heals;
 use super::kds::{self, EnrolmentError, KeyDistribution};
 use super::metadata::Recoveries;
-use super::notes::Notes;
+use super::notes::{put, Notes, Reader};
 use super::provisioning;
 use super::replace::Replacements;
 use super::store::{MlsStore, SaveState, StoreError};
@@ -69,6 +70,78 @@ pub enum DeviceError {
     Enrolment(EnrolmentError),
 }
 
+const LOG_TAG: &str = "e2ee";
+
+/// By group, the Message-ID of the control message carrying the Commit of
+/// the device last sent, as the notes of the device keep them for it to
+/// restart with: a refusal of it from the Conversation Focus is known then
+/// too (RCC.16 sections 6.2.5, 7.7.2.1)
+pub(super) struct ControlMessages<'a> {
+    notes: &'a Notes,
+    store: &'a MlsStore,
+}
+
+impl ControlMessages<'_> {
+    /// Takes note of `message_id` sent last in the group `conversation_id`
+    pub(super) fn insert(&self, conversation_id: &str, message_id: String) {
+        self.notes.hold(self.store, |data| {
+            data.control_messages
+                .insert(String::from(conversation_id), message_id)
+        });
+    }
+
+    /// Whether one of the group `conversation_id` waits for the Focus
+    pub(super) fn contains(&self, conversation_id: &str) -> bool {
+        self.notes
+            .read(|data| data.control_messages.contains_key(conversation_id))
+    }
+
+    /// Lets go of that of the group `conversation_id`
+    pub(super) fn remove(&self, conversation_id: &str) {
+        if self.contains(conversation_id) {
+            self.notes.hold(self.store, |data| {
+                data.control_messages.remove(conversation_id)
+            });
+        }
+    }
+
+    /// Lets go of that of the group `conversation_id` if it is `message_id`;
+    /// whether it was
+    pub(super) fn take(&self, conversation_id: &str, message_id: &str) -> bool {
+        let sent = self.notes.read(|data| {
+            data.control_messages
+                .get(conversation_id)
+                .is_some_and(|sent| sent == message_id)
+        });
+        if sent {
+            self.remove(conversation_id);
+        }
+        sent
+    }
+}
+
+/// The control messages `control_messages`, as the notes of the device hold
+/// them
+pub(super) fn encode_control_messages(control_messages: &BTreeMap<String, String>) -> Vec<u8> {
+    let mut data = Vec::new();
+    for (conversation_id, message_id) in control_messages {
+        put(&mut data, conversation_id.as_bytes());
+        put(&mut data, message_id.as_bytes());
+    }
+    data
+}
+
+/// The control messages `reader` reads to its end, as
+/// encode_control_messages() puts them; None if they cannot be read
+pub(super) fn decode_control_messages(reader: &mut Reader) -> Option<BTreeMap<String, String>> {
+    let mut control_messages = BTreeMap::new();
+    while !reader.is_empty() {
+        let conversation_id = reader.string()?;
+        control_messages.insert(conversation_id, reader.string()?);
+    }
+    Some(control_messages)
+}
+
 pub struct E2eeDevice {
     store: MlsStore,
     validator: Arc<RcsCredentialValidator>,
@@ -78,16 +151,13 @@ pub struct E2eeDevice {
     /// if ACS gave one
     provisioned: Mutex<Option<(String, Option<Vec<u8>>)>>,
     make_signer: MakeSigner,
-    /// By group, the Message-ID of the control message carrying the Commit
-    /// of the device last sent, for as long as the device runs
-    control_messages: Mutex<HashMap<String, String>>,
-    /// The groups to self-heal and being self-healed
-    heals: Heals,
     /// The groups whose KeyPackage Update is put off for now
     replacements: Replacements,
-    /// The groups moved to unencrypted, and being moved back
-    upgrades: Upgrades,
-    /// The messages not decrypted, and those sent, kept with the MLS state
+    /// What the device keeps besides MLS, with the MLS state: the messages
+    /// not decrypted, and those sent; the control messages it waits for the
+    /// Conversation Focus to take; the groups to self-heal, being
+    /// self-healed and made anew; and those moved to unencrypted, and being
+    /// moved back
     notes: Notes,
     /// The groups whose Group Metadata keys are recovered
     recoveries: Recoveries,
@@ -119,35 +189,58 @@ impl E2eeDevice {
         }
 
         let notes = Notes::kept_by(&store);
-        Ok(E2eeDevice {
+        let device = E2eeDevice {
             store,
             validator,
             kds,
             home_kds,
             provisioned: Mutex::new(None),
             make_signer: Box::new(|| SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).ok()),
-            control_messages: Mutex::new(HashMap::new()),
-            heals: Heals::default(),
             replacements: Replacements::default(),
-            upgrades: Upgrades::default(),
             notes,
             recoveries: Recoveries::default(),
             uploads: Uploads::default(),
             descriptions: Descriptions::default(),
             unencrypted_chats: Unencrypted::default(),
-        })
+        };
+        device.settle_restarts();
+        Ok(device)
+    }
+
+    /// Lets go of the Eras moving groups back to encrypted made before the
+    /// device restarted, which the Conversation Focus is to accept by the
+    /// INVITE restarting each group: that INVITE went with the device. The
+    /// groups stay unencrypted until moved back again (RCC.16 section 11.1).
+    fn settle_restarts(&self) {
+        for conversation_id in self.upgrades().all_restarting() {
+            if let Err(e) = self.discard_pending(&conversation_id, false) {
+                platform_log(
+                    LOG_TAG,
+                    format!(
+                        "Era made before the device restarted not discarded: {:?}",
+                        e
+                    ),
+                );
+            }
+        }
     }
 
     pub fn store(&self) -> &MlsStore {
         &self.store
     }
 
-    pub(super) fn control_messages(&self) -> &Mutex<HashMap<String, String>> {
-        &self.control_messages
+    pub(super) fn control_messages(&self) -> ControlMessages<'_> {
+        ControlMessages {
+            notes: &self.notes,
+            store: &self.store,
+        }
     }
 
-    pub(super) fn heals(&self) -> &Heals {
-        &self.heals
+    pub(super) fn heals(&self) -> Heals<'_> {
+        Heals {
+            notes: &self.notes,
+            store: &self.store,
+        }
     }
 
     pub(super) fn replacements(&self) -> &Replacements {
@@ -158,8 +251,11 @@ impl E2eeDevice {
         &self.notes
     }
 
-    pub(super) fn upgrades(&self) -> &Upgrades {
-        &self.upgrades
+    pub(super) fn upgrades(&self) -> Upgrades<'_> {
+        Upgrades {
+            notes: &self.notes,
+            store: &self.store,
+        }
     }
 
     pub(super) fn recoveries(&self) -> &Recoveries {

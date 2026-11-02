@@ -18,7 +18,13 @@
 //!
 //! A change to them is kept before anything it brings is given out, as the
 //! MLS state is: a message lost or sent survives the device restarting.
+//!
+//! So too, as far as they can be kept, the control message of each group
+//! the device waits for the Conversation Focus to take, where self-healing
+//! and making new Eras of groups stand, and where moving groups back to
+//! encrypted stands (RCC.16 sections 6.2.5, 10.1, 11.1, 11.2).
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -27,10 +33,13 @@ use rust_rcs_core::mls::{self, MlsClient, MlsConversation};
 
 use super::chat::{self, Chat};
 use super::description::{self, Icon};
+use super::device;
 use super::file::{self, Received};
+use super::heal::{self, Heal};
 use super::lost::{self, Lost};
 use super::sent::{self, Membership, Sent};
 use super::store::{MlsStore, StoreError};
+use super::upgrade::{self, UpgradeState};
 
 const LOG_TAG: &str = "e2ee";
 
@@ -48,6 +57,9 @@ const SECTION_RECEIVED: u8 = 4;
 const SECTION_ICONS: u8 = 5;
 const SECTION_CHATS: u8 = 6;
 const SECTION_CHAT_ACTIVITY: u8 = 7;
+const SECTION_CONTROL_MESSAGES: u8 = 8;
+const SECTION_HEALS: u8 = 9;
+const SECTION_UPGRADES: u8 = 10;
 
 /// What the device keeps besides MLS
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -64,6 +76,13 @@ pub(super) struct NotesData {
     pub(super) icons: Vec<Icon>,
     /// The encrypted 1-to-1 chats
     pub(super) chats: Vec<Chat>,
+    /// By group, the Message-ID of the control message carrying the Commit
+    /// of the device last sent, until the Conversation Focus takes it
+    pub(super) control_messages: BTreeMap<String, String>,
+    /// By group, where self-healing it and making its next Era stands
+    pub(super) heals: BTreeMap<String, Heal>,
+    /// By group, where moving it back to encrypted stands
+    pub(super) upgrades: BTreeMap<String, UpgradeState>,
 }
 
 /// What the device keeps besides MLS, as the store keeps it
@@ -100,6 +119,22 @@ impl Notes {
             *data = changed;
         }
         Ok(result)
+    }
+
+    /// Changes the notes as `change` does, kept by `store` if they can be:
+    /// what the device does without after a restart, if it must, changed
+    /// all the same
+    pub(super) fn hold<R>(&self, store: &MlsStore, change: impl FnOnce(&mut NotesData) -> R) -> R {
+        let mut data = self.0.lock().unwrap();
+        let mut changed = data.clone();
+        let result = change(&mut changed);
+        if changed != *data {
+            if let Err(e) = store.keep_notes(encode(&changed)) {
+                platform_log(LOG_TAG, format!("notes of the device not kept: {:?}", e));
+            }
+            *data = changed;
+        }
+        result
     }
 
     /// Calls `mls` with the group `group_id` of `store` and the client, then
@@ -211,6 +246,12 @@ fn encode(data: &NotesData) -> Vec<u8> {
     section(SECTION_ICONS, description::encode(&data.icons));
     section(SECTION_CHATS, chat::encode(&data.chats));
     section(SECTION_CHAT_ACTIVITY, chat::encode_activity(&data.chats));
+    section(
+        SECTION_CONTROL_MESSAGES,
+        device::encode_control_messages(&data.control_messages),
+    );
+    section(SECTION_HEALS, heal::encode(&data.heals));
+    section(SECTION_UPGRADES, upgrade::encode(&data.upgrades));
     notes
 }
 
@@ -238,6 +279,11 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
                     SECTION_ICONS => data.icons = description::decode(&mut body)?,
                     SECTION_CHATS => data.chats = chat::decode(&mut body)?,
                     SECTION_CHAT_ACTIVITY => activity = chat::decode_activity(&mut body)?,
+                    SECTION_CONTROL_MESSAGES => {
+                        data.control_messages = device::decode_control_messages(&mut body)?
+                    }
+                    SECTION_HEALS => data.heals = heal::decode(&mut body)?,
+                    SECTION_UPGRADES => data.upgrades = upgrade::decode(&mut body)?,
                     _ => {}
                 }
             }
@@ -255,15 +301,20 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::{Duration, SystemTime};
+
+    use rust_rcs_core::mls::rcs::proto::EndMlsReason;
 
     use crate::messaging::cpm::encryption::FailedToDecrypt;
 
     use super::super::chat::Chat;
     use super::super::description::Icon;
     use super::super::file::Received;
+    use super::super::heal::{Heal, NextEra, Ongoing};
     use super::super::lost::Lost;
     use super::super::sent::{Membership, Sent};
+    use super::super::upgrade::UpgradeState;
     use super::{decode, encode, NotesData, NOTES_VERSION_LOST};
 
     const BOB: &str = "tel:+491707654321";
@@ -329,6 +380,51 @@ mod tests {
                     active: None,
                 },
             ],
+            control_messages: BTreeMap::from([
+                (String::from("group-1"), String::from("c1")),
+                (String::from("group-2"), String::from("c2")),
+            ]),
+            heals: BTreeMap::from([
+                (
+                    String::from("group-1"),
+                    Heal {
+                        wanted: true,
+                        ongoing: None,
+                        attempts: vec![then, then + Duration::from_secs(60)],
+                        failed: true,
+                        singleton: Some(EndMlsReason::OutgoingCommitFailed),
+                        eras: vec![then],
+                    },
+                ),
+                (
+                    String::from("group-2"),
+                    Heal {
+                        failed: true,
+                        eras: vec![then],
+                        ..Heal::default()
+                    },
+                ),
+            ]),
+            upgrades: BTreeMap::from([
+                (
+                    String::from("group-1"),
+                    UpgradeState {
+                        ended: Some(then),
+                        attempted: None,
+                        incapable: Some(then + Duration::from_secs(60)),
+                        without_group: true,
+                        restarting: true,
+                    },
+                ),
+                (
+                    String::from("group-2"),
+                    UpgradeState {
+                        attempted: Some(then),
+                        restarting: true,
+                        ..UpgradeState::default()
+                    },
+                ),
+            ]),
         }
     }
 
@@ -374,10 +470,67 @@ mod tests {
 
         // a section of a kind not known passed over
         let mut later = encode(&data);
-        later.push(9);
+        later.push(99);
         later.extend_from_slice(&3u32.to_be_bytes());
         later.extend_from_slice(b"new");
         assert_eq!(decode(&later), Some(data.clone()));
+    }
+
+    #[test]
+    fn what_was_being_done_to_a_group_as_the_device_stopped_is_due_again() {
+        let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let heal = |ongoing| Heal {
+            ongoing: Some(ongoing),
+            attempts: vec![then],
+            ..Heal::default()
+        };
+        let kept = NotesData {
+            heals: BTreeMap::from([
+                (String::from("healing"), heal(Ongoing::Healing)),
+                (
+                    String::from("making-era"),
+                    heal(Ongoing::MakingEra(NextEra::Encrypted)),
+                ),
+                (
+                    String::from("making-singleton"),
+                    heal(Ongoing::MakingEra(NextEra::Singleton(
+                        EndMlsReason::CannotFetchKeypackages,
+                    ))),
+                ),
+            ]),
+            ..NotesData::default()
+        };
+        let read = decode(&encode(&kept)).unwrap();
+        let attempted = Heal {
+            attempts: vec![then],
+            ..Heal::default()
+        };
+        assert_eq!(
+            read.heals,
+            BTreeMap::from([
+                (
+                    String::from("healing"),
+                    Heal {
+                        wanted: true,
+                        ..attempted.clone()
+                    }
+                ),
+                (
+                    String::from("making-era"),
+                    Heal {
+                        failed: true,
+                        ..attempted.clone()
+                    }
+                ),
+                (
+                    String::from("making-singleton"),
+                    Heal {
+                        singleton: Some(EndMlsReason::CannotFetchKeypackages),
+                        ..attempted
+                    }
+                ),
+            ])
+        );
     }
 
     #[test]
