@@ -10174,6 +10174,10 @@ fn an_unencrypted_group_used_lately_is_moved_back_on_schedule() {
     assert_eq!(device.scheduled_upgrades(), []);
     device.group_used(CONVERSATION);
     assert_eq!(device.scheduled_upgrades(), scheduled);
+    // and not again within the week, though moving it back is due
+    clock.advance(DAY + MINUTE);
+    assert!(device.upgrade_due(CONVERSATION));
+    assert_eq!(device.scheduled_upgrades(), []);
 
     // a try as a session of it starts counting as a refresh: none on
     // schedule for a week after
