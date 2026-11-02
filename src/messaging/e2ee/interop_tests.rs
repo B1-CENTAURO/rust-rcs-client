@@ -1,0 +1,641 @@
+// Copyright 2023 宋昊文
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Two devices of the client, Alice's and Bob's, in conversations with each
+//! other: what one makes, the other takes, through a Conversation Focus and
+//! a Home KDS of the tests, as RCC.16 has them pass it on
+//!
+//! Each device is as the client sets it up: an `E2eeDevice` enrolled with
+//! its certificate, and the `DeviceGroups` the session service is given,
+//! which asks the other for its capabilities as an OPTIONS would. The Focus
+//! does what the tests need of one: it forwards what a member sends to the
+//! others as RCC.16 gives it (sections 6.2.4, 7.9.3, 8.2.1), and tells the
+//! sender it accepted it; it doesn't validate it.
+
+use std::collections::{HashMap, VecDeque};
+use std::io::Read;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime};
+
+use base64::{engine::general_purpose, Engine as _};
+use futures::executor::block_on;
+use rust_rcs_core::cpim::CPIMMessage;
+use rust_rcs_core::imdn::notification::{Imdn, Notification, Status};
+use rust_rcs_core::io::Serializable;
+use rust_rcs_core::mls::rcs::proto::{
+    self, server_mls_rcs_message, AcceptedMlsRcsMessage, EpochIdentifier, ServerCommitBundle,
+    ServerMlsRcsMessage, WelcomeCommitBundle,
+};
+use rust_rcs_core::mls::rcs::same_tel_uri;
+use rust_rcs_core::mls::Ciphersuite;
+
+use crate::capability::{Capabilities, CapabilityQuery, FEATURE_TAGS};
+use crate::messaging::cpm::encryption::{
+    EncryptedMetadata, GroupEncryption, GroupMetadata, MetadataChange, Sealed, Taken, Verified,
+};
+use crate::messaging::cpm::make_cpim_imdn_body;
+
+use super::chat::contact_tel_uri;
+use super::device::{E2eeDevice, Enrolled};
+use super::device_tests::provision;
+use super::group::DeviceGroups;
+use super::group_tests::{bundle_of, cpim_message, forwarded_of, metadata_parts, xml_value};
+use super::kds::{Enrolment, Fetched, KdsFuture, KeyDistribution, Recipient};
+use super::kds_tests::certificates::*;
+use super::kds_tests::{bytes, signer, validator, ALICE_TEL, BOB_TEL, HOME_KDS, TODAY};
+
+const ALICE_IMPU: &str = "sip:+491701234567@ims.example.com";
+const BOB_IMPU: &str = "sip:+491707654321@ims.example.com";
+const CONVERSATION: &str = "7b2c4e1a-9d3f-4a6b-8c5e-1f2a3b4c5d6e";
+const GROUP_URI: &str = "sip:conf7@conf.example.com";
+const TOKEN: &str = "focus-token-1";
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The KeyPackages the Participants uploaded, by tel URI, handed out one per
+/// Client and fetch, each once, as a Home KDS does (RCC.16 sections 5.1,
+/// 5.3)
+#[derive(Default)]
+struct Directory(Mutex<HashMap<String, VecDeque<Vec<u8>>>>);
+
+/// The Home KDS as the device of the Participant `tel_uri` reaches it,
+/// issuing it `chain` (section 4.2)
+struct HomeKds {
+    directory: Arc<Directory>,
+    tel_uri: &'static str,
+    chain: Vec<Vec<u8>>,
+}
+
+impl KeyDistribution for HomeKds {
+    fn enrol(&self, enrolment: Enrolment) -> KdsFuture<Vec<Vec<u8>>> {
+        assert_eq!(enrolment.tel_uri, self.tel_uri);
+        let chain = self.chain.clone();
+        Box::pin(async move { Ok(chain) })
+    }
+
+    fn upload(&self, key_packages: Vec<Vec<u8>>) -> KdsFuture<()> {
+        self.directory
+            .0
+            .lock()
+            .unwrap()
+            .entry(String::from(self.tel_uri))
+            .or_default()
+            .extend(key_packages);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn fetch(
+        &self,
+        _ciphersuites: Vec<Ciphersuite>,
+        recipients: Vec<Recipient>,
+    ) -> KdsFuture<Vec<(String, Fetched)>> {
+        let mut uploaded = self.directory.0.lock().unwrap();
+        let fetched = recipients
+            .into_iter()
+            .map(|recipient| {
+                let key_package = uploaded
+                    .iter_mut()
+                    .find(|(tel_uri, _)| same_tel_uri(tel_uri, &recipient.tel_uri))
+                    .and_then(|(_, key_packages)| key_packages.pop_front());
+                let fetched = match key_package {
+                    Some(key_package) => Fetched::KeyPackages(vec![key_package]),
+                    None => Fetched::NotFound,
+                };
+                (recipient.tel_uri, fetched)
+            })
+            .collect();
+        Box::pin(async move { Ok(fetched) })
+    }
+}
+
+/// The devices answering OPTIONS, by the tel URI of their user
+type Network = Arc<Mutex<Vec<(String, Weak<E2eeDevice>)>>>;
+
+/// What `contact` answers an OPTIONS with: the feature tags of the client,
+/// with the E2EE capability of its device while it tells it (RCC.16 section
+/// 5.2); 404 if it is none of `network`
+fn options(network: &Network) -> CapabilityQuery {
+    let network = Arc::clone(network);
+    Arc::new(move |contact: String| {
+        let device = contact_tel_uri(&contact).and_then(|tel_uri| {
+            network
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(of, _)| same_tel_uri(of, &tel_uri))
+                .and_then(|(_, device)| device.upgrade())
+        });
+        let answer = match device {
+            Some(device) => Capabilities {
+                status_code: 200,
+                feature_tags: match device.mls_feature_tags() {
+                    Some(mls) => format!("{};{}", FEATURE_TAGS, mls),
+                    None => String::from(FEATURE_TAGS),
+                },
+            },
+            None => Capabilities {
+                status_code: 404,
+                feature_tags: String::new(),
+            },
+        };
+        Box::pin(async move { answer })
+    })
+}
+
+/// The time both devices tell, which the tests move on
+#[derive(Clone)]
+struct Clock(Arc<Mutex<SystemTime>>);
+
+impl Clock {
+    fn now(&self) -> SystemTime {
+        *self.0.lock().unwrap()
+    }
+
+    fn advance(&self, by: Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+}
+
+/// The device of a Participant, with the groups of its session service
+struct Party {
+    device: Arc<E2eeDevice>,
+    groups: DeviceGroups,
+    impu: &'static str,
+}
+
+/// Alice and Bob, enrolled with the Home KDS of both, telling the time of
+/// the clock given
+fn alice_and_bob() -> (Party, Party, Clock) {
+    let network: Network = Arc::default();
+    let directory: Arc<Directory> = Arc::default();
+    let clock = Clock(Arc::new(Mutex::new(SystemTime::now())));
+    let party = |impu, tel_uri, certificate, key, public_key| {
+        let kds = HomeKds {
+            directory: Arc::clone(&directory),
+            tel_uri,
+            chain: vec![bytes(certificate), bytes(CA)],
+        };
+        let clock = clock.clone();
+        let device = E2eeDevice::new(
+            validator(TODAY),
+            HOME_KDS,
+            Arc::new(kds),
+            Box::new(|_| true),
+            None,
+        )
+        .unwrap()
+        .with_signer(move || Some(signer(key, public_key)))
+        .with_clock(move || clock.now());
+        provision(&device, &[impu], None);
+        assert_eq!(block_on(device.enrol()), Ok(Enrolled::Now), "{}", impu);
+        let device = Arc::new(device);
+        network
+            .lock()
+            .unwrap()
+            .push((String::from(tel_uri), Arc::downgrade(&device)));
+        let groups = DeviceGroups::new(&device, options(&network));
+        Party {
+            device,
+            groups,
+            impu,
+        }
+    };
+    let alice = party(ALICE_IMPU, ALICE_TEL, ALICE, ALICE_KEY, ALICE_PUBLIC_KEY);
+    let bob = party(BOB_IMPU, BOB_TEL, BOB, BOB_KEY, BOB_PUBLIC_KEY);
+    (alice, bob, clock)
+}
+
+/// The epoch `party` is in, in the MLS group `group_id`, which the Focus
+/// tells of when it accepts what was sent in it (RCC.16 section 6.2.4)
+fn epoch_of(party: &Party, group_id: &str) -> EpochIdentifier {
+    party
+        .device
+        .store()
+        .peek_conversation(group_id.as_bytes(), |conversation, _| {
+            conversation.epoch_identifier()
+        })
+        .unwrap()
+}
+
+/// What the Focus sends the sender of what was sent in the epoch `previous`
+/// once it accepts it (RCC.16 section 6.2.4)
+fn accepted(previous: EpochIdentifier) -> Vec<u8> {
+    proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::AcceptedMlsRcsMessage(
+            AcceptedMlsRcsMessage {
+                message_id: String::from("accepted"),
+                previous_epoch_identifier: Some(previous),
+            },
+        )),
+    })
+}
+
+/// What the Focus sends those the initial Commit `bundle` adds: the Commit,
+/// the Welcome and the ratchet tree (RCC.16 sections 7.9.3, 8.2.1)
+fn welcomed(bundle: &WelcomeCommitBundle) -> Vec<u8> {
+    proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: bundle.commit_list.clone(),
+                welcome: bundle.welcome.clone(),
+                ratchet_tree: bundle.ratchet_tree.clone(),
+                ..ServerCommitBundle::default()
+            },
+        )),
+    })
+}
+
+/// A message `from` sends `to`, as the client sends one, asking to be told
+/// of its delivery and display
+fn message(from: &str, to: &str, message_id: &str, text: &str) -> Vec<u8> {
+    format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:00.000+00:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: {}\r\n\
+imdn.Disposition-Notification: positive-delivery, display\r\n\
+NS: cpm <http://www.openmobilealliance.org/cpm/>\r\n\
+cpm.Payload-Type: text/plain\r\n\
+\r\n\
+Content-Type: text/plain\r\n\
+Content-Length: {}\r\n\
+\r\n\
+{}",
+        from,
+        to,
+        message_id,
+        text.len(),
+        text
+    )
+    .into_bytes()
+}
+
+/// The body of the CPIM message `cpim`, decoded if Base64
+fn body_of(cpim: &CPIMMessage) -> Vec<u8> {
+    let (_, content, base64) = cpim.get_message_body().unwrap();
+    match base64 {
+        true => general_purpose::STANDARD.decode(content).unwrap(),
+        false => content.to_vec(),
+    }
+}
+
+/// What `to` takes of `cpim`, which `from` sends encrypted in the MLS group
+/// `group_id`, as the Focus forwards it as it is (RCC.16 sections 7.5.6,
+/// 9.1.1)
+fn passed(from: &Party, to: &Party, group_id: &str, cpim: &[u8]) -> Vec<u8> {
+    let outer = match block_on(from.groups.encrypt(group_id, cpim)) {
+        Sealed::Encrypted(outer) => outer,
+        other => panic!("not encrypted: {:?}", other),
+    };
+    let message = cpim_message(&outer);
+    let (content_type, _, _) = message.get_message_body().unwrap();
+    assert_eq!(content_type, Some(&b"message/mls"[..]));
+    to.groups
+        .decrypt(group_id, &message.get_info().unwrap(), &body_of(&message))
+        .expect("decrypted")
+}
+
+/// What `from` says to `to` in the MLS group `group_id`, as `to` takes it:
+/// from whom, the Message-ID and the text
+fn said(from: &Party, to: &Party, group_id: &str, to_uri: &str, message_id: &str, text: &str) {
+    let taken = passed(
+        from,
+        to,
+        group_id,
+        &message(from.impu, to_uri, message_id, text),
+    );
+    let taken = cpim_message(&taken);
+    let info = taken.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", from.impu).as_bytes());
+    assert_eq!(info.imdn_message_id, message_id.as_bytes());
+    assert_eq!(body_of(&taken), text.as_bytes());
+}
+
+/// Whether `to` takes as signed by `from` the notification of `status` of
+/// the message `message_id` that `from` signs in the MLS group `group_id`,
+/// as the session sends it (RCC.16 sections 7.6, 9.1.3, 9.1.4); and that
+/// one changed on the way, as forged
+fn notified(from: &Party, to: &Party, group_id: &str, message_id: &str, status: Status) {
+    let notification = match status {
+        Status::Displayed => Notification::Display,
+        _ => Notification::Delivery,
+    };
+    let xml = Imdn {
+        message_id: String::from(message_id),
+        datetime: String::from("2026-10-25T12:00:01.000+00:00"),
+        recipient_uri: None,
+        original_recipient_uri: None,
+        notification,
+        status,
+    }
+    .to_xml()
+    .unwrap();
+    let body = make_cpim_imdn_body(&xml, to.impu, None, from.impu);
+    let mut cpim = Vec::with_capacity(body.estimated_size());
+    body.reader().unwrap().read_to_end(&mut cpim).unwrap();
+
+    let signed = block_on(from.groups.sign(group_id, &cpim)).expect("signed");
+    let message = cpim_message(&signed);
+    let info = message.get_info().unwrap();
+    let content = body_of(&message);
+    assert_eq!(content, xml.as_bytes());
+    assert_eq!(
+        to.groups.verify(group_id, &info, &content),
+        Verified::Signed
+    );
+
+    let changed = String::from_utf8(content)
+        .unwrap()
+        .replace(message_id, "another-message");
+    assert_eq!(
+        to.groups.verify(group_id, &info, changed.as_bytes()),
+        Verified::Forged
+    );
+}
+
+/// Alice makes the group chat of the two, which Bob joins with what the
+/// Focus sends him of it (RCC.16 sections 7.9.2, 8.1, 8.2.1)
+fn group_of_the_two(alice: &Party, bob: &Party) {
+    let cpim = block_on(alice.groups.prepare(
+        String::from(CONVERSATION),
+        String::from(alice.impu),
+        String::from(GROUP_URI),
+        vec![String::from(bob.impu)],
+    ))
+    .expect("an encrypted group");
+    let bundle = bundle_of(&cpim);
+    let previous = epoch_of(alice, CONVERSATION);
+    assert!(bob.groups.join(CONVERSATION, &welcomed(&bundle)));
+    assert_eq!(
+        alice
+            .groups
+            .on_server_message(CONVERSATION, &accepted(previous)),
+        Taken::default()
+    );
+}
+
+#[test]
+fn a_group_one_device_makes_the_other_joins_and_both_talk_in() {
+    let (alice, bob, _) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+
+    // both in the same epoch of the same Era (RCC.16 section 6.1.1)
+    let epoch = epoch_of(&alice, CONVERSATION);
+    assert_eq!((epoch.era_id, epoch.epoch_id), (0, 1));
+    assert_eq!(epoch_of(&bob, CONVERSATION), epoch);
+
+    // each taking what the other says (section 9.1.1)
+    said(
+        &alice,
+        &bob,
+        CONVERSATION,
+        GROUP_URI,
+        "alice-1",
+        "hello Bob",
+    );
+    said(
+        &bob,
+        &alice,
+        CONVERSATION,
+        GROUP_URI,
+        "bob-1",
+        "hello Alice",
+    );
+    said(
+        &alice,
+        &bob,
+        CONVERSATION,
+        GROUP_URI,
+        "alice-2",
+        "how are you?",
+    );
+
+    // and the notifications the other signs (sections 9.1.3, 9.1.4)
+    notified(&bob, &alice, CONVERSATION, "alice-1", Status::Delivered);
+    notified(&bob, &alice, CONVERSATION, "alice-1", Status::Displayed);
+    notified(&alice, &bob, CONVERSATION, "bob-1", Status::Delivered);
+
+    // shown the same identity verification code (section 5.5)
+    let code = alice
+        .device
+        .identity_verification_code(bob.impu, Some(CONVERSATION))
+        .expect("Alice's code");
+    assert_eq!(code.len(), 80);
+    assert_eq!(
+        bob.device
+            .identity_verification_code(alice.impu, Some(CONVERSATION)),
+        Ok(code)
+    );
+}
+
+#[test]
+fn a_file_one_device_sends_in_a_group_the_other_opens() {
+    let (alice, bob, _) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+
+    // sealed with a key of its own, uploaded, its key carried in the
+    // message sending it (RCC.16 sections 7.8, 9.1.2.1)
+    let url = "https://ftcs.example.com/f/7";
+    let file = alice
+        .groups
+        .seal_file(b"the picture", "picture.jpg", "image/jpeg")
+        .unwrap();
+    let xml = super::file::upload_xml(url);
+    assert!(alice
+        .groups
+        .uploaded(CONVERSATION, xml.as_bytes(), &file.metadata, None));
+    let cpim = format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:00.000+00:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: alice-ft-1\r\n\
+imdn.Disposition-Notification: positive-delivery, display\r\n\
+\r\n\
+Content-Type: application/vnd.gsma.rcs-ft-http+xml\r\n\
+Content-Length: {}\r\n\
+\r\n\
+{}",
+        alice.impu,
+        GROUP_URI,
+        xml.len(),
+        xml
+    );
+    let outer = match block_on(alice.groups.encrypt(CONVERSATION, cpim.as_bytes())) {
+        Sealed::Encrypted(outer) => outer,
+        other => panic!("not encrypted: {:?}", other),
+    };
+
+    // Bob given the XML of the file, as it was named, and opening it once
+    // downloaded (section 9.1.2.2)
+    let message = cpim_message(&outer);
+    let (content_type, xml, _) = message.get_message_body().unwrap();
+    assert_eq!(
+        content_type,
+        Some(&b"application/vnd.gsma.rcs-ft-http+xml"[..])
+    );
+    let opened = bob
+        .groups
+        .decrypt_file_transfer(CONVERSATION, &message.get_info().unwrap(), xml)
+        .expect("the file transfer message decrypted");
+    let opened = String::from_utf8_lossy(&body_of(&cpim_message(&opened))).into_owned();
+    assert!(
+        opened.contains("<file-name>picture.jpg</file-name>"),
+        "{}",
+        opened
+    );
+    assert!(!opened.contains("mls-file"), "{}", opened);
+    assert!(bob.groups.opens_file(url));
+    assert_eq!(
+        bob.groups.open_file(url, &file.ciphertext).as_deref(),
+        Some(&b"the picture"[..])
+    );
+}
+
+#[test]
+fn the_subject_one_device_sets_in_a_group_the_other_opens() {
+    let (alice, bob, _) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+
+    // the Commit bringing its key, which the Focus forwards, and the request
+    // it takes the encrypted subject from (RCC.16 sections 7.13.1, 9.7.1.5)
+    let cpim = block_on(alice.groups.change_metadata(
+        String::from(CONVERSATION),
+        String::from(alice.impu),
+        String::from(GROUP_URI),
+        MetadataChange::Subject(Some(String::from("Team <7>"))),
+    ))
+    .expect("the subject set");
+    let (_, bundle, request) = metadata_parts(&cpim);
+    let subject = xml_value(&request, "encrypted-subject").expect("the encrypted subject");
+    let previous = epoch_of(&alice, CONVERSATION);
+    bob.groups
+        .on_server_message(CONVERSATION, &forwarded_of(&bundle));
+    alice
+        .groups
+        .on_server_message(CONVERSATION, &accepted(previous));
+    assert_eq!(epoch_of(&bob, CONVERSATION), epoch_of(&alice, CONVERSATION));
+
+    // which both open, as the Focus tells of it (section 7.13.2)
+    let told = || {
+        Some(EncryptedMetadata {
+            value: subject.clone(),
+            participant: Some(String::from(alice.impu)),
+        })
+    };
+    let opened = GroupMetadata::Subject {
+        subject: Some(String::from("Team <7>")),
+        participant: Some(String::from(alice.impu)),
+    };
+    assert_eq!(
+        bob.groups.take_metadata(CONVERSATION, told(), None),
+        [opened.clone()]
+    );
+    assert_eq!(
+        alice.groups.take_metadata(CONVERSATION, told(), None),
+        [opened]
+    );
+}
+
+#[test]
+fn an_encrypted_chat_one_device_starts_the_other_joins_and_both_talk_in() {
+    let (alice, bob, clock) = alice_and_bob();
+
+    // a new MLS group of a random GUID, joined by Bob with what the Focus
+    // fans out of the INVITE (RCC.16 sections 6.1.1, 8.1.1, 8.2.1)
+    let (group_id, cpim) = block_on(
+        alice
+            .groups
+            .prepare_chat(String::from(bob.impu), String::from(alice.impu)),
+    )
+    .expect("an encrypted chat");
+    let bundle = bundle_of(&cpim);
+    let previous = epoch_of(&alice, &group_id);
+    assert_eq!(
+        bob.groups
+            .join_chat(alice.impu, &welcomed(&bundle), Some(String::from(TOKEN))),
+        Some(group_id.clone())
+    );
+    alice
+        .groups
+        .keep_chat(bob.impu, &group_id, Some(String::from(TOKEN)));
+    alice
+        .groups
+        .on_server_message(&group_id, &accepted(previous));
+    assert_eq!(
+        alice.groups.chat_group(bob.impu),
+        Some((group_id.clone(), Some(String::from(TOKEN))))
+    );
+    assert_eq!(
+        bob.groups.chat_group(alice.impu),
+        Some((group_id.clone(), Some(String::from(TOKEN))))
+    );
+    assert_eq!(epoch_of(&bob, &group_id), epoch_of(&alice, &group_id));
+
+    // each taking what the other says, and the notifications the other signs
+    // (sections 9.1.1, 9.1.3, 9.1.4)
+    said(&alice, &bob, &group_id, bob.impu, "alice-1", "hi Bob");
+    said(&bob, &alice, &group_id, alice.impu, "bob-1", "hi Alice");
+    notified(&bob, &alice, &group_id, "alice-1", Status::Displayed);
+    notified(&alice, &bob, &group_id, "bob-1", Status::Delivered);
+
+    // shown the same identity verification code, from the chat alone
+    // (section 5.5)
+    let code = alice
+        .device
+        .identity_verification_code(bob.impu, None)
+        .expect("Alice's code");
+    assert_eq!(
+        bob.device.identity_verification_code(alice.impu, None),
+        Ok(code)
+    );
+
+    // 30 days unused, it starts again in its next Era, which Bob joins in
+    // place of the one he has (sections 6.1.2, 8.3)
+    assert!(!alice.groups.chat_era_due(bob.impu));
+    clock.advance(31 * DAY);
+    assert!(alice.groups.chat_era_due(bob.impu));
+    let (era_group, cpim) = block_on(
+        alice
+            .groups
+            .prepare_chat_era(String::from(bob.impu), String::from(alice.impu)),
+    )
+    .expect("the next Era");
+    assert_eq!(era_group, group_id);
+    let bundle = bundle_of(&cpim);
+    let previous = epoch_of(&alice, &group_id);
+    assert_eq!(
+        bob.groups.join_chat(
+            alice.impu,
+            &welcomed(&bundle),
+            Some(String::from("focus-token-2"))
+        ),
+        Some(group_id.clone())
+    );
+    alice
+        .groups
+        .keep_chat(bob.impu, &group_id, Some(String::from("focus-token-2")));
+    alice
+        .groups
+        .on_server_message(&group_id, &accepted(previous));
+    let epoch = epoch_of(&alice, &group_id);
+    assert_eq!((epoch.era_id, epoch.epoch_id), (1, 1));
+    assert_eq!(epoch_of(&bob, &group_id), epoch);
+    assert!(!alice.groups.chat_era_due(bob.impu));
+
+    // in which both talk on
+    said(&bob, &alice, &group_id, alice.impu, "bob-2", "back again");
+    said(&alice, &bob, &group_id, bob.impu, "alice-2", "welcome back");
+    notified(&bob, &alice, &group_id, "alice-2", Status::Delivered);
+}

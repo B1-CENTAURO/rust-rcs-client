@@ -199,7 +199,7 @@ fn epoch(device: &E2eeDevice, conversation_id: &str) -> Result<(u64, bool), Stor
 }
 
 /// The bundle the CPIM message `cpim` carries
-fn bundle_of(cpim: &[u8]) -> WelcomeCommitBundle {
+pub(super) fn bundle_of(cpim: &[u8]) -> WelcomeCommitBundle {
     let message = CPIMMessage::try_from(&Body::construct_message(cpim).unwrap()).unwrap();
     let (content_type, content, base64) = message.get_message_body().unwrap();
     assert_eq!(content_type, Some(CONTENT_TYPE_MLS_RCS_CLIENT));
@@ -892,7 +892,7 @@ fn header_names(message: &CPIMMessage) -> Vec<String> {
         .collect()
 }
 
-fn cpim_message(data: &[u8]) -> CPIMMessage {
+pub(super) fn cpim_message(data: &[u8]) -> CPIMMessage {
     CPIMMessage::try_from(&Body::construct_message(data).unwrap()).unwrap()
 }
 
@@ -8777,7 +8777,7 @@ fn an_icon_that_does_not_open_has_the_metadata_keys_checked() {
 /// (RCC.16 sections 9.7.1.4 to 9.7.1.7): its CPIM message, then from its
 /// multipart body, in that order, the CommitBundle of its
 /// `message/mls-rcs-client` and its CPM group data request
-fn metadata_parts(cpim: &[u8]) -> (CPIMMessage, CommitBundle, String) {
+pub(super) fn metadata_parts(cpim: &[u8]) -> (CPIMMessage, CommitBundle, String) {
     let message = cpim_message(cpim);
     let (content_type, content, _) = message.get_message_body().unwrap();
     let content_type = String::from_utf8_lossy(content_type.unwrap()).into_owned();
@@ -8822,7 +8822,7 @@ fn metadata_parts(cpim: &[u8]) -> (CPIMMessage, CommitBundle, String) {
 }
 
 /// What the Conversation Focus forwards of the CommitBundle `bundle`
-fn forwarded_of(bundle: &CommitBundle) -> Vec<u8> {
+pub(super) fn forwarded_of(bundle: &CommitBundle) -> Vec<u8> {
     proto::encode(&ServerMlsRcsMessage {
         payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
             ServerCommitBundle {
@@ -8835,7 +8835,7 @@ fn forwarded_of(bundle: &CommitBundle) -> Vec<u8> {
 }
 
 /// The value of the element `name` of the XML `xml`, unescaped
-fn xml_value(xml: &str, name: &str) -> Option<String> {
+pub(super) fn xml_value(xml: &str, name: &str) -> Option<String> {
     let start = xml.find(&format!("<{}>", name))? + name.len() + 2;
     let end = start + xml[start..].find(&format!("</{}>", name))?;
     Some(
