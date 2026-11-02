@@ -34,15 +34,18 @@ use rust_rcs_core::cpim::CPIMMessage;
 use rust_rcs_core::imdn::notification::{Imdn, Notification, Status};
 use rust_rcs_core::io::Serializable;
 use rust_rcs_core::mls::rcs::proto::{
-    self, server_mls_rcs_message, AcceptedMlsRcsMessage, EpochIdentifier, ServerCommitBundle,
+    self, client_mls_rcs_message, server_mls_rcs_message, AcceptedMlsRcsMessage,
+    ClientMlsRcsMessage, CommitBundle, EpochIdentifier, MlsGroupInfo, ServerCommitBundle,
     ServerMlsRcsMessage, WelcomeCommitBundle,
 };
 use rust_rcs_core::mls::rcs::same_tel_uri;
+use rust_rcs_core::mls::rcs::INFO_PACKAGE_MLS_GROUP_INFO_PULL;
 use rust_rcs_core::mls::Ciphersuite;
 
 use crate::capability::{Capabilities, CapabilityQuery, FEATURE_TAGS};
 use crate::messaging::cpm::encryption::{
-    EncryptedMetadata, GroupEncryption, GroupMetadata, MetadataChange, Sealed, Taken, Verified,
+    EncryptedMetadata, EndReason, FtdAnswer, GroupEncryption, GroupInfoPull, GroupMetadata,
+    MetadataChange, Sealed, Taken, UploadedIcon, Verified,
 };
 use crate::messaging::cpm::make_cpim_imdn_body;
 
@@ -638,4 +641,484 @@ fn an_encrypted_chat_one_device_starts_the_other_joins_and_both_talk_in() {
     said(&bob, &alice, &group_id, alice.impu, "bob-2", "back again");
     said(&alice, &bob, &group_id, bob.impu, "alice-2", "welcome back");
     notified(&bob, &alice, &group_id, "alice-2", Status::Delivered);
+}
+
+/// The `message/mls-rcs-client` the control message `cpim` carries, alone
+/// or first of its parts (RCC.16 sections 7.9.1, 7.13.1)
+fn client_message(cpim: &[u8]) -> ClientMlsRcsMessage {
+    let message = cpim_message(cpim);
+    let (content_type, _, _) = message.get_message_body().unwrap();
+    let multipart =
+        content_type.is_some_and(|content_type| content_type.starts_with(b"multipart/"));
+    if multipart {
+        let (_, bundle, _) = metadata_parts(cpim);
+        return ClientMlsRcsMessage {
+            payload: Some(client_mls_rcs_message::Payload::CommitBundle(bundle)),
+        };
+    }
+    proto::decode(&body_of(&message)).expect("a message/mls-rcs-client")
+}
+
+/// The CommitBundle the control message `cpim` carries
+fn commit_bundle(cpim: &[u8]) -> CommitBundle {
+    match client_message(cpim).payload {
+        Some(client_mls_rcs_message::Payload::CommitBundle(bundle)) => bundle,
+        other => panic!("not a CommitBundle: {:?}", other.is_some()),
+    }
+}
+
+/// What `from` makes with `commit`, a Commit of the MLS group `group_id`
+/// in a control message, as the Focus takes it: forwarded to `to`, `from`
+/// told it accepted it (RCC.16 sections 6.2.4, 7.9.3); what `to`, then
+/// `from`, take of it, and the GroupInfo of the epoch it leads to, with the
+/// ratchet tree, as the Focus keeps it to give (section 6.3.1)
+fn committed(
+    from: &Party,
+    to: Option<&Party>,
+    group_id: &str,
+    commit: impl FnOnce(&Party) -> Option<Vec<u8>>,
+) -> (Taken, Taken, MlsGroupInfo) {
+    let cpim = commit(from).expect("a Commit");
+    let bundle = commit_bundle(&cpim);
+    let previous = epoch_of(from, group_id);
+    let taken = to.map_or(Taken::default(), |to| {
+        to.groups
+            .on_server_message(group_id, &forwarded_of(&bundle))
+    });
+    let own = from.groups.on_server_message(group_id, &accepted(previous));
+    let group_info = MlsGroupInfo {
+        group_info: bundle.group_info,
+        ratchet_tree: ratchet_tree_of(from, group_id),
+        pending_proposals: Vec::new(),
+    };
+    (taken, own, group_info)
+}
+
+/// The ratchet tree of the MLS group `group_id` as `party` has it, which the
+/// Focus keeps of the latest epoch to give with Welcomes and GroupInfos
+/// (RCC.16 sections 6.3.1, 8.2.1)
+fn ratchet_tree_of(party: &Party, group_id: &str) -> Vec<u8> {
+    party
+        .device
+        .store()
+        .peek_conversation(group_id.as_bytes(), |conversation, _| {
+            conversation.ratchet_tree()
+        })
+        .unwrap()
+        .unwrap()
+}
+
+/// The Focus answering INFO requests with `group_info`, the GroupInfo it
+/// keeps, to an MLS-Group-Info-Pull; the enhanced one not supported
+/// (RCC.16 sections 6.3.1, 6.3.2)
+fn giving(group_info: MlsGroupInfo) -> GroupInfoPull {
+    Arc::new(move |package: &'static [u8], _| {
+        let answer = match package == INFO_PACKAGE_MLS_GROUP_INFO_PULL {
+            true => Some((
+                200,
+                proto::encode(&ServerMlsRcsMessage {
+                    payload: Some(server_mls_rcs_message::Payload::MlsGroupInfo(
+                        group_info.clone(),
+                    )),
+                }),
+            )),
+            false => Some((501, Vec::new())),
+        };
+        Box::pin(async move { answer })
+    })
+}
+
+/// `party` setting the subject of the group chat, a Commit (RCC.16 section
+/// 9.7.1.5)
+fn subject_set(party: &Party) -> Option<Vec<u8>> {
+    block_on(party.groups.change_metadata(
+        String::from(CONVERSATION),
+        String::from(party.impu),
+        String::from(GROUP_URI),
+        MetadataChange::Subject(Some(String::from("Team"))),
+    ))
+}
+
+/// `party` sending `count` messages in the group chat, which the others need
+/// not take
+fn chatted(party: &Party, count: usize) {
+    for n in 0..count {
+        let cpim = message(party.impu, GROUP_URI, &format!("chat-{}", n), "chat");
+        assert!(matches!(
+            block_on(party.groups.encrypt(CONVERSATION, &cpim)),
+            Sealed::Encrypted(_)
+        ));
+    }
+}
+
+/// What `to` decrypts of `cpim`, which `from` sends encrypted in the MLS
+/// group `group_id`; None if it cannot
+fn decrypted_by(from: &Party, to: &Party, group_id: &str, cpim: &[u8]) -> Option<Vec<u8>> {
+    let outer = match block_on(from.groups.encrypt(group_id, cpim)) {
+        Sealed::Encrypted(outer) => outer,
+        other => panic!("not encrypted: {:?}", other),
+    };
+    let message = cpim_message(&outer);
+    to.groups
+        .decrypt(group_id, &message.get_info().unwrap(), &body_of(&message))
+}
+
+#[test]
+fn a_device_leaving_is_committed_out_by_the_other_and_can_be_added_again() {
+    let (alice, bob, _) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+
+    // Bob's self_remove Proposal, which the Focus forwards (RCC.16 sections
+    // 7.9.4, 9.4)
+    let cpim = block_on(bob.groups.prepare_leave(
+        String::from(CONVERSATION),
+        String::from(bob.impu),
+        String::from(GROUP_URI),
+    ))
+    .expect("the leave");
+    let proposals = match client_message(&cpim).payload {
+        Some(client_mls_rcs_message::Payload::ProposalList(proposals)) => proposals,
+        _ => panic!("not a ProposalList"),
+    };
+    let forwarded = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ProposalList(proposals)),
+    });
+    assert!(
+        alice
+            .groups
+            .on_server_message(CONVERSATION, &forwarded)
+            .proposals
+    );
+
+    // committed by Alice, Bob's group let go of once he left (section 9.5.1)
+    committed(&alice, None, CONVERSATION, |alice| {
+        block_on(alice.groups.commit_leaves(
+            String::from(CONVERSATION),
+            String::from(alice.impu),
+            String::from(GROUP_URI),
+        ))
+    });
+    bob.groups.abandon(CONVERSATION);
+    let members = alice
+        .device
+        .store()
+        .peek_conversation(CONVERSATION.as_bytes(), |conversation, _| {
+            conversation.members().len()
+        });
+    assert_eq!(members, Ok(1));
+    assert!(!bob.groups.encrypts(CONVERSATION));
+
+    // added again, with a KeyPackage of his the Home KDS has (sections 5.3,
+    // 9.2)
+    let cpim = block_on(alice.groups.prepare_add(
+        String::from(CONVERSATION),
+        String::from(alice.impu),
+        String::from(GROUP_URI),
+        vec![String::from(bob.impu)],
+    ))
+    .expect("Bob added");
+    let mut bundle = bundle_of(&cpim);
+    let previous = epoch_of(&alice, CONVERSATION);
+    alice
+        .groups
+        .on_server_message(CONVERSATION, &accepted(previous));
+    // the ratchet tree from the Focus, if the Commit doesn't bring it
+    if bundle.ratchet_tree.is_empty() {
+        bundle.ratchet_tree = ratchet_tree_of(&alice, CONVERSATION);
+    }
+    assert!(bob.groups.join(CONVERSATION, &welcomed(&bundle)));
+    assert_eq!(epoch_of(&bob, CONVERSATION), epoch_of(&alice, CONVERSATION));
+    said(
+        &alice,
+        &bob,
+        CONVERSATION,
+        GROUP_URI,
+        "alice-3",
+        "welcome back",
+    );
+    said(&bob, &alice, CONVERSATION, GROUP_URI, "bob-3", "thanks");
+}
+
+#[test]
+fn a_device_removed_takes_nothing_more_while_the_other_talks_on() {
+    let (alice, bob, _) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+
+    // the Commit removing Bob, which the Focus forwards to him too (RCC.16
+    // section 9.3)
+    let _ = committed(&alice, Some(&bob), CONVERSATION, |alice| {
+        block_on(alice.groups.prepare_remove(
+            String::from(CONVERSATION),
+            String::from(alice.impu),
+            String::from(GROUP_URI),
+            String::from(bob.impu),
+        ))
+    });
+    let members = alice
+        .device
+        .store()
+        .peek_conversation(CONVERSATION.as_bytes(), |conversation, _| {
+            conversation.members().len()
+        });
+    assert_eq!(members, Ok(1));
+
+    // what Alice says next not his to decrypt
+    assert_eq!(
+        decrypted_by(
+            &alice,
+            &bob,
+            CONVERSATION,
+            &message(alice.impu, GROUP_URI, "alice-2", "Bob is gone")
+        ),
+        None
+    );
+}
+
+#[test]
+fn the_keys_one_device_updates_the_other_follows_and_both_talk_on() {
+    let (alice, bob, clock) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+    let before = epoch_of(&alice, CONVERSATION);
+    // due once 50 messages are sent, a week on at the earliest
+    clock.advance(8 * DAY);
+
+    // each in turn, by a Commit the Focus forwards (RCC.16 section 9.5.2)
+    for (from, to) in [(&alice, &bob), (&bob, &alice)] {
+        chatted(from, 50);
+        committed(from, Some(to), CONVERSATION, |from| {
+            block_on(from.groups.update_keys(
+                String::from(CONVERSATION),
+                String::from(from.impu),
+                String::from(GROUP_URI),
+            ))
+        });
+        assert_eq!(epoch_of(to, CONVERSATION), epoch_of(from, CONVERSATION));
+    }
+    assert_eq!(epoch_of(&alice, CONVERSATION).epoch_id, before.epoch_id + 2);
+    said(&alice, &bob, CONVERSATION, GROUP_URI, "alice-2", "new keys");
+    said(&bob, &alice, CONVERSATION, GROUP_URI, "bob-2", "mine too");
+}
+
+#[test]
+fn a_device_that_missed_a_commit_heals_and_has_what_it_could_not_decrypt_re_sent() {
+    let (alice, bob, _) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+
+    // Alice's Commit setting the subject, which Bob misses, then a message
+    // of hers he can't decrypt (RCC.16 section 10.1)
+    let (_, _, group_info) = committed(&alice, None, CONVERSATION, subject_set);
+    let missed = message(alice.impu, GROUP_URI, "alice-2", "did you get this?");
+    assert_eq!(decrypted_by(&alice, &bob, CONVERSATION, &missed), None);
+    assert!(bob.groups.needs_healing(CONVERSATION));
+
+    // healed with an External Commit from the GroupInfo the Focus gives,
+    // which it forwards to Alice (sections 6.3.1, 10.1.1)
+    let _ = committed(&bob, Some(&alice), CONVERSATION, |bob| {
+        block_on(bob.groups.heal(
+            String::from(CONVERSATION),
+            String::from(bob.impu),
+            String::from(GROUP_URI),
+            giving(group_info),
+        ))
+    });
+    assert!(!bob.groups.needs_healing(CONVERSATION));
+    assert_eq!(epoch_of(&bob, CONVERSATION), epoch_of(&alice, CONVERSATION));
+    said(
+        &bob,
+        &alice,
+        CONVERSATION,
+        GROUP_URI,
+        "bob-2",
+        "back in step",
+    );
+
+    // Alice told, by the negative delivery Bob signs, of what he could not
+    // decrypt, which she re-sends to him alone (sections 10.2 to 10.4)
+    let failed = bob.groups.failed_to_decrypt(CONVERSATION);
+    assert_eq!(failed.len(), 1);
+    let failed = &failed[0];
+    let body = make_cpim_imdn_body(
+        &failed.imdn,
+        &failed.sender_uri,
+        failed.original_message_id.as_deref(),
+        bob.impu,
+    );
+    let mut cpim = Vec::with_capacity(body.estimated_size());
+    body.reader().unwrap().read_to_end(&mut cpim).unwrap();
+    let signed = block_on(bob.groups.sign(CONVERSATION, &cpim)).expect("signed");
+    let signed = cpim_message(&signed);
+    let resent = match alice.groups.answer_failed_to_decrypt(
+        CONVERSATION,
+        &signed.get_info().unwrap(),
+        &body_of(&signed),
+    ) {
+        FtdAnswer::Resend(resent) => resent,
+        _ => panic!("not re-sent"),
+    };
+    let resent = cpim_message(&resent);
+    let taken = bob
+        .groups
+        .decrypt(CONVERSATION, &resent.get_info().unwrap(), &body_of(&resent))
+        .expect("the Re-Sent Message decrypted");
+    let taken = cpim_message(&taken);
+    let info = taken.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", alice.impu).as_bytes());
+    assert_eq!(info.mls_original_message_id, Some(&b"alice-2"[..]));
+    assert_eq!(body_of(&taken), b"did you get this?");
+}
+
+#[test]
+fn the_icon_one_device_sets_in_a_group_the_other_opens() {
+    let (alice, bob, _) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+
+    // sealed with a key of its own, uploaded, the Commit bringing its key
+    // forwarded, its URL told by the Focus (RCC.16 sections 7.13, 9.7.1.4)
+    let url = "https://ftcs.example.com/i/7";
+    let sealed = alice.groups.seal_icon(b"the icon", "image/png").unwrap();
+    let uploaded = UploadedIcon {
+        xml: super::file::upload_xml(url).into_bytes(),
+        metadata: sealed.metadata.clone(),
+    };
+    let cpim = block_on(alice.groups.change_metadata(
+        String::from(CONVERSATION),
+        String::from(alice.impu),
+        String::from(GROUP_URI),
+        MetadataChange::Icon(Some(uploaded)),
+    ))
+    .expect("the icon set");
+    let (_, bundle, request) = metadata_parts(&cpim);
+    assert_eq!(xml_value(&request, "encrypted-icon").as_deref(), Some(url));
+    let previous = epoch_of(&alice, CONVERSATION);
+    bob.groups
+        .on_server_message(CONVERSATION, &forwarded_of(&bundle));
+    alice
+        .groups
+        .on_server_message(CONVERSATION, &accepted(previous));
+
+    // which Bob opens once downloaded
+    let told = bob.groups.take_metadata(
+        CONVERSATION,
+        None,
+        Some(EncryptedMetadata {
+            value: String::from(url),
+            participant: Some(String::from(alice.impu)),
+        }),
+    );
+    assert!(
+        matches!(&told[..], [GroupMetadata::Icon { url: Some(told), .. }] if told == url),
+        "{:?}",
+        told
+    );
+    assert_eq!(
+        bob.groups.open_file(url, &sealed.ciphertext).as_deref(),
+        Some(&b"the icon"[..])
+    );
+}
+
+#[test]
+fn a_group_one_device_moves_to_unencrypted_is_unencrypted_for_the_other() {
+    let (alice, bob, _) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+
+    // by a Commit adding end_mls (RCC.16 sections 7.11.2, 11.2)
+    let (taken, own, _) = committed(&alice, Some(&bob), CONVERSATION, |alice| {
+        block_on(alice.groups.end_encryption(
+            String::from(CONVERSATION),
+            String::from(alice.impu),
+            String::from(GROUP_URI),
+            EndReason::ClientFailureEncryptionNotAvailable,
+        ))
+    });
+    assert!(taken.encryption_ended && own.encryption_ended);
+    for party in [&alice, &bob] {
+        assert!(party.groups.encryption_ended(CONVERSATION));
+        assert_eq!(
+            block_on(party.groups.encrypt(
+                CONVERSATION,
+                &message(party.impu, GROUP_URI, "plain-1", "in the clear")
+            )),
+            Sealed::Unencrypted
+        );
+    }
+}
+
+#[test]
+fn the_next_era_of_a_group_one_device_makes_the_other_joins() {
+    let (alice, bob, _) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+    let (_, _, group_info) = committed(&alice, Some(&bob), CONVERSATION, subject_set);
+
+    // made after the GroupInfo the Focus gives, with Bob's Clients as the
+    // Home KDS gives them, and joined by him in place of the Era he has
+    // (RCC.16 sections 8.3.1, 10.1)
+    alice.device.heals().want_new_era(CONVERSATION);
+    assert!(alice.groups.new_era_due(CONVERSATION));
+    let cpim = block_on(alice.groups.prepare_next_era(
+        String::from(CONVERSATION),
+        String::from(alice.impu),
+        String::from(GROUP_URI),
+        giving(group_info),
+    ))
+    .expect("the next Era");
+    let bundle = bundle_of(&cpim);
+    let previous = epoch_of(&alice, CONVERSATION);
+    assert!(bob.groups.join(CONVERSATION, &welcomed(&bundle)));
+    alice
+        .groups
+        .on_server_message(CONVERSATION, &accepted(previous));
+    let epoch = epoch_of(&alice, CONVERSATION);
+    assert_eq!((epoch.era_id, epoch.epoch_id), (1, 1));
+    assert_eq!(epoch_of(&bob, CONVERSATION), epoch);
+    said(
+        &alice,
+        &bob,
+        CONVERSATION,
+        GROUP_URI,
+        "alice-2",
+        "a new Era",
+    );
+    said(&bob, &alice, CONVERSATION, GROUP_URI, "bob-2", "so it is");
+}
+
+#[test]
+fn a_device_whose_keys_went_stale_is_replaced_by_the_other_and_rejoins() {
+    let (alice, bob, clock) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+
+    // Bob's leaf not updated for over 30 days, Alice replaces his Client
+    // with a KeyPackage of his the Home KDS has, updating her keys as well
+    // (RCC.16 section 9.5.4)
+    clock.advance(31 * DAY);
+    assert!(alice.groups.key_update_due(CONVERSATION));
+    let cpim = block_on(alice.groups.update_keys(
+        String::from(CONVERSATION),
+        String::from(alice.impu),
+        String::from(GROUP_URI),
+    ))
+    .expect("the KeyPackage Update");
+    let mut bundle = bundle_of(&cpim);
+    let previous = epoch_of(&alice, CONVERSATION);
+    alice
+        .groups
+        .on_server_message(CONVERSATION, &accepted(previous));
+    if bundle.ratchet_tree.is_empty() {
+        bundle.ratchet_tree = ratchet_tree_of(&alice, CONVERSATION);
+    }
+
+    // the Commit forwarded to Bob's old Client, a member still, with the
+    // Welcome along, which he joins anew with once his leaf is gone
+    bob.groups
+        .on_server_message(CONVERSATION, &welcomed(&bundle));
+    assert!(bob.groups.encrypts(CONVERSATION));
+    assert_eq!(epoch_of(&bob, CONVERSATION), epoch_of(&alice, CONVERSATION));
+    said(
+        &alice,
+        &bob,
+        CONVERSATION,
+        GROUP_URI,
+        "alice-2",
+        "still there?",
+    );
+    said(&bob, &alice, CONVERSATION, GROUP_URI, "bob-2", "anew");
 }
