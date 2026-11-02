@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime};
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::mls::{self, MlsClient, MlsConversation};
 
+use super::chat::{self, Chat};
 use super::description::{self, Icon};
 use super::file::{self, Received};
 use super::lost::{self, Lost};
@@ -45,6 +46,7 @@ const SECTION_SENT: u8 = 2;
 const SECTION_MEMBERSHIPS: u8 = 3;
 const SECTION_RECEIVED: u8 = 4;
 const SECTION_ICONS: u8 = 5;
+const SECTION_CHATS: u8 = 6;
 
 /// What the device keeps besides MLS
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -59,6 +61,8 @@ pub(super) struct NotesData {
     pub(super) received: Vec<Received>,
     /// The encrypted icons of the groups
     pub(super) icons: Vec<Icon>,
+    /// The encrypted 1-to-1 chats
+    pub(super) chats: Vec<Chat>,
 }
 
 /// What the device keeps besides MLS, as the store keeps it
@@ -204,6 +208,7 @@ fn encode(data: &NotesData) -> Vec<u8> {
     );
     section(SECTION_RECEIVED, file::encode(&data.received));
     section(SECTION_ICONS, description::encode(&data.icons));
+    section(SECTION_CHATS, chat::encode(&data.chats));
     notes
 }
 
@@ -228,6 +233,7 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
                     SECTION_MEMBERSHIPS => data.memberships = sent::decode_memberships(&mut body)?,
                     SECTION_RECEIVED => data.received = file::decode(&mut body)?,
                     SECTION_ICONS => data.icons = description::decode(&mut body)?,
+                    SECTION_CHATS => data.chats = chat::decode(&mut body)?,
                     _ => {}
                 }
             }
@@ -243,6 +249,7 @@ mod tests {
 
     use crate::messaging::cpm::encryption::FailedToDecrypt;
 
+    use super::super::chat::Chat;
     use super::super::description::Icon;
     use super::super::file::Received;
     use super::super::lost::Lost;
@@ -296,6 +303,18 @@ mod tests {
                     conversation_id: String::from("group-2"),
                     url: String::from("https://ftcs.example.com/i/2"),
                     participant: None,
+                },
+            ],
+            chats: vec![
+                Chat {
+                    contact: String::from(BOB),
+                    group_id: String::from("chat-1"),
+                    mls_opaque_token: Some(String::from("token-1")),
+                },
+                Chat {
+                    contact: String::from("tel:+491701111111"),
+                    group_id: String::from("chat-2"),
+                    mls_opaque_token: None,
                 },
             ],
         }

@@ -14,6 +14,7 @@
 
 extern crate libc;
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
@@ -179,6 +180,10 @@ pub struct RcsEngine {
 
     /// Told of the identifiers of group chats to keep, if the app set one
     group_chat_ids_listener: Arc<Mutex<Option<GroupChatIdsListener>>>,
+
+    /// The messages to contacts waiting for an encrypted 1-to-1 chat to
+    /// start or not (RCC.16 section 8.1.1)
+    preparing_chats: PreparingChats,
 
     // msrp_channels: Arc<MsrpChannelManager>,
     core: Arc<SipCore>,
@@ -854,6 +859,7 @@ impl RcsEngine {
             group_chat_invitation_listener,
 
             group_chat_ids_listener,
+            preparing_chats: Arc::new(Mutex::new(HashMap::new())),
 
             // msrp_channels,
             core,
@@ -1036,144 +1042,50 @@ impl RcsEngine {
     ) where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
-        let core = Arc::clone(&self.core);
-
         let message_id = match message_id {
             Some(message_id) => String::from(message_id),
             None => new_message_id(),
         };
+        let route = self.message_route();
 
-        // what to send with, decided under the engine's locks, which are not
-        // held while sending or calling back, so that the application may
-        // call into the engine from the callback
-        let (transport, public_user_identity) = match registered_identity(&self.state) {
-            Some(registered) => registered,
-            None => {
-                message_result_callback(403, String::from("Forbidden"));
+        // with E2EE, one to a contact goes in an encrypted 1-to-1 chat if it
+        // can (RCC.16 sections 5.2, 8.1, 8.1.1)
+        if let RecipientType::Contact = recipient_type {
+            let chat_auth = self.messaging_config.lock().unwrap().chat_auth == 1;
+            let encryption = self.cpm_session_service.group_encryption();
+            if let (true, Some(encryption)) = (chat_auth, encryption) {
+                let message = PendingMessage {
+                    message_type: String::from(message_type),
+                    message_content: String::from(message_content),
+                    message_id,
+                    recipient: String::from(recipient),
+                    callback: Box::new(message_result_callback),
+                };
+                send_to_contact(&route, &self.preparing_chats, encryption, message, rt);
                 return;
             }
-        };
+        }
 
-        let mut send_through_one_to_one_chat_service = false;
-        let mut send_through_group_chat_service = false;
-        let mut send_through_standalone_message_service = false;
+        route_message(
+            &route,
+            message_type,
+            message_content,
+            &message_id,
+            recipient,
+            recipient_type,
+            message_result_callback,
+            rt,
+        );
+    }
 
-        // bool contact_is_chatbot = (options & rcs_send_message_option_contact_is_chatbot) != 0;
-
-        // a chat with the recipient, which an answer goes in; without one,
-        // whether the recipient takes chats is not known, as capabilities
-        // are not exchanged
-        let has_session = self.cpm_session_service.has_session_with(recipient);
-
-        // bool contact_supports_standalone = (options & rcs_send_message_option_contact_supports_standalone) != 0;
-        let recipient_supports_standalone = true;
-
-        // bool contact_is_group = (options & rcs_send_message_option_send_to_group) != 0;
-        // let recipient_is_group = false;
-
-        let mut recipient_uri = String::from(recipient);
-
-        let (standalone_msg_max_size, standalone_msg_switch_over_size) = {
-            let messaging_config = &*self.messaging_config.lock().unwrap();
-
-            if let RecipientType::Chatbot = recipient_type {
-                // chatbots by chat only, or by either (GSMA RCC.07 chatbot
-                // messaging technology)
-                if messaging_config.chatbot_msg_tech == 1 && messaging_config.chat_auth == 1 {
-                    send_through_one_to_one_chat_service = true;
-                } else if messaging_config.chatbot_msg_tech == 2 {
-                    if messaging_config.chat_auth == 1 && has_session {
-                        send_through_one_to_one_chat_service = true;
-                    }
-
-                    if messaging_config.standalone_msg_auth == 1 && recipient_supports_standalone {
-                        send_through_standalone_message_service = true;
-                    }
-                } else if messaging_config.chatbot_msg_tech == 3
-                    && messaging_config.standalone_msg_auth == 1
-                    && recipient_supports_standalone
-                {
-                    send_through_standalone_message_service = true;
-                }
-            } else if let RecipientType::Group = recipient_type {
-                if messaging_config.group_chat_auth == 1 {
-                    send_through_group_chat_service = true;
-                }
-            } else if let RecipientType::ResourceList = recipient_type {
-                // to-do: check max_one_to_many_recipients for limit
-                // through the exploder the network gives, which has no
-                // address to fall back on
-                if let (1, Some(exploder_uri)) = (
-                    messaging_config.standalone_msg_auth,
-                    &messaging_config.exploder_uri,
-                ) {
-                    recipient_uri = String::from(exploder_uri);
-                    send_through_standalone_message_service = true;
-                }
-            } else {
-                // in the chat there is, or in a new one when the message
-                // cannot go standalone
-                if messaging_config.chat_auth == 1
-                    && (has_session || messaging_config.standalone_msg_auth != 1)
-                {
-                    send_through_one_to_one_chat_service = true;
-                }
-
-                if messaging_config.standalone_msg_auth == 1 && recipient_supports_standalone {
-                    send_through_standalone_message_service = true;
-                }
-            }
-
-            (
-                messaging_config.standalone_msg_max_size,
-                messaging_config.standalone_msg_switch_over_size,
-            )
-        };
-
-        if send_through_one_to_one_chat_service || send_through_group_chat_service {
-            self.cpm_session_service.send_message(
-                message_type,
-                message_content,
-                &message_id,
-                recipient,
-                &recipient_type,
-                &recipient_uri,
-                message_result_callback,
-                &core,
-                rt,
-            );
-        } else if send_through_standalone_message_service
-            && standalone_msg_max_size >= message_content.len()
-        {
-            if standalone_msg_switch_over_size < message_content.len() {
-                self.standalone_messaging_service.send_large_mode_message(
-                    message_type,
-                    message_content,
-                    &message_id,
-                    recipient,
-                    &recipient_type,
-                    &recipient_uri,
-                    message_result_callback,
-                    &core,
-                    rt,
-                );
-            } else {
-                standalone_messaging::send_message(
-                    message_type,
-                    message_content,
-                    &message_id,
-                    recipient,
-                    &recipient_type,
-                    &recipient_uri,
-                    message_result_callback,
-                    core,
-                    &transport,
-                    &public_user_identity,
-                    &rt,
-                );
-            }
-        } else {
-            message_result_callback(403, String::from("Forbidden"))
+    /// What messages are sent with
+    fn message_route(&self) -> MessageRoute {
+        MessageRoute {
+            state: Arc::clone(&self.state),
+            messaging_config: Arc::clone(&self.messaging_config),
+            cpm_session_service: Arc::clone(&self.cpm_session_service),
+            standalone_messaging_service: Arc::clone(&self.standalone_messaging_service),
+            core: Arc::clone(&self.core),
         }
     }
 
@@ -3014,6 +2926,9 @@ async fn open_stream(
 mod tests {
     use std::time::Duration;
 
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
     use super::{download_uri, reconnect_delay, DownloadOrigin};
     use crate::connectivity::retry::Reconnect;
 
@@ -3163,6 +3078,106 @@ mod tests {
 
         assert_eq!(reconnect_delay(Reconnect::Never, 0), None);
     }
+
+    fn pending(recipient: &str, id: &str, told: &Arc<Mutex<Vec<String>>>) -> super::PendingMessage {
+        let told = Arc::clone(told);
+        let id_ = String::from(id);
+        super::PendingMessage {
+            message_type: String::from("text/plain"),
+            message_content: String::from("hi"),
+            message_id: String::from(id),
+            recipient: String::from(recipient),
+            callback: Box::new(move |status_code, _| {
+                told.lock()
+                    .unwrap()
+                    .push(format!("{} {}", id_, status_code));
+            }),
+        }
+    }
+
+    #[test]
+    fn messages_waiting_for_an_encrypted_chat_are_sent_in_order_once_it_starts_or_not() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let preparing: super::PreparingChats = Arc::new(Mutex::new(HashMap::new()));
+
+        // none waits: given back
+        let message = pending("tel:+1", "m0", &told);
+        assert!(super::wait_after_others(&preparing, message).is_some());
+
+        // after the first, as it was sent; another contact's apart
+        preparing
+            .lock()
+            .unwrap()
+            .insert(String::from("tel:+1"), vec![pending("tel:+1", "m1", &told)]);
+        assert!(super::wait_after_others(&preparing, pending("tel:+1", "m2", &told)).is_none());
+        assert!(super::wait_after_others(&preparing, pending("tel:+2", "x", &told)).is_some());
+
+        // the first starting the chat, the others in it, one sent meanwhile
+        // too
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let preparing_ = Arc::clone(&preparing);
+        let told_ = Arc::clone(&told);
+        super::send_waiting(
+            &preparing,
+            "tel:+1",
+            true,
+            |message| {
+                sent.lock()
+                    .unwrap()
+                    .push(format!("start {}", message.message_id));
+                // not holding the lock
+                assert!(
+                    super::wait_after_others(&preparing_, pending("tel:+1", "m3", &told_))
+                        .is_none()
+                );
+            },
+            |message| {
+                sent.lock()
+                    .unwrap()
+                    .push(format!("in {}", message.message_id))
+            },
+            |message| {
+                sent.lock()
+                    .unwrap()
+                    .push(format!("plain {}", message.message_id))
+            },
+        );
+        assert_eq!(*sent.lock().unwrap(), ["start m1", "in m2", "in m3"]);
+        assert!(preparing.lock().unwrap().is_empty());
+
+        // each as it would be without E2EE if the chat is not had
+        preparing.lock().unwrap().insert(
+            String::from("tel:+1"),
+            vec![
+                pending("tel:+1", "m4", &told),
+                pending("tel:+1", "m5", &told),
+            ],
+        );
+        sent.lock().unwrap().clear();
+        super::send_waiting(
+            &preparing,
+            "tel:+1",
+            false,
+            |message| {
+                sent.lock()
+                    .unwrap()
+                    .push(format!("start {}", message.message_id))
+            },
+            |message| {
+                sent.lock()
+                    .unwrap()
+                    .push(format!("in {}", message.message_id))
+            },
+            |message| {
+                sent.lock()
+                    .unwrap()
+                    .push(format!("plain {}", message.message_id))
+            },
+        );
+        assert_eq!(*sent.lock().unwrap(), ["plain m4", "plain m5"]);
+        assert!(preparing.lock().unwrap().is_empty());
+        assert!(told.lock().unwrap().is_empty());
+    }
 }
 
 /// Changes the encrypted subject or icon of the group chat at
@@ -3191,5 +3206,353 @@ fn change_group_metadata<F>(
         if let Some(callback) = callback.lock().unwrap().take() {
             callback(404, String::from("Not Found"));
         }
+    }
+}
+
+/// What messages are sent with, which the engine shares
+struct MessageRoute {
+    state: Arc<Mutex<(RcsEngineConnectionState, RcsEngineRegistrationState)>>,
+    messaging_config: Arc<Mutex<MessagingConfigs>>,
+    cpm_session_service: Arc<CPMSessionService>,
+    standalone_messaging_service: Arc<StandaloneMessagingService>,
+    core: Arc<SipCore>,
+}
+
+/// A message to a contact waiting for the MLS group of the encrypted 1-to-1
+/// chat it is to go in, or for the contact found not to take one
+struct PendingMessage {
+    message_type: String,
+    message_content: String,
+    message_id: String,
+    recipient: String,
+    callback: Box<dyn FnOnce(u16, String) + Send + Sync>,
+}
+
+/// The messages to each contact waiting for an encrypted 1-to-1 chat to
+/// start or not, by the contact as the app sent to it, in the order they
+/// were sent
+type PreparingChats = Arc<Mutex<HashMap<String, Vec<PendingMessage>>>>;
+
+/// Sends `message` to its contact in an encrypted 1-to-1 chat, if it can go
+/// in one, with `encryption` (RCC.16 sections 5.2, 8.1, 8.1.1): in the session
+/// or invitation there is with the contact, or in a new session of the chat
+/// kept with it, or else of one with a new MLS group, if the contact
+/// advertises E2EE v1 and the Home KDS has its KeyPackages
+///
+/// Messages sent while the new MLS group is made wait for it, in the order
+/// they were sent. If the contact does not take an encrypted chat, they are
+/// sent as they would be without E2EE, standalone or in a chat not
+/// encrypted.
+fn send_to_contact(
+    route: &MessageRoute,
+    preparing: &PreparingChats,
+    encryption: Arc<dyn GroupEncryption>,
+    message: PendingMessage,
+    rt: &Arc<Runtime>,
+) {
+    // after those waiting before it
+    let Some(message) = wait_after_others(preparing, message) else {
+        return;
+    };
+    // in the chat there is, or a new session of the one kept
+    let has_session = route
+        .cpm_session_service
+        .has_session_with(&message.recipient);
+    if has_session || encryption.chat_group(&message.recipient).is_some() {
+        send_in_chat(route, message, rt);
+        return;
+    }
+    let Some((_, public_user_identity)) = registered_identity(&route.state) else {
+        (message.callback)(403, String::from("Forbidden"));
+        return;
+    };
+
+    let recipient = message.recipient.clone();
+    {
+        let mut waiting = preparing.lock().unwrap();
+        // one sent meanwhile by another thread waits as well
+        if let Some(queue) = waiting.get_mut(&recipient) {
+            queue.push(message);
+            return;
+        }
+        waiting.insert(recipient.clone(), vec![message]);
+    }
+    let preparing_chat = encryption.prepare_chat(recipient.clone(), public_user_identity);
+    let route = route.clone();
+    let preparing = Arc::clone(preparing);
+    let rt_ = Arc::clone(rt);
+    rt.spawn(async move {
+        let prepared = preparing_chat.await;
+        let (group_id, bundle) = prepared.unzip();
+        send_waiting(
+            &preparing,
+            &recipient,
+            group_id.is_some(),
+            |message| {
+                if let (Some(group_id), Some(bundle)) = (&group_id, &bundle) {
+                    route.cpm_session_service.send_in_new_chat(
+                        &message.message_type,
+                        &message.message_content,
+                        &message.message_id,
+                        &message.recipient,
+                        group_id,
+                        bundle,
+                        message.callback,
+                        &route.core,
+                        &rt_,
+                    );
+                }
+            },
+            // in its invitation, or its session
+            |message| send_in_chat(&route, message, &rt_),
+            |message| {
+                route_message(
+                    &route,
+                    &message.message_type,
+                    &message.message_content,
+                    &message.message_id,
+                    &message.recipient,
+                    RecipientType::Contact,
+                    message.callback,
+                    &rt_,
+                )
+            },
+        );
+    });
+}
+
+/// Sends the messages waiting in `preparing` for `recipient`, those added
+/// meanwhile too, in the order they were sent: if the chat was had
+/// (`chatting`), the first with `start`, which starts it, and those after it
+/// with `in_chat`; else each with `unencrypted`
+///
+/// No lock is held while each is sent, as the app may be called back at
+/// once. Those sent once none waits any longer find the chat started, or
+/// none to wait for.
+fn send_waiting(
+    preparing: &PreparingChats,
+    recipient: &str,
+    chatting: bool,
+    mut start: impl FnMut(PendingMessage),
+    mut in_chat: impl FnMut(PendingMessage),
+    mut unencrypted: impl FnMut(PendingMessage),
+) {
+    let mut first = true;
+    loop {
+        let next = {
+            let mut waiting = preparing.lock().unwrap();
+            let next = waiting
+                .get_mut(recipient)
+                .filter(|queue| !queue.is_empty())
+                .map(|queue| queue.remove(0));
+            if next.is_none() {
+                waiting.remove(recipient);
+            }
+            next
+        };
+        let Some(message) = next else {
+            break;
+        };
+        match (chatting, first) {
+            (true, true) => start(message),
+            (true, false) => in_chat(message),
+            (false, _) => unencrypted(message),
+        }
+        first = false;
+    }
+}
+
+/// Has `message` wait in `preparing` after those waiting for its contact,
+/// if any do; else gives it back
+fn wait_after_others(
+    preparing: &PreparingChats,
+    message: PendingMessage,
+) -> Option<PendingMessage> {
+    let mut waiting = preparing.lock().unwrap();
+    match waiting.get_mut(&message.recipient) {
+        Some(queue) => {
+            queue.push(message);
+            None
+        }
+        None => Some(message),
+    }
+}
+
+/// Sends `message` to its contact through the 1-to-1 chat service
+fn send_in_chat(route: &MessageRoute, message: PendingMessage, rt: &Arc<Runtime>) {
+    route.cpm_session_service.send_message(
+        &message.message_type,
+        &message.message_content,
+        &message.message_id,
+        &message.recipient,
+        &RecipientType::Contact,
+        &message.recipient,
+        message.callback,
+        &route.core,
+        rt,
+    );
+}
+
+impl Clone for MessageRoute {
+    fn clone(&self) -> MessageRoute {
+        MessageRoute {
+            state: Arc::clone(&self.state),
+            messaging_config: Arc::clone(&self.messaging_config),
+            cpm_session_service: Arc::clone(&self.cpm_session_service),
+            standalone_messaging_service: Arc::clone(&self.standalone_messaging_service),
+            core: Arc::clone(&self.core),
+        }
+    }
+}
+
+/// Sends a message as it is to be without E2EE: in a chat, through the
+/// group chat service, or standalone, as the configuration and the
+/// recipient allow
+fn route_message<F>(
+    route: &MessageRoute,
+    message_type: &str,
+    message_content: &str,
+    message_id: &str,
+    recipient: &str,
+    recipient_type: RecipientType,
+    message_result_callback: F,
+    rt: &Arc<Runtime>,
+) where
+    F: FnOnce(u16, String) + Send + Sync + 'static,
+{
+    let core = Arc::clone(&route.core);
+    let message_id = String::from(message_id);
+
+    // what to send with, decided under the engine's locks, which are not
+    // held while sending or calling back, so that the application may
+    // call into the engine from the callback
+    let (transport, public_user_identity) = match registered_identity(&route.state) {
+        Some(registered) => registered,
+        None => {
+            message_result_callback(403, String::from("Forbidden"));
+            return;
+        }
+    };
+
+    let mut send_through_one_to_one_chat_service = false;
+    let mut send_through_group_chat_service = false;
+    let mut send_through_standalone_message_service = false;
+
+    // bool contact_is_chatbot = (options & rcs_send_message_option_contact_is_chatbot) != 0;
+
+    // a chat with the recipient, which an answer goes in; without one,
+    // whether the recipient takes chats is not known, as capabilities
+    // are not exchanged
+    let has_session = route.cpm_session_service.has_session_with(recipient);
+
+    // bool contact_supports_standalone = (options & rcs_send_message_option_contact_supports_standalone) != 0;
+    let recipient_supports_standalone = true;
+
+    // bool contact_is_group = (options & rcs_send_message_option_send_to_group) != 0;
+    // let recipient_is_group = false;
+
+    let mut recipient_uri = String::from(recipient);
+
+    let (standalone_msg_max_size, standalone_msg_switch_over_size) = {
+        let messaging_config = &*route.messaging_config.lock().unwrap();
+
+        if let RecipientType::Chatbot = recipient_type {
+            // chatbots by chat only, or by either (GSMA RCC.07 chatbot
+            // messaging technology)
+            if messaging_config.chatbot_msg_tech == 1 && messaging_config.chat_auth == 1 {
+                send_through_one_to_one_chat_service = true;
+            } else if messaging_config.chatbot_msg_tech == 2 {
+                if messaging_config.chat_auth == 1 && has_session {
+                    send_through_one_to_one_chat_service = true;
+                }
+
+                if messaging_config.standalone_msg_auth == 1 && recipient_supports_standalone {
+                    send_through_standalone_message_service = true;
+                }
+            } else if messaging_config.chatbot_msg_tech == 3
+                && messaging_config.standalone_msg_auth == 1
+                && recipient_supports_standalone
+            {
+                send_through_standalone_message_service = true;
+            }
+        } else if let RecipientType::Group = recipient_type {
+            if messaging_config.group_chat_auth == 1 {
+                send_through_group_chat_service = true;
+            }
+        } else if let RecipientType::ResourceList = recipient_type {
+            // to-do: check max_one_to_many_recipients for limit
+            // through the exploder the network gives, which has no
+            // address to fall back on
+            if let (1, Some(exploder_uri)) = (
+                messaging_config.standalone_msg_auth,
+                &messaging_config.exploder_uri,
+            ) {
+                recipient_uri = String::from(exploder_uri);
+                send_through_standalone_message_service = true;
+            }
+        } else {
+            // in the chat there is, or in a new one when the message
+            // cannot go standalone
+            if messaging_config.chat_auth == 1
+                && (has_session || messaging_config.standalone_msg_auth != 1)
+            {
+                send_through_one_to_one_chat_service = true;
+            }
+
+            if messaging_config.standalone_msg_auth == 1 && recipient_supports_standalone {
+                send_through_standalone_message_service = true;
+            }
+        }
+
+        (
+            messaging_config.standalone_msg_max_size,
+            messaging_config.standalone_msg_switch_over_size,
+        )
+    };
+
+    if send_through_one_to_one_chat_service || send_through_group_chat_service {
+        route.cpm_session_service.send_message(
+            message_type,
+            message_content,
+            &message_id,
+            recipient,
+            &recipient_type,
+            &recipient_uri,
+            message_result_callback,
+            &core,
+            rt,
+        );
+    } else if send_through_standalone_message_service
+        && standalone_msg_max_size >= message_content.len()
+    {
+        if standalone_msg_switch_over_size < message_content.len() {
+            route.standalone_messaging_service.send_large_mode_message(
+                message_type,
+                message_content,
+                &message_id,
+                recipient,
+                &recipient_type,
+                &recipient_uri,
+                message_result_callback,
+                &core,
+                rt,
+            );
+        } else {
+            standalone_messaging::send_message(
+                message_type,
+                message_content,
+                &message_id,
+                recipient,
+                &recipient_type,
+                &recipient_uri,
+                message_result_callback,
+                core,
+                &transport,
+                &public_user_identity,
+                &rt,
+            );
+        }
+    } else {
+        message_result_callback(403, String::from("Forbidden"))
     }
 }

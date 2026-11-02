@@ -119,12 +119,23 @@ pub struct CPMSessionInfo {
     /// The encryption of the conversation, if it is encrypted end to end,
     /// its MLS group kept (RCC.16 sections 8.1, 9.1.1)
     pub encryption: Option<Arc<dyn GroupEncryption>>,
+    /// The ID of the MLS group of a 1-to-1 chat encrypted end to end, a
+    /// random GUID (RCC.16 section 6.1.1); that of a group is its
+    /// Conversation-ID
+    pub mls_group_id: Option<String>,
 }
 
 impl CPMSessionInfo {
     /// Whether the conversation is encrypted end to end
     pub fn encrypted(&self) -> bool {
         self.encryption.is_some()
+    }
+
+    /// The ID of the MLS group the conversation is encrypted with: that of
+    /// its 1-to-1 chat, or else its Conversation-ID, as for a group (RCC.16
+    /// section 6.1.1)
+    pub fn mls_group(&self) -> Option<&String> {
+        self.mls_group_id.as_ref().or(self.conversation_id.as_ref())
     }
 
     /// Whom the messages of the session are from, as the app knows it: a
@@ -475,6 +486,7 @@ pub fn get_cpm_session_info_from_message(
                             conversation_is_using_anonymization_token,
                             mls_opaque_token: opaque_token.and_then(mls_opaque_token_value),
                             encryption: None,
+                            mls_group_id: None,
                         });
                     }
                 }
@@ -808,7 +820,7 @@ impl CPMSession {
                         .session_info
                         .encryption
                         .clone()
-                        .zip(self.session_info.conversation_id.clone());
+                        .zip(self.session_info.mls_group().cloned());
                     let session_end = Arc::clone(&self.session_end);
 
                     let rt_ = Arc::clone(rt);
@@ -1156,7 +1168,7 @@ impl SessionEnd {
             session_info
                 .encryption
                 .clone()
-                .zip(session_info.conversation_id.clone())
+                .zip(session_info.mls_group().cloned())
         };
         let public_user_identity = self
             .registered_public_identity
@@ -1259,7 +1271,7 @@ impl SessionEnd {
                 session_info
                     .encryption
                     .clone()
-                    .zip(session_info.conversation_id.clone()),
+                    .zip(session_info.mls_group().cloned()),
                 String::from_utf8_lossy(&session_info.cpm_contact.service_uri).into_owned(),
             )
         };
@@ -1383,7 +1395,7 @@ impl SessionEnd {
                 session_info
                     .encryption
                     .clone()
-                    .zip(session_info.conversation_id.clone()),
+                    .zip(session_info.mls_group().cloned()),
                 String::from_utf8_lossy(&session_info.cpm_contact.service_uri).into_owned(),
             )
         };
@@ -1406,7 +1418,7 @@ impl SessionEnd {
             session_info
                 .encryption
                 .as_ref()
-                .zip(session_info.conversation_id.as_ref())
+                .zip(session_info.mls_group())
                 .is_some_and(|(encryption, conversation_id)| {
                     encryption.metadata_keys_due(conversation_id)
                 })
@@ -1429,7 +1441,7 @@ impl SessionEnd {
             session_info
                 .encryption
                 .clone()
-                .zip(session_info.conversation_id.clone())
+                .zip(session_info.mls_group().cloned())
         };
         let Some((encryption, conversation_id)) = encrypted else {
             return;
@@ -1481,7 +1493,7 @@ impl SessionEnd {
                 session_info
                     .encryption
                     .clone()
-                    .zip(session_info.conversation_id.clone()),
+                    .zip(session_info.mls_group().cloned()),
                 String::from_utf8_lossy(&session_info.cpm_contact.service_uri).into_owned(),
             )
         };
@@ -1535,7 +1547,7 @@ impl SessionEnd {
             session_info
                 .encryption
                 .clone()
-                .zip(session_info.conversation_id.clone())
+                .zip(session_info.mls_group().cloned())
         };
         let Some(((encryption, conversation_id), public_user_identity)) =
             encrypted.zip(self.public_user_identity())
@@ -2124,7 +2136,7 @@ impl CPMSessionService {
                     let decrypted = session_info
                         .encryption
                         .as_ref()
-                        .zip(session_info.conversation_id.as_ref())
+                        .zip(session_info.mls_group())
                         .and_then(|(encryption, conversation_id)| match file_transfer {
                             true => encryption.decrypt_file_transfer(
                                 conversation_id,
@@ -2177,7 +2189,7 @@ impl CPMSessionService {
                     if let Some((encryption, conversation_id)) = session_info
                         .encryption
                         .as_ref()
-                        .zip(session_info.conversation_id.as_ref())
+                        .zip(session_info.mls_group())
                     {
                         // the Conversation Focus refusing a control message
                         // of this client tells the encryption, not the app
@@ -2235,7 +2247,7 @@ impl CPMSessionService {
                     let encrypted = session_info
                         .encryption
                         .as_ref()
-                        .zip(session_info.conversation_id.as_ref())
+                        .zip(session_info.mls_group())
                         .is_some_and(|(encryption, conversation_id)| {
                             !encryption.encryption_ended(conversation_id)
                         });
@@ -2396,6 +2408,7 @@ impl CPMSessionService {
                 known_as: Some(conference_uri),
                 new_group: None,
                 new_era: Some(cpim),
+                chat: None,
             },
             None,
             Some(Box::new(move |status_code, _, _| {
@@ -2510,7 +2523,7 @@ impl CPMSessionService {
             session_info
                 .encryption
                 .clone()
-                .zip(session_info.conversation_id.clone())
+                .zip(session_info.mls_group().cloned())
         };
         let Some((encryption, conversation_id)) = encrypted else {
             return refer(
@@ -2569,7 +2582,7 @@ impl CPMSessionService {
             session_info
                 .encryption
                 .clone()
-                .zip(session_info.conversation_id.clone()),
+                .zip(session_info.mls_group().cloned()),
         )
     }
 
@@ -2799,6 +2812,7 @@ impl CPMSessionService {
                 known_as: Some(conference_uri),
                 new_group: None,
                 new_era: None,
+                chat: None,
             },
             None,
             Some(Box::new(move |status_code, reason_phrase, _| {
@@ -2933,6 +2947,14 @@ impl CPMSessionService {
             message_result_callback,
         );
 
+        // a new session of the encrypted 1-to-1 chat kept with the contact
+        // (RCC.16 section 8.1.1)
+        let chat = match recipient_type {
+            RecipientType::Contact => self
+                .group_encryption()
+                .and_then(|encryption| encryption.chat_group(recipient)),
+            _ => None,
+        };
         self.invite(
             sessions,
             invitations,
@@ -2943,9 +2965,113 @@ impl CPMSessionService {
                 known_as: Some(recipient),
                 new_group: None,
                 new_era: None,
+                chat: chat
+                    .as_ref()
+                    .map(|(group_id, mls_opaque_token)| EncryptedChat {
+                        group_id,
+                        mls_opaque_token: mls_opaque_token.as_deref(),
+                        new_group: None,
+                    }),
             },
             Some(message),
             None,
+            core,
+            rt,
+        );
+    }
+
+    /// Sends a message to the contact `recipient` as send_message() does, in
+    /// a new encrypted 1-to-1 chat with it of the new MLS group `group_id`,
+    /// whose INVITE carries the CPIM message `bundle` of its initial Commit,
+    /// GroupInfo and Welcome (RCC.16 sections 8.1, 8.1.1)
+    ///
+    /// The MLS group is let go of if the INVITE is not answered with a 200,
+    /// or if there is a session or an invitation with the contact by then,
+    /// which the message goes in.
+    pub fn send_in_new_chat<F>(
+        &self,
+        message_type: &str,
+        message_content: &str,
+        message_id: &str,
+        recipient: &str,
+        group_id: &str,
+        bundle: &[u8],
+        message_result_callback: F,
+        core: &Arc<SipCore>,
+        rt: &Arc<Runtime>,
+    ) where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        let encryption = self.group_encryption();
+        let sessions = self.ongoing_sessions.lock().unwrap();
+        let invitations = self.ongoing_outgoing_invitations.lock().unwrap();
+        let with_contact = sessions
+            .iter()
+            .any(|(known_identities, _)| known_identities == recipient)
+            || invitations
+                .iter()
+                .any(|invitation| invitation.0 == *recipient);
+        if with_contact || encryption.is_none() {
+            drop(invitations);
+            drop(sessions);
+            if let Some(encryption) = &encryption {
+                encryption.abandon(group_id);
+            }
+            self.send_message(
+                message_type,
+                message_content,
+                message_id,
+                recipient,
+                &RecipientType::Contact,
+                recipient,
+                message_result_callback,
+                core,
+                rt,
+            );
+            return;
+        }
+
+        let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
+        let message = CPMMessageParam::new(
+            String::from(message_type),
+            String::from(message_content),
+            String::from(message_id),
+            recipient,
+            &RecipientType::Contact,
+            recipient,
+            move |status_code, reason_phrase| {
+                let mut guard = message_result_callback.lock().unwrap();
+                if let Some(message_result_callback) = guard.take() {
+                    message_result_callback(status_code, reason_phrase);
+                }
+            },
+        );
+        let abandoned = String::from(group_id);
+        let started: Started = Box::new(move |status_code, _, _| {
+            if status_code != 200 {
+                if let Some(encryption) = encryption {
+                    encryption.abandon(&abandoned);
+                }
+            }
+        });
+        self.invite(
+            sessions,
+            invitations,
+            Invitee {
+                uri: recipient,
+                to_uri: recipient,
+                recipient_type: &RecipientType::Contact,
+                known_as: Some(recipient),
+                new_group: None,
+                new_era: None,
+                chat: Some(EncryptedChat {
+                    group_id,
+                    mls_opaque_token: None,
+                    new_group: Some(bundle),
+                }),
+            },
+            Some(message),
+            Some(started),
             core,
             rt,
         );
@@ -3065,6 +3191,7 @@ impl CPMSessionService {
                     encrypted,
                 }),
                 new_era: None,
+                chat: None,
             },
             None,
             Some(started),
@@ -3092,15 +3219,16 @@ impl CPMSessionService {
         let recipient_type = invitee.recipient_type;
         // a new group to be encrypted, or a group whose MLS group is kept
         let group_encryption = self.group_encryption.lock().unwrap().clone();
-        let encrypted = match (recipient_type, &invitee.new_group) {
-            (_, Some(new_group)) => new_group.encrypted.is_some(),
-            (RecipientType::Group, None) => self
-                .group_chats
-                .ids_of(recipient)
-                .zip(group_encryption.as_ref())
-                .is_some_and(|(ids, encryption)| encryption.encrypts(&ids.conversation_id)),
-            _ => false,
-        };
+        let encrypted = invitee.chat.is_some()
+            || match (recipient_type, &invitee.new_group) {
+                (_, Some(new_group)) => new_group.encrypted.is_some(),
+                (RecipientType::Group, None) => self
+                    .group_chats
+                    .ids_of(recipient)
+                    .zip(group_encryption.as_ref())
+                    .is_some_and(|(ids, encryption)| encryption.encrypts(&ids.conversation_id)),
+                _ => false,
+            };
 
         if let Ok((sock, host, port, tls, active_setup, ipv6)) =
             (self.msrp_socket_allocator_function)(None)
@@ -3206,12 +3334,19 @@ impl CPMSessionService {
                     (RecipientType::Group, None) => self.group_chats.ids_of(recipient),
                     _ => None,
                 };
-                // and the token its focus gave (RCC.16 section 6.1.3)
+                // and the token its focus gave (RCC.16 section 6.1.3), or that
+                // of the encrypted 1-to-1 chat
                 add_mls_opaque_token(
                     &mut invite_message,
                     stored_ids
                         .as_ref()
-                        .and_then(|ids| ids.mls_opaque_token.clone()),
+                        .and_then(|ids| ids.mls_opaque_token.clone())
+                        .or_else(|| {
+                            invitee
+                                .chat
+                                .as_ref()
+                                .and_then(|chat| chat.mls_opaque_token.map(String::from))
+                        }),
                 );
                 let stored_ids = stored_ids.map(|ids| (ids.conversation_id, ids.contribution_id));
                 let (conversation_id, contribution_id) = stored_ids.unwrap_or_else(|| {
@@ -3292,9 +3427,13 @@ impl CPMSessionService {
                         invite_message.set_body(Arc::new(body));
                     }
 
-                    None => match invitee.new_era {
-                        // with the next Era of its MLS group (RCC.16 section
-                        // 8.3.1), the focus knowing its participants
+                    // with the next Era of its MLS group (RCC.16 section
+                    // 8.3.1), the focus knowing its participants, or with the
+                    // MLS group of a new encrypted 1-to-1 chat (section 8.1.1)
+                    None => match invitee
+                        .new_era
+                        .or(invitee.chat.as_ref().and_then(|chat| chat.new_group))
+                    {
                         Some(cpim) => {
                             let (boundary, body) = era_restart_body(&sdp, cpim);
                             invite_message.add_header(Header::new(
@@ -3346,6 +3485,15 @@ impl CPMSessionService {
                 let ongoing_outgoing_invitations = Arc::clone(&self.ongoing_outgoing_invitations);
                 let ongoing_sessions = Arc::clone(&self.ongoing_sessions);
                 let group_chats = Arc::clone(&self.group_chats);
+                // the MLS group of the encrypted 1-to-1 chat, and the token
+                // kept for it
+                let chat = invitee.chat.as_ref().map(|chat| {
+                    (
+                        String::from(chat.group_id),
+                        chat.mls_opaque_token.map(String::from),
+                    )
+                });
+                let chat_contact = String::from(recipient);
 
                 let registered_public_identity = Arc::clone(&self.registered_public_identity);
                 let links = self.links();
@@ -3389,6 +3537,24 @@ impl CPMSessionService {
                                         .clone()
                                         .filter(|encryption| encryption.encrypts(&conversation_id));
                                 }
+                                // an encrypted 1-to-1 chat with its MLS
+                                // group, kept with the token given, which
+                                // its requests carry (RCC.16 sections 6.1.3,
+                                // 8.1.1)
+                                let chat_token = chat.as_ref().map(|(group_id, kept_token)| {
+                                    session_info.mls_group_id = Some(group_id.clone());
+                                    session_info.encryption = group_encryption
+                                        .clone()
+                                        .filter(|encryption| encryption.encrypts(group_id));
+                                    let token = session_info
+                                        .mls_opaque_token
+                                        .clone()
+                                        .or_else(|| kept_token.clone());
+                                    if let Some(encryption) = &group_encryption {
+                                        encryption.keep_chat(&chat_contact, group_id, token.clone());
+                                    }
+                                    token
+                                });
 
                                 if let Some(l_sdp) = match l_sdp_body.as_ref() {
                                     Body::Raw(raw) => {
@@ -3421,6 +3587,9 @@ impl CPMSessionService {
                                                     known_identities.add_identity(known_as.clone());
                                                 }
                                                 let cpm_session = CPMSession::new(session_info);
+                                                if let Some(token) = chat_token {
+                                                    *cpm_session.mls_opaque_token().lock().unwrap() = token;
+                                                }
 
                                                 if let Ok(_) = cpm_session.set_local_sdp(l_sdp_body, sock, tls, host, port, path) {
                                                     if let Ok(_) = cpm_session.set_remote_sdp(r_sdp_body, raddr, rport, rpath) {
@@ -3752,7 +3921,7 @@ fn update_keys_if_due(session: &Arc<SipSession<CPMSession>>) {
         session_info
             .encryption
             .as_ref()
-            .zip(session_info.conversation_id.as_ref())
+            .zip(session_info.mls_group())
             .is_some_and(|(encryption, conversation_id)| encryption.key_update_due(conversation_id))
     };
     if due {
@@ -3814,6 +3983,20 @@ struct Invitee<'a> {
     /// The CPIM message of the next Era of the MLS group of the group
     /// restarted (RCC.16 section 8.3.1)
     new_era: Option<&'a [u8]>,
+    /// The encrypted 1-to-1 chat it starts a session of (RCC.16 section
+    /// 8.1.1)
+    chat: Option<EncryptedChat<'a>>,
+}
+
+/// An encrypted 1-to-1 chat to start a session of (RCC.16 section 8.1.1)
+struct EncryptedChat<'a> {
+    /// The ID of its MLS group
+    group_id: &'a str,
+    /// The MLS-Opaque-Token its Conversation Focus gave, if it did
+    mls_opaque_token: Option<&'a str>,
+    /// The CPIM message of the initial Commit, GroupInfo and Welcome of its
+    /// MLS group, if it is new, which the INVITE carries
+    new_group: Option<&'a [u8]>,
 }
 
 /// A group to start

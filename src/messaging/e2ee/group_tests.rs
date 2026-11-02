@@ -9116,3 +9116,126 @@ fn a_change_of_the_subject_the_focus_refuses_is_let_go_of() {
         change_metadata(&device, MetadataChange::Subject(Some(String::from("Team")))).is_some()
     );
 }
+
+#[test]
+fn a_new_chat_is_prepared_with_an_mls_group_of_its_own_for_the_contact() {
+    let clock = Clock::new();
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) = enrolled_in_time(
+        Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]),
+        Some(&clock),
+    );
+    let (query, asked) = answering(&[(BOB_IMPU, mls(&HOME_KDS.to_string()))]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // a group of a random GUID, of the contact's Clients, for the INVITE
+    // (RCC.16 sections 6.1.1, 8.1, 8.1.1)
+    let (group_id, cpim) =
+        block_on(groups.prepare_chat(String::from(BOB_IMPU), String::from(IMPU)))
+            .expect("an encrypted chat");
+    assert_eq!(*asked.lock().unwrap(), [BOB_IMPU]);
+    assert_eq!(
+        *kds.queries.lock().unwrap(),
+        vec![(vec![CIPHERSUITE], vec![recipient(BOB_TEL)])]
+    );
+    assert_eq!(group_id.len(), 36);
+    assert_ne!(group_id, CONVERSATION);
+    let info_message = cpim_message(&cpim);
+    let info = info_message.get_info().unwrap();
+    assert_eq!(info.from, format!("<{}>", IMPU).as_bytes());
+    assert_eq!(info.to, format!("<{}>", BOB_IMPU).as_bytes());
+    let bobs_group = joined(&bob, &bundle_of(&cpim));
+    assert_eq!(bobs_group.group_id(), group_id.as_bytes());
+    assert_eq!(bobs_group.era(), Some(0));
+
+    // the chat kept once its INVITE is answered, by the tel URI of the
+    // contact, with the token given; through a restart too
+    assert_eq!(device.chat_group(BOB_TEL), None);
+    device
+        .keep_chat(BOB_IMPU, &group_id, Some("token-1"))
+        .unwrap();
+    assert_eq!(
+        device.chat_group(BOB_TEL),
+        Some((group_id.clone(), Some(String::from("token-1"))))
+    );
+    assert_eq!(device.chat_group(BOB_IMPU), device.chat_group(BOB_TEL));
+    assert_eq!(device.chat_group("tel:+491701111111"), None);
+    assert_eq!(device.chat_group("sip:bob@example.com"), None);
+    let restored = {
+        let clock = clock.clone();
+        alice(&app, &kds, TODAY, Some(&app.last().unwrap())).with_clock(move || clock.now())
+    };
+    assert_eq!(
+        restored.chat_group(BOB_TEL),
+        Some((group_id.clone(), Some(String::from("token-1"))))
+    );
+
+    // another kept in its place, the token given anew
+    restored.keep_chat(BOB_TEL, &group_id, None).unwrap();
+    assert_eq!(
+        restored.chat_group(BOB_IMPU),
+        Some((group_id.clone(), None))
+    );
+
+    // let go of with its MLS group, nothing of it left in the notes
+    restored.abandon(&group_id).unwrap();
+    assert_eq!(restored.chat_group(BOB_TEL), None);
+    assert!(restored.notes().read(|data| data.chats.is_empty()));
+}
+
+#[test]
+fn a_chat_whose_mls_group_is_not_kept_is_not_kept_either() {
+    let (_, bobs) = bob_with_key_package();
+    let (device, _) = enrolled(Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]));
+    device
+        .keep_chat(BOB_TEL, "not-a-group", Some("token"))
+        .unwrap();
+    assert_eq!(device.chat_group(BOB_TEL), None);
+}
+
+#[test]
+fn a_contact_not_taking_an_encrypted_chat_is_not_asked_again_for_an_hour() {
+    let clock = Clock::new();
+    let (_, bobs) = bob_with_key_package();
+    let (device, _, _) = enrolled_in_time(
+        Some(vec![
+            (BOB_TEL, Fetched::KeyPackages(vec![bobs])),
+            (CAROL_TEL, Fetched::NotFound),
+        ]),
+        Some(&clock),
+    );
+
+    // not advertising E2EE v1 (RCC.16 section 8.1)
+    let (query, asked) = answering(&[
+        (
+            BOB_TEL,
+            answered(
+                200,
+                "+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+            ),
+        ),
+        (CAROL_TEL, mls(&HOME_KDS.to_string())),
+    ]);
+    let groups = DeviceGroups::new(&device, query);
+    let prepare =
+        |contact: &str| block_on(groups.prepare_chat(String::from(contact), String::from(IMPU)));
+    assert_eq!(prepare(BOB_TEL), None);
+    assert_eq!(prepare(BOB_TEL), None);
+    assert_eq!(prepare("sip:+491707654321@ims.example.com"), None);
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL]);
+
+    // advertising it, the Home KDS having no KeyPackages of it
+    assert_eq!(prepare(CAROL_TEL), None);
+    assert_eq!(prepare(CAROL_TEL), None);
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL, CAROL_TEL]);
+
+    // asked again an hour on
+    clock.advance(Duration::from_secs(60 * 60));
+    assert_eq!(prepare(BOB_TEL), None);
+    assert_eq!(*asked.lock().unwrap(), [BOB_TEL, CAROL_TEL, BOB_TEL]);
+    assert_eq!(device.store().has_conversation(b"any"), false);
+
+    // nor one of no number, which is not asked
+    assert_eq!(prepare("sip:dave@example.com"), None);
+    assert_eq!(asked.lock().unwrap().len(), 3);
+}
