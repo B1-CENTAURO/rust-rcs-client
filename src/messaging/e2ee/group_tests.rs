@@ -9717,3 +9717,185 @@ fn a_chat_of_no_activity_noted_is_due_once_unused_from_its_next_message_on() {
     clock.advance(31 * DAY);
     assert!(!device.chat_era_due(CAROL_TEL));
 }
+
+/// Bob's device in a group with both phones of Alice, made on 1 October,
+/// as of `date` from then on: the device, its Home KDS, and each phone of
+/// Alice with its group
+fn bob_with_both_phones_of_alice_as_of(
+    date: &str,
+) -> (
+    Arc<E2eeDevice>,
+    Arc<Kds>,
+    (MlsClient, MlsConversation),
+    (MlsClient, MlsConversation),
+) {
+    let app = Arc::new(App::default());
+    let (device, kds, phone, other_phone) =
+        bob_with_both_phones_of_alice_kept_by(&app, OCTOBER, None);
+    drop(device);
+    let device = Arc::new(bobs_device(&app, &kds, date, Some(&app.last().unwrap())));
+    (device, kds, phone, other_phone)
+}
+
+#[test]
+fn no_message_is_decrypted_while_a_member_expired_its_sender_told_why() {
+    // the device as of 2 November, when the certificate of Alice's phone
+    // expired, as did its own
+    let (device, _, (phone, mut phones_group), _) =
+        bob_with_both_phones_of_alice_as_of("2026-11-02");
+    let (query, _) = answering(&[(ALICE_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    assert!(device.has_expired_member(CONVERSATION));
+
+    // her messages not decrypted (RCC.16 section 9.1.1), one asking to be
+    // told of a negative delivery, and one not
+    for (message_id, disposition) in [
+        ("alice-1", Some("positive-delivery, negative-delivery")),
+        ("alice-2", Some("positive-delivery")),
+    ] {
+        let (outer, mls_message) = from_bob_asking(
+            &phone,
+            &mut phones_group,
+            ALICE_TEL,
+            message_id,
+            disposition,
+        );
+        assert_eq!(
+            decrypted(&device, &outer, &mls_message),
+            Err(MessageError::ExpiredMember)
+        );
+        assert!(groups
+            .decrypt(
+                CONVERSATION,
+                &cpim_message(&outer).get_info().unwrap(),
+                &mls_message
+            )
+            .is_none());
+    }
+    // the group not to be healed for it
+    assert!(!groups.needs_healing(CONVERSATION));
+
+    // she is told at once of the one asking, with the expired-credential
+    // reason
+    let told = groups.failed_to_decrypt(CONVERSATION);
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].sender_uri, ALICE_TEL);
+    assert_eq!(told[0].original_message_id, None);
+    let imdn = Imdn::from_xml(told[0].imdn.as_bytes()).unwrap();
+    assert_eq!(
+        (
+            imdn.message_id.as_str(),
+            imdn.datetime.as_str(),
+            imdn.notification,
+            imdn.status
+        ),
+        (
+            "alice-1",
+            "2026-10-25T12:00:01.000+00:00",
+            Notification::Delivery,
+            Status::Failed
+        )
+    );
+    assert!(told[0]
+        .imdn
+        .contains("<mls-client-failure-reason><expired-credential/></mls-client-failure-reason>"));
+    assert_eq!(
+        failure_reason(told[0].imdn.as_bytes()),
+        Some(FailureReason::Client(
+            ClientFailureReason::ExpiredCredential
+        ))
+    );
+    assert_eq!(groups.failed_to_decrypt(CONVERSATION), []);
+
+    // signed with the reason, as her phone checks (sections 7.6, 7.7.2.2)
+    let message = signed_by_the_device(&device, &told[0].imdn, ALICE_TEL, None);
+    assert!(checked_by_bob(
+        &phone,
+        &mut phones_group,
+        &message,
+        VerifiableDerivedContent::DeliveryImdn(VerifiableDeliveryImdn::new(
+            DeliveryNotificationStatus::Failed,
+            b"alice-1",
+            b"",
+            ClientFailureReason::ExpiredCredential,
+        )),
+    ));
+
+    // no KeyPackage Update while the device's own certificate expired, which
+    // is renewed first (section 9.5.3, Annex A.4.1.5)
+    assert!(!groups.key_update_due(CONVERSATION));
+}
+
+#[test]
+fn the_client_of_a_credential_not_passing_is_replaced_once_a_message_is_refused() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // the device as of 15 September, when the certificate of Alice's other
+    // phone is not valid yet, its own lasting
+    let (device, kds, (phone, mut phones_group), (other_phone, _)) =
+        bob_with_both_phones_of_alice_as_of(TODAY);
+    let (query, asked) = answering(&[(ALICE_TEL, mls("42"))]);
+    let groups = DeviceGroups::new(&device, query);
+    let (outer, mls_message) = from_bob_asking(
+        &phone,
+        &mut phones_group,
+        ALICE_TEL,
+        "alice-1",
+        Some("negative-delivery"),
+    );
+    assert_eq!(
+        decrypted(&device, &outer, &mls_message),
+        Err(MessageError::ExpiredMember)
+    );
+    let told = groups.failed_to_decrypt(CONVERSATION);
+    assert_eq!(told.len(), 1);
+    assert_eq!(
+        failure_reason(told[0].imdn.as_bytes()),
+        Some(FailureReason::Client(
+            ClientFailureReason::ExpiredCredential
+        ))
+    );
+
+    // then a KeyPackage Update, the other phone replaced with the
+    // KeyPackages of her Home KDS, her phone staying a member left out
+    // (RCC.16 sections 9.1.1, 9.5.4)
+    assert!(groups.key_update_due(CONVERSATION));
+    kds.now_knowing(vec![(
+        ALICE_TEL,
+        Fetched::KeyPackages(vec![phone.generate_key_package(false).unwrap()]),
+    )]);
+    let cpim = rt
+        .block_on(groups.update_keys(
+            String::from(CONVERSATION),
+            String::from(BOB_IMPU),
+            String::from(GROUP_URI),
+        ))
+        .expect("a control message");
+    assert_eq!(*asked.lock().unwrap(), [ALICE_TEL]);
+    // still refused while the Focus is yet to accept it
+    assert!(device.has_expired_member(CONVERSATION));
+    accepted_from_device(&device);
+    let members = device
+        .store()
+        .peek_conversation(CONVERSATION.as_bytes(), |conversation, _| {
+            conversation.members()
+        })
+        .unwrap();
+    assert_eq!(members.len(), 2);
+    assert!(members.contains(phone.credential()));
+    assert!(!members.contains(other_phone.credential()));
+
+    // the group fixed: none expired, nothing due, and her next message taken
+    assert!(!device.has_expired_member(CONVERSATION));
+    assert!(!groups.key_update_due(CONVERSATION));
+    phones_group
+        .process_server_message(&phone, &forwarded_commit(&cpim))
+        .unwrap();
+    let (outer, mls_message) = from_bob_asking(
+        &phone,
+        &mut phones_group,
+        ALICE_TEL,
+        "alice-2",
+        Some("negative-delivery"),
+    );
+    assert!(decrypted(&device, &outer, &mls_message).is_ok());
+}

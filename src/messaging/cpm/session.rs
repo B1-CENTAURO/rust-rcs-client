@@ -2180,11 +2180,13 @@ impl CPMSessionService {
                     }
                     // the group healed if it could not be decrypted (RCC.16
                     // section 10.1), and the sender told so once it is
-                    // (section 10.2)
+                    // (section 10.2), or told at once that it was not as a
+                    // member's credential expired (section 9.1.1)
                     heal_if_needed(session);
                     tell_failed_to_decrypt(session);
                     // and the keys of this client updated once due, the
-                    // group being active (section 9.5.2)
+                    // group being active (section 9.5.2), or the Clients
+                    // whose credentials expired replaced (section 9.1.1)
                     update_keys_if_due(session);
                     return;
                 }
@@ -2309,6 +2311,10 @@ impl CPMSessionService {
                     // and the senders of messages not decrypted told so,
                     // once it is in step (section 10.2)
                     tell_failed_to_decrypt(session);
+                    // and the Clients whose credentials expired replaced
+                    // once a Commit is applied (section 6.2.6), or the keys
+                    // of this client updated once due
+                    update_keys_if_due(session);
                     // and the Group Metadata keys this client misses asked
                     // for, or those asked for sent (sections 10.5.2, 10.5.3),
                     // the subject told once the keys it waited for came

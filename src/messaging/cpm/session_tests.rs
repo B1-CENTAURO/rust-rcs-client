@@ -7878,6 +7878,106 @@ fn the_keys_are_updated_after_a_message_received_once_due() {
     }
 }
 
+#[test]
+fn the_keys_are_updated_after_a_commit_of_the_focus_once_due() {
+    // as when a member's credential expired once it is applied (RCC.16
+    // section 6.2.6), with a KeyPackage Update
+    for due in [true, false] {
+        let (client, mut peer) = start(true);
+        let rt = Arc::clone(&client.rt);
+        let encryption = updating_in(&client, due);
+        let (mut connection, msrp_path, our_path) =
+            joined_encrypted_group(&client, &mut peer, "group-updating-on-commit");
+        let send = connection.next_message(&rt);
+        assert_eq!(send.body, UPDATING_CPIM);
+        connection.respond(&rt, &send, "200 OK");
+
+        connection.send_content(
+            &rt,
+            &msrp_path,
+            &our_path,
+            "message/cpim",
+            &from_the_focus("a Commit"),
+        );
+        assert!(connection.next_response(&rt).first_line.contains(" 200"));
+        if due {
+            let send = connection.next_message(&rt);
+            assert_eq!(send.body, UPDATING_CPIM);
+            connection.respond(&rt, &send, "200 OK");
+        }
+        connection.quiet(&rt);
+        assert_eq!(encryption.server_messages.lock().unwrap().len(), 1);
+        assert_eq!(
+            encryption.updated.lock().unwrap().len(),
+            if due { 2 } else { 1 },
+            "due {}",
+            due
+        );
+    }
+}
+
+#[test]
+fn a_message_refused_as_a_member_expired_is_told_of_then_the_group_fixed() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    // the encryption refusing it, its sender to be told at once, and a
+    // KeyPackage Update due (RCC.16 section 9.1.1)
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        signature: Some(String::from(SIGNED)),
+        failing_to_decrypt: std::sync::Mutex::new(vec![FailedToDecrypt {
+            imdn: String::from("<imdn>expired-credential</imdn>"),
+            sender_uri: String::from("tel:+15550002"),
+            original_message_id: None,
+        }]),
+        keys_due: true,
+        updating: Some(UPDATING_CPIM.to_vec()),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-member-expired");
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, UPDATING_CPIM);
+    connection.respond(&rt, &send, "200 OK");
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &encrypted_group_cpim("tel:+15550002", "", "not to be decrypted"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+
+    // the negative delivery signed, and the Commit, each going out in a
+    // task of its own
+    let mut sent = Vec::new();
+    for _ in 0..2 {
+        let send = connection.next_message(&rt);
+        sent.push(send.body.clone());
+        connection.respond(&rt, &send, "200 OK");
+    }
+    sent.sort();
+    let mut expected = vec![SIGNED.as_bytes().to_vec(), UPDATING_CPIM.to_vec()];
+    expected.sort();
+    assert_eq!(sent, expected);
+    assert!(encryption.healed.lock().unwrap().is_empty());
+    assert_eq!(
+        signed_from(&encryption, 0),
+        [(
+            String::from("<tel:+15550002>"),
+            None,
+            String::from("<imdn>expired-credential</imdn>")
+        )]
+    );
+    assert_eq!(encryption.updated.lock().unwrap().len(), 2);
+    connection.quiet(&rt);
+}
+
 /// The group the client joined with `invitation`, accepted, its session
 /// ended since
 fn group_left_for_now(
