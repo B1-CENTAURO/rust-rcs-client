@@ -9357,10 +9357,9 @@ fn a_chat_is_not_joined_unless_of_the_contact_and_the_user_only() {
     // nor one whose bundled message is not one of the group, as joining a
     // group does
     let bob = super::kds_tests::bob();
-    let (_, bundled_wrong) =
-        focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 2), |_| {
-            b"not a message".to_vec()
-        });
+    let (_, bundled_wrong) = focus_welcome(&bob, BOBS_CHAT, &uploaded_key_package(&kds, 2), |_| {
+        b"not a message".to_vec()
+    });
     assert!(device.join_chat(BOB_TEL, &bundled_wrong, None).is_err());
     assert!(!device.store().has_conversation(BOBS_CHAT.as_bytes()));
 
