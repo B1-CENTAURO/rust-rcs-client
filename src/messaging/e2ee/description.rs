@@ -24,8 +24,7 @@
 //! What does not open has the Group Metadata keys of the group checked, once
 //! nothing of the device waits for the Focus (section 10.5.1, item 3).
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::BTreeMap;
 
 use base64::{engine::general_purpose, Engine as _};
 use rust_rcs_core::ffi::log::platform_log;
@@ -43,8 +42,8 @@ use crate::messaging::cpm::encryption::{
 use super::device::E2eeDevice;
 use super::file::{file_urls, seal_file};
 use super::group::GroupError;
-use super::notes::{put, NotesData, Reader as NotesReader};
-use super::store::StoreError;
+use super::notes::{put, Notes, NotesData, Reader as NotesReader};
+use super::store::{MlsStore, StoreError};
 
 const LOG_TAG: &str = "e2ee";
 
@@ -61,25 +60,53 @@ pub(super) struct Icon {
     pub(super) participant: Option<String>,
 }
 
-/// What of the subject and icon of a group did not open yet
-#[derive(Default)]
-struct Unopened {
+/// What of the subject and icon of a group did not open yet, as kept in the
+/// notes of the device
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Unopened {
     /// The encrypted subject, and who set it, if told
-    subject: Option<(Vec<u8>, Option<String>)>,
+    pub(super) subject: Option<(Vec<u8>, Option<String>)>,
     /// The tag of the key of the icon its download did not open with, empty
     /// if no key was kept
-    icon: Option<Vec<u8>>,
+    pub(super) icon: Option<Vec<u8>>,
 }
 
 /// What did not open of the subjects and icons of the groups, by
-/// Conversation-ID, for as long as the device runs
-#[derive(Default)]
-pub(super) struct Descriptions(Mutex<HashMap<String, Unopened>>);
+/// Conversation-ID, as the notes of the device keep it for it to restart
+/// with: tried again once the keys come then too
+pub(super) struct Descriptions<'a> {
+    pub(super) notes: &'a Notes,
+    pub(super) store: &'a MlsStore,
+}
 
-impl Descriptions {
+impl Descriptions<'_> {
+    /// What did not open of the group `conversation_id`, if anything
+    fn unopened(&self, conversation_id: &str) -> Option<Unopened> {
+        self.notes
+            .read(|data| data.unopened.get(conversation_id).cloned())
+    }
+
+    /// Changes what did not open of the group `conversation_id` as `change`
+    /// does, kept as the notes are; let go of once nothing is left
+    fn change(&self, conversation_id: &str, change: impl FnOnce(&mut Unopened)) {
+        self.notes.hold(self.store, |data| {
+            let unopened = data
+                .unopened
+                .entry(String::from(conversation_id))
+                .or_default();
+            change(unopened);
+            if *unopened == Unopened::default() {
+                data.unopened.remove(conversation_id);
+            }
+        });
+    }
+
     /// Lets go of the group `conversation_id`
     pub(super) fn forget(&self, conversation_id: &str) {
-        self.0.lock().unwrap().remove(conversation_id);
+        if self.unopened(conversation_id).is_some() {
+            self.notes
+                .hold(self.store, |data| data.unopened.remove(conversation_id));
+        }
     }
 }
 
@@ -117,7 +144,8 @@ impl E2eeDevice {
         subject: EncryptedMetadata,
     ) -> Option<GroupMetadata> {
         let EncryptedMetadata { value, participant } = subject;
-        self.forget_unopened(conversation_id, |unopened| unopened.subject = None);
+        self.descriptions()
+            .change(conversation_id, |unopened| unopened.subject = None);
         if value.is_empty() {
             return Some(GroupMetadata::Subject {
                 subject: None,
@@ -137,13 +165,9 @@ impl E2eeDevice {
                 participant,
             }),
             None => {
-                self.descriptions()
-                    .0
-                    .lock()
-                    .unwrap()
-                    .entry(String::from(conversation_id))
-                    .or_default()
-                    .subject = Some((ciphertext, participant));
+                self.descriptions().change(conversation_id, |unopened| {
+                    unopened.subject = Some((ciphertext, participant))
+                });
                 self.recoveries().check(conversation_id, false);
                 None
             }
@@ -168,12 +192,7 @@ impl E2eeDevice {
             return None;
         }
         self.descriptions()
-            .0
-            .lock()
-            .unwrap()
-            .entry(String::from(conversation_id))
-            .or_default()
-            .icon = None;
+            .change(conversation_id, |unopened| unopened.icon = None);
 
         Some(match kept {
             Some(icon) => self.told_icon(icon),
@@ -207,18 +226,18 @@ impl E2eeDevice {
     /// keys of the group checked
     pub fn metadata_opened(&self, conversation_id: &str) -> Vec<GroupMetadata> {
         let mut told = Vec::new();
-        let (subject, icon_tag) = {
-            let descriptions = self.descriptions().0.lock().unwrap();
-            match descriptions.get(conversation_id) {
-                Some(unopened) => (unopened.subject.clone(), unopened.icon.clone()),
-                None => return told,
-            }
+        let Some(Unopened {
+            subject,
+            icon: icon_tag,
+        }) = self.descriptions().unopened(conversation_id)
+        else {
+            return told;
         };
 
         if let Some((ciphertext, participant)) = subject {
             match self.open_subject(conversation_id, &ciphertext) {
                 Some(subject) => {
-                    self.forget_unopened(conversation_id, |unopened| {
+                    self.descriptions().change(conversation_id, |unopened| {
                         if unopened.subject.as_ref().map(|(c, _)| c) == Some(&ciphertext) {
                             unopened.subject = None;
                         }
@@ -234,24 +253,13 @@ impl E2eeDevice {
 
         if let Some(tag) = icon_tag {
             if self.icon_key_tag(conversation_id) != tag {
-                self.forget_unopened(conversation_id, |unopened| unopened.icon = None);
+                self.descriptions()
+                    .change(conversation_id, |unopened| unopened.icon = None);
                 let icon = self.notes().read(|data| icon_of(data, conversation_id));
                 told.extend(icon.map(|icon| self.told_icon(icon)));
             }
         }
         told
-    }
-
-    fn forget_unopened(&self, conversation_id: &str, forget: impl FnOnce(&mut Unopened)) {
-        if let Some(unopened) = self
-            .descriptions()
-            .0
-            .lock()
-            .unwrap()
-            .get_mut(conversation_id)
-        {
-            forget(unopened);
-        }
     }
 
     /// The subject `ciphertext` of the group chat `conversation_id` decrypted
@@ -315,12 +323,7 @@ impl E2eeDevice {
                 .map(|info| info.hmac_tag)
                 .unwrap_or_default();
             self.descriptions()
-                .0
-                .lock()
-                .unwrap()
-                .entry(String::from(conversation_id))
-                .or_default()
-                .icon = Some(tag);
+                .change(conversation_id, |unopened| unopened.icon = Some(tag));
             self.recoveries().check(conversation_id, false);
         }
         opened
@@ -506,6 +509,63 @@ pub(super) fn encode(icons: &[Icon]) -> Vec<u8> {
         }
     }
     data
+}
+
+/// What did not open of the groups `unopened`, as the notes of the device
+/// hold it
+pub(super) fn encode_unopened(unopened: &BTreeMap<String, Unopened>) -> Vec<u8> {
+    let mut data = Vec::new();
+    for (conversation_id, unopened) in unopened {
+        put(&mut data, conversation_id.as_bytes());
+        match &unopened.subject {
+            Some((ciphertext, participant)) => {
+                data.push(1);
+                put(&mut data, ciphertext);
+                match participant {
+                    Some(participant) => {
+                        data.push(1);
+                        put(&mut data, participant.as_bytes());
+                    }
+                    None => data.push(0),
+                }
+            }
+            None => data.push(0),
+        }
+        match &unopened.icon {
+            Some(tag) => {
+                data.push(1);
+                put(&mut data, tag);
+            }
+            None => data.push(0),
+        }
+    }
+    data
+}
+
+/// What did not open of the groups `reader` reads to its end, as
+/// encode_unopened() puts it; None if it cannot be read
+pub(super) fn decode_unopened(reader: &mut NotesReader) -> Option<BTreeMap<String, Unopened>> {
+    let mut all = BTreeMap::new();
+    while !reader.is_empty() {
+        let conversation_id = reader.string()?;
+        let subject = match reader.flag()? {
+            true => {
+                let ciphertext = reader.vec()?;
+                let participant = match reader.flag()? {
+                    true => Some(reader.string()?),
+                    false => None,
+                };
+                Some((ciphertext, participant))
+            }
+            false => None,
+        };
+        let icon = match reader.flag()? {
+            true => Some(reader.vec()?),
+            false => None,
+        };
+        all.insert(conversation_id, Unopened { subject, icon });
+    }
+    Some(all)
 }
 
 /// The icons `reader` reads, as encode() puts them
