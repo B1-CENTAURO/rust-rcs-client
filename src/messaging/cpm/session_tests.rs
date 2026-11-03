@@ -5621,6 +5621,9 @@ fn an_encrypted_group_restarted_is_encrypted_again() {
         Ok(200)
     );
     assert!(cpim_text(&encryption.encrypted.lock().unwrap()[0].1) == "again");
+    // its INVITE carrying no first Commit, none applied as the focus
+    // answers it
+    assert!(encryption.invites_accepted.lock().unwrap().is_empty());
 
     // and by its focus
     assert!(client.sessions.end_session(GROUP));
