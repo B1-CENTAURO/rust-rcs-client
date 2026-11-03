@@ -220,6 +220,22 @@ typedef void (*group_chat_event_callback) (int32_t event, const char *conference
 // sets the group chat listener; the context of one set before is released
 extern void rcs_client_set_group_chat_listener(struct rcs_client *client, group_chat_event_callback cb, void *context);
 
+// sets the user alias (RCC.07 section 2.5.3.3), or none if alias is NULL or empty, for the requests starting a
+// conversation and the messages of group chats from now on: the display name of their From, and in a group chat of
+// their CPIM From; in an encrypted chat or group, encrypted for it in the encrypted-alias parameter of the From's URI
+// (RCC.16 section 9.1.5), or left out while it cannot be decrypted by those invited, as when the chat or group is new
+extern void rcs_client_set_user_alias(struct rcs_client *client, const char *alias);
+
+// told of the alias a sender gives itself, as a chat invitation, a group chat invitation's inviter, a message of a
+// group chat, or a standalone message carries it: its URI, the alias, and encrypted != 0 if the alias came encrypted
+// end to end, decrypted (RCC.16 section 9.1.5) and checked to be of a client of that URI's user; told once for each
+// sender, and again when it changes; an alias is the user's own claim, to be shown as unchecked for a contact not
+// in the address book (RCC.07 section 2.5.3.3)
+typedef void (*alias_callback) (const char *uri, const char *alias, int32_t encrypted, void *context);
+
+// sets the alias listener; the context of one set before is released
+extern void rcs_client_set_alias_listener(struct rcs_client *client, alias_callback cb, void *context);
+
 // told of an invitation to a group chat not known before: the group's URI and Conversation-ID, then its subject and the URI
 // and display name of whoever invited, each NULL if not told; pending != 0 if it waits for the user's answer, as group chats
 // are not accepted automatically (AutAcceptGroupChat 0), else it is being accepted, and joined (event 0) once it is;

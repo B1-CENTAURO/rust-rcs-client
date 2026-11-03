@@ -92,6 +92,8 @@ pub struct CPMMessageParam {
     recipient: String,
     recipient_type: RecipientType,
     recipient_uri: String,
+    /// The user alias it is sent with, as the formal name of its CPIM From
+    sender_alias: Option<String>,
     message_result_callback: Arc<dyn Fn(u16, String) + Send + Sync>, // to-do: use FnOnce in CPMSession ?
 }
 
@@ -117,8 +119,16 @@ impl CPMMessageParam {
             recipient: String::from(recipient),
             recipient_type: RecipientType::from(recipient_type),
             recipient_uri: String::from(recipient_uri),
+            sender_alias: None,
             message_result_callback: Arc::new(message_result_callback),
         }
+    }
+
+    /// The message sent with the user alias `alias`, as the formal name of
+    /// its CPIM From, as a group chat has it (RCC.07 section 2.5.3.3)
+    pub(crate) fn with_alias(mut self, alias: Option<String>) -> CPMMessageParam {
+        self.sender_alias = alias;
+        self
     }
 
     /// The message sent as it is, not in a CPIM message
@@ -143,6 +153,79 @@ impl CPMMessageParam {
         message.signed = true;
         message
     }
+}
+
+/// `alias` as the display name of a SIP name-addr, or the formal name of a
+/// CPIM From: a quoted string, its quotes and backslashes escaped, and the
+/// control characters it may not carry left out (RFC 3261 section 25.1,
+/// RFC 3862 section 3.6.1)
+pub fn quoted_alias(alias: &str) -> String {
+    let mut quoted = String::with_capacity(alias.len() + 2);
+    quoted.push('"');
+    for c in alias.chars().filter(|c| !c.is_control()) {
+        if c == '"' || c == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// The name-addr of `uri` with the user alias `alias` as its display name,
+/// if there is one (RCC.07 section 2.5.3.3)
+pub fn name_addr(alias: Option<&str>, uri: &str) -> String {
+    match alias {
+        Some(alias) => format!("{} <{}>", quoted_alias(alias), uri),
+        None => format!("<{}>", uri),
+    }
+}
+
+/// The user alias a request or message of this client carries in its From
+pub enum SenderAlias<'a> {
+    None,
+    /// In an unencrypted conversation, as the display name
+    Plain(&'a str),
+    /// In an encrypted one, encrypted for it, as the `encrypted-alias`
+    /// parameter of the URI, never in the clear (RCC.16 section 9.1.5)
+    Sealed(&'a str),
+}
+
+/// The From of `uri` carrying `alias` (RCC.07 section 2.5.3.3, RCC.16
+/// section 9.1.5)
+pub fn sender_name_addr(uri: &str, alias: &SenderAlias) -> String {
+    match alias {
+        SenderAlias::None => name_addr(None, uri),
+        SenderAlias::Plain(alias) => name_addr(Some(alias), uri),
+        SenderAlias::Sealed(sealed) => format!(
+            "<{};{}={}>",
+            uri,
+            String::from_utf8_lossy(encryption::SIP_URI_PARAMETER_ENCRYPTED_ALIAS),
+            sealed
+        ),
+    }
+}
+
+/// Told of the user alias a sender gives itself, as a request or message
+/// from it carries it (RCC.07 section 2.5.3.3): its URI, the alias, and
+/// whether the alias came encrypted end to end (RCC.16 section 9.1.5)
+pub type AliasListener = Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
+
+/// The user alias the display name `display_name` of a name-addr gives, its
+/// quoted pairs taken as the characters they escape; None if it is empty
+pub fn alias_of(display_name: &[u8]) -> Option<String> {
+    let mut alias = Vec::with_capacity(display_name.len());
+    let mut escaped = false;
+    for b in display_name {
+        if *b == b'\\' && !escaped {
+            escaped = true;
+            continue;
+        }
+        escaped = false;
+        alias.push(*b);
+    }
+    let alias = String::from_utf8_lossy(&alias).trim().to_string();
+    (!alias.is_empty()).then_some(alias)
 }
 
 /// A new imdn.Message-ID
@@ -194,6 +277,7 @@ pub fn make_cpim_message_content_body(
     recipient_uri: &str,
     message_imdn_id: &str,
     public_user_identity: &str,
+    sender_alias: &SenderAlias,
 ) -> Body {
     let encoded = general_purpose::STANDARD.encode(message_content);
 
@@ -218,7 +302,10 @@ pub fn make_cpim_message_content_body(
 
     let mut cpim_headers = Vec::new();
 
-    cpim_headers.push(Header::new("From", format!("<{}>", public_user_identity)));
+    cpim_headers.push(Header::new(
+        "From",
+        sender_name_addr(public_user_identity, sender_alias),
+    ));
     cpim_headers.push(Header::new("To", format!("<{}>", recipient_uri)));
 
     let utc: DateTime<Local> = Local::now();
@@ -323,7 +410,84 @@ mod tests {
     use rust_rcs_core::cpim::CPIMMessage;
     use rust_rcs_core::internet::Body;
 
-    use super::understands_cpim_requirements;
+    use super::{
+        alias_of, quoted_alias, sender_name_addr, understands_cpim_requirements, SenderAlias,
+    };
+
+    #[test]
+    fn an_alias_is_quoted_and_taken_back() {
+        // its quotes and backslashes escaped, its control characters left
+        // out, so that it cannot end the header it is in (RFC 3261 section
+        // 25.1)
+        assert_eq!(quoted_alias("Alice"), "\"Alice\"");
+        assert_eq!(
+            quoted_alias("A \"b\" \\ c\r\n\td"),
+            "\"A \\\"b\\\" \\\\ cd\""
+        );
+        // and taken back from a display name, as the parser gives it
+        for alias in ["Alice", "A \"b\" \\ c", "Alice ☺"] {
+            let quoted = quoted_alias(alias);
+            let display_name = &quoted.as_bytes()[1..quoted.len() - 1];
+            assert_eq!(alias_of(display_name).as_deref(), Some(alias));
+        }
+        assert_eq!(alias_of(b"  "), None);
+        assert_eq!(alias_of(b""), None);
+    }
+
+    #[test]
+    fn an_encrypted_alias_is_found_among_the_parameters_of_a_uri() {
+        use super::encryption::encrypted_alias;
+        use rust_rcs_core::internet::name_addr::AsNameAddr;
+
+        assert_eq!(
+            encrypted_alias(b"user=phone;encrypted-alias=aGVsbG8gd29ybGQ"),
+            Some(&b"aGVsbG8gd29ybGQ"[..])
+        );
+        assert_eq!(
+            encrypted_alias(b"Encrypted-Alias=abc_-"),
+            Some(&b"abc_-"[..])
+        );
+        for parameters in [
+            &b""[..],
+            b"user=phone",
+            b"encrypted-alias",
+            b"encrypted-alias=",
+            b"encrypted-aliases=abc",
+        ] {
+            assert_eq!(encrypted_alias(parameters), None);
+        }
+        // as a name-addr gives them, in angle brackets or not
+        for from in [
+            &b"<sip:+1234578901@operator.com;user=phone;encrypted-alias=aGVsbG8>;tag=1"[..],
+            b"sip:+1234578901@operator.com;user=phone;encrypted-alias=aGVsbG8",
+        ] {
+            let addresses = from.as_name_addresses();
+            let uri_part = addresses[0].uri_part.as_ref().unwrap();
+            assert_eq!(uri_part.uri, b"sip:+1234578901@operator.com");
+            assert_eq!(
+                encrypted_alias(uri_part.uri_parameters),
+                Some(&b"aGVsbG8"[..])
+            );
+        }
+    }
+
+    #[test]
+    fn the_from_carries_the_alias_in_the_clear_or_encrypted() {
+        let uri = "sip:+15551234@example.com";
+        assert_eq!(
+            sender_name_addr(uri, &SenderAlias::None),
+            format!("<{}>", uri)
+        );
+        assert_eq!(
+            sender_name_addr(uri, &SenderAlias::Plain("Alice")),
+            format!("\"Alice\" <{}>", uri)
+        );
+        // in the encrypted-alias parameter of the URI (RCC.16 section 9.1.5)
+        assert_eq!(
+            sender_name_addr(uri, &SenderAlias::Sealed("aGVsbG8")),
+            format!("<{};encrypted-alias=aGVsbG8>", uri)
+        );
+    }
 
     fn message(require: &str) -> CPIMMessage {
         let data = format!(

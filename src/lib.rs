@@ -63,16 +63,17 @@ use ffi::{
     StateChangeCallbackContext, StateChangeCallbackContextWrapper,
 };
 use messaging::ffi::{
-    get_recipient_type, DownloadFileProgressCallback, DownloadFileProgressCallbackContext,
-    DownloadFileResultCallback, DownloadFileResultCallbackContext,
-    DownloadFileResultCallbackContextWrapper, DownloadileProgressCallbackContextWrapper,
-    GroupChatEventCallback, GroupChatIdsCallback, GroupChatInvitationCallback,
-    GroupChatResultCallback, MessageResultCallback, MessageResultCallbackContext,
-    MessageResultCallbackContextWrapper, SendImdnReportResultCallback,
-    SendImdnReportResultCallbackContext, SendImdnReportResultCallbackContextWrapper,
-    UploadFileProgressCallback, UploadFileProgressCallbackContext,
-    UploadFileProgressCallbackContextWrapper, UploadFileResultCallback,
-    UploadFileResultCallbackContext, UploadFileResultCallbackContextWrapper,
+    get_recipient_type, AliasCallback, DownloadFileProgressCallback,
+    DownloadFileProgressCallbackContext, DownloadFileResultCallback,
+    DownloadFileResultCallbackContext, DownloadFileResultCallbackContextWrapper,
+    DownloadileProgressCallbackContextWrapper, GroupChatEventCallback, GroupChatIdsCallback,
+    GroupChatInvitationCallback, GroupChatResultCallback, MessageResultCallback,
+    MessageResultCallbackContext, MessageResultCallbackContextWrapper,
+    SendImdnReportResultCallback, SendImdnReportResultCallbackContext,
+    SendImdnReportResultCallbackContextWrapper, UploadFileProgressCallback,
+    UploadFileProgressCallbackContext, UploadFileProgressCallbackContextWrapper,
+    UploadFileResultCallback, UploadFileResultCallbackContext,
+    UploadFileResultCallbackContextWrapper,
 };
 use provisioning::device_configuration::{
     start_auto_config, DeviceConfigurationStatus, RetryReason,
@@ -1337,6 +1338,55 @@ pub unsafe extern "C" fn rcs_client_set_group_chat_listener(
                 cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr()),
             );
         });
+    }
+}
+
+/// Sets the user alias, `alias`, or none if it is NULL or empty, for the
+/// requests starting a conversation and the messages of group chats from now
+/// on (RCC.07 section 2.5.3.3): as the display name of their From, and in a
+/// group chat of their CPIM From; in an encrypted conversation, encrypted for
+/// it (RCC.16 section 9.1.5), or left out while it cannot be
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_user_alias(client: *mut RcsClient, alias: *const c_char) {
+    platform_log(LOG_TAG, "calling rcs_client_set_user_alias()");
+
+    if let Some(client) = client.as_ref() {
+        client.engine.set_user_alias(optional_string(alias));
+    }
+}
+
+/// Sets what is told of the alias each sender gives itself, as a chat
+/// invitation, a group chat invitation's inviter, a message of a group chat,
+/// or a standalone message carries it: its URI, the alias, and whether the
+/// alias came encrypted end to end, decrypted (RCC.16 section 9.1.5). Told
+/// once, and again when it changes. The context of one set before is let go
+/// of.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_alias_listener(
+    client: *mut RcsClient,
+    cb: Option<AliasCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_set_alias_listener()");
+
+    let cb_context = NonNull::new(cb_context)
+        .map(|cb_context| Arc::new(Mutex::new(MessageResultCallbackContextWrapper(cb_context))));
+
+    if let (Some(client), Some(cb)) = (client.as_ref(), cb) {
+        client
+            .engine
+            .set_alias_listener(move |uri, alias, encrypted| {
+                let (uri, alias) = (c_string(uri), c_string(alias));
+                let cb_context = cb_context
+                    .as_ref()
+                    .map(|cb_context| cb_context.lock().unwrap());
+                cb(
+                    uri.as_ptr(),
+                    alias.as_ptr(),
+                    i32::from(encrypted),
+                    cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr()),
+                );
+            });
     }
 }
 

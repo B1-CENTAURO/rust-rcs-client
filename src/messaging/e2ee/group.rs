@@ -1314,6 +1314,14 @@ impl GroupEncryption for DeviceGroups {
             .is_some_and(|device| device.sealed_for_chat(contact, xml))
     }
 
+    fn seal_alias(&self, group_id: &str, alias: &str) -> Option<String> {
+        self.device.upgrade()?.seal_alias(group_id, alias)
+    }
+
+    fn open_alias(&self, group_id: &str, uri: &str, encrypted: &[u8]) -> Option<String> {
+        self.device.upgrade()?.open_alias(group_id, uri, encrypted)
+    }
+
     fn decrypt_file_transfer(
         &self,
         conversation_id: &str,

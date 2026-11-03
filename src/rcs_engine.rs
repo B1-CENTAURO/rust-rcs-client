@@ -111,6 +111,7 @@ use crate::messaging::cpm::session::CPMSessionServiceWrapper;
 use crate::messaging::cpm::session::{CPMGroupEvent, CPMSessionService};
 use crate::messaging::cpm::standalone_messaging::StandaloneMessagingServiceWrapper;
 use crate::messaging::cpm::standalone_messaging::{self, StandaloneMessagingService};
+use crate::messaging::cpm::AliasListener;
 use crate::messaging::cpm::MessagingSessionHandle;
 use crate::messaging::ffi::RecipientType;
 use crate::messaging::ft_http::config::FileTransferOverHTTPConfigs;
@@ -1127,6 +1128,37 @@ impl RcsEngine {
             .lock()
             .unwrap()
             .replace(Arc::new(listener));
+    }
+
+    /// Has the requests starting a conversation, and the messages of group
+    /// chats, carry `alias` as the user alias from now on, or none (RCC.07
+    /// section 2.5.3.3): as the display name of their From, or of their CPIM
+    /// From in a group chat, or encrypted for an encrypted conversation
+    /// (RCC.16 section 9.1.5)
+    pub fn set_user_alias(&self, alias: Option<String>) {
+        self.cpm_session_service.set_user_alias(alias.clone());
+        self.standalone_messaging_service.set_user_alias(alias);
+    }
+
+    /// Sets what is told of the alias each sender gives itself, as a chat
+    /// invitation, a group chat invitation's inviter, a message of a group
+    /// chat, or a standalone message carries it: its URI, the alias, and
+    /// whether the alias came encrypted end to end; told once, and again
+    /// when it changes
+    pub fn set_alias_listener<L>(&self, listener: L)
+    where
+        L: Fn(&str, &str, bool) + Send + Sync + 'static,
+    {
+        let told = AliasesTold::default();
+        let listener: AliasListener = Arc::new(move |uri, alias, encrypted| {
+            if told.changed(uri, alias, encrypted) {
+                listener(uri, alias, encrypted);
+            }
+        });
+        self.cpm_session_service
+            .set_alias_listener(Arc::clone(&listener));
+        self.standalone_messaging_service
+            .set_alias_listener(listener);
     }
 
     /// Sets what is told of the invitations to group chats not known before,
@@ -2964,6 +2996,20 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_is_told_once_and_again_when_it_changes() {
+        let told = super::AliasesTold::default();
+        assert!(told.changed("sip:alice", "Alice", false));
+        assert!(!told.changed("sip:alice", "Alice", false));
+        // encrypted now, or another
+        assert!(told.changed("sip:alice", "Alice", true));
+        assert!(told.changed("sip:alice", "Ally", true));
+        assert!(!told.changed("sip:alice", "Ally", true));
+        // of each sender apart
+        assert!(told.changed("sip:bob", "Ally", true));
+        assert!(!told.changed("sip:alice", "Ally", true));
+    }
+
+    #[test]
     fn a_file_transfer_message_is_known_by_its_type() {
         for message_type in [
             "application/vnd.gsma.rcs-ft-http+xml",
@@ -3253,6 +3299,25 @@ fn change_group_metadata<F>(
         if let Some(callback) = callback.lock().unwrap().take() {
             callback(404, String::from("Not Found"));
         }
+    }
+}
+
+/// The alias last told of each sender, by its URI, and whether it came
+/// encrypted
+#[derive(Default)]
+struct AliasesTold(Mutex<HashMap<String, (String, bool)>>);
+
+impl AliasesTold {
+    /// Whether `alias`, `encrypted` or not, is not what was last told of
+    /// `uri`, which it is from now on
+    fn changed(&self, uri: &str, alias: &str, encrypted: bool) -> bool {
+        let told = (String::from(alias), encrypted);
+        let mut aliases = self.0.lock().unwrap();
+        if aliases.get(uri) == Some(&told) {
+            return false;
+        }
+        aliases.insert(String::from(uri), told);
+        true
     }
 }
 
@@ -3650,7 +3715,7 @@ fn route_message<F>(
                 rt,
             );
         } else {
-            standalone_messaging::send_message(
+            standalone_messaging::send_message_from(
                 message_type,
                 message_content,
                 &message_id,
@@ -3661,6 +3726,7 @@ fn route_message<F>(
                 core,
                 &transport,
                 &public_user_identity,
+                route.standalone_messaging_service.user_alias().as_deref(),
                 &rt,
             );
         }

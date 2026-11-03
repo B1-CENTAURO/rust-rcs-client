@@ -27,8 +27,8 @@ use tokio::sync::Notify;
 use crate::messaging::config::MessagingConfigs;
 use crate::messaging::cpm::encryption::GroupEncryption;
 use crate::messaging::cpm::session_tests::{
-    answer, body_data, cpim_text, header_value, request_uri, start, ChatScript, Client, MsrpPeer,
-    Peer, ScriptedEncryption, CHAT_BUNDLE, IMPU, PEER, TOKEN,
+    answer, body_data, cpim_text, header_value, request_uri, start, status_code, ChatScript,
+    Client, MsrpPeer, Peer, ScriptedEncryption, CHAT_BUNDLE, IMPU, PEER, TOKEN, TRANSPORT_ADDRESS,
 };
 use crate::messaging::ffi::RecipientType;
 
@@ -666,4 +666,82 @@ fn a_file_is_sealed_for_what_it_is_uploaded_for_while_that_is_encrypted() {
     ] {
         assert!(rt.block_on(sealing_of(&upload_for, None)).is_none());
     }
+}
+
+#[test]
+fn a_standalone_message_carries_the_user_alias_in_its_from() {
+    let (client, mut peer) = start(true);
+    let engine = Engine::over(&client, configured(true, true));
+
+    // as its display name (RCC.07 section 2.5.3.3); standalone messages are
+    // not encrypted
+    client
+        .standalone
+        .set_user_alias(Some(String::from("Alice")));
+    let sent = engine.route("text/plain", "hello", "m1");
+    let message = peer.next_request("MESSAGE");
+    let from = header_value(&message, "From");
+    assert!(
+        from.starts_with(&format!("\"Alice\" <{}>;tag=", IMPU)),
+        "{}",
+        from
+    );
+    peer.send(&answer(&message, "200 OK", None));
+    assert_eq!(told(&sent), 200);
+
+    // none once let go of
+    client.standalone.set_user_alias(Some(String::from("  ")));
+    let sent = engine.route("text/plain", "again", "m2");
+    let message = peer.next_request("MESSAGE");
+    let from = header_value(&message, "From");
+    assert!(from.starts_with(&format!("<{}>;tag=", IMPU)), "{}", from);
+    peer.send(&answer(&message, "200 OK", None));
+    assert_eq!(told(&sent), 200);
+    peer.silence();
+}
+
+#[test]
+fn the_alias_of_the_sender_of_a_standalone_message_is_told() {
+    let (client, mut peer) = start(true);
+    // as the display name of its From (RCC.07 section 2.5.3.3)
+    peer.send(&standalone_message_from(
+        "alias-message",
+        "\"Bob\" <sip:+15559876@example.com>;tag=peer1",
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(
+        client.aliases.recv_timeout(Duration::from_secs(5)),
+        Ok((String::from(PEER), String::from("Bob"), false))
+    );
+}
+
+/// A pager MESSAGE from PEER, its From `from`
+fn standalone_message_from(call_id: &str, from: &str) -> String {
+    let cpim = format!(
+        "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: standalone-1\r\n\r\nContent-Type: text/plain\r\n\r\nhello",
+        PEER, IMPU
+    );
+    format!(
+        "MESSAGE sip:+15551234@{};transport=tcp SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bK{}\r\n\
+From: {}\r\n\
+To: <{}>\r\n\
+Call-ID: {}\r\n\
+CSeq: 1 MESSAGE\r\n\
+Accept-Contact: *;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.msg\"\r\n\
+P-Asserted-Identity: <{}>\r\n\
+Max-Forwards: 70\r\n\
+Content-Type: message/cpim\r\n\
+Content-Length: {}\r\n\
+\r\n\
+{}",
+        TRANSPORT_ADDRESS,
+        call_id,
+        from,
+        IMPU,
+        call_id,
+        PEER,
+        cpim.len(),
+        cpim
+    )
 }

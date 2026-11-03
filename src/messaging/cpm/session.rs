@@ -81,6 +81,7 @@ use uuid::Uuid;
 use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
 
+use super::encryption::encrypted_alias;
 use super::encryption::{
     EncryptedMetadata, EndReason, FtdAnswer, GroupEncryption, GroupMetadata, ImdnTold,
     MetadataChange, Sealed, Upgrade, Verified, CONTENT_TYPE_MLS, CONTENT_TYPE_MLS_RCS_SERVER,
@@ -97,8 +98,9 @@ use super::session_invitation::{
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMContact, CPMServiceType};
 use super::{
-    decode_base64, is_composing_document, is_media_type, make_cpim_message_content_body,
-    new_message_id, understands_cpim_requirements, CPMMessageParam, IS_COMPOSING, LOG_TAG,
+    alias_of, decode_base64, is_composing_document, is_media_type, make_cpim_message_content_body,
+    new_message_id, sender_name_addr, understands_cpim_requirements, AliasListener,
+    CPMMessageParam, SenderAlias, IS_COMPOSING, LOG_TAG,
 };
 
 // to-do: use enum
@@ -111,6 +113,9 @@ pub struct CPMSessionInfo {
     pub referred_by: Option<String>,
     pub is_deferred_session: bool,
     pub contact_alias: Option<String>,
+    /// The encrypted alias of the From of an incoming request, which an MLS
+    /// group of the conversation decrypts (RCC.16 section 9.1.5)
+    pub contact_encrypted_alias: Option<Vec<u8>>,
     pub conversation_supports_anonymization: bool,
     pub conversation_is_using_anonymization_token: bool,
     /// The MLS-Opaque-Token the message carried, for the requests of the
@@ -401,6 +406,7 @@ pub fn get_cpm_session_info_from_message(
                         let asserted_contact_uri = String::from(asserted_contact_uri);
 
                         let mut contact_alias = None;
+                        let mut contact_encrypted_alias = None;
                         if is_outgoing {
                             if let Some(to_header) = to_header {
                                 if let Some(name_addr) = to_header
@@ -433,6 +439,13 @@ pub fn get_cpm_session_info_from_message(
                                             contact_alias = Some(String::from(display_name));
                                         }
                                     }
+                                    contact_encrypted_alias = name_addr
+                                        .uri_part
+                                        .as_ref()
+                                        .and_then(|uri_part| {
+                                            encrypted_alias(uri_part.uri_parameters)
+                                        })
+                                        .map(<[u8]>::to_vec);
                                 }
                             }
                         }
@@ -482,6 +495,7 @@ pub fn get_cpm_session_info_from_message(
                             },
                             is_deferred_session,
                             contact_alias,
+                            contact_encrypted_alias,
                             conversation_supports_anonymization,
                             conversation_is_using_anonymization_token,
                             mls_opaque_token: opaque_token.and_then(mls_opaque_token_value),
@@ -936,6 +950,26 @@ impl CPMSession {
                                     }
                                     (message.message_type.as_bytes().to_vec(), data)
                                 } else {
+                                    // the user alias, which the CPIM From
+                                    // leaves unencrypted: in an encrypted
+                                    // group, encrypted for it, or left out
+                                    // (RCC.16 sections 7.5.7, 9.1.5)
+                                    let sealed = message
+                                        .sender_alias
+                                        .as_deref()
+                                        .zip(encryption.as_ref())
+                                        .filter(|(_, (encryption, conversation_id))| {
+                                            !encryption.encryption_ended(conversation_id)
+                                        })
+                                        .map(|(alias, (encryption, conversation_id))| {
+                                            encryption.seal_alias(conversation_id, alias)
+                                        });
+                                    let sender_alias = match (&sealed, &message.sender_alias) {
+                                        (Some(Some(sealed)), _) => SenderAlias::Sealed(sealed),
+                                        (Some(None), _) => SenderAlias::None,
+                                        (None, Some(alias)) => SenderAlias::Plain(alias),
+                                        (None, None) => SenderAlias::None,
+                                    };
                                     let body = make_cpim_message_content_body(
                                         &message.message_type,
                                         &message.message_content,
@@ -943,6 +977,7 @@ impl CPMSession {
                                         &message.recipient_uri,
                                         &message.message_id,
                                         &public_user_identity,
+                                        &sender_alias,
                                     );
 
                                     let mut data = Vec::with_capacity(body.estimated_size());
@@ -1854,6 +1889,80 @@ fn fail_invitation(
     }
 }
 
+/// Tells `listener` of the alias the contact of an incoming 1-to-1 chat
+/// gives itself in the From of its INVITE: encrypted, as the MLS group of
+/// the chat decrypts it, else as its display name (RCC.07 section 2.5.3.3,
+/// RCC.16 section 9.1.5)
+fn tell_contact_alias(listener: &Mutex<Option<AliasListener>>, session_info: &CPMSessionInfo) {
+    let Some(listener) = listener.lock().unwrap().clone() else {
+        return;
+    };
+    let contact = &session_info.asserted_contact_uri;
+    let opened = session_info
+        .contact_encrypted_alias
+        .as_ref()
+        .zip(session_info.encryption.as_ref())
+        .zip(session_info.mls_group())
+        .and_then(|((encrypted, encryption), group_id)| {
+            encryption.open_alias(group_id, contact, encrypted)
+        });
+    let told = match opened {
+        Some(alias) => Some((alias, true)),
+        None => session_info
+            .contact_alias
+            .as_deref()
+            .and_then(|display_name| alias_of(display_name.as_bytes()))
+            .map(|alias| (alias, false)),
+    };
+    if let Some((alias, encrypted)) = told {
+        listener(contact, &alias, encrypted);
+    }
+}
+
+/// Tells `listener` of the alias the sender of a message of the group chat
+/// of `session` gives itself, which the CPIM From `cpim_info` tells: the
+/// encrypted alias of its URI, as the MLS group of the session decrypts it,
+/// else its formal name, which is not encrypted, even in an encrypted
+/// message (RCC.07 section 2.5.3.3, RCC.16 sections 7.5.7, 9.1.5)
+fn tell_sender_alias(
+    session: &Arc<SipSession<CPMSession>>,
+    cpim_info: &CPIMInfo,
+    listener: &Mutex<Option<AliasListener>>,
+) {
+    let Some(listener) = listener.lock().unwrap().clone() else {
+        return;
+    };
+    let inner = session.get_inner();
+    let session_info = inner.get_session_info();
+    if !matches!(session_info.cpm_contact.service_type, CPMServiceType::Group) {
+        return;
+    }
+    let addresses = cpim_info.from.as_name_addresses();
+    let Some(from) = addresses.first() else {
+        return;
+    };
+    let Some(uri_part) = &from.uri_part else {
+        return;
+    };
+    let uri = String::from_utf8_lossy(uri_part.uri).into_owned();
+    let opened = encrypted_alias(uri_part.uri_parameters)
+        .zip(session_info.encryption.as_ref())
+        .zip(session_info.mls_group())
+        .and_then(|((encrypted, encryption), group_id)| {
+            encryption.open_alias(group_id, &uri, encrypted)
+        });
+    let told = match opened {
+        Some(alias) => Some((alias, true)),
+        None => from
+            .display_name
+            .and_then(alias_of)
+            .map(|alias| (alias, false)),
+    };
+    if let Some((alias, encrypted)) = told {
+        listener(&uri, &alias, encrypted);
+    }
+}
+
 impl Drop for CPMSession {
     /// The messages that waited for a session that never started fail
     fn drop(&mut self) {
@@ -2029,6 +2138,12 @@ pub struct CPMSessionService {
     >,
     ongoing_outgoing_invitations: Arc<Mutex<Vec<OutgoingInvitation>>>,
 
+    /// The user alias, which the requests starting a conversation and the
+    /// messages of a group chat carry (RCC.07 section 2.5.3.3)
+    user_alias: Arc<Mutex<Option<String>>>,
+    /// Told of the alias each sender gives itself
+    alias_listener: Arc<Mutex<Option<AliasListener>>>,
+
     registered_public_identity: Arc<Mutex<Option<(Arc<SipTransport>, String, String)>>>,
 
     message_receive_listener:
@@ -2126,6 +2241,8 @@ impl CPMSessionService {
         let group_encryption: Arc<Mutex<Option<Arc<dyn GroupEncryption>>>> =
             Arc::new(Mutex::new(None));
         let encryption = Arc::clone(&group_encryption);
+        let alias_listener: Arc<Mutex<Option<AliasListener>>> = Arc::new(Mutex::new(None));
+        let alias_listener_ = Arc::clone(&alias_listener);
         let group_listener = Arc::clone(&group_chats.listener);
         let message_receive_listener =
             move |session: &Arc<SipSession<CPMSession>>,
@@ -2167,6 +2284,7 @@ impl CPMSessionService {
                             } else {
                                 content.to_vec()
                             };
+                            tell_sender_alias(session, &info, &alias_listener_);
                             message_receive_listener(
                                 session,
                                 contact,
@@ -2269,6 +2387,7 @@ impl CPMSessionService {
                     }
                 }
                 if !content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS_RCS_SERVER) {
+                    tell_sender_alias(session, cpim_info, &alias_listener_);
                     message_receive_listener(
                         session,
                         contact,
@@ -2343,7 +2462,24 @@ impl CPMSessionService {
             group_chats,
             group_encryption,
             restarter: Arc::new(Mutex::new(None)),
+            user_alias: Arc::new(Mutex::new(None)),
+            alias_listener,
         }
+    }
+
+    /// Has the requests starting a conversation, and the messages of group
+    /// chats, carry `alias` as the user alias from now on, or none (RCC.07
+    /// section 2.5.3.3); encrypted in an encrypted conversation (RCC.16
+    /// section 9.1.5)
+    pub fn set_user_alias(&self, alias: Option<String>) {
+        *self.user_alias.lock().unwrap() = alias.filter(|alias| !alias.trim().is_empty());
+    }
+
+    /// Has `listener` told of the alias each sender gives itself, as a chat
+    /// invitation, a group chat invitation's inviter, or a message of a
+    /// group chat carries it
+    pub fn set_alias_listener(&self, listener: AliasListener) {
+        *self.alias_listener.lock().unwrap() = Some(listener);
     }
 
     /// Has the group chats created from now on encrypted end to end by
@@ -3016,6 +3152,13 @@ impl CPMSessionService {
                 }
             },
         );
+        // in a group chat, with the user alias as the formal name of its
+        // CPIM From (RCC.07 section 2.5.3.3), encrypted with the message in
+        // an encrypted group
+        let message = match recipient_type {
+            RecipientType::Group => message.with_alias(self.user_alias.lock().unwrap().clone()),
+            _ => message,
+        };
         let _ = self.deliver(
             message,
             recipient,
@@ -3417,6 +3560,32 @@ impl CPMSessionService {
                     .is_some_and(|(ids, encryption)| encryption.encrypts(&ids.conversation_id)),
                 _ => false,
             };
+        // the user alias of its From: in an encrypted conversation, encrypted
+        // for its MLS group, so that those it invites can decrypt it, else
+        // left out, as while the group's first Commit is pending; in
+        // another, its display name (RCC.07 section 2.5.3.3, RCC.16 section
+        // 9.1.5)
+        let alias = self.user_alias.lock().unwrap().clone();
+        let alias_group = match (&invitee.chat, &invitee.new_group, invitee.new_era) {
+            (Some(chat), _, _) => chat
+                .new_group
+                .is_none()
+                .then(|| String::from(chat.group_id)),
+            (None, None, None) if matches!(recipient_type, RecipientType::Group) => self
+                .group_chats
+                .ids_of(recipient)
+                .map(|ids| ids.conversation_id),
+            _ => None,
+        };
+        let (display_alias, sealed_alias) = match alias {
+            Some(alias) if encrypted => (
+                None,
+                alias_group
+                    .zip(group_encryption.as_ref())
+                    .and_then(|(group_id, encryption)| encryption.seal_alias(&group_id, &alias)),
+            ),
+            alias => (alias, None),
+        };
 
         if let Ok((sock, host, port, tls, active_setup, ipv6)) =
             (self.msrp_socket_allocator_function)(None)
@@ -3490,10 +3659,13 @@ impl CPMSessionService {
                 let tag = create_raw_alpha_numeric_string(8);
                 let tag = String::from_utf8_lossy(&tag);
 
-                invite_message.add_header(Header::new(
-                    b"From",
-                    format!("<{}>;tag={}", contact_identity, tag),
-                ));
+                let sender_alias = match (&sealed_alias, &display_alias) {
+                    (Some(sealed), _) => SenderAlias::Sealed(sealed),
+                    (None, Some(alias)) => SenderAlias::Plain(alias),
+                    (None, None) => SenderAlias::None,
+                };
+                let from = sender_name_addr(contact_identity, &sender_alias);
+                invite_message.add_header(Header::new(b"From", format!("{};tag={}", from, tag)));
 
                 invite_message.add_header(Header::new(b"To", format!("<{}>", recipient_uri)));
 
@@ -4830,11 +5002,23 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                                         .into_owned()
                                                                 })
                                                                 .unwrap_or_default(),
+                                                            name_addr
+                                                                .uri_part
+                                                                .as_ref()
+                                                                .and_then(|u| {
+                                                                    encrypted_alias(
+                                                                        u.uri_parameters,
+                                                                    )
+                                                                })
+                                                                .map(<[u8]>::to_vec),
                                                         )
                                                     })
                                             });
-                                            let (referred_by_name, referred_by_uri) =
-                                                referred_by.unwrap_or_default();
+                                            let (
+                                                referred_by_name,
+                                                referred_by_uri,
+                                                referred_by_encrypted_alias,
+                                            ) = referred_by.unwrap_or_default();
 
                                             match msrp_info.direction {
                                                 MsrpDirection::SendReceive => {
@@ -4882,6 +5066,47 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                             encryption,
                                                             conversation_id.clone(),
                                                         ));
+                                                    }
+
+                                                    // the inviter's alias:
+                                                    // encrypted, as the MLS
+                                                    // group joined decrypts
+                                                    // it, else its display
+                                                    // name (RCC.07 section
+                                                    // 2.5.3.3, RCC.16 section
+                                                    // 9.1.5)
+                                                    let opened = referred_by_encrypted_alias
+                                                        .as_ref()
+                                                        .zip(session_info.encryption.as_ref())
+                                                        .and_then(|(encrypted, encryption)| {
+                                                            encryption.open_alias(
+                                                                conversation_id,
+                                                                &referred_by_uri,
+                                                                encrypted,
+                                                            )
+                                                        });
+                                                    let alias_encrypted = opened.is_some();
+                                                    let referred_by_name = opened
+                                                        .or_else(|| {
+                                                            alias_of(referred_by_name.as_bytes())
+                                                        })
+                                                        .unwrap_or_default();
+                                                    let listener = self
+                                                        .service
+                                                        .alias_listener
+                                                        .lock()
+                                                        .unwrap()
+                                                        .clone();
+                                                    if let (Some(listener), false, false) = (
+                                                        listener,
+                                                        referred_by_name.is_empty(),
+                                                        referred_by_uri.is_empty(),
+                                                    ) {
+                                                        listener(
+                                                            &referred_by_uri,
+                                                            &referred_by_name,
+                                                            alias_encrypted,
+                                                        );
                                                     }
 
                                                     auto_accept_response_code = (self
@@ -4991,6 +5216,13 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                 }
                                             }
                                         }
+
+                                        // the alias of the contact, as the
+                                        // app is asked to take the chat
+                                        tell_contact_alias(
+                                            &self.service.alias_listener,
+                                            &session_info,
+                                        );
 
                                         let mut is_chatbot_session = false;
 
