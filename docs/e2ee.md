@@ -195,6 +195,5 @@ Nothing is written unless it returns 0.
 ## Not covered yet
 
 - **Encrypted aliases of new conversations:** one sent with the INVITE starting a chat or group, as another client might, is in the epoch before its first Commit, which those it invites cannot decrypt. It is not told.
-- **The keys of a file uploaded for an encrypted group whose message wasn't sent yet** are kept in memory only, for a day at most. After a restart the message fails, and the file has to be sent again.
 - **A new group or chat whose INVITE wasn't answered before the client stopped** isn't made on the device, even if the Focus made it. Nothing is encrypted in it until a message from another member has it heal. Once the Focus answers the INVITE with 200 OK, the group's first Commit is applied, as the Focus validated it first (section 8.2.1); the same goes for a new Era carried by an INVITE.
 - **RCS Video encryption** (section 9.8).

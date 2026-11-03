@@ -18,7 +18,6 @@
 //! and those received, their keys kept until they are downloaded and opened
 //! (section 9.1.2.2, Annex C.3)
 
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use base64::{engine::general_purpose, Engine as _};
@@ -36,7 +35,8 @@ use crate::messaging::cpm::encryption::SealedFile;
 use super::chat::contact_tel_uri;
 use super::device::E2eeDevice;
 use super::message::MessageError;
-use super::notes::{put, put_time, NotesData, Reader as NotesReader};
+use super::notes::{put, put_time, Notes, NotesData, Reader as NotesReader};
+use super::store::MlsStore;
 
 const LOG_TAG: &str = "e2ee";
 
@@ -49,49 +49,84 @@ pub const CONTENT_TYPE_FT_HTTP: &[u8] = b"application/vnd.gsma.rcs-ft-http+xml";
 const UPLOAD_KEPT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 const UPLOADS_MOST: usize = 64;
 
-/// The keys of files uploaded for a group chat, by the URL of the file
+/// The keys of files uploaded for a group chat, by the URL of the file, as
+/// kept in the notes of the device
 #[derive(Clone, Debug, PartialEq)]
-struct Upload {
-    conversation_id: String,
-    url: String,
-    file_info: FileInfo,
-    uploaded: SystemTime,
+pub(super) struct Upload {
+    pub(super) conversation_id: String,
+    pub(super) url: String,
+    pub(super) file_info: FileInfo,
+    pub(super) uploaded: SystemTime,
 }
 
-/// The files uploaded for the encrypted group chats of the device, for as
-/// long as it runs
-#[derive(Default)]
-pub(super) struct Uploads(Mutex<Vec<Upload>>);
+/// The files uploaded for the encrypted group chats of the device, as the
+/// notes of the device keep them for it to restart with: the message
+/// sending one carries its keys then too
+pub(super) struct Uploads<'a> {
+    pub(super) notes: &'a Notes,
+    pub(super) store: &'a MlsStore,
+}
 
-impl Uploads {
+impl Uploads<'_> {
     /// Keeps `file_info` for the message sending the file at `url` in the
     /// group chat `conversation_id`, uploaded `now`
     fn keep(&self, conversation_id: &str, url: &str, file_info: FileInfo, now: SystemTime) {
-        let mut uploads = self.0.lock().unwrap();
-        uploads.retain(|upload| upload.url != url && kept(upload, now));
-        if uploads.len() >= UPLOADS_MOST {
-            uploads.remove(0);
-        }
-        uploads.push(Upload {
-            conversation_id: String::from(conversation_id),
-            url: String::from(url),
-            file_info,
-            uploaded: now,
+        self.notes.hold(self.store, |data| {
+            data.uploads
+                .retain(|upload| upload.url != url && kept(upload, now));
+            if data.uploads.len() >= UPLOADS_MOST {
+                data.uploads.remove(0);
+            }
+            data.uploads.push(Upload {
+                conversation_id: String::from(conversation_id),
+                url: String::from(url),
+                file_info,
+                uploaded: now,
+            });
         });
     }
 
     /// What the FileInfo of the file at `url`, uploaded for the group chat
     /// `conversation_id`, tells, if it was within UPLOAD_KEPT_FOR of `now`
     fn file_info(&self, conversation_id: &str, url: &str, now: SystemTime) -> Option<FileInfo> {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|upload| {
-                upload.conversation_id == conversation_id && upload.url == url && kept(upload, now)
-            })
-            .map(|upload| upload.file_info.clone())
+        self.notes.read(|data| {
+            data.uploads
+                .iter()
+                .find(|upload| {
+                    upload.conversation_id == conversation_id
+                        && upload.url == url
+                        && kept(upload, now)
+                })
+                .map(|upload| upload.file_info.clone())
+        })
     }
+}
+
+/// The files uploaded `uploads`, as the notes of the device hold them
+pub(super) fn encode_uploads(uploads: &[Upload]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for upload in uploads {
+        put(&mut data, upload.conversation_id.as_bytes());
+        put(&mut data, upload.url.as_bytes());
+        put(&mut data, &proto::encode(&upload.file_info));
+        put_time(&mut data, upload.uploaded);
+    }
+    data
+}
+
+/// The files uploaded `reader` reads to its end, as encode_uploads() puts
+/// them; None if they cannot be read
+pub(super) fn decode_uploads(reader: &mut NotesReader) -> Option<Vec<Upload>> {
+    let mut uploads = Vec::new();
+    while !reader.is_empty() {
+        uploads.push(Upload {
+            conversation_id: reader.string()?,
+            url: reader.string()?,
+            file_info: proto::decode(&reader.vec()?).ok()?,
+            uploaded: reader.time()?,
+        });
+    }
+    Some(uploads)
 }
 
 fn kept(upload: &Upload, now: SystemTime) -> bool {
@@ -433,7 +468,7 @@ impl E2eeDevice {
     /// (RCC.16 sections 7.8, 9.1.2.1); false if it tells none, or if `file`
     /// or `thumbnail` is no FileMetadata
     ///
-    /// They are kept for a day at most, in memory.
+    /// They are kept for a day at most, with the notes of the device.
     pub fn uploaded(
         &self,
         conversation_id: &str,
@@ -621,13 +656,15 @@ pub(super) fn upload_xml(file_url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     use base64::{engine::general_purpose, Engine as _};
     use rust_rcs_core::mls::rcs::file::decrypt_file;
     use rust_rcs_core::mls::rcs::proto::{self, FileInfo, FileMetadata};
 
-    use super::super::notes::{NotesData, Reader as NotesReader};
+    use super::super::lost::tests::{store, App};
+    use super::super::notes::{Notes, NotesData, Reader as NotesReader};
     use super::{
         decode, encode, file_urls, keep_received, mls_file_of, opened_xml, received_file,
         seal_file, upload_xml, with_mls_file, Received, Uploads, RECEIVED_KEPT_FOR, RECEIVED_MOST,
@@ -722,7 +759,12 @@ mod tests {
 
     #[test]
     fn uploads_are_kept_a_day_by_group_and_url() {
-        let uploads = Uploads::default();
+        let store = store(&Arc::new(App::default()));
+        let notes = Notes::kept_by(&store);
+        let uploads = Uploads {
+            notes: &notes,
+            store: &store,
+        };
         let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         uploads.keep("group-1", "u1", info("a"), then);
         assert_eq!(uploads.file_info("group-1", "u1", then), Some(info("a")));

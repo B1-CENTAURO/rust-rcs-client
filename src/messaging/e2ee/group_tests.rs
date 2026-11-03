@@ -8317,6 +8317,34 @@ fn a_file_transfer_message_is_not_sent_unless_its_files_were_sealed_for_the_grou
     assert_eq!(not_fit(&plain), Err(MessageError::NotEncrypted));
 }
 
+#[test]
+fn a_file_uploaded_before_the_device_restarted_is_sent_with_its_keys() {
+    let clock = Clock::new();
+    let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    let file = groups
+        .seal_file(b"the picture", "picture.jpg", "image/jpeg")
+        .unwrap();
+    let xml = super::file::upload_xml("https://ftcs.example.com/f/1");
+    assert!(groups.uploaded(CONVERSATION, xml.as_bytes(), &file.metadata, None));
+    drop(groups);
+    drop(device);
+
+    // once restarted, the message sending it carries its keys, within a day
+    // of its upload (RCC.16 sections 7.8, 9.1.2.1)
+    let device = alice_restarted(&app, &kds, &clock);
+    let sent = device
+        .encrypt_message(CONVERSATION, &file_transfer("ft-1", &xml))
+        .unwrap();
+    assert!(String::from_utf8_lossy(&sent).contains("<mls-file>"));
+    clock.advance(DAY);
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, &file_transfer("ft-2", &xml)),
+        Err(MessageError::FileNotFit)
+    );
+}
+
 /// The device, enrolled and telling the time of `clock`, in a group with
 /// Bob, the Commit making it accepted, and the app keeping its state
 fn alice_and_bob_kept(
