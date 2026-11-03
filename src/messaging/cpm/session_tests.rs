@@ -1298,7 +1298,7 @@ fn an_outgoing_chat_runs_in_the_session_it_starts() {
 
 /// What the scripted encryption makes the INVITE of a new encrypted 1-to-1
 /// chat carry: the CPIM message of its MLS group
-const CHAT_BUNDLE: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x09\x0bnew chat";
+pub(crate) const CHAT_BUNDLE: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x09\x0bnew chat";
 
 /// The client with encrypted 1-to-1 chats, its messages in the MLS group
 /// `chat-1` encrypted as `ciphertext`
@@ -2702,7 +2702,7 @@ fn a_group_chat_the_factory_refuses_is_reported_and_not_known() {
 /// The encryption of group chats as the tests script it: the CPIM message it
 /// prepares for each, if any, and what it is asked and given
 #[derive(Default)]
-struct ScriptedEncryption {
+pub(crate) struct ScriptedEncryption {
     cpim: Option<Vec<u8>>,
     /// Whether it joins the groups invited to
     joining: bool,
@@ -2882,6 +2882,68 @@ struct ScriptedEncryption {
     chat_eras_due: Vec<String>,
     /// The contact and from each time a new Era of a chat is asked for
     chat_eras_prepared: std::sync::Mutex<Vec<(String, String)>>,
+    /// Whether the files to contacts are sealed for their chats
+    sealing_chat_files: bool,
+    /// Whether the files sent to contacts were sealed for their chats
+    sealed_for_chats: bool,
+}
+
+/// What the engine's tests script of the encryption of the chats with
+/// contacts
+#[derive(Default)]
+pub(crate) struct ChatScript {
+    /// The contact, MLS group and token of each chat kept
+    pub(crate) kept: Vec<(String, String, Option<String>)>,
+    /// The MLS group and CPIM message of each new chat, or new Era, if any
+    pub(crate) chatting: Option<(String, Vec<u8>)>,
+    /// What making a new chat waits for, if anything
+    pub(crate) held: Option<Arc<tokio::sync::Notify>>,
+    /// The contacts whose kept chat is due a new Era
+    pub(crate) eras_due: Vec<String>,
+    /// The groups it encrypts, files too, as `ciphertext`
+    pub(crate) encrypting: Vec<String>,
+    pub(crate) ciphertext: Option<String>,
+    /// Whether the files to contacts are sealed for their chats
+    pub(crate) sealing_chat_files: bool,
+    /// Whether those sent were
+    pub(crate) sealed_for_chats: bool,
+}
+
+impl ScriptedEncryption {
+    /// The encryption the engine's tests script with `script`
+    pub(crate) fn of_chats(script: ChatScript) -> Arc<ScriptedEncryption> {
+        Arc::new(ScriptedEncryption {
+            chats: std::sync::Mutex::new(script.kept),
+            chatting: script.chatting,
+            chat_held: script.held,
+            chat_eras_due: script.eras_due,
+            encrypting: script.encrypting,
+            ciphertext: script.ciphertext,
+            sealing_chat_files: script.sealing_chat_files,
+            sealed_for_chats: script.sealed_for_chats,
+            ..ScriptedEncryption::default()
+        })
+    }
+
+    /// The contact and from each new chat was asked for with
+    pub(crate) fn chats_prepared(&self) -> Vec<(String, String)> {
+        self.chats_prepared.lock().unwrap().clone()
+    }
+
+    /// The contact and from each new Era of a chat was asked for with
+    pub(crate) fn chat_eras_prepared(&self) -> Vec<(String, String)> {
+        self.chat_eras_prepared.lock().unwrap().clone()
+    }
+
+    /// The MLS group and CPIM message of each message encrypted
+    pub(crate) fn encrypted(&self) -> Vec<(String, Vec<u8>)> {
+        self.encrypted.lock().unwrap().clone()
+    }
+
+    /// Each MLS group let go of
+    pub(crate) fn abandoned(&self) -> Vec<String> {
+        self.abandoned.lock().unwrap().clone()
+    }
 }
 
 impl GroupEncryption for ScriptedEncryption {
@@ -3075,7 +3137,8 @@ impl GroupEncryption for ScriptedEncryption {
     }
 
     fn seals_chat_files(&self, _contact: &str) -> BoxFuture<'static, bool> {
-        Box::pin(async { false })
+        let sealing = self.sealing_chat_files;
+        Box::pin(async move { sealing })
     }
 
     fn uploaded_for_chat(
@@ -3089,7 +3152,7 @@ impl GroupEncryption for ScriptedEncryption {
     }
 
     fn sealed_for_chat(&self, _contact: &str, _xml: &[u8]) -> bool {
-        false
+        self.sealed_for_chats
     }
 
     fn decrypt_file_transfer(
@@ -3486,7 +3549,7 @@ fn encrypting(client: &Client, cpim: Option<&[u8]>) -> Arc<ScriptedEncryption> {
 }
 
 /// The content type and content of each part of the body of `message`
-fn parts_of(message: &SipMessage) -> Vec<(String, Vec<u8>)> {
+pub(crate) fn parts_of(message: &SipMessage) -> Vec<(String, Vec<u8>)> {
     use std::io::Read;
 
     let content_type = header_value(message, "Content-Type");
@@ -6159,7 +6222,7 @@ fn a_group_given_back_is_known_when_its_focus_restarts_it() {
 }
 
 /// A token as RCC.16 section 7.2.4 has them, with each kind of character
-const TOKEN: &str = "Focus.1!%*_+`'~z";
+pub(crate) const TOKEN: &str = "Focus.1!%*_+`'~z";
 
 #[test]
 fn the_mls_opaque_token_of_a_group_is_carried_by_its_requests_from_then_on() {
