@@ -10256,6 +10256,24 @@ fn a_group_whose_focus_has_no_mls_group_is_so_after_the_device_restarted() {
     clock.advance(2 * HOUR);
     assert!(groups.upgrade_due(CONVERSATION));
 
+    // let go of too if its control message is no longer noted, as when a
+    // Commit applied of another voided it
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    upgrade_by_restart(&groups, &rt, &[IMPU, BOB_SIP]).expect("an Era");
+    device.control_messages().remove(CONVERSATION);
+    drop(groups);
+    drop(device);
+    let device = restarted();
+    let groups = groups_of(&device);
+    assert!(!device.upgrades().restarting(CONVERSATION));
+    assert_eq!(
+        epoch(&device, CONVERSATION).map(|(_, pending)| pending),
+        Ok(false)
+    );
+
     // nothing for a group let go of
     device.abandon(CONVERSATION).unwrap();
     drop(groups);
