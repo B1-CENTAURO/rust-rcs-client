@@ -10209,6 +10209,8 @@ fn a_group_whose_focus_has_no_mls_group_is_so_after_the_device_restarted() {
         Ok(false)
     );
     assert!(!device.upgrades().restarting(CONVERSATION));
+    // its control message let go of too, no refusal of it to come
+    assert!(!device.control_messages().contains(CONVERSATION));
     assert!(groups.encryption_ended(CONVERSATION));
     assert!(!groups.upgrade_due(CONVERSATION));
     clock.advance(2 * HOUR);
