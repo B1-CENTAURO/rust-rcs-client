@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rust_rcs_core::cpim::CPIMInfo;
+use rust_rcs_core::internet::parameter::ParameterParser;
 use rust_rcs_core::sip::SipMessage;
 
 /// Content-Type of what the Conversation Focus sends of the MLS group of a
@@ -27,6 +28,24 @@ pub const CONTENT_TYPE_MLS_RCS_SERVER: &[u8] = b"message/mls-rcs-server";
 
 /// Content-Type of an encrypted message (RCC.16 section 7.5.6)
 pub const CONTENT_TYPE_MLS: &[u8] = b"message/mls";
+
+/// The SIP URI parameter carrying an encrypted user alias (RCC.16 section
+/// 9.1.5)
+pub const SIP_URI_PARAMETER_ENCRYPTED_ALIAS: &[u8] = b"encrypted-alias";
+
+/// The value of the `encrypted-alias` parameter among `uri_parameters`, the
+/// parameters of a SIP URI after its first semicolon, as a name-addr gives
+/// them; None if there is none, or it is empty (RCC.16 section 9.1.5)
+pub fn encrypted_alias(uri_parameters: &[u8]) -> Option<&[u8]> {
+    ParameterParser::new(uri_parameters, b';', false)
+        .find(|parameter| {
+            parameter
+                .name
+                .eq_ignore_ascii_case(SIP_URI_PARAMETER_ENCRYPTED_ALIAS)
+        })
+        .and_then(|parameter| parameter.value)
+        .filter(|value| !value.is_empty())
+}
 
 /// Content-Type of the EpochIdentifier an MLS-Enhanced-Group-Info-Pull
 /// request carries (RCC.16 section 7.10.2)
@@ -484,6 +503,19 @@ pub trait GroupEncryption: Send + Sync {
     /// for the encrypted 1-to-1 chat with `contact`: a message sending it
     /// unencrypted could not be opened
     fn sealed_for_chat(&self, contact: &str, xml: &[u8]) -> bool;
+
+    /// The user alias `alias` encrypted for the MLS group `group_id`, for the
+    /// `encrypted-alias` parameter of the SIP URI of this client in a
+    /// request of the conversation (RCC.16 section 9.1.5); None if it cannot
+    /// be, or not so that its members can decrypt it, as while a Commit of
+    /// this client is pending
+    fn seal_alias(&self, group_id: &str, alias: &str) -> Option<String>;
+
+    /// The alias `uri` gives itself, which the `encrypted-alias` parameter
+    /// `encrypted` of the URI carries, decrypted in the MLS group `group_id`
+    /// (RCC.16 section 9.1.5); None if it cannot be, or was not encrypted by
+    /// a Client of whom `uri` is
+    fn open_alias(&self, group_id: &str, uri: &str, encrypted: &[u8]) -> Option<String>;
 
     /// The CPIM message the file transfer message of the group chat
     /// `conversation_id`, delivered in the CPIM message `cpim_info` tells of

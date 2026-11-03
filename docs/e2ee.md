@@ -145,6 +145,24 @@ The client advertises E2EE in its capabilities only once enrolled. If enrolling 
   None of this needs the app.
 - **Moving back to encrypted** is also checked on schedule while the engine runs: about weekly for unencrypted groups with a message in the last 30 days (section 11.1.1).
 
+## User aliases
+
+Set the user's alias with `rcs_client_set_user_alias` (NULL for none). The client sends it as RCC.07 section 2.5.3.3 has it: as the display name of the From of the requests starting a chat, a group chat or a standalone message, and in a group chat also in the CPIM From of each message.
+
+In an encrypted chat or group, the alias is never sent in the clear (RCC.16 section 9.1.5):
+- **It goes encrypted** for the conversation's MLS group, in the `encrypted-alias` parameter of the From's URI. That covers a new session of a chat kept, a group restarted, and each message of an encrypted group, whose CPIM From the encryption otherwise leaves in the clear (section 7.5.7).
+- **It is left out** when it cannot go so that its members can decrypt it: in the INVITE starting a new chat or group, whose first Commit is still pending, and while the device cannot encrypt for the group.
+
+Set `rcs_client_set_alias_listener` to be told the alias each sender gives itself: its URI, the alias, and `encrypted`. The alias comes from:
+- the From of a chat invitation;
+- the Referred-By of a group chat invitation, which also gives `inviter_name`;
+- the CPIM From of a message of a group chat;
+- the From of a standalone message.
+
+An encrypted alias is decrypted in the conversation's MLS group, and told with `encrypted` 1 only if a Client of that URI's user encrypted it. One that cannot be decrypted is not told, though a display name next to it is, with `encrypted` 0. Each sender's alias is told once, and again when it changes.
+
+An alias is the sender's own claim. Show it as unchecked for a contact not in the address book, and the address book's name otherwise (RCC.07 section 2.5.3.3).
+
 ## Identity verification
 
 Show the user the code they and a contact compare to check that nobody stands between them (section 5.5):
@@ -172,7 +190,7 @@ Nothing is written unless it returns 0.
 
 ## Not covered yet
 
-- **Encrypted user aliases** of other clients are not decrypted (section 9.1.5).
+- **Encrypted aliases of new conversations:** one sent with the INVITE starting a chat or group, as another client might, is in the epoch before its first Commit, which those it invites cannot decrypt. It is not told.
 - **Some state that is found again on its own is lost on restart:**
   - the hour a KeyPackage Update is put off for;
   - the contacts found lately not to take encrypted chats;

@@ -82,7 +82,8 @@ use super::session_invitation::set_sdp;
 use super::sip::cpm_accept_contact::CPMAcceptContact;
 use super::sip::cpm_contact::{AsCPMContact, CPMServiceType};
 use super::{
-    decode_base64, make_cpim_message_content_body, understands_cpim_requirements, CPMMessageParam,
+    alias_of, decode_base64, make_cpim_message_content_body, name_addr,
+    understands_cpim_requirements, AliasListener, CPMMessageParam, SenderAlias,
 };
 
 const LOG_TAG: &str = "messaging";
@@ -677,6 +678,12 @@ impl MsrpMessageReceiver for StandaloneLargeModeReceiver {
 
 pub struct StandaloneMessagingService {
     registered_public_identity: Arc<Mutex<Option<(Arc<SipTransport>, String, String)>>>,
+    /// The user alias, which the requests sending a message carry as the
+    /// display name of their From (RCC.07 section 2.5.3.3); standalone
+    /// messages are not encrypted
+    user_alias: Arc<Mutex<Option<String>>>,
+    /// Told of the alias each sender gives itself
+    alias_listener: Arc<Mutex<Option<AliasListener>>>,
     message_receive_listener: Arc<dyn Fn(&[u8], &CPIMInfo, &[u8], &[u8]) + Send + Sync>,
     msrp_socket_allocator_function: Arc<
         dyn Fn(
@@ -727,10 +734,29 @@ impl StandaloneMessagingService {
     {
         StandaloneMessagingService {
             registered_public_identity: Arc::new(Mutex::new(None)),
+            user_alias: Arc::new(Mutex::new(None)),
+            alias_listener: Arc::new(Mutex::new(None)),
             message_receive_listener: Arc::new(message_receive_listener),
             msrp_socket_allocator_function: Arc::new(msrp_socket_allocator_function),
             msrp_socket_connect_function: Arc::new(msrp_socket_connect_function),
         }
+    }
+
+    /// Has the requests sending a message carry `alias` as the user alias
+    /// from now on, or none (RCC.07 section 2.5.3.3)
+    pub fn set_user_alias(&self, alias: Option<String>) {
+        *self.user_alias.lock().unwrap() = alias.filter(|alias| !alias.trim().is_empty());
+    }
+
+    /// The user alias set, if any
+    pub fn user_alias(&self) -> Option<String> {
+        self.user_alias.lock().unwrap().clone()
+    }
+
+    /// Has `listener` told of the alias each sender of a message gives
+    /// itself
+    pub fn set_alias_listener(&self, listener: AliasListener) {
+        *self.alias_listener.lock().unwrap() = Some(listener);
     }
 
     pub fn set_registered_public_identity(
@@ -819,10 +845,9 @@ impl StandaloneMessagingService {
                     let tag = rand::create_raw_alpha_numeric_string(8);
                     let tag = String::from_utf8_lossy(&tag);
 
-                    invite_message.add_header(Header::new(
-                        b"From",
-                        format!("<{}>;tag={}", public_user_identity, tag),
-                    ));
+                    let from = name_addr(self.user_alias().as_deref(), &public_user_identity);
+                    invite_message
+                        .add_header(Header::new(b"From", format!("{};tag={}", from, tag)));
 
                     invite_message.add_header(Header::new(b"To", format!("<{}>", recipient_uri)));
 
@@ -882,6 +907,7 @@ impl StandaloneMessagingService {
                         recipient_uri,
                         message_id,
                         &public_user_identity,
+                        &SenderAlias::None,
                     );
 
                     let boundary = create_raw_alpha_numeric_string(16);
@@ -1039,6 +1065,7 @@ impl StandaloneMessagingService {
                                                         &message.recipient_uri,
                                                         &message.message_id,
                                                         &public_user_identity,
+                                                        &SenderAlias::None,
                                                     );
                                                     let message_body = Arc::new(message_body);
 
@@ -2048,6 +2075,27 @@ impl TransactionHandler for StandaloneMessagingServiceWrapper {
                                 }
 
                                 if let Some(contact_uri) = contact_uri {
+                                    // the alias the sender gives itself, the
+                                    // display name of the From (RCC.07
+                                    // section 2.5.3.3)
+                                    let alias = header::search(req_headers, b"From", true)
+                                        .and_then(|from| {
+                                            from.get_value()
+                                                .as_name_addresses()
+                                                .first()
+                                                .and_then(|from| from.display_name)
+                                                .and_then(alias_of)
+                                        });
+                                    let listener =
+                                        self.service.alias_listener.lock().unwrap().clone();
+                                    if let (Some(alias), Some(listener)) = (alias, listener) {
+                                        listener(
+                                            &String::from_utf8_lossy(&contact_uri),
+                                            &alias,
+                                            false,
+                                        );
+                                    }
+
                                     if let Ok(message_info) = cpim_message.get_info() {
                                         let mut accepted = true;
                                         if let Some((content_type, body, encoded)) =
@@ -2167,6 +2215,40 @@ pub fn send_message<F>(
 ) where
     F: FnOnce(u16, String) + Send + Sync + 'static,
 {
+    send_message_from(
+        message_type,
+        message_content,
+        message_id,
+        recipient,
+        recipient_type,
+        recipient_uri,
+        message_result_callback,
+        core,
+        transport,
+        public_user_identity,
+        None,
+        rt,
+    )
+}
+
+/// As send_message(), the MESSAGE carrying the user alias `alias`, if any,
+/// as the display name of its From (RCC.07 section 2.5.3.3)
+pub fn send_message_from<F>(
+    message_type: &str,
+    message_content: &str,
+    message_id: &str,
+    recipient: &str,
+    recipient_type: &RecipientType,
+    recipient_uri: &str,
+    message_result_callback: F,
+    core: Arc<SipCore>,
+    transport: &Arc<SipTransport>,
+    public_user_identity: &str,
+    alias: Option<&str>,
+    rt: &Arc<Runtime>,
+) where
+    F: FnOnce(u16, String) + Send + Sync + 'static,
+{
     let mut req_message = SipMessage::new_request(MESSAGE, recipient_uri.as_bytes());
 
     req_message.add_header(Header::new(
@@ -2185,7 +2267,7 @@ pub fn send_message<F>(
 
     req_message.add_header(Header::new(
         b"From",
-        format!("<{}>;tag={}", public_user_identity, tag),
+        format!("{};tag={}", name_addr(alias, public_user_identity), tag),
     ));
 
     req_message.add_header(Header::new(b"To", format!("<{}>", recipient_uri)));
@@ -2247,6 +2329,7 @@ pub fn send_message<F>(
         recipient_uri,
         message_id,
         public_user_identity,
+        &SenderAlias::None,
     );
 
     if let RecipientType::ResourceList = recipient_type {

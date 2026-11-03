@@ -1921,3 +1921,85 @@ fn a_commit_one_device_makes_in_its_session_the_other_takes_in_its() {
     alice.sip.silence();
     bob.sip.silence();
 }
+
+#[test]
+fn the_alias_one_device_encrypts_the_other_decrypts_as_its_own() {
+    let (alice, bob, _) = alice_and_bob();
+    group_of_the_two(&alice, &bob);
+
+    // encrypted for the group, decrypted by Bob as Alice's, by her SIP or
+    // tel URI (RCC.16 section 9.1.5)
+    let sealed = alice
+        .device
+        .seal_alias(CONVERSATION, "Alice ☺")
+        .expect("sealed");
+    assert_eq!(
+        bob.device
+            .open_alias(CONVERSATION, ALICE_IMPU, sealed.as_bytes())
+            .as_deref(),
+        Some("Alice ☺")
+    );
+    let sealed = alice.device.seal_alias(CONVERSATION, "Alice").unwrap();
+    assert_eq!(
+        bob.device
+            .open_alias(CONVERSATION, ALICE_TEL, sealed.as_bytes())
+            .as_deref(),
+        Some("Alice")
+    );
+
+    // not as another's, which Alice could otherwise give Bob of her choosing
+    let sealed = alice.device.seal_alias(CONVERSATION, "Not Bob").unwrap();
+    assert_eq!(
+        bob.device
+            .open_alias(CONVERSATION, BOB_IMPU, sealed.as_bytes()),
+        None
+    );
+    // nor in a group not known, nor garbled
+    let sealed = alice.device.seal_alias(CONVERSATION, "Alice").unwrap();
+    assert_eq!(
+        bob.device
+            .open_alias("unknown", ALICE_IMPU, sealed.as_bytes()),
+        None
+    );
+    assert_eq!(
+        bob.device.open_alias(CONVERSATION, ALICE_IMPU, b"garbled!"),
+        None
+    );
+
+    // none while a Commit of Alice's is pending, as the alias would be in
+    // the epoch before it, which those the Commit adds could not decrypt
+    assert!(subject_set(&alice).is_some());
+    assert_eq!(alice.device.seal_alias(CONVERSATION, "Alice"), None);
+    // nor in a group not known
+    assert_eq!(bob.device.seal_alias("unknown", "Bob"), None);
+}
+
+#[test]
+fn the_alias_of_a_group_message_goes_encrypted_and_is_told_decrypted() {
+    let (mut alice, mut bob, _, _) = group_through_the_focus();
+    alice
+        .client
+        .sessions
+        .set_user_alias(Some(String::from("Alice ☺")));
+
+    // in the CPIM From, which encryption leaves in the clear, encrypted for
+    // the group (RCC.16 sections 7.5.7, 9.1.5)
+    let send = alice.says("hi Bob");
+    let outer = String::from_utf8_lossy(&send.body).into_owned();
+    assert!(!outer.contains("Alice"), "{}", outer);
+    assert!(outer.contains(";encrypted-alias="), "{}", outer);
+
+    // told to Bob's app decrypted, as Alice's
+    bob.relayed(&send);
+    let (_, _, content) = bob.given();
+    assert_eq!(content, "hi Bob");
+    assert_eq!(
+        bob.client.aliases.recv_timeout(Duration::from_secs(5)),
+        Ok((String::from(ALICE_IMPU), String::from("Alice ☺"), true))
+    );
+    let delivery = bob.sent();
+    alice.relayed(&delivery);
+    alice.given();
+    alice.sip.silence();
+    bob.sip.silence();
+}

@@ -83,6 +83,8 @@ pub struct Client {
     pub chat_answer: Arc<AtomicU16>,
     /// The identifiers of groups the app is told to keep
     pub group_ids: Receiver<GroupIds>,
+    /// (URI, alias, encrypted) of each alias a sender gives itself
+    pub aliases: Receiver<(String, String, bool)>,
 }
 
 impl Client {
@@ -476,6 +478,24 @@ pub fn start_as(registered: bool, impu: &str) -> (Client, Peer) {
     ));
     sessions.attach_core(&core, &rt);
 
+    let (aliases_tx, aliases) = mpsc::channel();
+    let aliases_tx = Arc::new(std::sync::Mutex::new(aliases_tx));
+    let aliases_tx_ = Arc::clone(&aliases_tx);
+    sessions.set_alias_listener(Arc::new(move |uri: &str, alias: &str, encrypted: bool| {
+        let _ =
+            aliases_tx
+                .lock()
+                .unwrap()
+                .send((String::from(uri), String::from(alias), encrypted));
+    }));
+    standalone.set_alias_listener(Arc::new(move |uri: &str, alias: &str, encrypted: bool| {
+        let _ =
+            aliases_tx_
+                .lock()
+                .unwrap()
+                .send((String::from(uri), String::from(alias), encrypted));
+    }));
+
     let transport = Arc::new(SipTransport::new::<DuplexStream>(
         String::from(TRANSPORT_ADDRESS),
         SipTransportType::TCP,
@@ -520,6 +540,7 @@ pub fn start_as(registered: bool, impu: &str) -> (Client, Peer) {
             group_answer,
             chat_answer,
             group_ids,
+            aliases,
         },
         Peer {
             rt,
@@ -2996,6 +3017,13 @@ pub(crate) struct ScriptedEncryption {
     sealing_chat_files: bool,
     /// Whether the files sent to contacts were sealed for their chats
     sealed_for_chats: bool,
+    /// The groups it seals aliases for, as `sealed-` and the alias
+    sealing_aliases: Vec<String>,
+    /// The group, URI and encrypted alias each time an alias is to be opened
+    aliases_opened: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+    /// What it opens encrypted aliases to: those starting `sealed-`, to what
+    /// follows, in the groups it seals them for
+    opening_aliases: bool,
 }
 
 /// What the engine's tests script of the encryption of the chats with
@@ -3263,6 +3291,29 @@ impl GroupEncryption for ScriptedEncryption {
 
     fn sealed_for_chat(&self, _contact: &str, _xml: &[u8]) -> bool {
         self.sealed_for_chats
+    }
+
+    fn seal_alias(&self, group_id: &str, alias: &str) -> Option<String> {
+        self.sealing_aliases
+            .iter()
+            .any(|sealing| sealing == group_id)
+            .then(|| format!("sealed-{}", alias))
+    }
+
+    fn open_alias(&self, group_id: &str, uri: &str, encrypted: &[u8]) -> Option<String> {
+        self.aliases_opened.lock().unwrap().push((
+            String::from(group_id),
+            String::from(uri),
+            encrypted.to_vec(),
+        ));
+        let sealing = self
+            .sealing_aliases
+            .iter()
+            .any(|sealing| sealing == group_id);
+        encrypted
+            .strip_prefix(b"sealed-")
+            .filter(|_| self.opening_aliases && sealing)
+            .map(|alias| String::from_utf8_lossy(alias).into_owned())
     }
 
     fn decrypt_file_transfer(
@@ -4328,6 +4379,14 @@ impl GroupEncryption for EncryptingPrepared {
 
     fn sealed_for_chat(&self, contact: &str, xml: &[u8]) -> bool {
         self.0.sealed_for_chat(contact, xml)
+    }
+
+    fn seal_alias(&self, group_id: &str, alias: &str) -> Option<String> {
+        self.0.seal_alias(group_id, alias)
+    }
+
+    fn open_alias(&self, group_id: &str, uri: &str, encrypted: &[u8]) -> Option<String> {
+        self.0.open_alias(group_id, uri, encrypted)
     }
 
     fn decrypt_file_transfer(
@@ -9583,4 +9642,428 @@ fn nothing_is_moved_back_on_schedule_for_a_group_not_known_or_not_registered() {
         .upgrade_on_schedule(&client.core, &client.rt);
     peer.silence();
     assert!(encryption.upgraded.lock().unwrap().is_empty());
+}
+
+/// The next alias the client tells of: its URI, the alias, and whether it
+/// came encrypted
+fn next_alias(client: &Client) -> (String, String, bool) {
+    client
+        .aliases
+        .recv_timeout(Duration::from_secs(5))
+        .expect("an alias told")
+}
+
+fn alias_told(uri: &str, alias: &str, encrypted: bool) -> (String, String, bool) {
+    (String::from(uri), String::from(alias), encrypted)
+}
+
+/// The CPIM From of the CPIM message `cpim`
+fn cpim_from(cpim: &[u8]) -> String {
+    let cpim = String::from_utf8_lossy(cpim).into_owned();
+    cpim.lines()
+        .find_map(|line| line.strip_prefix("From: "))
+        .map(String::from)
+        .expect("a CPIM From")
+}
+
+#[test]
+fn the_user_alias_is_the_display_name_of_the_from_of_unencrypted_conversations() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    // quoted, its quotes and backslashes escaped, its line breaks left out
+    // (RCC.07 section 2.5.3.3, RFC 3261 section 25.1)
+    client
+        .sessions
+        .set_user_alias(Some(String::from("Al \"ice\" \\ x\r\nVia: evil")));
+    let quoted = "\"Al \\\"ice\\\" \\\\ xVia: evil\"";
+
+    // a 1-to-1 chat: in the From of its INVITE, not in its CPIM From
+    let msrp = MsrpPeer::listen(&rt);
+    let first = client.send(PEER, RecipientType::Contact, "first");
+    let invite = peer.next_request("INVITE");
+    let from = header_value(&invite, "From");
+    assert!(
+        from.starts_with(&format!("{} <{}>;tag=", quoted, IMPU)),
+        "{}",
+        from
+    );
+    assert_eq!(header_value(&invite, "Via").matches("evil").count(), 0);
+    peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
+    peer.next_request("ACK");
+    let mut connection = msrp.accept(&rt);
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_from(&send.body), format!("<{}>", IMPU));
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        first.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+
+    // a group chat: in the From of its INVITE, and the CPIM From of its
+    // messages
+    client.sessions.set_user_alias(Some(String::from("Alice")));
+    let (mut connection, invite, _subscribe, _) = new_group(&client, &mut peer);
+    assert!(header_value(&invite, "From").starts_with(&format!("\"Alice\" <{}>;tag=", IMPU)));
+    let hello = client.send(GROUP, RecipientType::Group, "hello all");
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_from(&send.body), format!("\"Alice\" <{}>", IMPU));
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        hello.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+
+    // none once let go of
+    client.sessions.set_user_alias(None);
+    let again = client.send(GROUP, RecipientType::Group, "again");
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_from(&send.body), format!("<{}>", IMPU));
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        again.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+}
+
+#[test]
+fn the_user_alias_is_encrypted_for_an_encrypted_chat_or_left_out() {
+    let (client, mut peer) = start(true);
+    let encryption = Arc::new(ScriptedEncryption {
+        encrypting: vec![String::from("chat-1"), String::from("chat-3")],
+        ciphertext: Some(String::from("ciphertext")),
+        // the new chat's too, which is not asked
+        sealing_aliases: vec![String::from("chat-1"), String::from("chat-2")],
+        ..ScriptedEncryption::default()
+    });
+    {
+        let mut chats = encryption.chats.lock().unwrap();
+        chats.push((
+            String::from(PEER),
+            String::from("chat-1"),
+            Some(String::from(TOKEN)),
+        ));
+        chats.push((String::from("tel:+15550008"), String::from("chat-3"), None));
+    }
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    client.sessions.set_user_alias(Some(String::from("Alice")));
+
+    // a new session of a chat kept: encrypted for its MLS group, in the
+    // encrypted-alias of the From's URI (RCC.16 section 9.1.5)
+    let _again = client.send(PEER, RecipientType::Contact, "again");
+    let invite = peer.next_request("INVITE");
+    let from = header_value(&invite, "From");
+    assert!(
+        from.starts_with(&format!("<{};encrypted-alias=sealed-Alice>;tag=", IMPU)),
+        "{}",
+        from
+    );
+
+    // one whose MLS group cannot seal it: left out, never in the clear
+    let _other = client.send("tel:+15550008", RecipientType::Contact, "hi");
+    let invite = peer.next_request("INVITE");
+    let from = header_value(&invite, "From");
+    assert!(from.starts_with(&format!("<{}>;tag=", IMPU)), "{}", from);
+
+    // a new chat, whose MLS group the INVITE carries: left out, as those it
+    // invites could not decrypt it while its first Commit is pending
+    let _new = client.send_in_new_chat("tel:+15550009", "first", "chat-2", CHAT_BUNDLE);
+    let invite = peer.next_request("INVITE");
+    let from = header_value(&invite, "From");
+    assert!(from.starts_with(&format!("<{}>;tag=", IMPU)), "{}", from);
+    peer.silence();
+}
+
+#[test]
+fn the_user_alias_of_a_message_of_an_encrypted_group_is_encrypted_or_left_out() {
+    for sealing in [true, false] {
+        let (client, mut peer) = start(true);
+        let rt = Arc::clone(&client.rt);
+        let encryption = Arc::new(ScriptedEncryption {
+            joining: true,
+            encrypting: vec![String::from("conversation-1")],
+            ciphertext: Some(String::from("ciphertext")),
+            sealing_aliases: match sealing {
+                true => vec![String::from("conversation-1")],
+                false => Vec::new(),
+            },
+            ..ScriptedEncryption::default()
+        });
+        client
+            .sessions
+            .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+        let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-alias");
+        client.sessions.set_user_alias(Some(String::from("Alice")));
+
+        // the CPIM From, which encryption leaves in the clear, carries it
+        // encrypted, or not at all (RCC.16 sections 7.5.7, 9.1.5)
+        let sent = client.send(GROUP, RecipientType::Group, "hello all");
+        let send = connection.next_message(&rt);
+        assert_eq!(send.body, b"ciphertext");
+        connection.respond(&rt, &send, "200 OK");
+        assert_eq!(
+            sent.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+            Ok(200)
+        );
+        let encrypted = encryption.encrypted.lock().unwrap().clone();
+        let expected = match sealing {
+            true => format!("<{};encrypted-alias=sealed-Alice>", IMPU),
+            false => format!("<{}>", IMPU),
+        };
+        assert_eq!(cpim_from(&encrypted[0].1), expected, "sealing {}", sealing);
+
+        // and in the From of the INVITE restarting the group (section 9.1.5)
+        assert!(client.sessions.end_session(GROUP));
+        let bye = peer.next_request("BYE");
+        connection.closed(&rt);
+        peer.send(&answer(&bye, "200 OK", None));
+        let _again = client.send(GROUP, RecipientType::Group, "again");
+        let restart = peer.next_request("INVITE");
+        let from = header_value(&restart, "From");
+        assert!(
+            from.starts_with(&format!("{};tag=", expected)),
+            "sealing {}: {}",
+            sealing,
+            from
+        );
+    }
+}
+
+#[test]
+fn the_alias_of_a_chat_invitation_is_told_decrypted_if_encrypted() {
+    // as the display name of its From (RCC.07 section 2.5.3.3)
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let msrp = MsrpPeer::listen(&rt);
+    peer.send(&chat_invite("alias-plain", &msrp.sdp("sendrecv")).replacen(
+        "From: <",
+        "From: \"Bob \\\"B\\\"\" <",
+        1,
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(next_alias(&client), alias_told(PEER, "Bob \"B\"", false));
+
+    // encrypted, in a new session of a chat kept, decrypted for whom the
+    // network asserts it is from (RCC.16 section 9.1.5)
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        encrypting: vec![String::from("chat-1")],
+        sealing_aliases: vec![String::from("chat-1")],
+        opening_aliases: true,
+        ..ScriptedEncryption::default()
+    });
+    encryption.chats.lock().unwrap().push((
+        String::from(PEER),
+        String::from("chat-1"),
+        Some(String::from(TOKEN)),
+    ));
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let msrp = MsrpPeer::listen(&rt);
+    peer.send(
+        &chat_invite("alias-sealed", &msrp.sdp("sendrecv")).replacen(
+            &format!("From: <{}>", PEER),
+            &format!("From: <{};encrypted-alias=sealed-Bob>", PEER),
+            1,
+        ),
+    );
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(next_alias(&client), alias_told(PEER, "Bob", true));
+    assert_eq!(
+        *encryption.aliases_opened.lock().unwrap(),
+        [(
+            String::from("chat-1"),
+            String::from(PEER),
+            b"sealed-Bob".to_vec()
+        )]
+    );
+
+    // one that cannot be decrypted is not told, a display name next to it
+    // is, as it is
+    let msrp = MsrpPeer::listen(&rt);
+    peer.send(
+        &chat_invite("alias-not-opened", &msrp.sdp("sendrecv")).replacen(
+            &format!("From: <{}>", PEER),
+            &format!("From: \"Bobby\" <{};encrypted-alias=garbled>", PEER),
+            1,
+        ),
+    );
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert_eq!(next_alias(&client), alias_told(PEER, "Bobby", false));
+}
+
+#[test]
+fn the_alias_of_the_inviter_to_a_group_is_told_decrypted_if_encrypted() {
+    // as the display name of the Referred-By of the invitation
+    let (client, mut peer) = start(true);
+    let _msrp = multipart_group_invitation(
+        &client,
+        &mut peer,
+        "group-inviter",
+        "Content-Type: text/plain\r\n",
+        "nothing",
+    );
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(next_alias(&client), alias_told(ALICE, "Alice", false));
+
+    // encrypted, as the MLS group joined decrypts it, which the invitation
+    // tells as its inviter's name too (RCC.16 section 9.1.5)
+    let (client, mut peer) = start(true);
+    let encryption = Arc::new(ScriptedEncryption {
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        sealing_aliases: vec![String::from("conversation-1")],
+        opening_aliases: true,
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let cpim = format!(
+        "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: welcome-1\r\n\r\nContent-Type: message/mls-rcs-server\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
+        GROUP,
+        IMPU,
+        general_purpose::STANDARD.encode(WELCOME)
+    );
+    let msrp = MsrpPeer::listen(&client.rt);
+    let body = format!(
+        "--part-1\r\nContent-Type: application/sdp\r\n\r\n{}\r\n--part-1\r\nContent-Type: message/cpim\r\n\r\n{}\r\n--part-1--\r\n",
+        msrp.sdp("sendrecv"),
+        cpim
+    );
+    peer.send(&invite(
+        "group-inviter-sealed",
+        &focus_contact(),
+        FOCUS,
+        "cpm.session",
+        &format!(
+            "Subject: Friends\r\nReferred-By: <{};encrypted-alias=sealed-Alice>\r\n",
+            ALICE
+        ),
+        "multipart/mixed; boundary=part-1",
+        &body,
+    ));
+    assert_eq!(status_code(&peer.next_response()), 200);
+    assert_eq!(next_alias(&client), alias_told(ALICE, "Alice", true));
+    assert_eq!(
+        next_group_event(&client),
+        format!(
+            "invited {} conversation-1 Friends {} Alice accepted encrypted",
+            GROUP, ALICE
+        )
+    );
+}
+
+#[test]
+fn the_alias_of_the_sender_of_a_group_message_is_told_decrypted_if_encrypted() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        sealing_aliases: vec![String::from("conversation-1")],
+        opening_aliases: true,
+        plaintext: Some(group_cpim(BOB, "", "decrypted").replacen(
+            &format!("From: <{}>", BOB),
+            &format!("From: <{};encrypted-alias=sealed-Bob>", BOB),
+            1,
+        )),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, msrp_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-senders");
+    while client.aliases.try_recv().is_ok() {}
+
+    // encrypted in the CPIM From of a message decrypted (RCC.16 section
+    // 9.1.5)
+    connection.send_content(
+        &rt,
+        &msrp_path,
+        &our_path,
+        "message/cpim",
+        &encrypted_group_cpim(BOB, "", "ciphertext"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(next_alias(&client), alias_told(BOB, "Bob", true));
+
+    // the formal name of a message sent in the clear, which is never
+    // encrypted (RCC.07 section 2.5.3.3, RCC.16 section 7.5.7)
+    connection.send_cpim(
+        &rt,
+        &msrp_path,
+        &our_path,
+        &group_cpim(ALICE, "", "in the clear").replacen("From: <", "From: \"Alice\" <", 1),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    assert_eq!(next_alias(&client), alias_told(ALICE, "Alice", false));
+}
+
+#[test]
+fn the_user_alias_of_a_message_of_a_group_moved_to_unencrypted_is_in_the_clear() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    // the group moved to unencrypted, its messages sent as they are, though
+    // its MLS group could encrypt the alias (RCC.16 section 11.2)
+    let encryption = Arc::new(ScriptedEncryption {
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        ciphertext: Some(String::from("ciphertext")),
+        unencrypted: true,
+        sealing_aliases: vec![String::from("conversation-1")],
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-moved");
+    client.sessions.set_user_alias(Some(String::from("Alice")));
+
+    // as the formal name of its CPIM From, as in any unencrypted group
+    // (RCC.07 section 2.5.3.3)
+    let sent = client.send(GROUP, RecipientType::Group, "in the clear");
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_text(&send.body), "in the clear");
+    assert_eq!(cpim_from(&send.body), format!("\"Alice\" <{}>", IMPU));
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        sent.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+}
+
+#[test]
+fn the_formal_name_of_a_chat_message_is_not_taken_as_an_alias() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (msrp, mut connection, _ok, our_path) = incoming_chat(&client, &mut peer, "formal-name");
+
+    // in a 1-to-1 chat, the alias comes with the From of the INVITE, not the
+    // CPIM From of its messages, which only group chats carry it in (RCC.07
+    // section 2.5.3.3)
+    connection.send_cpim(
+        &rt,
+        &msrp.path,
+        &our_path,
+        &format!(
+            "From: \"Bob\" <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-18T12:00:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: chat-message-1\r\n\r\nContent-Type: text/plain\r\n\r\nhello",
+            PEER, IMPU
+        ),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let (_, _, content) = client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the message given to the app");
+    assert_eq!(content, "hello");
+    assert!(client
+        .aliases
+        .recv_timeout(Duration::from_millis(300))
+        .is_err());
 }

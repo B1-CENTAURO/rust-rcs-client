@@ -66,6 +66,15 @@ pub type GroupChatResultCallback = extern "C" fn(
 /// Told of a group chat taken part in: joined (0), a participant's status
 /// (1), with its URI, display name or NULL, and status, or left (2); or that
 /// an invitation to one that waited for the user's answer was withdrawn (3)
+/// Told of the alias a sender gives itself: its URI, the alias, and whether
+/// the alias came encrypted end to end
+pub type AliasCallback = extern "C" fn(
+    uri: *const c_char,
+    alias: *const c_char,
+    encrypted: i32,
+    context: *mut MessageResultCallbackContext,
+);
+
 pub type GroupChatEventCallback = extern "C" fn(
     event: i32,
     conference_uri: *const c_char,
