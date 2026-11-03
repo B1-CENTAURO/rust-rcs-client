@@ -1296,6 +1296,111 @@ fn an_outgoing_chat_runs_in_the_session_it_starts() {
     peer.silence();
 }
 
+/// Sends each of `texts` to PEER, one right after another, from a task of
+/// the runtime, as the engine does with messages that waited; and receivers
+/// of their results, in that order
+fn send_from_a_task(client: &Client, texts: &[String]) -> Vec<Receiver<(u16, String)>> {
+    let (sessions, core, rt) = (
+        Arc::clone(&client.sessions),
+        Arc::clone(&client.core),
+        Arc::clone(&client.rt),
+    );
+    let texts = texts.to_vec();
+    let (results_tx, results_rx) = mpsc::channel();
+    client.rt.spawn(async move {
+        let results: Vec<_> = texts
+            .iter()
+            .map(|text| {
+                let (result_tx, result_rx) = mpsc::channel();
+                let result_tx = std::sync::Mutex::new(result_tx);
+                sessions.send_message(
+                    "text/plain",
+                    text,
+                    &new_message_id(),
+                    PEER,
+                    &RecipientType::Contact,
+                    PEER,
+                    move |status_code, reason_phrase| {
+                        let _ = result_tx.lock().unwrap().send((status_code, reason_phrase));
+                    },
+                    &core,
+                    &rt,
+                );
+                result_rx
+            })
+            .collect();
+        let _ = results_tx.send(results);
+    });
+    results_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the messages sent")
+}
+
+/// The texts of the next `n` messages sent on `connection`, each answered 200
+fn texts_sent(connection: &mut MsrpConnection, rt: &Runtime, n: usize) -> Vec<String> {
+    (0..n)
+        .map(|_| {
+            let send = connection.next_message(rt);
+            connection.respond(rt, &send, "200 OK");
+            cpim_text(&send.body)
+        })
+        .collect()
+}
+
+#[test]
+fn messages_go_in_a_session_in_the_order_sent() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let msrp = MsrpPeer::listen(&rt);
+
+    let first = client.send(PEER, RecipientType::Contact, "first");
+    let invite = peer.next_request("INVITE");
+    peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
+    peer.next_request("ACK");
+    let mut connection = msrp.accept(&rt);
+    assert_eq!(texts_sent(&mut connection, &rt, 1), ["first"]);
+    assert_eq!(
+        first.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+
+    // sent one right after another
+    let texts: Vec<String> = (1..=10).map(|i| format!("message {}", i)).collect();
+    let results = send_from_a_task(&client, &texts);
+    assert_eq!(texts_sent(&mut connection, &rt, texts.len()), texts);
+    for result in results {
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+            Ok(200)
+        );
+    }
+    peer.silence();
+}
+
+#[test]
+fn messages_sent_while_a_chat_starts_go_in_the_order_sent() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let msrp = MsrpPeer::listen(&rt);
+
+    // the first starting it, the others waiting for it
+    let texts: Vec<String> = (1..=10).map(|i| format!("message {}", i)).collect();
+    let first = client.send(PEER, RecipientType::Contact, &texts[0]);
+    let invite = peer.next_request("INVITE");
+    let results = send_from_a_task(&client, &texts[1..]);
+    peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
+    peer.next_request("ACK");
+    let mut connection = msrp.accept(&rt);
+    assert_eq!(texts_sent(&mut connection, &rt, texts.len()), texts);
+    for result in std::iter::once(first).chain(results) {
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+            Ok(200)
+        );
+    }
+    peer.silence();
+}
+
 /// What the scripted encryption makes the INVITE of a new encrypted 1-to-1
 /// chat carry: the CPIM message of its MLS group
 pub(crate) const CHAT_BUNDLE: &[u8] = b"From: <sip:+15551234@example.com>\r\n\r\nContent-Type: message/mls-rcs-client\r\n\r\n\x09\x0bnew chat";

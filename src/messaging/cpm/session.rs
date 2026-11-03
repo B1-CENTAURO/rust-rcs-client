@@ -525,7 +525,7 @@ enum CPMSessionState {
         String,
         u16,
         // Arc<MsrpChannel>,
-        mpsc::Sender<CPMMessageParam>,
+        mpsc::UnboundedSender<CPMMessageParam>,
     ),
     /// Ended by either side, its MSRP connection closing as the sender of
     /// the messages, kept by Starting, is dropped
@@ -733,7 +733,7 @@ impl CPMSession {
         >,
         session_end_function: F,
         rt: &Arc<Runtime>,
-    ) -> Result<mpsc::Sender<CPMMessageParam>, ()>
+    ) -> Result<mpsc::UnboundedSender<CPMMessageParam>, ()>
     where
         MRL: Fn(&CPIMInfo, &[u8], &[u8]) + Send + Sync + 'static,
         F: Fn() + Send + Sync + 'static,
@@ -793,24 +793,18 @@ impl CPMSession {
                     // let raddr_ = String::from(&raddr);
                     let rport = *rport;
 
-                    let (message_tx, mut message_rx) = mpsc::channel::<CPMMessageParam>(8);
+                    // taken as they come, so that they go in the order
+                    // they were sent
+                    let (message_tx, mut message_rx) = mpsc::unbounded_channel::<CPMMessageParam>();
                     let message_tx_ = message_tx.clone();
 
-                    // the messages sent while the session was set up go first
+                    // the messages sent while the session was set up go
+                    // first, before any sent once it starts, which waits
+                    // for this lock
                     let pending_messages =
                         std::mem::take(&mut *self.pending_messages.lock().unwrap());
-                    if !pending_messages.is_empty() {
-                        let message_tx = message_tx.clone();
-                        rt.spawn(async move {
-                            for message in pending_messages {
-                                if let Err(e) = message_tx.send(message).await {
-                                    (e.0.message_result_callback)(
-                                        500,
-                                        String::from("Internal Error"),
-                                    );
-                                }
-                            }
-                        });
+                    for message in pending_messages {
+                        let _ = message_tx.send(message);
                     }
 
                     *guard = CPMSessionState::Starting(
@@ -1030,23 +1024,22 @@ impl CPMSession {
         Err(())
     }
 
-    pub fn send_message(&self, message: CPMMessageParam, rt: &Arc<Runtime>) {
+    /// Sends `message` in the session after those sent before it, once the
+    /// session starts if it has not yet; `_rt` is not used, as the message is
+    /// handed over at once
+    pub fn send_message(&self, message: CPMMessageParam, _rt: &Arc<Runtime>) {
         let guard = self.session_state.lock().unwrap();
         match &*guard {
             // until the session starts, as an incoming one does on the ACK
             CPMSessionState::Negotiating(_) | CPMSessionState::Negotiated(..) => {
                 self.pending_messages.lock().unwrap().push(message);
             }
+            // at once, so that the messages go in the order they are sent
             CPMSessionState::Starting(_, _, _, _, _, _, message_tx) => {
-                let message_tx = message_tx.clone();
-                rt.spawn(async move {
-                    match message_tx.send(message).await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            (e.0.message_result_callback)(500, String::from("Internal Error"))
-                        }
-                    }
-                });
+                if let Err(e) = message_tx.send(message) {
+                    drop(guard);
+                    (e.0.message_result_callback)(500, String::from("Internal Error"));
+                }
             }
             CPMSessionState::Ended => {
                 drop(guard);
@@ -1829,7 +1822,10 @@ impl SessionEnd {
     }
 }
 
-type OutgoingInvitation = Arc<(ContactKnownIdentities, mpsc::Sender<CPMMessageParam>)>;
+type OutgoingInvitation = Arc<(
+    ContactKnownIdentities,
+    mpsc::UnboundedSender<CPMMessageParam>,
+)>;
 
 fn remove_invitation(
     invitations: &Arc<Mutex<Vec<OutgoingInvitation>>>,
@@ -1846,7 +1842,7 @@ fn remove_invitation(
 fn fail_invitation(
     invitations: &Arc<Mutex<Vec<OutgoingInvitation>>>,
     invitation: OutgoingInvitation,
-    message_rx: &mut mpsc::Receiver<CPMMessageParam>,
+    message_rx: &mut mpsc::UnboundedReceiver<CPMMessageParam>,
     status_code: u16,
     reason_phrase: &str,
 ) {
@@ -2031,8 +2027,7 @@ pub struct CPMSessionService {
             >,
         >,
     >,
-    ongoing_outgoing_invitations:
-        Arc<Mutex<Vec<Arc<(ContactKnownIdentities, mpsc::Sender<CPMMessageParam>)>>>>,
+    ongoing_outgoing_invitations: Arc<Mutex<Vec<OutgoingInvitation>>>,
 
     registered_public_identity: Arc<Mutex<Option<(Arc<SipTransport>, String, String)>>>,
 
@@ -3106,15 +3101,13 @@ impl CPMSessionService {
         for invitation in &*invitations {
             let (known_identities, message_tx) = invitation.as_ref();
             if known_identities == recipient {
-                let message_tx = message_tx.clone();
-                rt.spawn(async move {
-                    match message_tx.send(message).await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            (e.0.message_result_callback)(403, String::from("Forbidden"));
-                        }
-                    }
-                });
+                // at once, so that the messages go in the order they are
+                // sent
+                if let Err(e) = message_tx.send(message) {
+                    drop(invitations);
+                    drop(sessions);
+                    (e.0.message_result_callback)(403, String::from("Forbidden"));
+                }
                 return Ok(());
             }
         }
@@ -3661,7 +3654,7 @@ impl CPMSessionService {
                 let (client_transaction_tx, mut client_transaction_rx) = mpsc::channel::<
                     Result<(SipMessage, CPMSessionInfo, Arc<Body>), (u16, String)>,
                 >(1);
-                let (message_tx, mut message_rx) = mpsc::channel::<CPMMessageParam>(8);
+                let (message_tx, mut message_rx) = mpsc::unbounded_channel::<CPMMessageParam>();
                 let message_receive_listener = Arc::clone(&self.message_receive_listener);
                 let message_receive_listener_ = Arc::clone(&message_receive_listener);
 
@@ -3947,34 +3940,40 @@ impl CPMSessionService {
                                                                     }, &rt) {
 
                                                                         // the session takes the messages
-                                                                        // from now on, the invitation those
-                                                                        // sent to it until no one holds it
+                                                                        // from now on, in the order they
+                                                                        // were sent: the first, those sent
+                                                                        // to the invitation, then those sent
+                                                                        // to the session, which deliver()
+                                                                        // finds only once the others are in
+                                                                        // it, as it holds the same lock
+                                                                        let mut refused = Vec::new();
+                                                                        let mut forward = |message: CPMMessageParam| {
+                                                                            if let Err(e) = message_tx.send(message) {
+                                                                                refused.push(e.0);
+                                                                            }
+                                                                        };
+                                                                        if let Some(message) = message {
+                                                                            forward(message);
+                                                                        }
                                                                         let joined = Arc::clone(&sip_session);
-                                                                        ongoing_sessions.lock().unwrap().push((known_identities, sip_session));
+                                                                        {
+                                                                            let mut sessions = ongoing_sessions.lock().unwrap();
+                                                                            remove_invitation(&ongoing_outgoing_invitations, &outgoing_invitation_);
+                                                                            message_rx.close();
+                                                                            while let Ok(message) = message_rx.try_recv() {
+                                                                                forward(message);
+                                                                            }
+                                                                            sessions.push((known_identities, sip_session));
+                                                                        }
                                                                         group_chats.started(&joined, &rt_);
-                                                                        remove_invitation(&ongoing_outgoing_invitations, &outgoing_invitation_);
                                                                         drop(outgoing_invitation_);
 
                                                                         if let Some(started) = started {
                                                                             started(200, String::from("Ok"), Some(service_uri));
                                                                         }
 
-                                                                        if let Some(message) = message {
-                                                                            match message_tx.send(message).await {
-                                                                                Ok(()) => {},
-                                                                                Err(e) => {
-                                                                                    (e.0.message_result_callback)(403, String::from("Forbidden"));
-                                                                                },
-                                                                            }
-                                                                        }
-
-                                                                        while let Some(message) = message_rx.recv().await {
-                                                                            match message_tx.send(message).await {
-                                                                                Ok(()) => {},
-                                                                                Err(e) => {
-                                                                                    (e.0.message_result_callback)(403, String::from("Forbidden"));
-                                                                                },
-                                                                            }
+                                                                        for message in refused {
+                                                                            (message.message_result_callback)(403, String::from("Forbidden"));
                                                                         }
 
                                                                         return;
