@@ -24,9 +24,10 @@
 //! and making new Eras of groups stand, where moving groups back to
 //! encrypted stands, the KeyPackage Updates put off, where recovering the
 //! Group Metadata keys of groups stands, the contacts found lately not to
-//! take an encrypted 1-to-1 chat, and the subjects and icons of groups that
-//! did not open yet (RCC.16 sections 6.2.5, 8.1, 9.5.4, 9.7.1, 10.1, 10.5,
-//! 11.1, 11.2).
+//! take an encrypted 1-to-1 chat, the subjects and icons of groups that did
+//! not open yet, and the keys of the files uploaded for the messages sending
+//! them (RCC.16 sections 6.2.5, 8.1, 9.1.2.1, 9.5.4, 9.7.1, 10.1, 10.5, 11.1,
+//! 11.2).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -38,7 +39,7 @@ use rust_rcs_core::mls::{self, MlsClient, MlsConversation};
 use super::chat::{self, Chat};
 use super::description::{self, Icon, Unopened};
 use super::device;
-use super::file::{self, Received};
+use super::file::{self, Received, Upload};
 use super::heal::{self, Heal};
 use super::lost::{self, Lost};
 use super::metadata::{self, Recovery};
@@ -70,6 +71,7 @@ const SECTION_REPLACEMENTS: u8 = 12;
 const SECTION_RECOVERIES: u8 = 13;
 const SECTION_UNENCRYPTED_CHATS: u8 = 14;
 const SECTION_UNOPENED: u8 = 15;
+const SECTION_UPLOADS: u8 = 16;
 
 /// What the device keeps besides MLS
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -104,6 +106,9 @@ pub(super) struct NotesData {
     pub(super) unencrypted_chats: BTreeMap<String, SystemTime>,
     /// By group, what did not open of its subject and icon
     pub(super) unopened: BTreeMap<String, Unopened>,
+    /// The keys of the files uploaded, for the messages sending them, the
+    /// oldest first
+    pub(super) uploads: Vec<Upload>,
 }
 
 /// What the device keeps besides MLS, as the store keeps it
@@ -319,6 +324,7 @@ fn encode(data: &NotesData) -> Vec<u8> {
         SECTION_UNOPENED,
         description::encode_unopened(&data.unopened),
     );
+    section(SECTION_UPLOADS, file::encode_uploads(&data.uploads));
     notes
 }
 
@@ -358,6 +364,7 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
                         data.unencrypted_chats = decode_times_by(&mut body)?
                     }
                     SECTION_UNOPENED => data.unopened = description::decode_unopened(&mut body)?,
+                    SECTION_UPLOADS => data.uploads = file::decode_uploads(&mut body)?,
                     _ => {}
                 }
             }
@@ -378,13 +385,13 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, SystemTime};
 
-    use rust_rcs_core::mls::rcs::proto::EndMlsReason;
+    use rust_rcs_core::mls::rcs::proto::{self, EndMlsReason};
 
     use crate::messaging::cpm::encryption::FailedToDecrypt;
 
     use super::super::chat::Chat;
     use super::super::description::{Icon, Unopened};
-    use super::super::file::Received;
+    use super::super::file::{Received, Upload};
     use super::super::heal::{Heal, NextEra, Ongoing};
     use super::super::lost::Lost;
     use super::super::metadata::Recovery;
@@ -570,6 +577,27 @@ mod tests {
                     },
                 ),
             ]),
+            uploads: vec![
+                Upload {
+                    conversation_id: String::from("group-1"),
+                    url: String::from("https://ftcs.example.com/f/1"),
+                    file_info: proto::FileInfo {
+                        file: Some(proto::FileMetadata {
+                            file_name: String::from("picture.jpg"),
+                            content_type: String::from("image/jpeg"),
+                            encryption_info: None,
+                        }),
+                        ..proto::FileInfo::default()
+                    },
+                    uploaded: then,
+                },
+                Upload {
+                    conversation_id: String::from(BOB),
+                    url: String::from("https://ftcs.example.com/f/2"),
+                    file_info: proto::FileInfo::default(),
+                    uploaded: then,
+                },
+            ],
         }
     }
 
