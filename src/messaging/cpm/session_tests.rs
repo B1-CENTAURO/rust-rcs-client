@@ -10037,3 +10037,33 @@ fn the_user_alias_of_a_message_of_a_group_moved_to_unencrypted_is_in_the_clear()
         Ok(200)
     );
 }
+
+#[test]
+fn the_formal_name_of_a_chat_message_is_not_taken_as_an_alias() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let (msrp, mut connection, _ok, our_path) = incoming_chat(&client, &mut peer, "formal-name");
+
+    // in a 1-to-1 chat, the alias comes with the From of the INVITE, not the
+    // CPIM From of its messages, which only group chats carry it in (RCC.07
+    // section 2.5.3.3)
+    connection.send_cpim(
+        &rt,
+        &msrp.path,
+        &our_path,
+        &format!(
+            "From: \"Bob\" <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-18T12:00:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: chat-message-1\r\n\r\nContent-Type: text/plain\r\n\r\nhello",
+            PEER, IMPU
+        ),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let (_, _, content) = client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the message given to the app");
+    assert_eq!(content, "hello");
+    assert!(client
+        .aliases
+        .recv_timeout(Duration::from_millis(300))
+        .is_err());
+}
