@@ -3074,6 +3074,24 @@ impl GroupEncryption for ScriptedEncryption {
         true
     }
 
+    fn seals_chat_files(&self, _contact: &str) -> BoxFuture<'static, bool> {
+        Box::pin(async { false })
+    }
+
+    fn uploaded_for_chat(
+        &self,
+        _contact: &str,
+        _xml: &[u8],
+        _file: &[u8],
+        _thumbnail: Option<&[u8]>,
+    ) -> bool {
+        true
+    }
+
+    fn sealed_for_chat(&self, _contact: &str, _xml: &[u8]) -> bool {
+        false
+    }
+
     fn decrypt_file_transfer(
         &self,
         conversation_id: &str,
@@ -4119,6 +4137,24 @@ impl GroupEncryption for EncryptingPrepared {
         thumbnail: Option<&[u8]>,
     ) -> bool {
         self.0.uploaded(conversation_id, xml, file, thumbnail)
+    }
+
+    fn seals_chat_files(&self, contact: &str) -> BoxFuture<'static, bool> {
+        self.0.seals_chat_files(contact)
+    }
+
+    fn uploaded_for_chat(
+        &self,
+        contact: &str,
+        xml: &[u8],
+        file: &[u8],
+        thumbnail: Option<&[u8]>,
+    ) -> bool {
+        self.0.uploaded_for_chat(contact, xml, file, thumbnail)
+    }
+
+    fn sealed_for_chat(&self, contact: &str, xml: &[u8]) -> bool {
+        self.0.sealed_for_chat(contact, xml)
     }
 
     fn decrypt_file_transfer(

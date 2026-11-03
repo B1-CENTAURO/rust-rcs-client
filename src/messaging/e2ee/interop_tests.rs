@@ -654,6 +654,85 @@ fn an_encrypted_chat_one_device_starts_the_other_joins_and_both_talk_in() {
     notified(&bob, &alice, &group_id, "alice-2", Status::Delivered);
 }
 
+#[test]
+fn a_file_one_device_sends_in_a_new_chat_the_other_opens() {
+    let (alice, bob, _) = alice_and_bob();
+
+    // sealed before any chat with Bob, as he advertises E2EE, and uploaded
+    // (RCC.16 sections 8.1.1, 9.1.2.1)
+    assert!(block_on(alice.groups.seals_chat_files(bob.impu)));
+    let url = "https://ftcs.example.com/f/8";
+    let file = alice
+        .groups
+        .seal_file(b"the picture", "picture.jpg", "image/jpeg")
+        .unwrap();
+    let xml = super::file::upload_xml(url);
+    assert!(alice
+        .groups
+        .uploaded_for_chat(bob.impu, xml.as_bytes(), &file.metadata, None));
+
+    // the chat its message starts, which Bob joins
+    let (group_id, cpim) = block_on(
+        alice
+            .groups
+            .prepare_chat(String::from(bob.impu), String::from(alice.impu)),
+    )
+    .expect("an encrypted chat");
+    let previous = epoch_of(&alice, &group_id);
+    assert_eq!(
+        bob.groups
+            .join_chat(alice.impu, &welcomed(&bundle_of(&cpim)), None),
+        Some(group_id.clone())
+    );
+    alice.groups.keep_chat(bob.impu, &group_id, None);
+    alice
+        .groups
+        .on_server_message(&group_id, &accepted(previous));
+
+    // the message carrying its key (section 7.8.2)
+    let cpim = format!(
+        "From: <{}>\r\n\
+To: <{}>\r\n\
+DateTime: 2026-10-25T12:00:00.000+00:00\r\n\
+NS: imdn <urn:ietf:params:imdn>\r\n\
+imdn.Message-ID: alice-ft-2\r\n\
+imdn.Disposition-Notification: positive-delivery, display\r\n\
+\r\n\
+Content-Type: application/vnd.gsma.rcs-ft-http+xml\r\n\
+Content-Length: {}\r\n\
+\r\n\
+{}",
+        alice.impu,
+        bob.impu,
+        xml.len(),
+        xml
+    );
+    let outer = match block_on(alice.groups.encrypt(&group_id, cpim.as_bytes())) {
+        Sealed::Encrypted(outer) => outer,
+        other => panic!("not encrypted: {:?}", other),
+    };
+
+    // Bob given the XML of the file, as it was named, and opening it once
+    // downloaded (section 9.1.2.2)
+    let message = cpim_message(&outer);
+    let (_, xml, _) = message.get_message_body().unwrap();
+    let opened = bob
+        .groups
+        .decrypt_file_transfer(&group_id, &message.get_info().unwrap(), xml)
+        .expect("the file transfer message decrypted");
+    let opened = String::from_utf8_lossy(&body_of(&cpim_message(&opened))).into_owned();
+    assert!(
+        opened.contains("<file-name>picture.jpg</file-name>"),
+        "{}",
+        opened
+    );
+    assert!(bob.groups.opens_file(url));
+    assert_eq!(
+        bob.groups.open_file(url, &file.ciphertext).as_deref(),
+        Some(&b"the picture"[..])
+    );
+}
+
 /// The `message/mls-rcs-client` the control message `cpim` carries, alone
 /// or first of its parts (RCC.16 sections 7.9.1, 7.13.1)
 fn client_message(cpim: &[u8]) -> ClientMlsRcsMessage {

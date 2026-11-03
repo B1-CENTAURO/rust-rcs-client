@@ -33,6 +33,7 @@ use rust_rcs_core::mls::rcs::CONTENT_TYPE_MLS_RCS_FILE_INFO;
 
 use crate::messaging::cpm::encryption::SealedFile;
 
+use super::chat::contact_tel_uri;
 use super::device::E2eeDevice;
 use super::message::MessageError;
 use super::notes::{put, put_time, NotesData, Reader as NotesReader};
@@ -461,11 +462,53 @@ impl E2eeDevice {
         true
     }
 
-    /// What the FileInfo of the file at `url`, uploaded for the group chat
-    /// `conversation_id`, tells, if it was within a day
-    pub(super) fn uploaded_file_info(&self, conversation_id: &str, url: &str) -> Option<FileInfo> {
+    /// Keeps, as uploaded() does, what the FileInfo of the file and the
+    /// thumbnail uploaded for the encrypted 1-to-1 chat with `contact`
+    /// tells, for the message sending them to the contact to carry, in
+    /// whichever MLS group of the chat it goes (RCC.16 sections 7.8, 8.1.1,
+    /// 9.1.2.1); false as uploaded() is, or if `contact` has no number
+    pub fn uploaded_for_chat(
+        &self,
+        contact: &str,
+        xml: &[u8],
+        file: &[u8],
+        thumbnail: Option<&[u8]>,
+    ) -> bool {
+        // by the tel URI of the contact, which no Conversation-ID is
+        contact_tel_uri(contact)
+            .is_some_and(|tel_uri| self.uploaded(&tel_uri, xml, file, thumbnail))
+    }
+
+    /// Whether the file the FT HTTP XML `xml` tells of was uploaded sealed
+    /// for the encrypted 1-to-1 chat with `contact`, within a day
+    pub fn sealed_for_chat(&self, contact: &str, xml: &[u8]) -> bool {
+        let (Some(url), _) = file_urls(xml) else {
+            return false;
+        };
+        contact_tel_uri(contact).is_some_and(|tel_uri| {
+            self.uploads()
+                .file_info(&tel_uri, &url, self.store().now())
+                .is_some()
+        })
+    }
+
+    /// What the FileInfo of the file at `url` tells, if it was uploaded
+    /// within a day for the group chat `conversation_id`, or for the
+    /// encrypted 1-to-1 chat with `to`, the URI the message sending it goes
+    /// to
+    pub(super) fn uploaded_file_info(
+        &self,
+        conversation_id: &str,
+        to: Option<&str>,
+        url: &str,
+    ) -> Option<FileInfo> {
+        let now = self.store().now();
         self.uploads()
-            .file_info(conversation_id, url, self.store().now())
+            .file_info(conversation_id, url, now)
+            .or_else(|| {
+                let tel_uri = contact_tel_uri(to?)?;
+                self.uploads().file_info(&tel_uri, url, now)
+            })
     }
 
     /// The CPIM message the file transfer message of the group chat

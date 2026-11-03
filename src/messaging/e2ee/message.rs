@@ -304,13 +304,20 @@ impl E2eeDevice {
         // a file transfer message, of a file encrypted for the group, whose
         // FileInfo is encrypted in place of what it carries (sections 7.8,
         // 9.1.2.1)
+        // or for the 1-to-1 chat with whom it goes to
+        let to = message.get_info().ok().and_then(|info| {
+            info.to_uri.map(|uri| {
+                String::from_utf8_lossy(&uri.string_representation_without_query_and_fragment())
+                    .into_owned()
+            })
+        });
         let file_transfer = match message.get_message_body() {
             Some((Some(content_type), xml, false))
                 if is_of_type(content_type, CONTENT_TYPE_FT_HTTP) =>
             {
                 let file_info = file_urls(xml)
                     .0
-                    .and_then(|url| self.uploaded_file_info(conversation_id, &url));
+                    .and_then(|url| self.uploaded_file_info(conversation_id, to.as_deref(), &url));
                 Some((xml.to_vec(), file_info))
             }
             _ => None,
