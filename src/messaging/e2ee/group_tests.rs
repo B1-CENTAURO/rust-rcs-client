@@ -8663,6 +8663,63 @@ fn the_encrypted_subject_is_told_decrypted_once_its_key_is_kept() {
 }
 
 #[test]
+fn a_subject_or_icon_not_opened_yet_is_told_once_its_key_comes_after_a_restart() {
+    let clock = Clock::new();
+    let (device, kds, app, bob, mut bobs_group) = alice_and_bob_kept(&clock);
+    let url = "https://ftcs.example.com/i/1";
+
+    // the subject told before the Commit bringing its key, and the icon,
+    // whose download does not open as its key is not kept yet (RCC.16
+    // sections 7.13.2, 9.7.1.4, 9.7.1.5)
+    let (team, subject_commit) =
+        subject_by_bob(&device, &bob, &mut bobs_group, "Team", false, false);
+    assert_eq!(
+        device.take_metadata(CONVERSATION, described(&team, Some(BOB_TEL)), None),
+        []
+    );
+    let (icon, icon_commit) = icon_by_bob(
+        &device,
+        &bob,
+        &mut bobs_group,
+        b"the icon",
+        "image/png",
+        false,
+    );
+    device.take_metadata(CONVERSATION, None, described(url, None));
+    assert_eq!(device.open_file(url, &icon), None);
+    drop(device);
+
+    // once restarted, both told as the keys come, once
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(device.metadata_opened(CONVERSATION), []);
+    for output in [&subject_commit, &icon_commit] {
+        device
+            .on_server_message(CONVERSATION, &proto::encode(&focus_bundle(output)))
+            .unwrap();
+    }
+    assert_eq!(
+        device.metadata_opened(CONVERSATION),
+        [
+            subject_told(Some("Team"), Some(BOB_TEL)),
+            icon_told(Some(url), Some("image/png"), None)
+        ]
+    );
+    assert_eq!(device.metadata_opened(CONVERSATION), []);
+    assert!(device.notes().read(|data| data.unopened.is_empty()));
+    assert_eq!(
+        device.open_file(url, &icon).as_deref(),
+        Some(&b"the icon"[..])
+    );
+
+    // nothing kept for a group let go of
+    let (later, _) = subject_by_bob(&device, &bob, &mut bobs_group, "Later", false, false);
+    device.take_metadata(CONVERSATION, described(&later, None), None);
+    assert!(!device.notes().read(|data| data.unopened.is_empty()));
+    device.abandon(CONVERSATION).unwrap();
+    assert!(device.notes().read(|data| data.unopened.is_empty()));
+}
+
+#[test]
 fn a_subject_that_does_not_open_has_the_metadata_keys_checked() {
     let (device, bob, mut bobs_group) = alice_and_bob();
     let (team, _) = subject_by_bob(&device, &bob, &mut bobs_group, "Team", true, true);

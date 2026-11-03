@@ -23,9 +23,10 @@
 //! the device waits for the Conversation Focus to take, where self-healing
 //! and making new Eras of groups stand, where moving groups back to
 //! encrypted stands, the KeyPackage Updates put off, where recovering the
-//! Group Metadata keys of groups stands, and the contacts found lately not
-//! to take an encrypted 1-to-1 chat (RCC.16 sections 6.2.5, 8.1, 9.5.4,
-//! 10.1, 10.5, 11.1, 11.2).
+//! Group Metadata keys of groups stands, the contacts found lately not to
+//! take an encrypted 1-to-1 chat, and the subjects and icons of groups that
+//! did not open yet (RCC.16 sections 6.2.5, 8.1, 9.5.4, 9.7.1, 10.1, 10.5,
+//! 11.1, 11.2).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -35,7 +36,7 @@ use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::mls::{self, MlsClient, MlsConversation};
 
 use super::chat::{self, Chat};
-use super::description::{self, Icon};
+use super::description::{self, Icon, Unopened};
 use super::device;
 use super::file::{self, Received};
 use super::heal::{self, Heal};
@@ -68,6 +69,7 @@ const SECTION_GROUPS: u8 = 11;
 const SECTION_REPLACEMENTS: u8 = 12;
 const SECTION_RECOVERIES: u8 = 13;
 const SECTION_UNENCRYPTED_CHATS: u8 = 14;
+const SECTION_UNOPENED: u8 = 15;
 
 /// What the device keeps besides MLS
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -100,6 +102,8 @@ pub(super) struct NotesData {
     /// By the tel URI of a contact, when it was found not to take an
     /// encrypted 1-to-1 chat
     pub(super) unencrypted_chats: BTreeMap<String, SystemTime>,
+    /// By group, what did not open of its subject and icon
+    pub(super) unopened: BTreeMap<String, Unopened>,
 }
 
 /// What the device keeps besides MLS, as the store keeps it
@@ -311,6 +315,10 @@ fn encode(data: &NotesData) -> Vec<u8> {
         SECTION_UNENCRYPTED_CHATS,
         encode_times_by(&data.unencrypted_chats),
     );
+    section(
+        SECTION_UNOPENED,
+        description::encode_unopened(&data.unopened),
+    );
     notes
 }
 
@@ -349,6 +357,7 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
                     SECTION_UNENCRYPTED_CHATS => {
                         data.unencrypted_chats = decode_times_by(&mut body)?
                     }
+                    SECTION_UNOPENED => data.unopened = description::decode_unopened(&mut body)?,
                     _ => {}
                 }
             }
@@ -374,7 +383,7 @@ mod tests {
     use crate::messaging::cpm::encryption::FailedToDecrypt;
 
     use super::super::chat::Chat;
-    use super::super::description::Icon;
+    use super::super::description::{Icon, Unopened};
     use super::super::file::Received;
     use super::super::heal::{Heal, NextEra, Ongoing};
     use super::super::lost::Lost;
@@ -537,6 +546,29 @@ mod tests {
             unencrypted_chats: BTreeMap::from([
                 (String::from(BOB), then),
                 (String::from("tel:+491701111111"), then),
+            ]),
+            unopened: BTreeMap::from([
+                (
+                    String::from("group-1"),
+                    Unopened {
+                        subject: Some((b"ciphertext".to_vec(), Some(String::from(BOB)))),
+                        icon: Some(b"tag".to_vec()),
+                    },
+                ),
+                (
+                    String::from("group-2"),
+                    Unopened {
+                        subject: Some((b"another".to_vec(), None)),
+                        icon: None,
+                    },
+                ),
+                (
+                    String::from("group-3"),
+                    Unopened {
+                        subject: None,
+                        icon: Some(Vec::new()),
+                    },
+                ),
             ]),
         }
     }

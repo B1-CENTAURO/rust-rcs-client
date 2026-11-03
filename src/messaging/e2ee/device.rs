@@ -162,14 +162,13 @@ pub struct E2eeDevice {
     /// Conversation Focus to take; the groups to self-heal, being
     /// self-healed and made anew; those moved to unencrypted, and being
     /// moved back; those whose KeyPackage Update is put off, and whose Group
-    /// Metadata keys are recovered; and the contacts found lately not to
-    /// take an encrypted 1-to-1 chat
+    /// Metadata keys are recovered; the contacts found lately not to take
+    /// an encrypted 1-to-1 chat; and the subjects and icons of groups that
+    /// did not open yet
     notes: Notes,
     /// The keys of the files uploaded for groups, for the messages sending
     /// them
     uploads: Uploads,
-    /// The subjects and icons of groups that did not open yet
-    descriptions: Descriptions,
 }
 
 impl E2eeDevice {
@@ -200,7 +199,6 @@ impl E2eeDevice {
             make_signer: Box::new(|| SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).ok()),
             notes,
             uploads: Uploads::default(),
-            descriptions: Descriptions::default(),
         };
         device.settle_restarts();
         Ok(device)
@@ -299,8 +297,11 @@ impl E2eeDevice {
         &self.uploads
     }
 
-    pub(super) fn descriptions(&self) -> &Descriptions {
-        &self.descriptions
+    pub(super) fn descriptions(&self) -> Descriptions<'_> {
+        Descriptions {
+            notes: &self.notes,
+            store: &self.store,
+        }
     }
 
     pub(super) fn unencrypted_chats(&self) -> Unencrypted<'_> {
