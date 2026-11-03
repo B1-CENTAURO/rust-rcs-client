@@ -1682,18 +1682,8 @@ impl RcsEngine {
                 if ft_auth == 1 {
                     if let Some(ft_http_cs_uri) = &self.ft_http_configs.ft_http_cs_uri {
                         let ft_http_service = Arc::clone(&self.ft_http_service);
-                        // that of an encrypted group chat, sealed; that of a
-                        // 1-to-1 chat, if it goes encrypted, as found below
                         let encryption = self.cpm_session_service.group_encryption();
-                        let sealing = match upload_for {
-                            UploadFor::Anyone => None,
-                            UploadFor::Group(conversation_id) => encryption
-                                .filter(|encryption| encryption.encrypts_files(conversation_id))
-                                .map(|encryption| (upload_for.clone(), encryption)),
-                            UploadFor::Chat(_) => {
-                                encryption.map(|encryption| (upload_for.clone(), encryption))
-                            }
-                        };
+                        let upload_for = upload_for.clone();
 
                         let ft_http_cs_uri = String::from(ft_http_cs_uri);
                         let credentials = self.ft_http_cs_credentials();
@@ -1731,18 +1721,7 @@ impl RcsEngine {
                         };
 
                         rt.spawn(async move {
-                            // a file to a contact sealed if the message sending
-                            // it goes in an encrypted 1-to-1 chat (RCC.16
-                            // sections 8.1.1, 9.1.2.1)
-                            let sealing = match sealing {
-                                Some((UploadFor::Chat(contact), encryption)) => {
-                                    match encryption.seals_chat_files(&contact).await {
-                                        true => Some((UploadFor::Chat(contact), encryption)),
-                                        false => None,
-                                    }
-                                }
-                                sealing => sealing,
-                            };
+                            let sealing = sealing_of(&upload_for, encryption).await;
 
                             let file: FileInfo<'_> = FileInfo {
                                 path: &file_path,
@@ -2967,6 +2946,10 @@ async fn open_stream(
 }
 
 #[cfg(test)]
+#[path = "rcs_engine_tests.rs"]
+mod sending_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 
@@ -3478,6 +3461,23 @@ fn wait_after_others(
         }
         None => Some(message),
     }
+}
+
+/// What a file uploaded for `upload_for` is sealed for, with `encryption`,
+/// if it is to be sealed before it is uploaded (RCC.16 section 9.1.2.1): for
+/// an encrypted group chat, while it is encrypted; for a contact, if the
+/// message sending it goes in an encrypted 1-to-1 chat (section 8.1.1)
+async fn sealing_of(
+    upload_for: &UploadFor,
+    encryption: Option<Arc<dyn GroupEncryption>>,
+) -> Option<(UploadFor, Arc<dyn GroupEncryption>)> {
+    let encryption = encryption?;
+    let sealed = match upload_for {
+        UploadFor::Anyone => false,
+        UploadFor::Group(conversation_id) => encryption.encrypts_files(conversation_id),
+        UploadFor::Chat(contact) => encryption.seals_chat_files(contact).await,
+    };
+    sealed.then(|| (upload_for.clone(), encryption))
 }
 
 /// Whether a message of `message_type` is a file transfer message (RCC.07
