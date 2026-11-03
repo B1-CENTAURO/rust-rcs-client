@@ -1070,7 +1070,12 @@ pub fn answer(request: &SipMessage, status: &str, sdp: Option<&str>) -> String {
 }
 
 /// As answer(), from the Contact `contact`
-fn answer_from(request: &SipMessage, status: &str, contact: &str, sdp: Option<&str>) -> String {
+pub(crate) fn answer_from(
+    request: &SipMessage,
+    status: &str,
+    contact: &str,
+    sdp: Option<&str>,
+) -> String {
     let mut data = format!("SIP/2.0 {}\r\n", status);
     for name in ["Via", "From", "Call-ID", "CSeq"] {
         data += &format!("{}: {}\r\n", name, header_value(request, name));
@@ -2657,7 +2662,7 @@ fn new_group_with(
 }
 
 /// The requests `methods` from the client, in whatever order
-fn next_requests(peer: &mut Peer, methods: &[&str]) -> Vec<SipMessage> {
+pub(crate) fn next_requests(peer: &mut Peer, methods: &[&str]) -> Vec<SipMessage> {
     let mut requests: Vec<SipMessage> = (0..methods.len()).map(|_| peer.next()).collect();
     let mut sent: Vec<String> = requests.iter().map(first_line).collect();
     sent.sort();
@@ -2699,7 +2704,7 @@ Content-Length: {}\r\n\
 }
 
 /// The next event the app is told of a group chat
-fn next_group_event(client: &Client) -> String {
+pub(crate) fn next_group_event(client: &Client) -> String {
     client
         .group_events
         .recv_timeout(Duration::from_secs(5))

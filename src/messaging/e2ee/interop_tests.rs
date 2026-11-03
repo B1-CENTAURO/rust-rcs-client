@@ -55,8 +55,9 @@ use rust_rcs_core::sip::SipMessage;
 use tokio::runtime::Runtime;
 
 use crate::messaging::cpm::session_tests::{
-    ack, answer, body_data, header_value, invite as invite_from, sdp_attribute, start_as,
-    status_code, MsrpConnection, MsrpFrame, MsrpPeer,
+    ack, answer, answer_from, body_data, header_value, invite as invite_from, next_group_event,
+    next_requests, sdp_attribute, start_as, status_code, Client, MsrpConnection, MsrpFrame,
+    MsrpPeer, Peer, TRANSPORT_ADDRESS,
 };
 use crate::messaging::ffi::RecipientType;
 
@@ -829,13 +830,13 @@ fn subject_set(party: &Party) -> Option<Vec<u8>> {
     ))
 }
 
-/// `party` sending `count` messages in the group chat, which the others need
-/// not take
-fn chatted(party: &Party, count: usize) {
+/// `party` sending `count` messages in the group chat `conversation_id`,
+/// which the others need not take
+fn chatted(party: &Party, conversation_id: &str, count: usize) {
     for n in 0..count {
         let cpim = message(party.impu, GROUP_URI, &format!("chat-{}", n), "chat");
         assert!(matches!(
-            block_on(party.groups.encrypt(CONVERSATION, &cpim)),
+            block_on(party.groups.encrypt(conversation_id, &cpim)),
             Sealed::Encrypted(_)
         ));
     }
@@ -974,7 +975,7 @@ fn the_keys_one_device_updates_the_other_follows_and_both_talk_on() {
 
     // each in turn, by a Commit the Focus forwards (RCC.16 section 9.5.2)
     for (from, to) in [(&alice, &bob), (&bob, &alice)] {
-        chatted(from, 50);
+        chatted(from, CONVERSATION, 50);
         committed(from, Some(to), CONVERSATION, |from| {
             block_on(from.groups.update_keys(
                 String::from(CONVERSATION),
@@ -1450,4 +1451,473 @@ fn an_encrypted_chat_runs_between_two_session_services_through_the_focus() {
         content_type
     );
     assert!(content.contains("<delivered/>"), "{}", content);
+}
+
+const FACTORY_URI: &str = "sip:conference-factory@conf.example.com";
+
+/// The Contact of the Focus of the group chat at GROUP_URI (RCC.07 section
+/// 3.4.4.1)
+fn focus_contact() -> String {
+    format!(
+        "<{}>;isfocus;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+        GROUP_URI
+    )
+}
+
+/// The INVITE the Focus sends `to` to the group chat of `conversation_id`,
+/// offering `sdp` and carrying `server_message`, the Welcome of its MLS
+/// group in a `message/mls-rcs-server` (RCC.07 section 3.4.4.1.2, RCC.16
+/// section 8.2.1)
+fn focus_invite(
+    call_id: &str,
+    to: &str,
+    conversation_id: &str,
+    sdp: &str,
+    server_message: &[u8],
+) -> String {
+    let welcome = format!(
+        "From: <{}>\r\nTo: <{}>\r\nDateTime: 2026-10-25T12:00:00.000Z\r\nNS: imdn <urn:ietf:params:imdn>\r\nimdn.Message-ID: welcome-1\r\n\r\nContent-Type: message/mls-rcs-server\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
+        GROUP_URI,
+        to,
+        general_purpose::STANDARD.encode(server_message)
+    );
+    let body = format!(
+        "--part-1\r\nContent-Type: application/sdp\r\n\r\n{}\r\n--part-1\r\nContent-Type: message/cpim\r\n\r\n{}\r\n--part-1--\r\n",
+        sdp, welcome
+    );
+    let user = to
+        .trim_start_matches("sip:")
+        .split('@')
+        .next()
+        .unwrap_or_default();
+    format!(
+        "INVITE sip:{}@{};transport=tcp SIP/2.0\r\n\
+Via: SIP/2.0/TCP 192.0.2.1:5060;branch=z9hG4bK{}\r\n\
+From: <{}>;tag=peer1\r\n\
+To: <{}>\r\n\
+Call-ID: {}\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: {}\r\n\
+Accept-Contact: *;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"\r\n\
+P-Asserted-Identity: <{}>\r\n\
+Conversation-ID: {}\r\n\
+Contribution-ID: contribution-1\r\n\
+Referred-By: <{}>\r\n\
+MLS-Opaque-Token: {}\r\n\
+Max-Forwards: 70\r\n\
+Content-Type: multipart/mixed; boundary=part-1\r\n\
+Content-Length: {}\r\n\
+\r\n\
+{}",
+        user,
+        TRANSPORT_ADDRESS,
+        call_id,
+        FOCUS_URI,
+        to,
+        call_id,
+        focus_contact(),
+        FOCUS_URI,
+        conversation_id,
+        ALICE_IMPU,
+        TOKEN,
+        body.len(),
+        body
+    )
+}
+
+/// A session service of a Participant's client in a group chat, with the
+/// Focus at the other end of its SIP connection, and of its session's MSRP
+/// connection, from `focus_path` to `path`
+struct Member {
+    party: Party,
+    client: Client,
+    sip: Peer,
+    connection: MsrpConnection,
+    focus_path: String,
+    path: String,
+}
+
+impl Member {
+    fn rt(&self) -> Arc<Runtime> {
+        Arc::clone(&self.client.rt)
+    }
+
+    /// Sends what the Focus sends in the session: the CPIM message `cpim`,
+    /// which the session takes
+    fn focus_sends(&mut self, cpim: &[u8]) {
+        let rt = self.rt();
+        self.connection
+            .send_data(&rt, &self.focus_path, &self.path, "message/cpim", cpim);
+        let response = self.connection.next_response(&rt);
+        assert!(
+            response.first_line.contains(" 200"),
+            "{}",
+            response.first_line
+        );
+    }
+
+    /// The next message the session sends, answered 200
+    fn sent(&mut self) -> MsrpFrame {
+        let rt = self.rt();
+        let send = self.connection.next_message(&rt);
+        self.connection.respond(&rt, &send, "200 OK");
+        send
+    }
+
+    /// What the app is given next: in which conversation, of what type, and
+    /// what
+    fn given(&self) -> (String, String, String) {
+        self.client
+            .received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a message given to the app")
+    }
+
+    /// Sends `text` in the group chat, returning once it is answered 200
+    fn says(&mut self, text: &str) -> MsrpFrame {
+        let result = self.client.send(GROUP_URI, RecipientType::Group, text);
+        let send = self.sent();
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+            Ok(200)
+        );
+        send
+    }
+
+    /// The Focus relaying `send`, what another member sent in the group, to
+    /// this one
+    fn relayed(&mut self, send: &MsrpFrame) {
+        let rt = self.rt();
+        relayed(
+            &mut self.connection,
+            &rt,
+            &self.focus_path,
+            &self.path,
+            send,
+        );
+    }
+}
+
+/// Alice's and Bob's session services in the encrypted group chat Alice's
+/// starts, which Bob's joins as the Focus invites it, its Conversation-ID,
+/// and the clock of both devices (RCC.16 sections 7.9.2, 8.1, 8.2.1)
+fn group_through_the_focus() -> (Member, Member, String, Clock) {
+    let (alice, bob, clock) = alice_and_bob();
+    let (alice_client, mut alice_sip) = start_as(true, ALICE_IMPU);
+    let (bob_client, mut bob_sip) = start_as(true, BOB_IMPU);
+    let (alice_rt, bob_rt) = (Arc::clone(&alice_client.rt), Arc::clone(&bob_client.rt));
+    alice_client
+        .sessions
+        .set_group_encryption(Arc::clone(&alice.groups) as Arc<dyn GroupEncryption>);
+    bob_client
+        .sessions
+        .set_group_encryption(Arc::clone(&bob.groups) as Arc<dyn GroupEncryption>);
+
+    // Alice's INVITE to the conference factory, carrying the MLS group
+    // made for Bob with a KeyPackage of his from the Home KDS
+    let (started_tx, started) = std::sync::mpsc::channel();
+    alice_client.sessions.create_group_chat(
+        FACTORY_URI,
+        &[String::from(BOB_IMPU)],
+        None,
+        move |status_code, _, conference_uri| {
+            let _ = started_tx.send((status_code, conference_uri));
+        },
+        &alice_client.core,
+        &alice_rt,
+    );
+    let invite = alice_sip.next_request("INVITE");
+    let conversation_id = header_value(&invite, "Conversation-ID");
+    let parts = parts_of(&invite);
+    let content_types: Vec<&str> = parts.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(
+        content_types,
+        [
+            "application/sdp",
+            "application/resource-lists+xml",
+            "message/cpim"
+        ]
+    );
+    let alice_path =
+        sdp_attribute(&String::from_utf8_lossy(&parts[0].1), "path").expect("Alice's a=path");
+    let bundle = bundle_of(&parts[2].1);
+
+    // the Focus answering, the group known by its URI, and Alice's
+    // subscription to its conference events taken
+    let alice_msrp = MsrpPeer::listen(&alice_rt);
+    let ok = answer_from(
+        &invite,
+        "200 OK",
+        &focus_contact(),
+        Some(&alice_msrp.sdp("sendrecv")),
+    )
+    .replacen(
+        "Contact:",
+        &format!("MLS-Opaque-Token: {}\r\nContact:", TOKEN),
+        1,
+    );
+    alice_sip.send(&ok);
+    let subscribe = next_requests(&mut alice_sip, &["ACK", "SUBSCRIBE"])
+        .pop()
+        .unwrap();
+    alice_sip.send(
+        &answer_from(&subscribe, "200 OK", &format!("<{}>", GROUP_URI), None).replacen(
+            "Contact:",
+            "Expires: 3600\r\nContact:",
+            1,
+        ),
+    );
+    let to_alice = alice_msrp.accept(&alice_rt);
+    assert_eq!(
+        started.recv_timeout(Duration::from_secs(5)),
+        Ok((200, Some(String::from(GROUP_URI))))
+    );
+
+    // the Focus accepting Alice's Commit (RCC.16 section 6.2.4)
+    let previous = epoch_of(&alice, &conversation_id);
+    let mut alice = Member {
+        party: alice,
+        client: alice_client,
+        sip: alice_sip,
+        connection: to_alice,
+        focus_path: alice_msrp.path.clone(),
+        path: alice_path,
+    };
+    alice.focus_sends(&from_the_focus(ALICE_IMPU, &accepted(previous)));
+
+    // then inviting Bob with the Welcome, which his session service joins
+    // before telling his app of the group
+    let bob_msrp = MsrpPeer::listen(&bob_rt);
+    bob_sip.send(&focus_invite(
+        "group-to-bob",
+        BOB_IMPU,
+        &conversation_id,
+        &bob_msrp.sdp("sendrecv"),
+        &welcomed(&bundle),
+    ));
+    let bobs_ok = bob_sip.next_response();
+    assert_eq!(status_code(&bobs_ok), 200);
+    assert_eq!(
+        epoch_of(&bob, &conversation_id),
+        epoch_of(&alice.party, &conversation_id)
+    );
+    let invited = next_group_event(&bob_client);
+    assert!(
+        invited.starts_with(&format!("invited {} {} ", GROUP_URI, conversation_id))
+            && invited.ends_with(" accepted encrypted"),
+        "{}",
+        invited
+    );
+    bob_sip.send(&ack(&bobs_ok, "group-to-bob"));
+    let subscribe = bob_sip.next_request("SUBSCRIBE");
+    bob_sip.send(
+        &answer_from(&subscribe, "200 OK", &format!("<{}>", GROUP_URI), None).replacen(
+            "Contact:",
+            "Expires: 3600\r\nContact:",
+            1,
+        ),
+    );
+    let bob_path = sdp_attribute(&super::super::cpm::session_tests::body(&bobs_ok), "path")
+        .expect("Bob's a=path");
+    let to_bob = bob_msrp.accept(&bob_rt);
+    assert_eq!(
+        next_group_event(&bob_client),
+        format!("joined {}", GROUP_URI)
+    );
+    let bob = Member {
+        party: bob,
+        client: bob_client,
+        sip: bob_sip,
+        connection: to_bob,
+        focus_path: bob_msrp.path.clone(),
+        path: bob_path,
+    };
+    (alice, bob, conversation_id, clock)
+}
+
+#[test]
+fn an_encrypted_group_runs_between_two_session_services_through_the_focus() {
+    let (mut alice, mut bob, conversation_id, _) = group_through_the_focus();
+    assert!(alice.party.groups.encrypts(&conversation_id));
+    assert!(bob.party.groups.encrypts(&conversation_id));
+
+    // Alice's message goes encrypted, which Bob's session service gives his
+    // app decrypted (RCC.16 section 9.1.1)
+    let send = alice.says("hi Bob");
+    assert!(
+        !String::from_utf8_lossy(&send.body).contains("hi Bob"),
+        "sent in the clear"
+    );
+    bob.relayed(&send);
+    let (contact, content_type, content) = bob.given();
+    assert_eq!(
+        (contact.as_str(), content_type.as_str(), content.as_str()),
+        (GROUP_URI, "text/plain", "hi Bob")
+    );
+
+    // its delivery, signed in Bob's session, verified by Alice's (sections
+    // 7.6.2, 9.1.3)
+    let delivery = bob.sent();
+    alice.relayed(&delivery);
+    let (_, content_type, content) = alice.given();
+    assert!(
+        content_type.starts_with("message/imdn+xml"),
+        "{}",
+        content_type
+    );
+    assert!(content.contains("<delivered/>"), "{}", content);
+
+    // and the same the other way
+    let send = bob.says("hi Alice");
+    alice.relayed(&send);
+    let (contact, content_type, content) = alice.given();
+    assert_eq!(
+        (contact.as_str(), content_type.as_str(), content.as_str()),
+        (GROUP_URI, "text/plain", "hi Alice")
+    );
+    let delivery = alice.sent();
+    bob.relayed(&delivery);
+    let (_, content_type, content) = bob.given();
+    assert!(
+        content_type.starts_with("message/imdn+xml"),
+        "{}",
+        content_type
+    );
+    assert!(content.contains("<delivered/>"), "{}", content);
+    alice.sip.silence();
+    bob.sip.silence();
+}
+
+#[test]
+fn a_device_leaving_a_group_through_its_session_is_committed_out_by_the_other() {
+    let (mut alice, mut bob, conversation_id, _) = group_through_the_focus();
+
+    // Bob's session service leaves with the BYE carrying his self_remove
+    // Proposal, his MLS group let go of once the Focus agrees (RCC.16
+    // sections 7.9.4, 9.4)
+    let (left_tx, left) = std::sync::mpsc::channel();
+    bob.client.sessions.leave_group_chat(
+        GROUP_URI,
+        move |status_code, _| {
+            let _ = left_tx.send(status_code);
+        },
+        &bob.client.core,
+        &bob.client.rt,
+    );
+    let bye = bob.sip.next_request("BYE");
+    assert_eq!(header_value(&bye, "Content-Type"), "message/cpim");
+    let proposals = match client_message(&body_data(&bye)).payload {
+        Some(client_mls_rcs_message::Payload::ProposalList(proposals)) => proposals,
+        _ => panic!("not a ProposalList"),
+    };
+    bob.sip.send(&answer(&bye, "200 OK", None));
+    assert_eq!(left.recv_timeout(Duration::from_secs(5)), Ok(200));
+    assert!(!bob.party.groups.encrypts(&conversation_id));
+
+    // the Focus forwards it in Alice's session, which commits Bob out in it
+    // (sections 7.9.3, 9.5.1)
+    let forwarded = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ProposalList(proposals)),
+    });
+    alice.focus_sends(&from_the_focus(ALICE_IMPU, &forwarded));
+    let send = alice.sent();
+    assert_eq!(send.header("Content-Type"), Some("message/cpim"));
+    commit_bundle(&send.body);
+    let members = |party: &Party| {
+        party
+            .device
+            .store()
+            .peek_conversation(conversation_id.as_bytes(), |conversation, _| {
+                conversation.members().len()
+            })
+            .unwrap()
+    };
+    assert_eq!(members(&alice.party), 2, "until the Focus accepts it");
+
+    // once the Focus accepts it, Alice is alone in the group, and talks on
+    // in its next epoch (section 6.2.4)
+    let previous = epoch_of(&alice.party, &conversation_id);
+    alice.focus_sends(&from_the_focus(ALICE_IMPU, &accepted(previous.clone())));
+    let merged = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        members(&alice.party) == 1
+    });
+    assert!(merged, "Bob committed out");
+    assert_eq!(
+        epoch_of(&alice.party, &conversation_id).epoch_id,
+        previous.epoch_id + 1
+    );
+    let send = alice.says("anyone?");
+    assert!(
+        !String::from_utf8_lossy(&send.body).contains("anyone?"),
+        "sent in the clear"
+    );
+    alice.sip.silence();
+    bob.sip.silence();
+}
+
+#[test]
+fn a_commit_one_device_makes_in_its_session_the_other_takes_in_its() {
+    let (mut alice, mut bob, conversation_id, clock) = group_through_the_focus();
+    let before = epoch_of(&alice.party, &conversation_id);
+
+    // Alice's keys due, a week on and 50 messages sent (RCC.16 section
+    // 9.5.2): the next message her session sends is followed by the Commit
+    // updating them
+    clock.advance(8 * DAY);
+    chatted(&alice.party, &conversation_id, 50);
+    let message = alice.says("new keys");
+    let commit = alice.sent();
+    assert_eq!(commit.header("Content-Type"), Some("message/cpim"));
+    let bundle = commit_bundle(&commit.body);
+
+    // the Focus relaying the message to Bob, which his session takes in the
+    // epoch it was sent in
+    bob.relayed(&message);
+    let (_, content_type, content) = bob.given();
+    assert_eq!(
+        (content_type.as_str(), content.as_str()),
+        ("text/plain", "new keys")
+    );
+    let delivery = bob.sent();
+    alice.relayed(&delivery);
+    let (_, content_type, _) = alice.given();
+    assert!(
+        content_type.starts_with("message/imdn+xml"),
+        "{}",
+        content_type
+    );
+
+    // then forwarding the Commit to Bob's session, and accepting it for
+    // Alice's: both in the next epoch (sections 6.2.4, 7.9.3)
+    bob.focus_sends(&from_the_focus(BOB_IMPU, &forwarded_of(&bundle)));
+    let previous = epoch_of(&alice.party, &conversation_id);
+    assert_eq!(previous, before, "until the Focus accepts it");
+    alice.focus_sends(&from_the_focus(ALICE_IMPU, &accepted(previous)));
+    let in_step = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        let alice_epoch = epoch_of(&alice.party, &conversation_id);
+        alice_epoch.epoch_id == before.epoch_id + 1
+            && epoch_of(&bob.party, &conversation_id) == alice_epoch
+    });
+    assert!(in_step, "both in the next epoch");
+
+    // in which both talk on
+    let send = bob.says("mine still fine");
+    alice.relayed(&send);
+    let (_, content_type, content) = alice.given();
+    assert_eq!(
+        (content_type.as_str(), content.as_str()),
+        ("text/plain", "mine still fine")
+    );
+    let delivery = alice.sent();
+    bob.relayed(&delivery);
+    let (_, content_type, _) = bob.given();
+    assert!(
+        content_type.starts_with("message/imdn+xml"),
+        "{}",
+        content_type
+    );
+    alice.sip.silence();
+    bob.sip.silence();
 }
