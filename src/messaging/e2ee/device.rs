@@ -157,23 +157,19 @@ pub struct E2eeDevice {
     /// if ACS gave one
     provisioned: Mutex<Option<(String, Option<Vec<u8>>)>>,
     make_signer: MakeSigner,
-    /// The groups whose KeyPackage Update is put off for now
-    replacements: Replacements,
     /// What the device keeps besides MLS, with the MLS state: the messages
     /// not decrypted, and those sent; the control messages it waits for the
     /// Conversation Focus to take; the groups to self-heal, being
-    /// self-healed and made anew; and those moved to unencrypted, and being
-    /// moved back
+    /// self-healed and made anew; those moved to unencrypted, and being
+    /// moved back; those whose KeyPackage Update is put off, and whose Group
+    /// Metadata keys are recovered; and the contacts found lately not to
+    /// take an encrypted 1-to-1 chat
     notes: Notes,
-    /// The groups whose Group Metadata keys are recovered
-    recoveries: Recoveries,
     /// The keys of the files uploaded for groups, for the messages sending
     /// them
     uploads: Uploads,
     /// The subjects and icons of groups that did not open yet
     descriptions: Descriptions,
-    /// The contacts found not to take an encrypted 1-to-1 chat lately
-    unencrypted_chats: Unencrypted,
 }
 
 impl E2eeDevice {
@@ -202,12 +198,9 @@ impl E2eeDevice {
             home_kds,
             provisioned: Mutex::new(None),
             make_signer: Box::new(|| SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).ok()),
-            replacements: Replacements::default(),
             notes,
-            recoveries: Recoveries::default(),
             uploads: Uploads::default(),
             descriptions: Descriptions::default(),
-            unencrypted_chats: Unencrypted::default(),
         };
         device.settle_restarts();
         Ok(device)
@@ -277,8 +270,11 @@ impl E2eeDevice {
         }
     }
 
-    pub(super) fn replacements(&self) -> &Replacements {
-        &self.replacements
+    pub(super) fn replacements(&self) -> Replacements<'_> {
+        Replacements {
+            notes: &self.notes,
+            store: &self.store,
+        }
     }
 
     pub(super) fn notes(&self) -> &Notes {
@@ -292,8 +288,11 @@ impl E2eeDevice {
         }
     }
 
-    pub(super) fn recoveries(&self) -> &Recoveries {
-        &self.recoveries
+    pub(super) fn recoveries(&self) -> Recoveries<'_> {
+        Recoveries {
+            notes: &self.notes,
+            store: &self.store,
+        }
     }
 
     pub(super) fn uploads(&self) -> &Uploads {
@@ -304,8 +303,11 @@ impl E2eeDevice {
         &self.descriptions
     }
 
-    pub(super) fn unencrypted_chats(&self) -> &Unencrypted {
-        &self.unencrypted_chats
+    pub(super) fn unencrypted_chats(&self) -> Unencrypted<'_> {
+        Unencrypted {
+            notes: &self.notes,
+            store: &self.store,
+        }
     }
 
     pub(super) fn home_kds(&self) -> u32 {

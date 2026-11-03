@@ -10133,6 +10133,102 @@ fn what_is_pending_in_a_group_whose_session_ended_is_discarded() {
 }
 
 #[test]
+fn a_key_package_update_put_off_is_so_after_the_device_restarted() {
+    let clock = Clock::new();
+    let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
+
+    // Bob's keys not updated in over 30 days, his KeyPackages not to be had
+    // for now: put off for an hour (RCC.16 section 9.5.4)
+    clock.advance(31 * DAY);
+    assert!(device.replacement_due(CONVERSATION));
+    let (query, _) = answering(&[(BOB_TEL, answered(480, ""))]);
+    let _ = block_on(device.replace_members(CONVERSATION, IMPU, GROUP_URI, &query));
+    assert!(!device.replacement_due(CONVERSATION));
+
+    // still so once restarted, then due an hour on
+    drop(device);
+    let device = alice_restarted(&app, &kds, &clock);
+    assert!(!device.replacement_due(CONVERSATION));
+    clock.advance(61 * MINUTE);
+    assert!(device.replacement_due(CONVERSATION));
+
+    // nothing for a group let go of
+    let (query, _) = answering(&[(BOB_TEL, answered(480, ""))]);
+    let _ = block_on(device.replace_members(CONVERSATION, IMPU, GROUP_URI, &query));
+    assert!(!device.notes().read(|data| data.replacements.is_empty()));
+    device.abandon(CONVERSATION).unwrap();
+    assert!(device.notes().read(|data| data.replacements.is_empty()));
+}
+
+#[test]
+fn a_contact_found_not_to_take_an_encrypted_chat_is_so_after_the_device_restarted() {
+    let clock = Clock::new();
+    let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
+    // Carol not advertising E2EE v1 (RCC.16 section 8.1)
+    let not_advertising = || {
+        answering(&[(
+            CAROL_TEL,
+            answered(
+                200,
+                "+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+            ),
+        )])
+    };
+    let prepare = |device: &Arc<E2eeDevice>, query| {
+        let groups = DeviceGroups::new(device, query);
+        block_on(groups.prepare_chat(String::from(CAROL_TEL), String::from(IMPU)))
+    };
+    let (query, asked) = not_advertising();
+    assert_eq!(prepare(&device, query), None);
+    assert_eq!(*asked.lock().unwrap(), [CAROL_TEL]);
+
+    // not asked again once restarted, until an hour on
+    drop(device);
+    let device = alice_restarted(&app, &kds, &clock);
+    let (query, asked) = not_advertising();
+    assert_eq!(prepare(&device, query), None);
+    assert!(asked.lock().unwrap().is_empty());
+    clock.advance(61 * MINUTE);
+    let (query, asked) = not_advertising();
+    assert_eq!(prepare(&device, query), None);
+    assert_eq!(*asked.lock().unwrap(), [CAROL_TEL]);
+}
+
+#[test]
+fn the_metadata_keys_recovered_are_so_after_the_device_restarted() {
+    let clock = Clock::new();
+    let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
+    let restarted = || alice_restarted(&app, &kds, &clock);
+
+    // the keys of the device lost, and to be checked, as once it rejoined
+    // the group: asked for once restarted (RCC.16 sections 10.5.1, 10.5.2)
+    forgotten_metadata(&device);
+    device.recoveries().check(CONVERSATION, false);
+    assert!(device.metadata_keys_due(CONVERSATION));
+    drop(device);
+
+    // the Focus refusing each request, asked for 5 times a day at most,
+    // counted through restarts
+    for _ in 0..5 {
+        let device = restarted();
+        assert!(device.metadata_keys_due(CONVERSATION));
+        assert!(metadata_keys(&device).is_some());
+        device.discard_pending(CONVERSATION, false).unwrap();
+    }
+    let device = restarted();
+    assert!(!device.metadata_keys_due(CONVERSATION));
+    // a day on, again
+    clock.advance(DAY);
+    assert!(device.metadata_keys_due(CONVERSATION));
+
+    // nothing for a group let go of
+    device.abandon(CONVERSATION).unwrap();
+    drop(device);
+    let device = restarted();
+    assert!(device.notes().read(|data| data.recoveries.is_empty()));
+}
+
+#[test]
 fn groups_to_heal_or_make_anew_are_so_after_the_device_restarted() {
     let clock = Clock::new();
     let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
