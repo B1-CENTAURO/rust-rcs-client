@@ -355,8 +355,7 @@ fn messages_to_a_contact_wait_for_the_new_encrypted_chat_they_start() {
     assert!(body.windows(CHAT_BUNDLE.len()).any(|w| w == CHAT_BUNDLE));
 
     // and the others after it in its session, all encrypted with that MLS
-    // group, the first first; the session does not keep the order of those
-    // after it yet
+    // group, in the order sent
     peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
     peer.next_request("ACK");
     let mut connection = msrp.accept(&rt);
@@ -368,22 +367,14 @@ fn messages_to_a_contact_wait_for_the_new_encrypted_chat_they_start() {
     for result in [&first, &second, &third] {
         assert_eq!(told(result), 200);
     }
-    let mut encrypted: Vec<_> = encryption
+    let encrypted: Vec<_> = encryption
         .encrypted()
         .iter()
         .map(|(group_id, cpim)| (group_id.clone(), message_id_of(cpim)))
         .collect();
     assert_eq!(
-        encrypted.remove(0),
-        (String::from("chat-1"), String::from("m1"))
-    );
-    encrypted.sort();
-    assert_eq!(
         encrypted,
-        [
-            (String::from("chat-1"), String::from("m2")),
-            (String::from("chat-1"), String::from("m3"))
-        ]
+        ["m1", "m2", "m3"].map(|id| (String::from("chat-1"), String::from(id)))
     );
     assert_eq!(encryption.chats_prepared().len(), 1);
     peer.silence();
