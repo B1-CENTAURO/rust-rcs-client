@@ -1317,6 +1317,7 @@ fn an_encrypted_chat_runs_between_two_session_services_through_the_focus() {
 
     // the Focus answers it, then fans it out to Bob, the Welcome in a
     // message/mls-rcs-server (section 8.2.1)
+    let previous = epoch_of(&alice, &group_id);
     let alice_msrp = MsrpPeer::listen(&alice_rt);
     let ok = answer(&invite, "200 OK", Some(&alice_msrp.sdp("sendrecv"))).replacen(
         "Contact:",
@@ -1359,10 +1360,19 @@ fn an_encrypted_chat_runs_between_two_session_services_through_the_focus() {
         Some(group_id.clone())
     );
 
-    // Alice's message waits for the Focus to accept her Commit, then goes
-    // encrypted, which Bob's session service gives his app decrypted
-    // (sections 6.2.4, 9.1.1)
-    let previous = epoch_of(&alice, &group_id);
+    // Alice's message goes encrypted at once, her Commit applied as the
+    // Focus answered her INVITE, having validated it (sections 8.2.1,
+    // 9.1.1), which Bob's session service gives his app decrypted
+    let send = to_alice.next_message(&alice_rt);
+    to_alice.respond(&alice_rt, &send, "200 OK");
+    assert_eq!(
+        sent.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    // the acceptance coming after in the session finding nothing to apply
+    // (section 6.2.4)
+    let applied = epoch_of(&alice, &group_id);
+    assert_ne!(applied, previous);
     to_alice.send_data(
         &alice_rt,
         &alice_msrp.path,
@@ -1376,12 +1386,7 @@ fn an_encrypted_chat_runs_between_two_session_services_through_the_focus() {
         "{}",
         response.first_line
     );
-    let send = to_alice.next_message(&alice_rt);
-    to_alice.respond(&alice_rt, &send, "200 OK");
-    assert_eq!(
-        sent.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
-        Ok(200)
-    );
+    assert_eq!(epoch_of(&alice, &group_id), applied);
     relayed(&mut to_bob, &bob_rt, &bob_msrp.path, &bob_path, &send);
     let (contact, content_type, content) = bob_client
         .received

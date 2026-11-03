@@ -562,6 +562,32 @@ impl E2eeDevice {
         taken.map_err(StoreError::Mls)
     }
 
+    /// Applies the first Commit of the MLS group `conversation_id`, or of its
+    /// next Era, which the INVITE starting a session of it carried, as the
+    /// Conversation Focus answered that INVITE with 200 OK: it validated the
+    /// Commit before (RCC.16 sections 8.2.1, 8.3.2). Its control message is
+    /// let go of, and an Era moving the group back to encrypted is accepted,
+    /// as on_server_message() does once the Focus accepts it in the session
+    /// (section 6.2.4), which finds nothing pending then. A session ending
+    /// before that no longer leaves the group in no epoch.
+    pub fn first_commit_accepted(&self, conversation_id: &str) -> Result<(), StoreError> {
+        let applied = self.store().with_conversation(
+            conversation_id.as_bytes(),
+            |conversation, client| {
+                if !conversation.has_pending_commit() {
+                    return Ok(false);
+                }
+                conversation.merge_pending_commit(client)?;
+                Ok(true)
+            },
+        )?;
+        if applied {
+            self.control_messages().remove(conversation_id);
+            self.upgrades().restart_ended(conversation_id, true);
+        }
+        Ok(())
+    }
+
     /// The reason the Conversation Focus of the group `conversation_id`
     /// gives in the IMDN `imdn` for refusing the control message carrying
     /// the pending Commit of the device, if it is that: the Commit is then
@@ -1127,6 +1153,19 @@ impl GroupEncryption for DeviceGroups {
         }
         // what waits for it is sent, or not, without it
         self.taken.notify_waiters();
+    }
+
+    fn invite_accepted(&self, conversation_id: &str) -> bool {
+        let resumed = self.device.upgrade().is_some_and(|device| {
+            let ended = device.encryption_ended(conversation_id);
+            if let Err(e) = device.first_commit_accepted(conversation_id) {
+                platform_log(LOG_TAG, format!("first Commit not applied: {:?}", e));
+            }
+            ended && !device.encryption_ended(conversation_id)
+        });
+        // what waits for it is sent with it
+        self.taken.notify_waiters();
+        resumed
     }
 
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {

@@ -386,6 +386,14 @@ pub trait GroupEncryption: Send + Sync {
     /// (RCC.16 section 6.2.4)
     fn session_ended(&self, conversation_id: &str);
 
+    /// Applies the first Commit of the MLS group `conversation_id`, or of its
+    /// next Era, which the INVITE starting a session of it carried, as the
+    /// Conversation Focus answered that INVITE with 200 OK: it validated the
+    /// Commit first, then accepts it in the session (RCC.16 sections 6.2.4,
+    /// 8.2.1, 8.3.2); whether the group moved back to encrypted with it
+    /// (section 11.1)
+    fn invite_accepted(&self, conversation_id: &str) -> bool;
+
     /// Joins the MLS group of the group chat `conversation_id` an invitation
     /// carries, as the `message/mls-rcs-server` `server_message` with the
     /// Welcome of the Conversation Focus (RCC.16 sections 6.2.6, 7.9.3, 8.1);
