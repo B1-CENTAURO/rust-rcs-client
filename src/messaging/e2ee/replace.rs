@@ -330,3 +330,43 @@ fn recipient(tel_uri: &str, answer: &Capabilities) -> Result<Recipient, Unavaila
         EndMlsReason::GroupMemberFailsCapabilitiesCheck,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use super::super::lost::tests::{store, App};
+    use super::super::notes::Notes;
+    use super::{Replacements, REPLACEMENT_RETRY};
+
+    #[test]
+    fn a_key_package_update_put_off_is_so_for_a_while_then_let_go_of() {
+        let store = store(&Arc::new(App::default()));
+        let notes = Notes::kept_by(&store);
+        let replacements = Replacements {
+            notes: &notes,
+            store: &store,
+        };
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let until = now + REPLACEMENT_RETRY;
+
+        // put off until then, in its group alone
+        replacements.put_off("group-1", now, until);
+        assert!(replacements.put_off_at("group-1", now));
+        assert!(replacements.put_off_at("group-1", until - Duration::from_secs(1)));
+        assert!(!replacements.put_off_at("group-1", until));
+        assert!(!replacements.put_off_at("group-2", now));
+
+        // let go of as another is put off once it no longer is
+        replacements.put_off("group-2", until, until + REPLACEMENT_RETRY);
+        assert_eq!(
+            notes.read(|data| data.replacements.keys().cloned().collect::<Vec<_>>()),
+            ["group-2"]
+        );
+
+        // and as its group is let go of
+        replacements.forget("group-2");
+        assert!(notes.read(|data| data.replacements.is_empty()));
+    }
+}

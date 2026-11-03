@@ -328,37 +328,30 @@ impl E2eeDevice {
             return Ok(None);
         }
         let message_id = super::group::new_message_id();
-        let mut checked = false;
-        let made =
-            self.store()
-                .with_conversation(conversation_id.as_bytes(), |conversation, client| {
-                    if conversation.has_pending_commit() {
-                        return Ok(Err(GroupError::Pending));
+        let client_message = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                if conversation.has_pending_commit() {
+                    return Ok(Err(GroupError::Pending));
+                }
+                // a check done with taken note of by keys_due() already
+                let (due, _) = self.keys_due_in(conversation_id, conversation, client);
+                let output = match due {
+                    Some(KeysDue::Request) => conversation.request_group_metadata_keys(client)?,
+                    Some(KeysDue::Send) => {
+                        conversation.send_group_metadata_keys(client, message_id.as_bytes())?
                     }
-                    let (due, done) = self.keys_due_in(conversation_id, conversation, client);
-                    checked = done;
-                    let output = match due {
-                        Some(KeysDue::Request) => {
-                            conversation.request_group_metadata_keys(client)?
-                        }
-                        Some(KeysDue::Send) => {
-                            conversation.send_group_metadata_keys(client, message_id.as_bytes())?
-                        }
-                        None => return Ok(Ok(None)),
-                    };
-                    match output.to_client_message() {
-                        Ok(client_message) => Ok(Ok(Some(client_message))),
-                        Err(e) => {
-                            conversation.discard_pending_commit(client)?;
-                            Err(e)
-                        }
+                    None => return Ok(Ok(None)),
+                };
+                match output.to_client_message() {
+                    Ok(client_message) => Ok(Ok(Some(client_message))),
+                    Err(e) => {
+                        conversation.discard_pending_commit(client)?;
+                        Err(e)
                     }
-                });
-        // noted once the store is no longer in use
-        if checked {
-            self.recoveries().checked(conversation_id);
-        }
-        let client_message = made.map_err(GroupError::Store)??;
+                }
+            })
+            .map_err(GroupError::Store)??;
 
         Ok(client_message.map(|client_message| {
             self.recoveries()
