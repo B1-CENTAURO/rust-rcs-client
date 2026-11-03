@@ -2848,6 +2848,8 @@ pub(crate) struct ScriptedEncryption {
     /// The Conversation-ID of each Commit let go of, and whether a refusal
     /// of it was to follow
     discarded: std::sync::Mutex<Vec<(String, bool)>>,
+    /// The Conversation-ID of the group of each session ended
+    sessions_ended: std::sync::Mutex<Vec<String>>,
     /// The CPIM message it prepares for each removal, if any
     removing: Option<Vec<u8>>,
     /// The Conversation-ID, from, to and participant of each removal
@@ -3181,6 +3183,13 @@ impl GroupEncryption for ScriptedEncryption {
             .lock()
             .unwrap()
             .push((String::from(conversation_id), refusal_follows));
+    }
+
+    fn session_ended(&self, conversation_id: &str) {
+        self.sessions_ended
+            .lock()
+            .unwrap()
+            .push(String::from(conversation_id));
     }
 
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
@@ -4308,6 +4317,10 @@ impl GroupEncryption for EncryptingPrepared {
 
     fn discard(&self, conversation_id: &str, refusal_follows: bool) {
         self.0.discard(conversation_id, refusal_follows)
+    }
+
+    fn session_ended(&self, conversation_id: &str) {
+        self.0.session_ended(conversation_id)
     }
 
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
@@ -6963,6 +6976,9 @@ fn an_encrypted_group_is_left_with_the_self_remove_in_the_bye() {
     assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(200));
     assert_eq!(*encryption.abandoned.lock().unwrap(), ["conversation-1"]);
     assert!(encryption.discarded.lock().unwrap().is_empty());
+    // nor is the leave let go of as the session ends, which the answer to
+    // the BYE settles
+    assert!(encryption.sessions_ended.lock().unwrap().is_empty());
     assert!(!client.sessions.has_session_with(GROUP));
 }
 
@@ -7150,6 +7166,53 @@ fn group_metadata_keys_are_asked_for_or_sent_in_the_session() {
         ]
     );
     peer.silence();
+}
+
+#[test]
+fn a_session_ending_lets_go_of_what_is_pending_in_its_mls_group() {
+    // by a BYE of the focus, by its MSRP connection dropping, or on request:
+    // the focus accepts a control message only in the session it came in
+    // (RCC.16 section 6.2.4)
+    for ending in ["bye", "dropped", "requested"] {
+        let (client, mut peer) = start(true);
+        let rt = Arc::clone(&client.rt);
+        let encryption = committing_in(&client);
+        let call_id = format!("group-{}", ending);
+        let msrp = encrypted_group_invitation(&client, &mut peer, &call_id);
+        let ok = peer.next_response();
+        assert_eq!(status_code(&ok), 200);
+        peer.send(&ack(&ok, &call_id));
+        peer.next_request("SUBSCRIBE");
+        let connection = msrp.accept(&rt);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(encryption.sessions_ended.lock().unwrap().is_empty());
+
+        match ending {
+            "bye" => {
+                peer.send(&in_dialog_request("BYE", 2, &ok, &call_id));
+                assert_eq!(status_code(&peer.next_response()), 200);
+            }
+            "dropped" => {
+                drop(connection);
+                peer.next_request("BYE");
+            }
+            _ => {
+                assert!(client.sessions.end_session(GROUP));
+                peer.next_request("BYE");
+            }
+        }
+        let told = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            !encryption.sessions_ended.lock().unwrap().is_empty()
+        });
+        assert!(told, "{}", ending);
+        assert_eq!(
+            *encryption.sessions_ended.lock().unwrap(),
+            ["conversation-1"],
+            "{}",
+            ending
+        );
+    }
 }
 
 #[test]
@@ -8431,13 +8494,13 @@ fn new_era_due(
 }
 
 /// The INVITE restarting the group, once its session ended, answered with
-/// `status`
+/// `status`, and the MSRP connection of the session it starts if it does
 fn restart_in_new_era(
     client: &Client,
     peer: &mut Peer,
     mut connection: MsrpConnection,
     status: &str,
-) -> SipMessage {
+) -> (SipMessage, Option<MsrpConnection>) {
     let rt = Arc::clone(&client.rt);
     let bye = peer.next_request("BYE");
     assert_eq!(header_value(&bye, "Call-ID"), "group-old-era");
@@ -8449,7 +8512,7 @@ fn restart_in_new_era(
     let restart = peer.next_request("INVITE");
     assert_eq!(request_uri(&restart), GROUP);
     assert_eq!(header_value(&restart, "Conversation-ID"), "conversation-1");
-    match status {
+    let restarted = match status {
         "200 OK" => {
             let msrp = MsrpPeer::listen(&rt);
             peer.send(&answer_from(
@@ -8459,21 +8522,22 @@ fn restart_in_new_era(
                 Some(&msrp.sdp("sendrecv")),
             ));
             next_requests(peer, &["ACK", "SUBSCRIBE"]);
-            let _connection = msrp.accept(&rt);
+            Some(msrp.accept(&rt))
         }
         _ => {
             peer.send(&answer(&restart, status, None));
             peer.next_request("ACK");
+            None
         }
-    }
-    restart
+    };
+    (restart, restarted)
 }
 
 #[test]
 fn a_group_whose_healing_failed_is_restarted_in_a_new_era() {
     let (client, mut peer) = start(true);
     let (encryption, connection) = new_era_due(&client, &mut peer, true);
-    let restart = restart_in_new_era(&client, &mut peer, connection, "200 OK");
+    let (restart, restarted) = restart_in_new_era(&client, &mut peer, connection, "200 OK");
 
     // the INVITE carries the SDP and the new Era of its MLS group (RCC.16
     // sections 8.1, 8.3.1)
@@ -8494,6 +8558,22 @@ fn a_group_whose_healing_failed_is_restarted_in_a_new_era() {
         )]
     );
     assert!(encryption.discarded.lock().unwrap().is_empty());
+    // nor is the Era let go of as the session ends to restart the group
+    // with it, but as the session it starts ends before the focus accepts
+    // it (section 6.2.4)
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(encryption.sessions_ended.lock().unwrap().is_empty());
+    drop(restarted);
+    peer.next_request("BYE");
+    let told = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        !encryption.sessions_ended.lock().unwrap().is_empty()
+    });
+    assert!(told);
+    assert_eq!(
+        *encryption.sessions_ended.lock().unwrap(),
+        ["conversation-1"]
+    );
 }
 
 #[test]
