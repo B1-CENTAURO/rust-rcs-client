@@ -1115,6 +1115,19 @@ impl GroupEncryption for DeviceGroups {
         self.taken.notify_waiters();
     }
 
+    fn session_ended(&self, conversation_id: &str) {
+        if let Some(device) = self.device.upgrade() {
+            if let Err(e) = device.discard_unaccepted(conversation_id) {
+                platform_log(
+                    LOG_TAG,
+                    format!("Commit or leave of a session ended not discarded: {:?}", e),
+                );
+            }
+        }
+        // what waits for it is sent, or not, without it
+        self.taken.notify_waiters();
+    }
+
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
         let Some(device) = self.device.upgrade() else {
             return false;

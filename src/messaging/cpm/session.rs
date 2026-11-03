@@ -1153,9 +1153,27 @@ impl SessionEnd {
     /// starts another, its MSRP connection closes, and its dialog goes,
     /// ended with a BYE if `send_bye`, as when its MSRP connection is lost;
     /// false if it ended already
+    ///
+    /// What this client has pending for the Conversation Focus in the MLS
+    /// group of the session is let go of, as the Focus accepts it only in
+    /// the session (RCC.16 section 6.2.4). Not so when the session ends to
+    /// restart the group with the Era it carries, nor when the group is
+    /// left, which the answer to the BYE settles.
     pub(crate) fn end(&self, send_bye: bool) -> bool {
         if !self.close() {
             return false;
+        }
+
+        let encrypted = {
+            let inner = self.sip_session.get_inner();
+            let session_info = inner.get_session_info();
+            session_info
+                .encryption
+                .clone()
+                .zip(session_info.mls_group().cloned())
+        };
+        if let Some((encryption, conversation_id)) = encrypted {
+            encryption.session_ended(&conversation_id);
         }
 
         if send_bye {

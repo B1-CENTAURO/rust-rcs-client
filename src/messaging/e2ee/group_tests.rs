@@ -10093,6 +10093,46 @@ fn a_commit_the_focus_accepted_as_the_device_stopped_leaves_the_group_to_heal() 
 }
 
 #[test]
+fn what_is_pending_in_a_group_whose_session_ended_is_discarded() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let clock = Clock::new();
+    let (device, _, _, bob, mut bobs_group) = alice_and_bob_kept(&clock);
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // a key update the Focus took, its session ending before the Focus
+    // accepted it (RCC.16 section 6.2.4), a message waiting for it
+    clock.advance(31 * DAY);
+    let cpim = device
+        .update_keys(CONVERSATION, IMPU, GROUP_URI)
+        .unwrap()
+        .expect("a key update");
+    let waiting = rt.spawn(groups.encrypt(CONVERSATION, &plaintext("message-1", None)));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !waiting.is_finished(),
+        "waits for the Commit to be accepted"
+    );
+
+    // discarded, the message encrypted in the epoch Bob is in, and the
+    // control message still known, which the Focus refuses
+    groups.session_ended(CONVERSATION);
+    let encrypted = ciphertext(rt.block_on(waiting).unwrap()).expect("sent once discarded");
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &encrypted))
+            .ends_with("hello Bob")
+    );
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert_eq!(
+        device.on_imdn(
+            CONVERSATION,
+            &refusal(&control_id(&cpim), "transient-error")
+        ),
+        Ok(Some(ServerFailureReason::TransientError))
+    );
+}
+
+#[test]
 fn groups_to_heal_or_make_anew_are_so_after_the_device_restarted() {
     let clock = Clock::new();
     let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
@@ -10215,6 +10255,24 @@ fn a_group_whose_focus_has_no_mls_group_is_so_after_the_device_restarted() {
     assert!(!groups.upgrade_due(CONVERSATION));
     clock.advance(2 * HOUR);
     assert!(groups.upgrade_due(CONVERSATION));
+
+    // let go of too if its control message is no longer noted, as when a
+    // Commit applied of another voided it
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    upgrade_by_restart(&groups, &rt, &[IMPU, BOB_SIP]).expect("an Era");
+    device.control_messages().remove(CONVERSATION);
+    drop(groups);
+    drop(device);
+    let device = restarted();
+    let groups = groups_of(&device);
+    assert!(!device.upgrades().restarting(CONVERSATION));
+    assert_eq!(
+        epoch(&device, CONVERSATION).map(|(_, pending)| pending),
+        Ok(false)
+    );
 
     // nothing for a group let go of
     device.abandon(CONVERSATION).unwrap();

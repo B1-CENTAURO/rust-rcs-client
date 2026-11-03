@@ -380,6 +380,12 @@ pub trait GroupEncryption: Send + Sync {
     /// `refusal_follows` (RCC.16 sections 6.2.5, 7.2.6)
     fn discard(&self, conversation_id: &str, refusal_follows: bool);
 
+    /// Lets go of what this client has pending for the Conversation Focus in
+    /// the MLS group `conversation_id`, as the session of the group ended:
+    /// the Focus accepts a control message only in the session it came in
+    /// (RCC.16 section 6.2.4)
+    fn session_ended(&self, conversation_id: &str);
+
     /// Joins the MLS group of the group chat `conversation_id` an invitation
     /// carries, as the `message/mls-rcs-server` `server_message` with the
     /// Welcome of the Conversation Focus (RCC.16 sections 6.2.6, 7.9.3, 8.1);

@@ -214,34 +214,15 @@ impl E2eeDevice {
     }
 
     /// Lets go of what the device had pending for the Conversation Focus
-    /// before it restarted, which the Focus is to accept no more:
-    /// - the Eras moving groups back to encrypted, which the Focus is to
-    ///   accept by the INVITE restarting each group: that INVITE went with
-    ///   the device. The groups stay unencrypted until moved back again
-    ///   (RCC.16 section 11.1);
-    /// - its other Commits, and the self_remove Proposals of its leaves. The
-    ///   Focus accepts a control message by an AcceptedMlsRcsMessage in the
-    ///   session it came in, which went with the device, and never sends a
-    ///   Commit back to its sender (section 6.2.4). Kept, a Commit would stay
-    ///   pending for good, and the device would encrypt and sign nothing in
-    ///   its group. Had the Focus accepted it, the group is out of step, and
-    ///   self-healed once that shows (section 10.1). The control message is
-    ///   still known, for a refusal of it coming after to be taken (sections
-    ///   6.2.5, 7.7.2.1).
+    /// before it restarted, as discard_unaccepted() does: the sessions that
+    /// were to carry its acceptance went with the device
     fn settle_restarts(&self) {
-        for conversation_id in self.upgrades().all_restarting() {
-            if let Err(e) = self.discard_pending(&conversation_id, false) {
-                platform_log(
-                    LOG_TAG,
-                    format!(
-                        "Era made before the device restarted not discarded: {:?}",
-                        e
-                    ),
-                );
-            }
-        }
-        for conversation_id in self.control_messages().groups() {
-            if let Err(e) = self.discard_pending(&conversation_id, true) {
+        let mut groups = self.upgrades().all_restarting();
+        groups.extend(self.control_messages().groups());
+        groups.sort();
+        groups.dedup();
+        for conversation_id in groups {
+            if let Err(e) = self.discard_unaccepted(&conversation_id) {
                 platform_log(
                     LOG_TAG,
                     format!(
@@ -250,6 +231,31 @@ impl E2eeDevice {
                     ),
                 );
             }
+        }
+    }
+
+    /// Lets go of what the device has pending for the Conversation Focus in
+    /// the group `conversation_id`, which the Focus is to accept no more, as
+    /// the session that was to carry its acceptance ended: its Commit, or the
+    /// self_remove Proposal of its leave. The Focus accepts a control message
+    /// by an AcceptedMlsRcsMessage in the session it came in, and never sends
+    /// a Commit back to its sender (RCC.16 section 6.2.4). Kept, a Commit
+    /// would stay pending for good, and the device would encrypt and sign
+    /// nothing in the group. Had the Focus accepted it, the group is out of
+    /// step, and self-healed once that shows (section 10.1).
+    ///
+    /// The control message is still known, for a refusal of it coming after
+    /// to be taken (sections 6.2.5, 7.7.2.1), but that of an Era moving the
+    /// group back to encrypted, which the Focus refuses by its answer to the
+    /// INVITE restarting the group: the group stays unencrypted until moved
+    /// back again (section 11.1).
+    pub fn discard_unaccepted(&self, conversation_id: &str) -> Result<(), StoreError> {
+        if self.upgrades().restarting(conversation_id) {
+            self.discard_pending(conversation_id, false)
+        } else if self.control_messages().contains(conversation_id) {
+            self.discard_pending(conversation_id, true)
+        } else {
+            Ok(())
         }
     }
 
