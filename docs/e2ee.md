@@ -198,5 +198,5 @@ Nothing is written unless it returns 0.
 - **Two short-lived things are kept in memory only, and lost on restart:**
   - the keys of a file uploaded for an encrypted group whose message wasn't sent yet. The message then fails, and the file has to be sent again;
   - a subject or icon that couldn't be decrypted yet. It isn't tried again when its key comes, only once the Focus tells of it again.
-- **A new group whose first Commit was still pending when its session ended or the client stopped** isn't made on the device, even if the Focus made it. Nothing is encrypted in it until a message from another member has it heal.
+- **A new group or chat whose INVITE wasn't answered before the client stopped** isn't made on the device, even if the Focus made it. Nothing is encrypted in it until a message from another member has it heal. Once the Focus answers the INVITE with 200 OK, the group's first Commit is applied, as the Focus validated it first (section 8.2.1); the same goes for a new Era carried by an INVITE.
 - **RCS Video encryption** (section 9.8).

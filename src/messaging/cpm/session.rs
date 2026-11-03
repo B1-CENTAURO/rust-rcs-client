@@ -3872,6 +3872,19 @@ impl CPMSessionService {
                     )
                 });
                 let chat_contact = String::from(recipient);
+                // the MLS group whose first Commit, or that of its next Era,
+                // the INVITE carries, applied once the focus answers it with
+                // 200 OK, having validated it (RCC.16 sections 8.2.1, 8.3.2)
+                let first_commit = match (&invitee.chat, &invitee.new_group, invitee.new_era) {
+                    (Some(chat), _, _) => chat.new_group.map(|_| String::from(chat.group_id)),
+                    (None, Some(new_group), _) => new_group
+                        .encrypted
+                        .map(|(conversation_id, _)| String::from(conversation_id)),
+                    (None, None, Some(_)) => {
+                        group_chats.ids_of(recipient).map(|ids| ids.conversation_id)
+                    }
+                    (None, None, None) => None,
+                };
 
                 let registered_public_identity = Arc::clone(&self.registered_public_identity);
                 let links = self.links();
@@ -3903,6 +3916,21 @@ impl CPMSessionService {
                     if let Some(res) = client_transaction_rx.recv().await {
                         match res {
                             Ok((resp_message, mut session_info, r_sdp_body)) => {
+                                // the first Commit it carried applied, the
+                                // app told of the group moved back to
+                                // encrypted with it (RCC.16 section 11.1)
+                                if let Some((encryption, group_id)) =
+                                    group_encryption.as_ref().zip(first_commit.as_ref())
+                                {
+                                    if encryption.invite_accepted(group_id) {
+                                        (links.group_listener)(CPMGroupEvent::EncryptionResumed(
+                                            String::from_utf8_lossy(
+                                                &session_info.cpm_contact.service_uri,
+                                            )
+                                            .into_owned(),
+                                        ));
+                                    }
+                                }
                                 // those sent, unless the answer tells others
                                 session_info.conversation_id.get_or_insert(conversation_id);
                                 session_info.contribution_id.get_or_insert(contribution_id);

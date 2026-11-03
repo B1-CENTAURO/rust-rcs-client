@@ -1490,6 +1490,9 @@ fn a_new_encrypted_chat_starts_with_the_mls_group_its_invite_carries() {
         first.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
         Ok(200)
     );
+    // the first Commit of its MLS group applied, as the focus validated it
+    // before answering (section 8.2.1)
+    assert_eq!(*encryption.invites_accepted.lock().unwrap(), ["chat-1"]);
     let encrypted = encryption.encrypted.lock().unwrap().clone();
     assert_eq!(encrypted.len(), 1);
     assert_eq!(encrypted[0].0, "chat-1");
@@ -1531,6 +1534,7 @@ fn a_new_encrypted_chat_refused_lets_its_mls_group_go() {
     );
     assert_eq!(*encryption.abandoned.lock().unwrap(), ["chat-1"]);
     assert!(encryption.chats.lock().unwrap().is_empty());
+    assert!(encryption.invites_accepted.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -1579,6 +1583,8 @@ fn a_kept_encrypted_chat_starts_again_with_its_mls_group_and_token() {
     assert_eq!(header_value(&invite, "MLS-Opaque-Token"), "");
     assert!(!String::from_utf8_lossy(&body_data(&invite)).contains("message/mls"));
     drop(other);
+    // no first Commit carried, none applied
+    assert!(encryption.invites_accepted.lock().unwrap().is_empty());
     peer.silence();
 }
 
@@ -2850,6 +2856,11 @@ pub(crate) struct ScriptedEncryption {
     discarded: std::sync::Mutex<Vec<(String, bool)>>,
     /// The Conversation-ID of the group of each session ended
     sessions_ended: std::sync::Mutex<Vec<String>>,
+    /// The MLS group of each INVITE carrying its first Commit answered with
+    /// 200 OK
+    invites_accepted: std::sync::Mutex<Vec<String>>,
+    /// Whether a group moves back to encrypted as one is
+    resuming: std::sync::atomic::AtomicBool,
     /// The CPIM message it prepares for each removal, if any
     removing: Option<Vec<u8>>,
     /// The Conversation-ID, from, to and participant of each removal
@@ -3190,6 +3201,14 @@ impl GroupEncryption for ScriptedEncryption {
             .lock()
             .unwrap()
             .push(String::from(conversation_id));
+    }
+
+    fn invite_accepted(&self, conversation_id: &str) -> bool {
+        self.invites_accepted
+            .lock()
+            .unwrap()
+            .push(String::from(conversation_id));
+        self.resuming.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
@@ -3775,6 +3794,12 @@ fn an_encrypted_group_chat_is_invited_with_its_mls_group() {
     );
     assert_eq!((&from[..], &to[..]), (IMPU, FACTORY));
     assert_eq!(participants, &[ALICE, BOB]);
+    // its first Commit applied once the focus answered the INVITE with 200
+    // OK, having validated it (RCC.16 section 8.2.1)
+    assert_eq!(
+        *encryption.invites_accepted.lock().unwrap(),
+        std::slice::from_ref(conversation_id)
+    );
 
     // which the INVITE carries, along with the participants
     let parts = parts_of(&invite);
@@ -3849,6 +3874,7 @@ fn a_group_chat_that_cannot_be_encrypted_is_invited_as_one_that_is_not() {
     assert_eq!(parts.len(), 2);
     let sdp = String::from_utf8_lossy(&parts[0].1).into_owned();
     assert!(!sdp.contains("message/mls"), "{}", sdp);
+    assert!(encryption.invites_accepted.lock().unwrap().is_empty());
 }
 
 /// The client starting a group chat with Alice, and a receiver of how it
@@ -4321,6 +4347,10 @@ impl GroupEncryption for EncryptingPrepared {
 
     fn session_ended(&self, conversation_id: &str) {
         self.0.session_ended(conversation_id)
+    }
+
+    fn invite_accepted(&self, conversation_id: &str) -> bool {
+        self.0.invite_accepted(conversation_id)
     }
 
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
@@ -5591,6 +5621,9 @@ fn an_encrypted_group_restarted_is_encrypted_again() {
         Ok(200)
     );
     assert!(cpim_text(&encryption.encrypted.lock().unwrap()[0].1) == "again");
+    // its INVITE carrying no first Commit, none applied as the focus
+    // answers it
+    assert!(encryption.invites_accepted.lock().unwrap().is_empty());
 
     // and by its focus
     assert!(client.sessions.end_session(GROUP));
@@ -8558,6 +8591,12 @@ fn a_group_whose_healing_failed_is_restarted_in_a_new_era() {
         )]
     );
     assert!(encryption.discarded.lock().unwrap().is_empty());
+    // applied once the focus answered the INVITE with 200 OK, having
+    // validated it (section 8.3.2)
+    assert_eq!(
+        *encryption.invites_accepted.lock().unwrap(),
+        ["conversation-1"]
+    );
     // nor is the Era let go of as the session ends to restart the group
     // with it, but as the session it starts ends before the focus accepts
     // it (section 6.2.4)
@@ -8594,6 +8633,7 @@ fn a_new_era_the_focus_refuses_is_told_how_it_was() {
             [(String::from("conversation-1"), status_code)]
         );
         assert!(encryption.discarded.lock().unwrap().is_empty());
+        assert!(encryption.invites_accepted.lock().unwrap().is_empty());
     }
 }
 
@@ -9649,6 +9689,50 @@ fn a_group_the_focus_has_no_mls_group_for_is_moved_back_on_schedule_with_an_era(
         (String::from("message/cpim"), NEXT_ERA_CPIM.to_vec())
     );
     assert_eq!(*encryption.upgraded.lock().unwrap(), upgraded_on_schedule());
+}
+
+#[test]
+fn a_group_moved_back_with_an_era_is_encrypted_once_the_focus_answers_its_invite() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = upgrading_on_schedule(&client, true);
+    encryption
+        .resuming
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    client
+        .sessions
+        .upgrade_on_schedule(&client.core, &client.rt);
+
+    // the Era applied as the focus answers with 200 OK, having validated it
+    // (RCC.16 sections 8.2.1, 8.3.2), and the app told the group is
+    // encrypted again (section 11.1)
+    let restart = peer.next_request("INVITE");
+    assert!(encryption.invites_accepted.lock().unwrap().is_empty());
+    let msrp = MsrpPeer::listen(&rt);
+    peer.send(&answer_from(
+        &restart,
+        "200 OK",
+        &focus_contact(),
+        Some(&msrp.sdp("sendrecv")),
+    ));
+    next_requests(&mut peer, &["ACK", "SUBSCRIBE"]);
+    let _connection = msrp.accept(&rt);
+    assert_eq!(
+        *encryption.invites_accepted.lock().unwrap(),
+        ["conversation-1"]
+    );
+    let events: Vec<String> = std::iter::from_fn(|| {
+        client
+            .group_events
+            .recv_timeout(Duration::from_millis(500))
+            .ok()
+    })
+    .collect();
+    assert!(
+        events.contains(&format!("encrypted {}", GROUP)),
+        "{:?}",
+        events
+    );
 }
 
 #[test]
