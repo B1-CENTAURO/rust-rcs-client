@@ -9731,7 +9731,8 @@ fn the_user_alias_is_encrypted_for_an_encrypted_chat_or_left_out() {
     let encryption = Arc::new(ScriptedEncryption {
         encrypting: vec![String::from("chat-1"), String::from("chat-3")],
         ciphertext: Some(String::from("ciphertext")),
-        sealing_aliases: vec![String::from("chat-1")],
+        // the new chat's too, which is not asked
+        sealing_aliases: vec![String::from("chat-1"), String::from("chat-2")],
         ..ScriptedEncryption::default()
     });
     {
@@ -9811,6 +9812,21 @@ fn the_user_alias_of_a_message_of_an_encrypted_group_is_encrypted_or_left_out() 
             false => format!("<{}>", IMPU),
         };
         assert_eq!(cpim_from(&encrypted[0].1), expected, "sealing {}", sealing);
+
+        // and in the From of the INVITE restarting the group (section 9.1.5)
+        assert!(client.sessions.end_session(GROUP));
+        let bye = peer.next_request("BYE");
+        connection.closed(&rt);
+        peer.send(&answer(&bye, "200 OK", None));
+        let _again = client.send(GROUP, RecipientType::Group, "again");
+        let restart = peer.next_request("INVITE");
+        let from = header_value(&restart, "From");
+        assert!(
+            from.starts_with(&format!("{};tag=", expected)),
+            "sealing {}: {}",
+            sealing,
+            from
+        );
     }
 }
 
