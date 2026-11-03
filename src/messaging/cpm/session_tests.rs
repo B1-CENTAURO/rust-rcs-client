@@ -10004,3 +10004,36 @@ fn the_alias_of_the_sender_of_a_group_message_is_told_decrypted_if_encrypted() {
     assert!(connection.next_response(&rt).first_line.contains(" 200"));
     assert_eq!(next_alias(&client), alias_told(ALICE, "Alice", false));
 }
+
+#[test]
+fn the_user_alias_of_a_message_of_a_group_moved_to_unencrypted_is_in_the_clear() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    // the group moved to unencrypted, its messages sent as they are, though
+    // its MLS group could encrypt the alias (RCC.16 section 11.2)
+    let encryption = Arc::new(ScriptedEncryption {
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        ciphertext: Some(String::from("ciphertext")),
+        unencrypted: true,
+        sealing_aliases: vec![String::from("conversation-1")],
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-moved");
+    client.sessions.set_user_alias(Some(String::from("Alice")));
+
+    // as the formal name of its CPIM From, as in any unencrypted group
+    // (RCC.07 section 2.5.3.3)
+    let sent = client.send(GROUP, RecipientType::Group, "in the clear");
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_text(&send.body), "in the clear");
+    assert_eq!(cpim_from(&send.body), format!("\"Alice\" <{}>", IMPU));
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        sent.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+}
