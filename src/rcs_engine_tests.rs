@@ -568,7 +568,22 @@ fn a_message_to_a_contact_goes_in_the_chat_there_is_with_it() {
     connection.respond(&rt, &send, "200 OK");
     assert_eq!(told(&first), 200);
 
-    // the next in it, no new chat or Era made for it
+    // the next in it, no new chat made for it, though one could be
+    let encryption = encrypting(
+        &client,
+        ChatScript {
+            chatting: Some((String::from("chat-2"), CHAT_BUNDLE.to_vec())),
+            ..ChatScript::default()
+        },
+    );
+    let second = engine.send(&encryption, "text/plain", "second", "m2");
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_text(&send.body), "second");
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(told(&second), 200);
+    assert!(encryption.chats_prepared().is_empty());
+
+    // nor a new Era of the chat kept, though it would be due
     let encryption = encrypting(
         &client,
         ChatScript {
@@ -578,11 +593,11 @@ fn a_message_to_a_contact_goes_in_the_chat_there_is_with_it() {
             ..ChatScript::default()
         },
     );
-    let second = engine.send(&encryption, "text/plain", "second", "m2");
+    let third = engine.send(&encryption, "text/plain", "third", "m3");
     let send = connection.next_message(&rt);
-    assert_eq!(cpim_text(&send.body), "second");
+    assert_eq!(cpim_text(&send.body), "third");
     connection.respond(&rt, &send, "200 OK");
-    assert_eq!(told(&second), 200);
+    assert_eq!(told(&third), 200);
     assert!(encryption.chats_prepared().is_empty());
     assert!(encryption.chat_eras_prepared().is_empty());
     peer.silence();
