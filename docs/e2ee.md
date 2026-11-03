@@ -68,6 +68,10 @@ All the E2EE state of the device goes through the `rcs_e2ee_save_state_function`
 
 Pass the state you kept back to `rcs_client_set_e2ee` (`saved_state`) when the client is made again. Losing it loses the device's enrolment and the keys of its groups.
 
+**A change to an encrypted conversation's MLS group still waiting for the Focus when the client stopped is dropped** once the client is made again. That covers a participant added or removed, a subject or icon changed, a key update and a leave. The Focus accepts a change only in the session that carried it (section 6.2.4), and that session ended with the client, so the change would otherwise stay pending and block the group: nothing could be encrypted or signed in it. Ask for the change again if you still want it.
+- **If the Focus never got it, or refused it,** the group goes on as before. A refusal that arrives later is still recognised, and not passed to the app.
+- **If the Focus did accept it,** the device is out of step with the group. The group heals itself once that shows, for example when a message from another member can't be decrypted (section 10.1).
+
 ### 4. Group chat identifiers
 
 Keep what `group_chat_ids_callback` tells you for each group, and give it back with `rcs_client_set_group_chat_ids` once the client is made again. That includes the MLS-Opaque-Token the Conversation Focus gives (section 6.1.3). Without it, the client cannot:
@@ -195,5 +199,5 @@ Nothing is written unless it returns 0.
   - the hour a KeyPackage Update is put off for;
   - the contacts found lately not to take encrypted chats;
   - the Group Metadata keys being recovered.
-- **A Commit whose control message never reached the Focus** before the client stopped stays pending.
+- **A new group whose first Commit was still pending when the client stopped** isn't made on the device, even if the Focus made it. Nothing is encrypted in it until a message from another member has it heal.
 - **RCS Video encryption** (section 9.8).

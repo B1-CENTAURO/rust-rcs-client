@@ -9926,15 +9926,15 @@ fn a_refusal_of_a_commit_sent_before_the_device_restarted_is_taken() {
     .unwrap();
     drop(device);
 
-    // its Commit still waiting for the Focus, which refuses it (RCC.16
-    // sections 6.2.5, 7.7.2.1)
+    // its Commit discarded, as the Focus is to accept it no more, and its
+    // control message still known, which the Focus refuses (RCC.16
+    // sections 6.2.4, 6.2.5, 7.7.2.1)
     let device = alice_restarted(&app, &kds, &clock);
-    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
     assert_eq!(
         device.on_imdn(CONVERSATION, &refusal("another", "transient-error")),
         Ok(None)
     );
-    assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
     assert_eq!(
         device.on_imdn(CONVERSATION, &refusal(&message_id, "transient-error")),
         Ok(Some(ServerFailureReason::TransientError))
@@ -9947,6 +9947,149 @@ fn a_refusal_of_a_commit_sent_before_the_device_restarted_is_taken() {
         device.on_imdn(CONVERSATION, &refusal(&message_id, "transient-error")),
         Ok(None)
     );
+}
+
+#[test]
+fn a_commit_left_pending_as_the_device_stopped_is_discarded() {
+    let clock = Clock::new();
+    let (device, kds, app, bob, mut bobs_group) = alice_and_bob_kept(&clock);
+    let xml = notification_xml("bob-1", "delivery-notification", "<delivered/>");
+    let notification = notification_cpim(IMPU, "imdn-1", "", &xml);
+
+    // a key update the device stopped before the Focus accepted (RCC.16
+    // sections 6.2.4, 9.5.2), nothing encrypted or signed meanwhile
+    clock.advance(31 * DAY);
+    device
+        .update_keys(CONVERSATION, IMPU, GROUP_URI)
+        .unwrap()
+        .expect("a key update");
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, &plaintext("message-1", None)),
+        Err(MessageError::Pending)
+    );
+    assert_eq!(
+        device.sign_notification(CONVERSATION, &notification),
+        Err(MessageError::Pending)
+    );
+    drop(device);
+
+    // once restarted, discarded: messages are encrypted in the epoch Bob is
+    // in, and notifications signed
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    let encrypted = device
+        .encrypt_message(CONVERSATION, &plaintext("message-2", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &encrypted))
+            .ends_with("hello Bob")
+    );
+    assert!(device
+        .sign_notification(CONVERSATION, &notification)
+        .is_ok());
+
+    // and the keys, still due, updated again, the Focus accepting it then
+    assert!(device.key_update_due(CONVERSATION));
+    let cpim = device
+        .update_keys(CONVERSATION, IMPU, GROUP_URI)
+        .unwrap()
+        .expect("a key update");
+    accepted_from_device(&device);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+    assert!(!device.key_update_due(CONVERSATION));
+    bobs_group
+        .process_server_message(&bob, &forwarded_commit(&cpim))
+        .unwrap();
+    assert_eq!(bobs_group.epoch(), 2);
+}
+
+#[test]
+fn a_leave_left_pending_as_the_device_stopped_is_withdrawn() {
+    let clock = Clock::new();
+    let (device, kds, app, _, _) = alice_and_bob_kept(&clock);
+
+    // the user leaving, the device stopping before the Focus answered the
+    // BYE carrying its self_remove (RCC.16 section 9.4), which no Commit of
+    // the device can be made with
+    let cpim = device.leave_group(CONVERSATION, IMPU, GROUP_URI).unwrap();
+    assert!(device
+        .remove_from_group(CONVERSATION, IMPU, GROUP_URI, BOB_TEL)
+        .is_err());
+    drop(device);
+
+    // withdrawn once restarted, the device committing as before, and its
+    // control message still known, which the Focus refuses
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert_eq!(
+        device.on_imdn(
+            CONVERSATION,
+            &refusal(&control_id(&cpim), "transient-error")
+        ),
+        Ok(Some(ServerFailureReason::TransientError))
+    );
+    assert!(device
+        .remove_from_group(CONVERSATION, IMPU, GROUP_URI, BOB_TEL)
+        .is_ok());
+}
+
+#[test]
+fn a_group_whose_first_commit_was_left_pending_is_not_made() {
+    let clock = Clock::new();
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) = enrolled_in_time(
+        Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]),
+        Some(&clock),
+    );
+    let cpim = block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)]))
+        .unwrap();
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    drop(device);
+
+    // the Commit making it discarded once the device restarted, the group
+    // its own alone, as when the Focus refuses it (RCC.16 sections 6.2.4,
+    // 8.1)
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
+    assert_eq!(
+        device.encrypt_message(CONVERSATION, &plaintext("message-1", None)),
+        Err(MessageError::NotCreated)
+    );
+
+    // the Focus having made it, a message of Bob, who joined it, has the
+    // group self-healed (section 10.1)
+    assert!(!device.needs_healing(CONVERSATION));
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, BOB_TEL, "bob-2");
+    assert!(decrypted(&device, &outer, &mls_message).is_err());
+    assert!(device.needs_healing(CONVERSATION));
+}
+
+#[test]
+fn a_commit_the_focus_accepted_as_the_device_stopped_leaves_the_group_to_heal() {
+    let clock = Clock::new();
+    let (device, kds, app, bob, mut bobs_group) = alice_and_bob_kept(&clock);
+
+    // the Focus forwarding the key update to Bob, its acceptance not
+    // reaching the device before it stopped (RCC.16 section 6.2.4)
+    clock.advance(31 * DAY);
+    let cpim = device
+        .update_keys(CONVERSATION, IMPU, GROUP_URI)
+        .unwrap()
+        .expect("a key update");
+    bobs_group
+        .process_server_message(&bob, &forwarded_commit(&cpim))
+        .unwrap();
+    drop(device);
+
+    // discarded once restarted, the group out of step: a message of Bob in
+    // the epoch of the Commit is not decrypted, and the group is to be
+    // self-healed (section 10.1)
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    assert!(!device.needs_healing(CONVERSATION));
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, BOB_TEL, "bob-2");
+    assert!(decrypted(&device, &outer, &mls_message).is_err());
+    assert!(device.needs_healing(CONVERSATION));
 }
 
 #[test]
@@ -10066,6 +10209,8 @@ fn a_group_whose_focus_has_no_mls_group_is_so_after_the_device_restarted() {
         Ok(false)
     );
     assert!(!device.upgrades().restarting(CONVERSATION));
+    // its control message let go of too, no refusal of it to come
+    assert!(!device.control_messages().contains(CONVERSATION));
     assert!(groups.encryption_ended(CONVERSATION));
     assert!(!groups.upgrade_due(CONVERSATION));
     clock.advance(2 * HOUR);

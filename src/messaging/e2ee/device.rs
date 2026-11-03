@@ -90,6 +90,12 @@ impl ControlMessages<'_> {
         });
     }
 
+    /// The groups one of which waits for the Focus
+    pub(super) fn groups(&self) -> Vec<String> {
+        self.notes
+            .read(|data| data.control_messages.keys().cloned().collect())
+    }
+
     /// Whether one of the group `conversation_id` waits for the Focus
     pub(super) fn contains(&self, conversation_id: &str) -> bool {
         self.notes
@@ -207,10 +213,21 @@ impl E2eeDevice {
         Ok(device)
     }
 
-    /// Lets go of the Eras moving groups back to encrypted made before the
-    /// device restarted, which the Conversation Focus is to accept by the
-    /// INVITE restarting each group: that INVITE went with the device. The
-    /// groups stay unencrypted until moved back again (RCC.16 section 11.1).
+    /// Lets go of what the device had pending for the Conversation Focus
+    /// before it restarted, which the Focus is to accept no more:
+    /// - the Eras moving groups back to encrypted, which the Focus is to
+    ///   accept by the INVITE restarting each group: that INVITE went with
+    ///   the device. The groups stay unencrypted until moved back again
+    ///   (RCC.16 section 11.1);
+    /// - its other Commits, and the self_remove Proposals of its leaves. The
+    ///   Focus accepts a control message by an AcceptedMlsRcsMessage in the
+    ///   session it came in, which went with the device, and never sends a
+    ///   Commit back to its sender (section 6.2.4). Kept, a Commit would stay
+    ///   pending for good, and the device would encrypt and sign nothing in
+    ///   its group. Had the Focus accepted it, the group is out of step, and
+    ///   self-healed once that shows (section 10.1). The control message is
+    ///   still known, for a refusal of it coming after to be taken (sections
+    ///   6.2.5, 7.7.2.1).
     fn settle_restarts(&self) {
         for conversation_id in self.upgrades().all_restarting() {
             if let Err(e) = self.discard_pending(&conversation_id, false) {
@@ -218,6 +235,17 @@ impl E2eeDevice {
                     LOG_TAG,
                     format!(
                         "Era made before the device restarted not discarded: {:?}",
+                        e
+                    ),
+                );
+            }
+        }
+        for conversation_id in self.control_messages().groups() {
+            if let Err(e) = self.discard_pending(&conversation_id, true) {
+                platform_log(
+                    LOG_TAG,
+                    format!(
+                        "Commit made before the device restarted not discarded: {:?}",
                         e
                     ),
                 );
