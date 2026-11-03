@@ -27,8 +27,6 @@
 //! its next session in a new Era of its MLS group, as its Conversation Focus
 //! lets go of the group by then (sections 6.1.2, 8.3).
 
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use rust_rcs_core::ffi::log::platform_log;
@@ -41,8 +39,8 @@ use crate::capability::CapabilityQuery;
 
 use super::device::{is_of, participant_tel_uri, same_participant, E2eeDevice};
 use super::group::recipients;
-use super::notes::{put, put_time, Reader as NotesReader};
-use super::store::StoreError;
+use super::notes::{put, put_time, Notes, Reader as NotesReader};
+use super::store::{MlsStore, StoreError};
 
 const LOG_TAG: &str = "e2ee";
 
@@ -74,25 +72,37 @@ pub(super) struct Chat {
 }
 
 /// The contacts found not to take an encrypted chat, by tel URI, and when,
-/// for as long as the device runs
-#[derive(Default)]
-pub(super) struct Unencrypted(Mutex<HashMap<String, SystemTime>>);
+/// as the notes of the device keep them for it to restart with
+pub(super) struct Unencrypted<'a> {
+    pub(super) notes: &'a Notes,
+    pub(super) store: &'a MlsStore,
+}
 
-impl Unencrypted {
+/// Whether what was found at `when` was found within UNENCRYPTED_FOR of
+/// `now`, as it is if found later than `now`
+fn within(when: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(when)
+        .map_or(true, |since| since < UNENCRYPTED_FOR)
+}
+
+impl Unencrypted<'_> {
     /// Whether `contact` was found not to take an encrypted chat within
     /// UNENCRYPTED_FOR of `now`
     pub(super) fn lately(&self, contact: &str, now: SystemTime) -> bool {
-        let mut found = self.0.lock().unwrap();
-        found.retain(|_, when| {
-            now.duration_since(*when)
-                .map_or(true, |since| since < UNENCRYPTED_FOR)
-        });
-        found.contains_key(contact)
+        self.notes.read(|data| {
+            data.unencrypted_chats
+                .get(contact)
+                .is_some_and(|when| within(*when, now))
+        })
     }
 
-    /// Takes note of `contact` found not to take an encrypted chat at `now`
+    /// Takes note of `contact` found not to take an encrypted chat at `now`,
+    /// letting go of those found earlier than UNENCRYPTED_FOR
     pub(super) fn found(&self, contact: &str, now: SystemTime) {
-        self.0.lock().unwrap().insert(String::from(contact), now);
+        self.notes.hold(self.store, |data| {
+            data.unencrypted_chats.retain(|_, when| within(*when, now));
+            data.unencrypted_chats.insert(String::from(contact), now);
+        });
     }
 }
 
@@ -438,8 +448,11 @@ pub(super) fn decode_activity(reader: &mut NotesReader) -> Option<Vec<(String, S
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
+    use super::super::lost::tests::{store, App};
+    use super::super::notes::Notes;
     use super::{contact_tel_uri, Unencrypted, UNENCRYPTED_FOR};
 
     #[test]
@@ -457,7 +470,13 @@ mod tests {
 
     #[test]
     fn a_contact_found_not_to_take_an_encrypted_chat_is_not_asked_again_for_a_while() {
-        let unencrypted = Unencrypted::default();
+        let app = Arc::new(App::default());
+        let store = store(&app);
+        let notes = Notes::kept_by(&store);
+        let unencrypted = Unencrypted {
+            notes: &notes,
+            store: &store,
+        };
         let now = SystemTime::now();
         assert!(!unencrypted.lately("tel:+491707654321", now));
         unencrypted.found("tel:+491707654321", now);
@@ -468,8 +487,14 @@ mod tests {
             now + UNENCRYPTED_FOR - Duration::from_secs(1)
         ));
 
-        // no longer once that long ago
-        assert!(!unencrypted.lately("tel:+491707654321", now + UNENCRYPTED_FOR));
-        assert!(!unencrypted.lately("tel:+491707654321", now));
+        // no longer once that long ago, and let go of as another is found
+        let later = now + UNENCRYPTED_FOR;
+        assert!(!unencrypted.lately("tel:+491707654321", later));
+        unencrypted.found("tel:+491701111111", later);
+        assert!(unencrypted.lately("tel:+491701111111", later));
+        assert_eq!(
+            notes.read(|data| data.unencrypted_chats.keys().cloned().collect::<Vec<_>>()),
+            ["tel:+491701111111"]
+        );
     }
 }

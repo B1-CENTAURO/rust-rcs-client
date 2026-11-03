@@ -776,6 +776,7 @@ impl E2eeDevice {
         self.heals().forget(conversation_id);
         self.upgrades().forget(conversation_id);
         self.recoveries().forget(conversation_id);
+        self.replacements().forget(conversation_id);
         self.forget_metadata(conversation_id);
         self.forget_chat(conversation_id);
         self.store().delete_conversation(conversation_id.as_bytes())

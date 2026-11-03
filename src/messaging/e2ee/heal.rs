@@ -35,7 +35,7 @@ use crate::messaging::cpm::encryption::GroupInfoPull;
 use super::device::E2eeDevice;
 use super::era::NO_MLS_GROUP;
 use super::group::GroupError;
-use super::notes::{put, put_time, Notes, Reader};
+use super::notes::{put, put_times, Notes, Reader};
 use super::store::{MlsStore, StoreError};
 
 const LOG_TAG: &str = "e2ee";
@@ -331,8 +331,8 @@ pub(super) fn decode(reader: &mut Reader) -> Option<BTreeMap<String, Heal>> {
             3 => put_back(&mut heal, NextEra::Singleton(reason(reader.u32()?)?)),
             _ => return None,
         }
-        heal.attempts = read_times(reader)?;
-        heal.eras = read_times(reader)?;
+        heal.attempts = reader.times()?;
+        heal.eras = reader.times()?;
         heals.insert(conversation_id, heal);
     }
     Some(heals)
@@ -358,19 +358,6 @@ fn read_reason(reader: &mut Reader) -> Option<Option<EndMlsReason>> {
 
 fn reason(value: u32) -> Option<EndMlsReason> {
     EndMlsReason::try_from(value as i32).ok()
-}
-
-/// `times`, their count first on four bytes
-fn put_times(data: &mut Vec<u8>, times: &[SystemTime]) {
-    data.extend_from_slice(&(times.len() as u32).to_be_bytes());
-    for time in times {
-        put_time(data, *time);
-    }
-}
-
-fn read_times(reader: &mut Reader) -> Option<Vec<SystemTime>> {
-    let count = reader.u32()?;
-    (0..count).map(|_| reader.time()).collect()
 }
 
 impl E2eeDevice {

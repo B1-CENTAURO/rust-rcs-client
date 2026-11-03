@@ -22,15 +22,16 @@
 //! of it waits for the Conversation Focus; a new Era it makes asks for them
 //! in its GroupContext instead (rust-rcs-core `create_next_era()`).
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 use rust_rcs_core::ffi::log::platform_log;
 use rust_rcs_core::mls::{self, IncomingMessage, MlsClient, MlsConversation};
 
 use super::device::E2eeDevice;
 use super::group::GroupError;
+use super::notes::{put, put_times, Notes, Reader};
+use super::store::MlsStore;
 
 const LOG_TAG: &str = "e2ee";
 
@@ -49,35 +50,64 @@ pub(super) enum KeysDue {
     Send,
 }
 
-/// Where recovering the keys of a group stands
-#[derive(Default)]
-struct Recovery {
+/// Where recovering the keys of a group stands, as the notes of the device
+/// keep it
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Recovery {
     /// The keys of the device are to be checked, and asked for if out of
     /// sync, once nothing of the device waits for the Conversation Focus
     /// (RCC.16 section 10.5.1)
-    check: bool,
+    pub(super) check: bool,
     /// The continuity token kept is not the one the group commits to, or
     /// that the keys received last had: the device has no keys to send then
     /// (sections 10.1.1, 10.5.4)
-    token_mismatch: bool,
-    /// When Commits asking for or sending the keys were made, within
-    /// COMMITS_PERIOD
-    commits: Vec<Instant>,
+    pub(super) token_mismatch: bool,
+    /// When Commits asking for or sending the keys were made, by the
+    /// device's clock, within COMMITS_PERIOD
+    pub(super) commits: Vec<SystemTime>,
 }
 
-/// The groups whose keys the device recovers, by Conversation-ID, for as
-/// long as it runs
-#[derive(Default)]
-pub(super) struct Recoveries(Mutex<HashMap<String, Recovery>>);
+/// Whether `commit`, made at that time, was made within COMMITS_PERIOD of
+/// `now`, as it is if made later than `now`
+fn lately(commit: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(commit)
+        .map_or(true, |since| since < COMMITS_PERIOD)
+}
 
-impl Recoveries {
+/// The groups whose keys the device recovers, by Conversation-ID, as the
+/// notes of the device keep them for it to restart with
+///
+/// What changes them is not to be called while the store is in use, as
+/// they are kept through it.
+pub(super) struct Recoveries<'a> {
+    pub(super) notes: &'a Notes,
+    pub(super) store: &'a MlsStore,
+}
+
+impl Recoveries<'_> {
+    /// Changes the Recovery of the group `conversation_id` as `change` does,
+    /// one made for it if it has none, kept as the notes are; one left as a
+    /// new one is let go of
+    fn change(&self, conversation_id: &str, change: impl FnOnce(&mut Recovery)) {
+        self.notes.hold(self.store, |data| {
+            let recovery = data
+                .recoveries
+                .entry(String::from(conversation_id))
+                .or_default();
+            change(recovery);
+            if *recovery == Recovery::default() {
+                data.recoveries.remove(conversation_id);
+            }
+        });
+    }
+
     /// Takes note of the keys of the group `conversation_id` to be checked,
     /// its continuity token found mismatched if `token_mismatch`
     pub(super) fn check(&self, conversation_id: &str, token_mismatch: bool) {
-        let mut recoveries = self.0.lock().unwrap();
-        let recovery = recoveries.entry(String::from(conversation_id)).or_default();
-        recovery.check = true;
-        recovery.token_mismatch |= token_mismatch;
+        self.change(conversation_id, |recovery| {
+            recovery.check = true;
+            recovery.token_mismatch |= token_mismatch;
+        });
     }
 
     /// Takes note of the keys received in the group `conversation_id` with a
@@ -85,54 +115,101 @@ impl Recoveries {
     /// once asked (sections 10.5.3, 10.5.4): the check is done with, and a
     /// token still mismatched not asked for again
     fn token_received(&self, conversation_id: &str, matches: bool) {
-        let mut recoveries = self.0.lock().unwrap();
-        let recovery = recoveries.entry(String::from(conversation_id)).or_default();
-        recovery.check = false;
-        recovery.token_mismatch = !matches;
+        self.change(conversation_id, |recovery| {
+            recovery.check = false;
+            recovery.token_mismatch = !matches;
+        });
     }
 
     /// Lets go of the group `conversation_id`
     pub(super) fn forget(&self, conversation_id: &str) {
-        self.0.lock().unwrap().remove(conversation_id);
+        if self
+            .notes
+            .read(|data| data.recoveries.contains_key(conversation_id))
+        {
+            self.notes
+                .hold(self.store, |data| data.recoveries.remove(conversation_id));
+        }
     }
 
-    /// What is due of the keys of the group `conversation_id`, the group
-    /// asking for them if `requested`, and the device keeping all those the
-    /// group has if `complete`; the check of the keys done with it
-    fn due(&self, conversation_id: &str, requested: bool, complete: bool) -> Option<KeysDue> {
-        let mut recoveries = self.0.lock().unwrap();
-        let recovery = recoveries.entry(String::from(conversation_id)).or_default();
+    /// What is due of the keys of the group `conversation_id` at `now`, the
+    /// group asking for them if `requested`, and the device keeping all
+    /// those the group has if `complete`; and whether the check of the keys
+    /// is done with, which checked() is to take note of. Nothing is changed,
+    /// as it is called while the store is in use.
+    fn due(
+        &self,
+        conversation_id: &str,
+        requested: bool,
+        complete: bool,
+        now: SystemTime,
+    ) -> (Option<KeysDue>, bool) {
+        let recovery = self
+            .notes
+            .read(|data| data.recoveries.get(conversation_id).cloned())
+            .unwrap_or_default();
         let complete = complete && !recovery.token_mismatch;
-        let due = match requested {
+        let (due, checked) = match requested {
             // whoever asked, the answer is for all
-            true => {
-                recovery.check = false;
-                complete.then_some(KeysDue::Send)
-            }
-            false if recovery.check && complete => {
-                recovery.check = false;
-                None
-            }
-            false => recovery.check.then_some(KeysDue::Request),
-        }?;
-        let now = Instant::now();
-        recovery
+            true => (complete.then_some(KeysDue::Send), recovery.check),
+            false if recovery.check && complete => (None, true),
+            false => (recovery.check.then_some(KeysDue::Request), false),
+        };
+        let made = recovery
             .commits
-            .retain(|commit| now.duration_since(*commit) < COMMITS_PERIOD);
-        if recovery.commits.len() >= COMMITS_MOST {
+            .iter()
+            .filter(|commit| lately(**commit, now))
+            .count();
+        if due.is_some() && made >= COMMITS_MOST {
             platform_log(LOG_TAG, "metadata keys not exchanged, tried too often");
-            return None;
+            return (None, checked);
         }
-        Some(due)
+        (due, checked)
+    }
+
+    /// Takes note of the check of the keys of the group `conversation_id`
+    /// done with, as due() told
+    fn checked(&self, conversation_id: &str) {
+        self.change(conversation_id, |recovery| recovery.check = false);
     }
 
     /// Takes note of a Commit asking for or sending the keys of the group
-    /// `conversation_id` made
-    fn committed(&self, conversation_id: &str) {
-        let mut recoveries = self.0.lock().unwrap();
-        let recovery = recoveries.entry(String::from(conversation_id)).or_default();
-        recovery.commits.push(Instant::now());
+    /// `conversation_id` made at `now`, letting go of those made earlier than
+    /// COMMITS_PERIOD
+    fn committed(&self, conversation_id: &str, now: SystemTime) {
+        self.change(conversation_id, |recovery| {
+            recovery.commits.retain(|commit| lately(*commit, now));
+            recovery.commits.push(now);
+        });
     }
+}
+
+/// The Recoveries `recoveries`, as the notes of the device hold them
+pub(super) fn encode(recoveries: &BTreeMap<String, Recovery>) -> Vec<u8> {
+    let mut data = Vec::new();
+    for (conversation_id, recovery) in recoveries {
+        put(&mut data, conversation_id.as_bytes());
+        data.push(u8::from(recovery.check));
+        data.push(u8::from(recovery.token_mismatch));
+        put_times(&mut data, &recovery.commits);
+    }
+    data
+}
+
+/// The Recoveries `reader` reads to its end, as encode() puts them; None if
+/// they cannot be read
+pub(super) fn decode(reader: &mut Reader) -> Option<BTreeMap<String, Recovery>> {
+    let mut recoveries = BTreeMap::new();
+    while !reader.is_empty() {
+        let conversation_id = reader.string()?;
+        let recovery = Recovery {
+            check: reader.flag()?,
+            token_mismatch: reader.flag()?,
+            commits: reader.times()?,
+        };
+        recoveries.insert(conversation_id, recovery);
+    }
+    Some(recoveries)
 }
 
 impl E2eeDevice {
@@ -184,33 +261,49 @@ impl E2eeDevice {
         {
             return None;
         }
-        self.store()
+        let (due, checked) = self
+            .store()
             .peek_conversation(conversation_id.as_bytes(), |conversation, client| {
                 self.keys_due_in(conversation_id, conversation, client)
             })
-            .ok()
-            .flatten()
+            .ok()?;
+        if checked {
+            self.recoveries().checked(conversation_id);
+        }
+        due
     }
 
+    /// What is due of the keys of the group `conversation_id`, in the state
+    /// `conversation`, as Recoveries::due() tells, and whether the check of
+    /// its keys is done with; called while the store is in use, it changes
+    /// nothing
     fn keys_due_in(
         &self,
         conversation_id: &str,
         conversation: &MlsConversation,
         client: &MlsClient,
-    ) -> Option<KeysDue> {
+    ) -> (Option<KeysDue>, bool) {
         if conversation.has_pending_commit() || !conversation.is_active() {
-            return None;
+            return (None, false);
         }
-        let complete = conversation.group_metadata_in_sync(client).ok()?
-            && !conversation
-                .group_metadata(client)
-                .ok()?
-                .continuity_token
-                .is_empty();
+        let complete = || {
+            Some(
+                conversation.group_metadata_in_sync(client).ok()?
+                    && !conversation
+                        .group_metadata(client)
+                        .ok()?
+                        .continuity_token
+                        .is_empty(),
+            )
+        };
+        let Some(complete) = complete() else {
+            return (None, false);
+        };
         self.recoveries().due(
             conversation_id,
             conversation.group_metadata_keys_requested(),
             complete,
+            self.store().now(),
         )
     }
 
@@ -241,7 +334,9 @@ impl E2eeDevice {
                 if conversation.has_pending_commit() {
                     return Ok(Err(GroupError::Pending));
                 }
-                let output = match self.keys_due_in(conversation_id, conversation, client) {
+                // a check done with taken note of by keys_due() already
+                let (due, _) = self.keys_due_in(conversation_id, conversation, client);
+                let output = match due {
                     Some(KeysDue::Request) => conversation.request_group_metadata_keys(client)?,
                     Some(KeysDue::Send) => {
                         conversation.send_group_metadata_keys(client, message_id.as_bytes())?
@@ -259,7 +354,8 @@ impl E2eeDevice {
             .map_err(GroupError::Store)??;
 
         Ok(client_message.map(|client_message| {
-            self.recoveries().committed(conversation_id);
+            self.recoveries()
+                .committed(conversation_id, self.store().now());
             self.sent_as(conversation_id, from, to, message_id, &client_message)
         }))
     }
@@ -290,73 +386,180 @@ pub(super) fn continuity_token(client: &MlsClient, group_id: &[u8]) -> mls::Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{KeysDue, Recoveries, COMMITS_MOST};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use super::super::lost::tests::{store, App};
+    use super::super::notes::Notes;
+    use super::super::store::MlsStore;
+    use super::{KeysDue, Recoveries, COMMITS_MOST, COMMITS_PERIOD};
 
     const GROUP: &str = "group-1";
 
+    const THEN: Duration = Duration::from_secs(1_000_000_000);
+
+    fn then() -> SystemTime {
+        SystemTime::UNIX_EPOCH + THEN
+    }
+
+    /// The notes of a device, and its store
+    fn kept() -> (Notes, MlsStore) {
+        let store = store(&Arc::new(App::default()));
+        (Notes::kept_by(&store), store)
+    }
+
+    /// What is due of the keys of `group` at `now`, as the device tells it,
+    /// the check done with taken note of once the store is no longer in use
+    fn due_at(
+        recoveries: &Recoveries,
+        group: &str,
+        requested: bool,
+        complete: bool,
+        now: SystemTime,
+    ) -> Option<KeysDue> {
+        let (due, checked) = recoveries.due(group, requested, complete, now);
+        if checked {
+            recoveries.checked(group);
+        }
+        due
+    }
+
+    fn due(
+        recoveries: &Recoveries,
+        group: &str,
+        requested: bool,
+        complete: bool,
+    ) -> Option<KeysDue> {
+        due_at(recoveries, group, requested, complete, then())
+    }
+
     #[test]
     fn keys_are_asked_for_once_checked_and_missed() {
-        let recoveries = Recoveries::default();
+        let (notes, store) = kept();
+        let recoveries = Recoveries {
+            notes: &notes,
+            store: &store,
+        };
         // not checked, nothing is asked for
-        assert_eq!(recoveries.due(GROUP, false, false), None);
+        assert_eq!(due(&recoveries, GROUP, false, false), None);
 
         // checked and complete, nothing is, nor later
         recoveries.check(GROUP, false);
-        assert_eq!(recoveries.due(GROUP, false, true), None);
-        assert_eq!(recoveries.due(GROUP, false, false), None);
+        assert_eq!(due(&recoveries, GROUP, false, true), None);
+        assert_eq!(due(&recoveries, GROUP, false, false), None);
 
         // checked and missing, until the group asks for them
         recoveries.check(GROUP, false);
-        assert_eq!(recoveries.due(GROUP, false, false), Some(KeysDue::Request));
-        assert_eq!(recoveries.due(GROUP, false, false), Some(KeysDue::Request));
-        assert_eq!(recoveries.due(GROUP, true, false), None);
-        assert_eq!(recoveries.due(GROUP, false, false), None);
+        assert_eq!(
+            due(&recoveries, GROUP, false, false),
+            Some(KeysDue::Request)
+        );
+        assert_eq!(
+            due(&recoveries, GROUP, false, false),
+            Some(KeysDue::Request)
+        );
+        assert_eq!(due(&recoveries, GROUP, true, false), None);
+        assert_eq!(due(&recoveries, GROUP, false, false), None);
         // of another group, nothing
         recoveries.check("group-2", false);
-        assert_eq!(recoveries.due(GROUP, false, false), None);
+        assert_eq!(due(&recoveries, GROUP, false, false), None);
+        // nor anything left of a group whose check is done with
+        assert_eq!(
+            notes.read(|data| data.recoveries.keys().cloned().collect::<Vec<_>>()),
+            ["group-2"]
+        );
+    }
+
+    #[test]
+    fn what_is_due_is_told_without_a_change() {
+        let (notes, store) = kept();
+        let recoveries = Recoveries {
+            notes: &notes,
+            store: &store,
+        };
+        // the check done with told, not taken note of, as the store may be
+        // in use
+        recoveries.check(GROUP, false);
+        let before = notes.read(|data| data.clone());
+        assert_eq!(recoveries.due(GROUP, false, true, then()), (None, true));
+        assert_eq!(
+            recoveries.due(GROUP, true, true, then()),
+            (Some(KeysDue::Send), true)
+        );
+        assert_eq!(
+            recoveries.due(GROUP, false, false, then()),
+            (Some(KeysDue::Request), false)
+        );
+        assert_eq!(notes.read(|data| data.clone()), before);
     }
 
     #[test]
     fn keys_asked_for_are_sent_by_who_has_them_all_with_its_token_matching() {
-        let recoveries = Recoveries::default();
-        assert_eq!(recoveries.due(GROUP, true, true), Some(KeysDue::Send));
-        assert_eq!(recoveries.due(GROUP, true, false), None);
+        let (notes, store) = kept();
+        let recoveries = Recoveries {
+            notes: &notes,
+            store: &store,
+        };
+        assert_eq!(due(&recoveries, GROUP, true, true), Some(KeysDue::Send));
+        assert_eq!(due(&recoveries, GROUP, true, false), None);
 
         // the token found mismatched, the device asks rather than send
         recoveries.check(GROUP, true);
-        assert_eq!(recoveries.due(GROUP, true, true), None);
-        assert_eq!(recoveries.due(GROUP, false, true), None);
+        assert_eq!(due(&recoveries, GROUP, true, true), None);
+        assert_eq!(due(&recoveries, GROUP, false, true), None);
         recoveries.check(GROUP, false);
-        assert_eq!(recoveries.due(GROUP, false, true), Some(KeysDue::Request));
+        assert_eq!(due(&recoveries, GROUP, false, true), Some(KeysDue::Request));
         // until keys come with a token, which ends the check, and matches
         recoveries.token_received(GROUP, true);
-        assert_eq!(recoveries.due(GROUP, false, true), None);
-        assert_eq!(recoveries.due(GROUP, true, true), Some(KeysDue::Send));
+        assert_eq!(due(&recoveries, GROUP, false, true), None);
+        assert_eq!(due(&recoveries, GROUP, true, true), Some(KeysDue::Send));
         recoveries.check(GROUP, false);
         recoveries.token_received(GROUP, false);
-        assert_eq!(recoveries.due(GROUP, false, false), None);
+        assert_eq!(due(&recoveries, GROUP, false, false), None);
         recoveries.token_received(GROUP, false);
-        assert_eq!(recoveries.due(GROUP, true, true), None);
+        assert_eq!(due(&recoveries, GROUP, true, true), None);
         recoveries.token_received(GROUP, true);
 
         // the group let go of, its check is
         recoveries.check(GROUP, true);
         recoveries.forget(GROUP);
-        assert_eq!(recoveries.due(GROUP, false, false), None);
-        assert_eq!(recoveries.due(GROUP, true, true), Some(KeysDue::Send));
+        assert_eq!(due(&recoveries, GROUP, false, false), None);
+        assert_eq!(due(&recoveries, GROUP, true, true), Some(KeysDue::Send));
+        assert!(notes.read(|data| data.recoveries.is_empty()));
     }
 
     #[test]
     fn so_many_commits_are_made_a_day_at_most() {
-        let recoveries = Recoveries::default();
+        let (notes, store) = kept();
+        let recoveries = Recoveries {
+            notes: &notes,
+            store: &store,
+        };
         recoveries.check(GROUP, false);
         for _ in 0..COMMITS_MOST {
-            assert_eq!(recoveries.due(GROUP, false, false), Some(KeysDue::Request));
-            recoveries.committed(GROUP);
+            assert_eq!(
+                due(&recoveries, GROUP, false, false),
+                Some(KeysDue::Request)
+            );
+            recoveries.committed(GROUP, then());
         }
-        assert_eq!(recoveries.due(GROUP, false, false), None);
-        assert_eq!(recoveries.due(GROUP, true, true), None);
+        assert_eq!(due(&recoveries, GROUP, false, false), None);
+        assert_eq!(due(&recoveries, GROUP, true, true), None);
         // still to be checked, in another group too
-        assert_eq!(recoveries.due("group-2", true, true), Some(KeysDue::Send));
+        assert_eq!(due(&recoveries, "group-2", true, true), Some(KeysDue::Send));
+
+        // a day on, again, those of the day before let go of as one is made;
+        // the check, done with as the group asked, made again
+        recoveries.check(GROUP, false);
+        let later = then() + COMMITS_PERIOD;
+        assert_eq!(
+            due_at(&recoveries, GROUP, false, false, later),
+            Some(KeysDue::Request)
+        );
+        recoveries.committed(GROUP, later);
+        assert_eq!(
+            notes.read(|data| data.recoveries[GROUP].commits.clone()),
+            [later]
+        );
     }
 }

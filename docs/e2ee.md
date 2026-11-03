@@ -195,9 +195,8 @@ Nothing is written unless it returns 0.
 ## Not covered yet
 
 - **Encrypted aliases of new conversations:** one sent with the INVITE starting a chat or group, as another client might, is in the epoch before its first Commit, which those it invites cannot decrypt. It is not told.
-- **Some state that is found again on its own is lost on restart:**
-  - the hour a KeyPackage Update is put off for;
-  - the contacts found lately not to take encrypted chats;
-  - the Group Metadata keys being recovered.
+- **Two short-lived things are kept in memory only, and lost on restart:**
+  - the keys of a file uploaded for an encrypted group whose message wasn't sent yet. The message then fails, and the file has to be sent again;
+  - a subject or icon that couldn't be decrypted yet. It isn't tried again when its key comes, only once the Focus tells of it again.
 - **A new group whose first Commit was still pending when its session ended or the client stopped** isn't made on the device, even if the Focus made it. Nothing is encrypted in it until a message from another member has it heal.
 - **RCS Video encryption** (section 9.8).

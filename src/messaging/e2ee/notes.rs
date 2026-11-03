@@ -21,8 +21,11 @@
 //!
 //! So too, as far as they can be kept, the control message of each group
 //! the device waits for the Conversation Focus to take, where self-healing
-//! and making new Eras of groups stand, and where moving groups back to
-//! encrypted stands (RCC.16 sections 6.2.5, 10.1, 11.1, 11.2).
+//! and making new Eras of groups stand, where moving groups back to
+//! encrypted stands, the KeyPackage Updates put off, where recovering the
+//! Group Metadata keys of groups stands, and the contacts found lately not
+//! to take an encrypted 1-to-1 chat (RCC.16 sections 6.2.5, 8.1, 9.5.4,
+//! 10.1, 10.5, 11.1, 11.2).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -37,6 +40,7 @@ use super::device;
 use super::file::{self, Received};
 use super::heal::{self, Heal};
 use super::lost::{self, Lost};
+use super::metadata::{self, Recovery};
 use super::sent::{self, Membership, Sent};
 use super::store::{MlsStore, StoreError};
 use super::upgrade::{self, GroupUse, UpgradeState};
@@ -61,6 +65,9 @@ const SECTION_CONTROL_MESSAGES: u8 = 8;
 const SECTION_HEALS: u8 = 9;
 const SECTION_UPGRADES: u8 = 10;
 const SECTION_GROUPS: u8 = 11;
+const SECTION_REPLACEMENTS: u8 = 12;
+const SECTION_RECOVERIES: u8 = 13;
+const SECTION_UNENCRYPTED_CHATS: u8 = 14;
 
 /// What the device keeps besides MLS
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -86,6 +93,13 @@ pub(super) struct NotesData {
     pub(super) upgrades: BTreeMap<String, UpgradeState>,
     /// By group, when it was last used and who takes part in it
     pub(super) groups: BTreeMap<String, GroupUse>,
+    /// By group, until when its KeyPackage Update is put off
+    pub(super) replacements: BTreeMap<String, SystemTime>,
+    /// By group, where recovering its Group Metadata keys stands
+    pub(super) recoveries: BTreeMap<String, Recovery>,
+    /// By the tel URI of a contact, when it was found not to take an
+    /// encrypted 1-to-1 chat
+    pub(super) unencrypted_chats: BTreeMap<String, SystemTime>,
 }
 
 /// What the device keeps besides MLS, as the store keeps it
@@ -178,6 +192,35 @@ pub(super) fn put_time(data: &mut Vec<u8>, time: SystemTime) {
     data.extend_from_slice(&secs.to_be_bytes());
 }
 
+/// `times`, their count first on four bytes, as Reader::times() reads them
+pub(super) fn put_times(data: &mut Vec<u8>, times: &[SystemTime]) {
+    data.extend_from_slice(&(times.len() as u32).to_be_bytes());
+    for time in times {
+        put_time(data, *time);
+    }
+}
+
+/// `times`, each after its key, as decode_times_by() reads them
+fn encode_times_by(times: &BTreeMap<String, SystemTime>) -> Vec<u8> {
+    let mut data = Vec::new();
+    for (key, time) in times {
+        put(&mut data, key.as_bytes());
+        put_time(&mut data, *time);
+    }
+    data
+}
+
+/// The times `reader` reads to its end, as encode_times_by() puts them; None
+/// if they cannot be read
+fn decode_times_by(reader: &mut Reader) -> Option<BTreeMap<String, SystemTime>> {
+    let mut times = BTreeMap::new();
+    while !reader.is_empty() {
+        let key = reader.string()?;
+        times.insert(key, reader.time()?);
+    }
+    Some(times)
+}
+
 /// What is left to read of notes
 pub(super) struct Reader<'a>(pub(super) &'a [u8]);
 
@@ -224,6 +267,12 @@ impl<'a> Reader<'a> {
         let secs = u64::from_be_bytes(self.bytes(8)?.try_into().ok()?);
         SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
     }
+
+    /// Times put with put_times()
+    pub(super) fn times(&mut self) -> Option<Vec<SystemTime>> {
+        let count = self.u32()?;
+        (0..count).map(|_| self.time()).collect()
+    }
 }
 
 /// The notes holding `data`: none for none, else NOTES_VERSION, then a
@@ -256,6 +305,12 @@ fn encode(data: &NotesData) -> Vec<u8> {
     section(SECTION_HEALS, heal::encode(&data.heals));
     section(SECTION_UPGRADES, upgrade::encode(&data.upgrades));
     section(SECTION_GROUPS, upgrade::encode_groups(&data.groups));
+    section(SECTION_REPLACEMENTS, encode_times_by(&data.replacements));
+    section(SECTION_RECOVERIES, metadata::encode(&data.recoveries));
+    section(
+        SECTION_UNENCRYPTED_CHATS,
+        encode_times_by(&data.unencrypted_chats),
+    );
     notes
 }
 
@@ -289,6 +344,11 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
                     SECTION_HEALS => data.heals = heal::decode(&mut body)?,
                     SECTION_UPGRADES => data.upgrades = upgrade::decode(&mut body)?,
                     SECTION_GROUPS => data.groups = upgrade::decode_groups(&mut body)?,
+                    SECTION_REPLACEMENTS => data.replacements = decode_times_by(&mut body)?,
+                    SECTION_RECOVERIES => data.recoveries = metadata::decode(&mut body)?,
+                    SECTION_UNENCRYPTED_CHATS => {
+                        data.unencrypted_chats = decode_times_by(&mut body)?
+                    }
                     _ => {}
                 }
             }
@@ -318,6 +378,7 @@ mod tests {
     use super::super::file::Received;
     use super::super::heal::{Heal, NextEra, Ongoing};
     use super::super::lost::Lost;
+    use super::super::metadata::Recovery;
     use super::super::sent::{Membership, Sent};
     use super::super::upgrade::{GroupUse, UpgradeState};
     use super::{decode, encode, NotesData, NOTES_VERSION_LOST};
@@ -450,6 +511,32 @@ mod tests {
                         refresh_at: Some(then),
                     },
                 ),
+            ]),
+            replacements: BTreeMap::from([
+                (String::from("group-1"), then),
+                (String::from("group-2"), then + Duration::from_secs(3600)),
+            ]),
+            recoveries: BTreeMap::from([
+                (
+                    String::from("group-1"),
+                    Recovery {
+                        check: true,
+                        token_mismatch: false,
+                        commits: vec![then, then + Duration::from_secs(60)],
+                    },
+                ),
+                (
+                    String::from("group-2"),
+                    Recovery {
+                        check: false,
+                        token_mismatch: true,
+                        commits: Vec::new(),
+                    },
+                ),
+            ]),
+            unencrypted_chats: BTreeMap::from([
+                (String::from(BOB), then),
+                (String::from("tel:+491701111111"), then),
             ]),
         }
     }

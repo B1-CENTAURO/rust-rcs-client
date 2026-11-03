@@ -16,8 +16,6 @@
 //! whose certificate expired, or who did not update their keys in over 30
 //! days, with new ones from their KeyPackages (RCC.16 section 9.5.4)
 
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use futures::future::join_all;
@@ -32,6 +30,8 @@ use crate::capability::{Capabilities, CapabilityQuery};
 use super::device::{is_of, E2eeDevice, CIPHERSUITE};
 use super::group::GroupError;
 use super::kds::{fetch_key_packages, Fetched, Recipient};
+use super::notes::Notes;
+use super::store::MlsStore;
 
 const LOG_TAG: &str = "e2ee";
 
@@ -39,26 +39,43 @@ const LOG_TAG: &str = "e2ee";
 const REPLACEMENT_RETRY: Duration = Duration::from_secs(60 * 60);
 
 /// The groups whose KeyPackage Update could not be made for now, by
-/// Conversation-ID, with the time until which it is put off
-#[derive(Default)]
-pub(super) struct Replacements(Mutex<HashMap<String, SystemTime>>);
+/// Conversation-ID, with the time until which it is put off, as the notes
+/// of the device keep them for it to restart with
+pub(super) struct Replacements<'a> {
+    pub(super) notes: &'a Notes,
+    pub(super) store: &'a MlsStore,
+}
 
-impl Replacements {
-    fn put_off(&self, conversation_id: &str, until: SystemTime) {
-        self.0
-            .lock()
-            .unwrap()
-            .insert(String::from(conversation_id), until);
+impl Replacements<'_> {
+    /// Puts off the KeyPackage Update of the group `conversation_id` at
+    /// `now` until `until`, letting go of those no longer put off
+    fn put_off(&self, conversation_id: &str, now: SystemTime, until: SystemTime) {
+        self.notes.hold(self.store, |data| {
+            data.replacements.retain(|_, until| now < *until);
+            data.replacements
+                .insert(String::from(conversation_id), until);
+        });
     }
 
     /// Whether the KeyPackage Update of the group `conversation_id` is put
     /// off at `now`
     fn put_off_at(&self, conversation_id: &str, now: SystemTime) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .get(conversation_id)
-            .is_some_and(|until| now < *until)
+        self.notes.read(|data| {
+            data.replacements
+                .get(conversation_id)
+                .is_some_and(|until| now < *until)
+        })
+    }
+
+    /// Lets go of the group `conversation_id`
+    pub(super) fn forget(&self, conversation_id: &str) {
+        if self
+            .notes
+            .read(|data| data.replacements.contains_key(conversation_id))
+        {
+            self.notes
+                .hold(self.store, |data| data.replacements.remove(conversation_id));
+        }
     }
 }
 
@@ -189,8 +206,9 @@ impl E2eeDevice {
             ))),
             Err(GroupError::Pending) => Err(GroupError::Pending),
             other => {
+                let now = self.store().now();
                 self.replacements()
-                    .put_off(conversation_id, self.store().now() + REPLACEMENT_RETRY);
+                    .put_off(conversation_id, now, now + REPLACEMENT_RETRY);
                 other
             }
         }
@@ -311,4 +329,44 @@ fn recipient(tel_uri: &str, answer: &Capabilities) -> Result<Recipient, Unavaila
     .ok_or(Unavailable::Never(
         EndMlsReason::GroupMemberFailsCapabilitiesCheck,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use super::super::lost::tests::{store, App};
+    use super::super::notes::Notes;
+    use super::{Replacements, REPLACEMENT_RETRY};
+
+    #[test]
+    fn a_key_package_update_put_off_is_so_for_a_while_then_let_go_of() {
+        let store = store(&Arc::new(App::default()));
+        let notes = Notes::kept_by(&store);
+        let replacements = Replacements {
+            notes: &notes,
+            store: &store,
+        };
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let until = now + REPLACEMENT_RETRY;
+
+        // put off until then, in its group alone
+        replacements.put_off("group-1", now, until);
+        assert!(replacements.put_off_at("group-1", now));
+        assert!(replacements.put_off_at("group-1", until - Duration::from_secs(1)));
+        assert!(!replacements.put_off_at("group-1", until));
+        assert!(!replacements.put_off_at("group-2", now));
+
+        // let go of as another is put off once it no longer is
+        replacements.put_off("group-2", until, until + REPLACEMENT_RETRY);
+        assert_eq!(
+            notes.read(|data| data.replacements.keys().cloned().collect::<Vec<_>>()),
+            ["group-2"]
+        );
+
+        // and as its group is let go of
+        replacements.forget("group-2");
+        assert!(notes.read(|data| data.replacements.is_empty()));
+    }
 }
