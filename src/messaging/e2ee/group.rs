@@ -150,6 +150,9 @@ impl E2eeDevice {
             })
             .map_err(GroupError::Store)?;
 
+        // its first Commit kept should the device stop before the Focus
+        // answers the INVITE carrying it
+        self.invite_sent(conversation_id, None);
         Ok(self.sent_in(conversation_id, from, to, &client_message))
     }
 
@@ -488,6 +491,8 @@ impl E2eeDevice {
                 }
             }
         })?;
+        // in place of one the device started, whose INVITE went unanswered
+        self.unanswered().forget(conversation_id);
         // a new Era of a group the device had has its keys checked, its
         // continuity token mismatched if the Welcome brought another
         // (RCC.16 section 10.5.1)
@@ -542,6 +547,8 @@ impl E2eeDevice {
         )?;
         if !pending {
             self.control_messages().remove(conversation_id);
+            // the INVITE starting it answered, its first Commit accepted
+            self.unanswered().forget(conversation_id);
             // the Era moving it back to encrypted accepted (RCC.16 section
             // 11.1)
             self.upgrades().restart_ended(conversation_id, true);
@@ -581,6 +588,7 @@ impl E2eeDevice {
                 Ok(true)
             },
         )?;
+        self.unanswered().forget(conversation_id);
         if applied {
             self.control_messages().remove(conversation_id);
             self.upgrades().restart_ended(conversation_id, true);
@@ -663,6 +671,7 @@ impl E2eeDevice {
     /// `conversation_id`, which the Conversation Focus did not take
     fn drop_pending(&self, conversation_id: &str) -> Result<(), StoreError> {
         self.upgrades().restart_ended(conversation_id, false);
+        self.unanswered().forget(conversation_id);
         self.store()
             .with_conversation(conversation_id.as_bytes(), |conversation, client| {
                 conversation.discard_pending_commit(client)?;
@@ -799,6 +808,7 @@ impl E2eeDevice {
     /// Lets go of the MLS group `conversation_id`
     pub fn abandon(&self, conversation_id: &str) -> Result<(), StoreError> {
         self.control_messages().remove(conversation_id);
+        self.unanswered().forget(conversation_id);
         self.heals().forget(conversation_id);
         self.upgrades().forget(conversation_id);
         self.recoveries().forget(conversation_id);
@@ -1155,6 +1165,29 @@ impl GroupEncryption for DeviceGroups {
         self.taken.notify_waiters();
     }
 
+    fn invited(&self, conversation_id: &str) -> bool {
+        let applied = self.device.upgrade().is_some_and(|device| {
+            device.group_invited(conversation_id).unwrap_or_else(|e| {
+                platform_log(LOG_TAG, format!("first Commit not applied: {:?}", e));
+                false
+            })
+        });
+        // what waits for it is sent with it
+        self.taken.notify_waiters();
+        applied
+    }
+
+    fn chat_invited(&self, contact: &str, mls_opaque_token: Option<String>) -> Option<String> {
+        let device = self.device.upgrade()?;
+        match device.chat_invited(contact, mls_opaque_token.as_deref()) {
+            Ok(group_id) => group_id,
+            Err(e) => {
+                platform_log(LOG_TAG, format!("chat not kept: {:?}", e));
+                None
+            }
+        }
+    }
+
     fn invite_accepted(&self, conversation_id: &str) -> bool {
         let resumed = self.device.upgrade().is_some_and(|device| {
             let ended = device.encryption_ended(conversation_id);
@@ -1446,7 +1479,12 @@ impl GroupEncryption for DeviceGroups {
                 .create_group(&group_id, &from, &contact, recipients)
                 .await
             {
-                Ok(cpim) => Some((group_id, cpim)),
+                Ok(cpim) => {
+                    // the chat known by its contact should the device stop
+                    // before the Focus answers its INVITE
+                    device.invite_sent(&group_id, Some(&contact));
+                    Some((group_id, cpim))
+                }
                 Err(e) => {
                     platform_log(LOG_TAG, format!("chat started unencrypted: {:?}", e));
                     // not again for a while unless it may do later

@@ -72,6 +72,12 @@ Pass the state you kept back to `rcs_client_set_e2ee` (`saved_state`) when the c
 - **If the Focus never got it, or refused it,** the group goes on as before. A refusal that arrives later is still recognised, and not passed to the app.
 - **If the Focus did accept it,** the device is out of step with the group. The group heals itself once that shows, for example when a message from another member can't be decrypted (section 10.1).
 
+**A new encrypted group or chat whose INVITE the Focus hadn't answered when the client stopped is kept waiting instead.** Its first Commit, which the INVITE carried, stays pending, as the Focus may have made the group. The Focus makes a group only once it validated that Commit (section 8.2.1), and the client learns it did when it's invited in again:
+- **a group:** when its Focus invites the client into it without a Welcome. The app is asked to take the invitation, as the client never learned the group's URI;
+- **a chat:** when the contact invites the client into a new session of it, without a Welcome. The chat is kept then, with the token that INVITE carries.
+
+The Commit is applied then, and the conversation is encrypted as for its other members. A group or chat the Focus never made is waited for 30 days at most. After that, its Commit is dropped the next time the client starts a new group or chat.
+
 ### 4. Group chat identifiers
 
 Keep what `group_chat_ids_callback` tells you for each group, and give it back with `rcs_client_set_group_chat_ids` once the client is made again. That includes the MLS-Opaque-Token the Conversation Focus gives (section 6.1.3). Without it, the client cannot:
@@ -195,5 +201,5 @@ Nothing is written unless it returns 0.
 
 ## Not covered yet
 
-- **A new group or chat whose INVITE wasn't answered before the client stopped** isn't made on the device, even if the Focus made it. Nothing is encrypted in it until a message from another member has it heal. Once the Focus answers the INVITE with 200 OK, the group's first Commit is applied, as the Focus validated it first (section 8.2.1); the same goes for a new Era carried by an INVITE.
+- **A new Era of a group or chat whose INVITE wasn't answered before the client stopped** is dropped as other changes are, and the group heals once another member's message shows it out of step. Only a new group or chat is kept waiting for the Focus.
 - **RCS Video encryption** (section 9.8).

@@ -45,6 +45,7 @@ use super::lost::{self, Lost};
 use super::metadata::{self, Recovery};
 use super::sent::{self, Membership, Sent};
 use super::store::{MlsStore, StoreError};
+use super::unanswered::{self, Invite};
 use super::upgrade::{self, GroupUse, UpgradeState};
 
 const LOG_TAG: &str = "e2ee";
@@ -72,6 +73,7 @@ const SECTION_RECOVERIES: u8 = 13;
 const SECTION_UNENCRYPTED_CHATS: u8 = 14;
 const SECTION_UNOPENED: u8 = 15;
 const SECTION_UPLOADS: u8 = 16;
+const SECTION_UNANSWERED: u8 = 17;
 
 /// What the device keeps besides MLS
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -109,6 +111,9 @@ pub(super) struct NotesData {
     /// The keys of the files uploaded, for the messages sending them, the
     /// oldest first
     pub(super) uploads: Vec<Upload>,
+    /// By MLS group, the INVITE starting a new group or chat, carrying its
+    /// first Commit, that its Conversation Focus did not answer yet
+    pub(super) unanswered: BTreeMap<String, Invite>,
 }
 
 /// What the device keeps besides MLS, as the store keeps it
@@ -325,6 +330,7 @@ fn encode(data: &NotesData) -> Vec<u8> {
         description::encode_unopened(&data.unopened),
     );
     section(SECTION_UPLOADS, file::encode_uploads(&data.uploads));
+    section(SECTION_UNANSWERED, unanswered::encode(&data.unanswered));
     notes
 }
 
@@ -365,6 +371,7 @@ fn decode(notes: &[u8]) -> Option<NotesData> {
                     }
                     SECTION_UNOPENED => data.unopened = description::decode_unopened(&mut body)?,
                     SECTION_UPLOADS => data.uploads = file::decode_uploads(&mut body)?,
+                    SECTION_UNANSWERED => data.unanswered = unanswered::decode(&mut body)?,
                     _ => {}
                 }
             }
@@ -396,6 +403,7 @@ mod tests {
     use super::super::lost::Lost;
     use super::super::metadata::Recovery;
     use super::super::sent::{Membership, Sent};
+    use super::super::unanswered::Invite;
     use super::super::upgrade::{GroupUse, UpgradeState};
     use super::{decode, encode, NotesData, NOTES_VERSION_LOST};
 
@@ -598,6 +606,22 @@ mod tests {
                     uploaded: then,
                 },
             ],
+            unanswered: BTreeMap::from([
+                (
+                    String::from("group-2"),
+                    Invite {
+                        contact: None,
+                        since: then,
+                    },
+                ),
+                (
+                    String::from("chat-2"),
+                    Invite {
+                        contact: Some(String::from(BOB)),
+                        since: then + Duration::from_secs(60),
+                    },
+                ),
+            ]),
         }
     }
 

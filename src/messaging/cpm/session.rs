@@ -4929,17 +4929,22 @@ impl TransactionHandler for CPMSessionServiceWrapper {
 
                                 let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
-                                // a group whose MLS group is kept encrypted
+                                // a group whose MLS group is kept encrypted,
+                                // its first Commit applied if the INVITE
+                                // starting it got no answer before the client
+                                // stopped, as its focus inviting this client
+                                // into it shows the focus made it (RCC.16
+                                // section 8.2.1)
                                 if let (CPMServiceType::Group, Some(conversation_id)) = (
                                     &session_info.cpm_contact.service_type,
                                     session_info.conversation_id.clone(),
                                 ) {
-                                    session_info.encryption = self
-                                        .service
-                                        .group_encryption
-                                        .lock()
-                                        .unwrap()
-                                        .clone()
+                                    let encryption =
+                                        self.service.group_encryption.lock().unwrap().clone();
+                                    if let (Some(encryption), None) = (&encryption, &mls_group) {
+                                        encryption.invited(&conversation_id);
+                                    }
+                                    session_info.encryption = encryption
                                         .filter(|encryption| encryption.encrypts(&conversation_id));
                                 }
 
@@ -5241,6 +5246,15 @@ impl TransactionHandler for CPMSessionServiceWrapper {
                                                     joined = Some((encryption, group_id));
                                                 }
                                                 None => {
+                                                    // or one this client
+                                                    // started, whose INVITE
+                                                    // got no answer before
+                                                    // it stopped (RCC.16
+                                                    // section 8.2.1)
+                                                    encryption.chat_invited(
+                                                        &contact,
+                                                        session_info.mls_opaque_token.clone(),
+                                                    );
                                                     let kept = encryption
                                                         .chat_group(&contact)
                                                         .filter(|(group_id, _)| {

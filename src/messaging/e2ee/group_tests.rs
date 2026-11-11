@@ -10253,7 +10253,7 @@ fn a_leave_left_pending_as_the_device_stopped_is_withdrawn() {
 }
 
 #[test]
-fn a_group_whose_first_commit_was_left_pending_is_not_made() {
+fn a_group_whose_invite_got_no_answer_is_made_once_its_focus_invites_the_device() {
     let clock = Clock::new();
     let (bob, bobs) = bob_with_key_package();
     let (device, kds, app) = enrolled_in_time(
@@ -10265,22 +10265,124 @@ fn a_group_whose_first_commit_was_left_pending_is_not_made() {
     let mut bobs_group = joined(&bob, &bundle_of(&cpim));
     drop(device);
 
-    // the Commit making it discarded once the device restarted, the group
-    // its own alone, as when the Focus refuses it (RCC.16 sections 6.2.4,
-    // 8.1)
+    // the Commit making it kept once the device restarted, as the Focus may
+    // have made the group, which the device knows nothing more of: nothing
+    // encrypted in it meanwhile (RCC.16 sections 8.1, 8.2.1)
     let device = alice_restarted(&app, &kds, &clock);
-    assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
-    assert_eq!(
-        device.encrypt_message(CONVERSATION, &plaintext("message-1", None)),
-        Err(MessageError::NotCreated)
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, true)));
+    assert!(device
+        .encrypt_message(CONVERSATION, &plaintext("message-1", None))
+        .is_err());
+    assert_eq!(device.group_invited("another"), Ok(false));
+
+    // applied as the Focus invites the device into it, which shows it made
+    // it: Bob's message taken, the group not to be healed, and the device's
+    // own taken by Bob
+    assert_eq!(device.group_invited(CONVERSATION), Ok(true));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, BOB_TEL, "bob-1");
+    assert!(decrypted(&device, &outer, &mls_message).is_ok());
+    assert!(!device.needs_healing(CONVERSATION));
+    let encrypted = device
+        .encrypt_message(CONVERSATION, &plaintext("message-2", None))
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&received_by_bob(&bob, &mut bobs_group, &encrypted))
+            .ends_with("hello Bob")
     );
 
-    // the Focus having made it, a message of Bob, who joined it, has the
-    // group self-healed (section 10.1)
-    assert!(!device.needs_healing(CONVERSATION));
-    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, BOB_TEL, "bob-2");
-    assert!(decrypted(&device, &outer, &mls_message).is_err());
-    assert!(device.needs_healing(CONVERSATION));
+    // once, through another restart too
+    assert_eq!(device.group_invited(CONVERSATION), Ok(false));
+    drop(device);
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(device.group_invited(CONVERSATION), Ok(false));
+    assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+}
+
+#[test]
+fn a_chat_whose_invite_got_no_answer_is_kept_once_its_contact_invites_the_device() {
+    let clock = Clock::new();
+    let (bob, bobs) = bob_with_key_package();
+    let (device, kds, app) = enrolled_in_time(
+        Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]),
+        Some(&clock),
+    );
+    let (query, _) = answering(&[(BOB_IMPU, mls(&HOME_KDS.to_string()))]);
+    let groups = DeviceGroups::new(&device, query);
+    let (group_id, cpim) =
+        block_on(groups.prepare_chat(String::from(BOB_IMPU), String::from(IMPU)))
+            .expect("an encrypted chat");
+    let mut bobs_group = joined(&bob, &bundle_of(&cpim));
+    drop(groups);
+    drop(device);
+
+    // not kept once the device restarted, its first Commit kept pending
+    // (RCC.16 sections 8.1.1, 8.2.1)
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(device.chat_group(BOB_TEL), None);
+    assert_eq!(epoch(&device, &group_id), Ok((0, true)));
+    assert_eq!(device.chat_invited("tel:+491701111111", None), Ok(None));
+
+    // kept as Bob invites the device into a new session of it, without a
+    // Welcome, with the token his INVITE carries: Bob's message taken
+    assert_eq!(
+        device.chat_invited(BOB_IMPU, Some("token-2")),
+        Ok(Some(group_id.clone()))
+    );
+    assert_eq!(
+        device.chat_group(BOB_TEL),
+        Some((group_id.clone(), Some(String::from("token-2"))))
+    );
+    assert_eq!(epoch(&device, &group_id), Ok((1, false)));
+    let (outer, mls_message) = from_bob(&bob, &mut bobs_group, BOB_TEL, "bob-1");
+    assert!(device
+        .decrypt_message(
+            &group_id,
+            &cpim_message(&outer).get_info().unwrap(),
+            &mls_message
+        )
+        .is_ok());
+
+    // once: the chat kept then
+    assert_eq!(device.chat_invited(BOB_TEL, None), Ok(None));
+    assert_eq!(
+        device.chat_group(BOB_TEL),
+        Some((group_id.clone(), Some(String::from("token-2"))))
+    );
+}
+
+#[test]
+fn a_group_whose_invite_got_no_answer_is_waited_for_30_days() {
+    let clock = Clock::new();
+    let (_, bobs) = bob_with_key_package();
+    let (device, kds, app) = enrolled_in_time(
+        Some(vec![(BOB_TEL, Fetched::KeyPackages(vec![bobs]))]),
+        Some(&clock),
+    );
+    block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    drop(device);
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, true)));
+
+    // still once another group is made 29 days after (RCC.16 section 8.3)
+    clock.advance(29 * DAY);
+    block_on(device.create_group("group-2", IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, true)));
+
+    // not once another is made 30 days after: its first Commit discarded,
+    // as that of any group is once the device restarts, the one made 29
+    // days after still waited for
+    clock.advance(DAY);
+    block_on(device.create_group("group-3", IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
+    assert_eq!(device.group_invited(CONVERSATION), Ok(false));
+    assert_eq!(device.group_invited("group-2"), Ok(true));
+
+    // and none for a group let go of
+    device.abandon("group-3").unwrap();
+    drop(device);
+    let device = alice_restarted(&app, &kds, &clock);
+    assert_eq!(device.group_invited("group-3"), Ok(false));
 }
 
 #[test]

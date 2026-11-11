@@ -1912,6 +1912,55 @@ fn an_invitation_of_a_kept_chat_is_encrypted_with_its_mls_group() {
 }
 
 #[test]
+fn an_invitation_into_a_chat_whose_invite_got_no_answer_is_encrypted_with_its_mls_group() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        encrypting: vec![String::from("chat-1")],
+        ciphertext: Some(String::from("ciphertext")),
+        unanswered_chat: Some(String::from("chat-1")),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+
+    // the SDP alone: the chat this client started with the contact, whose
+    // INVITE got no answer before it stopped, kept with the token given,
+    // as the contact taking part shows the focus made it (RCC.16 sections
+    // 6.1.3, 8.2.1)
+    let msrp = MsrpPeer::listen(&rt);
+    peer.send(&invite(
+        "chat-unanswered",
+        "<sip:+15559876@192.0.2.1:5060;transport=tcp>;+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.oma.cpm.session\"",
+        PEER,
+        "cpm.session",
+        &format!("MLS-Opaque-Token: {}\r\n", TOKEN),
+        "application/sdp",
+        &msrp.sdp("sendrecv"),
+    ));
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert_eq!(
+        *encryption.chats_invited.lock().unwrap(),
+        [(String::from(PEER), Some(String::from(TOKEN)))]
+    );
+    assert!(encryption.chats_joined.lock().unwrap().is_empty());
+    peer.send(&ack(&ok, "chat-unanswered"));
+    let mut connection = msrp.accept(&rt);
+    let sent = client.send(PEER, RecipientType::Contact, "hi");
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, b"ciphertext");
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(
+        sent.recv_timeout(Duration::from_secs(5)).map(|r| r.0),
+        Ok(200)
+    );
+    assert_eq!(encryption.encrypted.lock().unwrap()[0].0, "chat-1");
+    peer.silence();
+}
+
+#[test]
 fn an_invitation_from_a_contact_of_no_kept_chat_is_not_encrypted() {
     let (client, mut peer) = start(true);
     let rt = Arc::clone(&client.rt);
@@ -3039,6 +3088,14 @@ pub(crate) struct ScriptedEncryption {
     /// The groups an alias was to be sealed for in the epoch after a first
     /// Commit
     sealed_after_commit: std::sync::Mutex<Vec<String>>,
+    /// The groups this client was invited into without a Welcome
+    invited: std::sync::Mutex<Vec<String>>,
+    /// The contacts that invited this client into a chat without a Welcome,
+    /// and the token each INVITE carried
+    chats_invited: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    /// The MLS group of a chat this client started whose INVITE got no
+    /// answer, kept once its contact invites this client
+    unanswered_chat: Option<String>,
     /// The group, URI and encrypted alias each time an alias is to be opened
     aliases_opened: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
     /// What it opens encrypted aliases to: those starting `sealed-`, to what
@@ -3216,6 +3273,14 @@ impl GroupEncryption for ScriptedEncryption {
             .unwrap()
             .push(String::from(conversation_id));
         self.resuming.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn invited(&self, conversation_id: &str) -> bool {
+        self.invited
+            .lock()
+            .unwrap()
+            .push(String::from(conversation_id));
+        false
     }
 
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
@@ -3437,6 +3502,21 @@ impl GroupEncryption for ScriptedEncryption {
             .iter()
             .find(|(kept, _, _)| kept == contact)
             .map(|(_, group_id, token)| (group_id.clone(), token.clone()))
+    }
+
+    fn chat_invited(&self, contact: &str, mls_opaque_token: Option<String>) -> Option<String> {
+        self.chats_invited
+            .lock()
+            .unwrap()
+            .push((String::from(contact), mls_opaque_token.clone()));
+        // the chat this client started, kept now
+        let group_id = self.unanswered_chat.clone()?;
+        self.chats.lock().unwrap().push((
+            String::from(contact),
+            group_id.clone(),
+            mls_opaque_token,
+        ));
+        Some(group_id)
     }
 
     fn prepare_chat(
@@ -4373,6 +4453,10 @@ impl GroupEncryption for EncryptingPrepared {
         self.0.invite_accepted(conversation_id)
     }
 
+    fn invited(&self, conversation_id: &str) -> bool {
+        self.0.invited(conversation_id)
+    }
+
     fn join(&self, conversation_id: &str, server_message: &[u8]) -> bool {
         self.0.join(conversation_id, server_message)
     }
@@ -4497,6 +4581,10 @@ impl GroupEncryption for EncryptingPrepared {
 
     fn chat_group(&self, contact: &str) -> Option<(String, Option<String>)> {
         self.0.chat_group(contact)
+    }
+
+    fn chat_invited(&self, contact: &str, mls_opaque_token: Option<String>) -> Option<String> {
+        self.0.chat_invited(contact, mls_opaque_token)
     }
 
     fn prepare_chat(
@@ -6281,6 +6369,26 @@ fn a_group_restarted_by_its_focus_is_taken_part_in_again_at_once() {
         format!("joined {}", GROUP),
         "not told of as an invitation"
     );
+}
+
+#[test]
+fn an_invitation_into_a_group_without_a_welcome_applies_a_first_commit_left_unanswered() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = joining(&client, true);
+
+    // the first Commit of a group this client started applied, if the
+    // INVITE starting it got no answer before the client stopped, as the
+    // focus inviting it shows the focus made the group (RCC.16 section
+    // 8.2.1)
+    let msrp = group_invitation(&client, &mut peer, "group-first");
+    let ok = peer.next_response();
+    assert_eq!(status_code(&ok), 200);
+    assert_eq!(*encryption.invited.lock().unwrap(), ["conversation-1"]);
+    peer.send(&ack(&ok, "group-first"));
+    peer.next_request("SUBSCRIBE");
+    let _connection = msrp.accept(&rt);
+    peer.silence();
 }
 
 #[test]
@@ -8455,6 +8563,8 @@ fn a_group_its_focus_restarts_with_a_new_era_joins_it_at_once() {
             (String::from("conversation-1"), WELCOME.to_vec())
         ]
     );
+    // nothing pending applied, the Welcome taking the place of the group
+    assert!(encryption.invited.lock().unwrap().is_empty());
     // its session taking what the focus sends of the MLS group
     assert!(sdp_attribute(&body(&ok), "accept-wrapped-types")
         .unwrap()
