@@ -3030,8 +3030,15 @@ pub(crate) struct ScriptedEncryption {
     sealing_chat_files: bool,
     /// Whether the files sent to contacts were sealed for their chats
     sealed_for_chats: bool,
-    /// The groups it seals aliases for, as `sealed-` and the alias
+    /// The groups it seals aliases for, as `sealed-` and the alias, or
+    /// `sealed-after-commit-` in the epoch after a first Commit
     sealing_aliases: Vec<String>,
+    /// Whether it seals aliases in the epoch after a first Commit for any
+    /// group, as it is made under a Conversation-ID of the client's
+    sealing_after_commit: bool,
+    /// The groups an alias was to be sealed for in the epoch after a first
+    /// Commit
+    sealed_after_commit: std::sync::Mutex<Vec<String>>,
     /// The group, URI and encrypted alias each time an alias is to be opened
     aliases_opened: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
     /// What it opens encrypted aliases to: those starting `sealed-`, to what
@@ -3326,6 +3333,19 @@ impl GroupEncryption for ScriptedEncryption {
             .iter()
             .any(|sealing| sealing == group_id)
             .then(|| format!("sealed-{}", alias))
+    }
+
+    fn seal_alias_after_commit(&self, group_id: &str, alias: &str) -> Option<String> {
+        self.sealed_after_commit
+            .lock()
+            .unwrap()
+            .push(String::from(group_id));
+        (self.sealing_after_commit
+            || self
+                .sealing_aliases
+                .iter()
+                .any(|sealing| sealing == group_id))
+        .then(|| format!("sealed-after-commit-{}", alias))
     }
 
     fn open_alias(&self, group_id: &str, uri: &str, encrypted: &[u8]) -> Option<String> {
@@ -4426,6 +4446,10 @@ impl GroupEncryption for EncryptingPrepared {
 
     fn seal_alias(&self, group_id: &str, alias: &str) -> Option<String> {
         self.0.seal_alias(group_id, alias)
+    }
+
+    fn seal_alias_after_commit(&self, group_id: &str, alias: &str) -> Option<String> {
+        self.0.seal_alias_after_commit(group_id, alias)
     }
 
     fn open_alias(&self, group_id: &str, uri: &str, encrypted: &[u8]) -> Option<String> {
@@ -9930,13 +9954,75 @@ fn the_user_alias_is_encrypted_for_an_encrypted_chat_or_left_out() {
     let from = header_value(&invite, "From");
     assert!(from.starts_with(&format!("<{}>;tag=", IMPU)), "{}", from);
 
-    // a new chat, whose MLS group the INVITE carries: left out, as those it
-    // invites could not decrypt it while its first Commit is pending
+    // a new chat, whose MLS group the INVITE carries: in the epoch its first
+    // Commit leads to, which those it invites join in
     let _new = client.send_in_new_chat("tel:+15550009", "first", "chat-2", CHAT_BUNDLE);
+    let invite = peer.next_request("INVITE");
+    let from = header_value(&invite, "From");
+    assert!(
+        from.starts_with(&format!(
+            "<{};encrypted-alias=sealed-after-commit-Alice>;tag=",
+            IMPU
+        )),
+        "{}",
+        from
+    );
+
+    // left out too if that cannot be
+    let _unsealed = client.send_in_new_chat("tel:+15550010", "first", "chat-4", CHAT_BUNDLE);
     let invite = peer.next_request("INVITE");
     let from = header_value(&invite, "From");
     assert!(from.starts_with(&format!("<{}>;tag=", IMPU)), "{}", from);
     peer.silence();
+}
+
+#[test]
+fn the_user_alias_of_the_invite_starting_an_encrypted_group_is_sealed_after_its_commit() {
+    for sealing in [true, false] {
+        let (client, mut peer) = start(true);
+        let encryption = Arc::new(ScriptedEncryption {
+            cpim: Some(MLS_GROUP_CPIM.to_vec()),
+            sealing_after_commit: sealing,
+            ..ScriptedEncryption::default()
+        });
+        client
+            .sessions
+            .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+        client.sessions.set_user_alias(Some(String::from("Alice")));
+
+        // in the epoch the first Commit it carries leads to, which those it
+        // invites join in (RCC.16 section 9.1.5), else left out, never in
+        // the clear
+        let _started = starting_group(&client);
+        let invite = peer.next_request("INVITE");
+        let from = header_value(&invite, "From");
+        let expected = match sealing {
+            true => format!("<{};encrypted-alias=sealed-after-commit-Alice>;tag=", IMPU),
+            false => format!("<{}>;tag=", IMPU),
+        };
+        assert!(from.starts_with(&expected), "{}", from);
+        assert_eq!(
+            *encryption.sealed_after_commit.lock().unwrap(),
+            [header_value(&invite, "Conversation-ID")]
+        );
+        peer.silence();
+    }
+}
+
+#[test]
+fn the_user_alias_of_the_invite_restarting_a_group_in_a_new_era_is_sealed_after_its_commit() {
+    let (client, mut peer) = start(true);
+    client.sessions.set_user_alias(Some(String::from("Alice")));
+    let (encryption, connection) = new_era_due(&client, &mut peer, true);
+    let (restart, _restarted) = restart_in_new_era(&client, &mut peer, connection, "200 OK");
+    // for the group's new Era, which this encryption cannot seal it in: left
+    // out, never in the clear
+    assert_eq!(
+        *encryption.sealed_after_commit.lock().unwrap(),
+        ["conversation-1"]
+    );
+    let from = header_value(&restart, "From");
+    assert!(from.starts_with(&format!("<{}>;tag=", IMPU)), "{}", from);
 }
 
 #[test]

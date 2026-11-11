@@ -25,7 +25,7 @@ impl E2eeDevice {
     /// None if the group is not encrypted, or moved to unencrypted, or self-
     /// healed, or while a Commit of the device is pending, as the alias would
     /// be in the epoch before it, which those the Commit adds could not
-    /// decrypt.
+    /// decrypt: seal_alias_after_commit() seals it in the epoch after.
     pub fn seal_alias(&self, group_id: &str, alias: &str) -> Option<String> {
         if self.heals().ongoing(group_id) || self.upgrades().without_group(group_id) {
             return None;
@@ -42,6 +42,20 @@ impl E2eeDevice {
             })
             .ok()
             .flatten()
+    }
+
+    /// `alias` encrypted for the MLS group `group_id` in the epoch the
+    /// pending Commit of the device leads to, for the INVITE carrying the
+    /// group's first Commit, or that of its next Era: those it invites join
+    /// the group in that epoch (RCC.16 section 9.1.5)
+    ///
+    /// None if no Commit of the device is pending for the group.
+    pub fn seal_alias_after_commit(&self, group_id: &str, alias: &str) -> Option<String> {
+        self.store()
+            .with_conversation(group_id.as_bytes(), |conversation, client| {
+                conversation.encrypt_alias_after_commit(client, alias)
+            })
+            .ok()
     }
 
     /// The alias `uri` gives itself, which the `encrypted-alias` parameter

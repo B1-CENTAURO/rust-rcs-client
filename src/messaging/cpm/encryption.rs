@@ -525,6 +525,13 @@ pub trait GroupEncryption: Send + Sync {
     /// this client is pending
     fn seal_alias(&self, group_id: &str, alias: &str) -> Option<String>;
 
+    /// The user alias `alias` encrypted for the MLS group `group_id` in the
+    /// epoch the pending first Commit of this client leads to, for the
+    /// INVITE carrying that Commit, which those it invites join the group in
+    /// (RCC.16 section 9.1.5); None if it cannot be, as when no Commit of
+    /// this client is pending
+    fn seal_alias_after_commit(&self, group_id: &str, alias: &str) -> Option<String>;
+
     /// The alias `uri` gives itself, which the `encrypted-alias` parameter
     /// `encrypted` of the URI carries, decrypted in the MLS group `group_id`
     /// (RCC.16 section 9.1.5); None if it cannot be, or was not encrypted by

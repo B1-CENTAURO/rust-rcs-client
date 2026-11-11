@@ -1980,6 +1980,77 @@ fn the_alias_one_device_encrypts_the_other_decrypts_as_its_own() {
 }
 
 #[test]
+fn the_alias_of_the_invite_starting_a_conversation_is_decrypted_by_those_it_invites() {
+    let (alice, bob, _) = alice_and_bob();
+
+    // a new chat: sealed in the epoch its first Commit leads to, which Bob
+    // joins in with the Welcome, not in the one before (RCC.16 section 9.1.5)
+    let (group_id, cpim) = block_on(
+        alice
+            .groups
+            .prepare_chat(String::from(bob.impu), String::from(alice.impu)),
+    )
+    .expect("an encrypted chat");
+    assert_eq!(alice.device.seal_alias(&group_id, "Alice"), None);
+    let sealed = alice
+        .groups
+        .seal_alias_after_commit(&group_id, "Alice ☺")
+        .expect("sealed");
+    let bundle = bundle_of(&cpim);
+    let previous = epoch_of(&alice, &group_id);
+    assert_eq!(
+        bob.groups
+            .join_chat(alice.impu, &welcomed(&bundle), Some(String::from(TOKEN))),
+        Some(group_id.clone())
+    );
+    assert_eq!(
+        bob.device
+            .open_alias(&group_id, ALICE_IMPU, sealed.as_bytes())
+            .as_deref(),
+        Some("Alice ☺")
+    );
+    // the key generation it took not used again once the Commit is applied
+    alice
+        .groups
+        .keep_chat(bob.impu, &group_id, Some(String::from(TOKEN)));
+    alice
+        .groups
+        .on_server_message(&group_id, &accepted(previous));
+    said(&alice, &bob, &group_id, bob.impu, "alice-1", "hi Bob");
+    // none with no Commit pending
+    assert_eq!(
+        alice.groups.seal_alias_after_commit(&group_id, "Alice"),
+        None
+    );
+
+    // a new group the same, Bob joining with the Welcome the Focus fans out
+    let cpim = block_on(alice.groups.prepare(
+        String::from(CONVERSATION),
+        String::from(alice.impu),
+        String::from(GROUP_URI),
+        vec![String::from(bob.impu)],
+    ))
+    .expect("an encrypted group");
+    let sealed = alice
+        .groups
+        .seal_alias_after_commit(CONVERSATION, "Alice")
+        .expect("sealed");
+    let bundle = bundle_of(&cpim);
+    let previous = epoch_of(&alice, CONVERSATION);
+    assert!(bob.groups.join(CONVERSATION, &welcomed(&bundle)));
+    assert_eq!(
+        bob.device
+            .open_alias(CONVERSATION, ALICE_TEL, sealed.as_bytes())
+            .as_deref(),
+        Some("Alice")
+    );
+    alice
+        .groups
+        .on_server_message(CONVERSATION, &accepted(previous));
+    said(&alice, &bob, CONVERSATION, GROUP_URI, "alice-2", "hi all");
+}
+
+#[test]
 fn the_alias_of_a_group_message_goes_encrypted_and_is_told_decrypted() {
     let (mut alice, mut bob, _, _) = group_through_the_focus();
     alice

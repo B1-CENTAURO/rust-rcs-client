@@ -1371,6 +1371,12 @@ impl GroupEncryption for DeviceGroups {
         self.device.upgrade()?.seal_alias(group_id, alias)
     }
 
+    fn seal_alias_after_commit(&self, group_id: &str, alias: &str) -> Option<String> {
+        self.device
+            .upgrade()?
+            .seal_alias_after_commit(group_id, alias)
+    }
+
     fn open_alias(&self, group_id: &str, uri: &str, encrypted: &[u8]) -> Option<String> {
         self.device.upgrade()?.open_alias(group_id, uri, encrypted)
     }
