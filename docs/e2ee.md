@@ -155,7 +155,8 @@ Set the user's alias with `rcs_client_set_user_alias` (NULL for none). The clien
 
 In an encrypted chat or group, the alias is never sent in the clear (RCC.16 section 9.1.5):
 - **It goes encrypted** for the conversation's MLS group, in the `encrypted-alias` parameter of the From's URI. That covers a new session of a chat kept, a group restarted, and each message of an encrypted group, whose CPIM From the encryption otherwise leaves in the clear (section 7.5.7).
-- **It is left out** when it cannot go so that its members can decrypt it: in the INVITE starting a new chat or group, whose first Commit is still pending, and while the device cannot encrypt for the group.
+- **In the INVITE starting a chat or group**, or restarting one in a new Era, it goes encrypted in the epoch the first Commit the INVITE carries leads to, which those it invites join in.
+- **It is left out** when it cannot go so that its members can decrypt it, as while the device cannot encrypt for the group.
 
 Set `rcs_client_set_alias_listener` to be told the alias each sender gives itself: its URI, the alias, and `encrypted`. The alias comes from:
 - the From of a chat invitation;
@@ -163,7 +164,7 @@ Set `rcs_client_set_alias_listener` to be told the alias each sender gives itsel
 - the CPIM From of a message of a group chat;
 - the From of a standalone message.
 
-An encrypted alias is decrypted in the conversation's MLS group, and told with `encrypted` 1 only if a Client of that URI's user encrypted it. One that cannot be decrypted is not told, though a display name next to it is, with `encrypted` 0. Each sender's alias is told once, and again when it changes.
+An encrypted alias is decrypted in the conversation's MLS group, and told with `encrypted` 1 only if a Client of that URI's user encrypted it. One that cannot be decrypted is not told, though a display name next to it is, with `encrypted` 0. That is the case of one another client encrypts for the INVITE starting a conversation in the epoch before its first Commit, which those it invites never join. Each sender's alias is told once, and again when it changes.
 
 An alias is the sender's own claim. Show it as unchecked for a contact not in the address book, and the address book's name otherwise (RCC.07 section 2.5.3.3).
 
@@ -194,6 +195,5 @@ Nothing is written unless it returns 0.
 
 ## Not covered yet
 
-- **Encrypted aliases of new conversations:** one sent with the INVITE starting a chat or group, as another client might, is in the epoch before its first Commit, which those it invites cannot decrypt. It is not told.
 - **A new group or chat whose INVITE wasn't answered before the client stopped** isn't made on the device, even if the Focus made it. Nothing is encrypted in it until a message from another member has it heal. Once the Focus answers the INVITE with 200 OK, the group's first Commit is applied, as the Focus validated it first (section 8.2.1); the same goes for a new Era carried by an INVITE.
 - **RCS Video encryption** (section 9.8).

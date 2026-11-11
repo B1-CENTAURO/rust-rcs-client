@@ -3578,11 +3578,25 @@ impl CPMSessionService {
                     .is_some_and(|(ids, encryption)| encryption.encrypts(&ids.conversation_id)),
                 _ => false,
             };
+        // the MLS group whose first Commit, or that of its next Era, the
+        // INVITE carries, applied once the focus answers it with 200 OK,
+        // having validated it (RCC.16 sections 8.2.1, 8.3.2)
+        let first_commit = match (&invitee.chat, &invitee.new_group, invitee.new_era) {
+            (Some(chat), _, _) => chat.new_group.map(|_| String::from(chat.group_id)),
+            (None, Some(new_group), _) => new_group
+                .encrypted
+                .map(|(conversation_id, _)| String::from(conversation_id)),
+            (None, None, Some(_)) => self
+                .group_chats
+                .ids_of(recipient)
+                .map(|ids| ids.conversation_id),
+            (None, None, None) => None,
+        };
         // the user alias of its From: in an encrypted conversation, encrypted
-        // for its MLS group, so that those it invites can decrypt it, else
-        // left out, as while the group's first Commit is pending; in
-        // another, its display name (RCC.07 section 2.5.3.3, RCC.16 section
-        // 9.1.5)
+        // for its MLS group so that those it invites can decrypt it, in the
+        // epoch the first Commit it carries leads to, which they join in,
+        // else left out; in another, its display name (RCC.07 section
+        // 2.5.3.3, RCC.16 section 9.1.5)
         let alias = self.user_alias.lock().unwrap().clone();
         let alias_group = match (&invitee.chat, &invitee.new_group, invitee.new_era) {
             (Some(chat), _, _) => chat
@@ -3598,9 +3612,13 @@ impl CPMSessionService {
         let (display_alias, sealed_alias) = match alias {
             Some(alias) if encrypted => (
                 None,
-                alias_group
-                    .zip(group_encryption.as_ref())
-                    .and_then(|(group_id, encryption)| encryption.seal_alias(&group_id, &alias)),
+                group_encryption
+                    .as_ref()
+                    .and_then(|encryption| match &first_commit {
+                        Some(group_id) => encryption.seal_alias_after_commit(group_id, &alias),
+                        None => alias_group
+                            .and_then(|group_id| encryption.seal_alias(&group_id, &alias)),
+                    }),
             ),
             alias => (alias, None),
         };
@@ -3872,19 +3890,6 @@ impl CPMSessionService {
                     )
                 });
                 let chat_contact = String::from(recipient);
-                // the MLS group whose first Commit, or that of its next Era,
-                // the INVITE carries, applied once the focus answers it with
-                // 200 OK, having validated it (RCC.16 sections 8.2.1, 8.3.2)
-                let first_commit = match (&invitee.chat, &invitee.new_group, invitee.new_era) {
-                    (Some(chat), _, _) => chat.new_group.map(|_| String::from(chat.group_id)),
-                    (None, Some(new_group), _) => new_group
-                        .encrypted
-                        .map(|(conversation_id, _)| String::from(conversation_id)),
-                    (None, None, Some(_)) => {
-                        group_chats.ids_of(recipient).map(|ids| ids.conversation_id)
-                    }
-                    (None, None, None) => None,
-                };
 
                 let registered_public_identity = Arc::clone(&self.registered_public_identity);
                 let links = self.links();
