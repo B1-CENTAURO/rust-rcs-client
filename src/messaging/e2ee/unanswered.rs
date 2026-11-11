@@ -176,10 +176,9 @@ impl E2eeDevice {
     pub(super) fn invite_sent(&self, conversation_id: &str, contact: Option<&str>) {
         let now = self.store().now();
         for expired in self.unanswered().expired(now) {
-            // its control message still known, for a refusal of it, and its
-            // note let go of with it, or else, not to be tried again
+            // its note let go of with it, though its MLS group went
+            // otherwise, its control message still known, for a refusal
             if let Err(e) = self.discard_pending(&expired, true) {
-                self.unanswered().forget(&expired);
                 platform_log(
                     LOG_TAG,
                     format!(
