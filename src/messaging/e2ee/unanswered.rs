@@ -177,7 +177,8 @@ impl E2eeDevice {
         let now = self.store().now();
         for expired in self.unanswered().expired(now) {
             self.unanswered().forget(&expired);
-            if let Err(e) = self.discard_unaccepted(&expired) {
+            // its control message still known, for a refusal of it
+            if let Err(e) = self.discard_pending(&expired, true) {
                 platform_log(
                     LOG_TAG,
                     format!(

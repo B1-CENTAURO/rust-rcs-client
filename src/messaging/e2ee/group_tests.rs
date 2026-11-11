@@ -10278,7 +10278,9 @@ fn a_group_whose_invite_got_no_answer_is_made_once_its_focus_invites_the_device(
     // applied as the Focus invites the device into it, which shows it made
     // it: Bob's message taken, the group not to be healed, and the device's
     // own taken by Bob
-    assert_eq!(device.group_invited(CONVERSATION), Ok(true));
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    assert!(groups.invited(CONVERSATION));
     assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
     let (outer, mls_message) = from_bob(&bob, &mut bobs_group, BOB_TEL, "bob-1");
     assert!(decrypted(&device, &outer, &mls_message).is_ok());
@@ -10292,7 +10294,8 @@ fn a_group_whose_invite_got_no_answer_is_made_once_its_focus_invites_the_device(
     );
 
     // once, through another restart too
-    assert_eq!(device.group_invited(CONVERSATION), Ok(false));
+    assert!(!groups.invited(CONVERSATION));
+    drop(groups);
     drop(device);
     let device = alice_restarted(&app, &kds, &clock);
     assert_eq!(device.group_invited(CONVERSATION), Ok(false));
@@ -10322,6 +10325,38 @@ fn a_chat_whose_invite_got_no_answer_is_kept_once_its_contact_invites_the_device
     assert_eq!(device.chat_group(BOB_TEL), None);
     assert_eq!(epoch(&device, &group_id), Ok((0, true)));
     assert_eq!(device.chat_invited("tel:+491701111111", None), Ok(None));
+    // nor taken for a group's
+    assert_eq!(device.group_invited(&group_id), Ok(false));
+    assert_eq!(epoch(&device, &group_id), Ok((0, true)));
+
+    // nor while another chat is kept with Bob, which his INVITE is of
+    block_on(device.create_group(CONVERSATION, IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    device.keep_chat(BOB_IMPU, CONVERSATION, None).unwrap();
+    assert_eq!(device.chat_invited(BOB_IMPU, None), Ok(None));
+    assert_eq!(epoch(&device, &group_id), Ok((0, true)));
+    device.abandon(CONVERSATION).unwrap();
+
+    // the latest of those started with Bob, as the one he joined last
+    clock.advance(DAY);
+    let (query, _) = answering(&[(BOB_IMPU, mls(&HOME_KDS.to_string()))]);
+    let groups = DeviceGroups::new(&device, query);
+    let (latest, _) = block_on(groups.prepare_chat(String::from(BOB_IMPU), String::from(IMPU)))
+        .expect("an encrypted chat");
+    drop(groups);
+    drop(device);
+    let device = alice_restarted(&app, &kds, &clock);
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+    assert_eq!(
+        groups.chat_invited(BOB_IMPU, Some(String::from("token-3"))),
+        Some(latest.clone())
+    );
+    assert_eq!(epoch(&device, &latest), Ok((1, false)));
+    assert_eq!(epoch(&device, &group_id), Ok((0, true)));
+
+    // the earlier kept in its place as Bob invites the device into it
+    device.abandon(&latest).unwrap();
+    assert_eq!(device.chat_group(BOB_TEL), None);
 
     // kept as Bob invites the device into a new session of it, without a
     // Welcome, with the token his INVITE carries: Bob's message taken
@@ -10376,7 +10411,26 @@ fn a_group_whose_invite_got_no_answer_is_waited_for_30_days() {
     block_on(device.create_group("group-3", IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
     assert_eq!(epoch(&device, CONVERSATION), Ok((0, false)));
     assert_eq!(device.group_invited(CONVERSATION), Ok(false));
-    assert_eq!(device.group_invited("group-2"), Ok(true));
+    assert_eq!(epoch(&device, "group-2"), Ok((0, true)));
+
+    // nor one joined from the Welcome of a later Era in its place
+    let bob = bob();
+    let mut bobs_era = bob.create_conversation(Some(b"group-2"), 1).unwrap();
+    let output = bobs_era
+        .add_members(&bob, &[&uploaded_key_package(&kds, 0)])
+        .unwrap();
+    let server_message = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: encode_message_list(&[&output.commit]).unwrap(),
+                welcome: output.welcome.unwrap(),
+                private_message: Vec::new(),
+                ratchet_tree: output.ratchet_tree.unwrap(),
+            },
+        )),
+    });
+    assert_eq!(device.join_group("group-2", &server_message), Ok(()));
+    assert_eq!(device.group_invited("group-2"), Ok(false));
 
     // and none for a group let go of
     device.abandon("group-3").unwrap();
