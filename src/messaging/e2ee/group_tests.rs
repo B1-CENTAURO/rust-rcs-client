@@ -10415,7 +10415,7 @@ fn a_group_whose_invite_got_no_answer_is_waited_for_30_days() {
 
     // nor one joined from the Welcome of a later Era in its place
     let bob = bob();
-    let mut bobs_era = bob.create_conversation(Some(b"group-2"), 1).unwrap();
+    let mut bobs_era = bob.create_conversation(Some(b"group-3"), 1).unwrap();
     let output = bobs_era
         .add_members(&bob, &[&uploaded_key_package(&kds, 0)])
         .unwrap();
@@ -10429,14 +10429,21 @@ fn a_group_whose_invite_got_no_answer_is_waited_for_30_days() {
             },
         )),
     });
-    assert_eq!(device.join_group("group-2", &server_message), Ok(()));
-    assert_eq!(device.group_invited("group-2"), Ok(false));
+    assert_eq!(device.join_group("group-3", &server_message), Ok(()));
+    assert_eq!(device.group_invited("group-3"), Ok(false));
+
+    // the one made 29 days after let go of 30 days after it was made, to
+    // the second
+    clock.advance(29 * DAY);
+    block_on(device.create_group("group-4", IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    assert_eq!(epoch(&device, "group-2"), Ok((0, false)));
+    assert_eq!(epoch(&device, "group-4"), Ok((0, true)));
 
     // and none for a group let go of
-    device.abandon("group-3").unwrap();
+    device.abandon("group-4").unwrap();
     drop(device);
     let device = alice_restarted(&app, &kds, &clock);
-    assert_eq!(device.group_invited("group-3"), Ok(false));
+    assert_eq!(device.group_invited("group-4"), Ok(false));
 }
 
 #[test]
