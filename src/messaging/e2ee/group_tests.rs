@@ -10444,6 +10444,14 @@ fn a_group_whose_invite_got_no_answer_is_waited_for_30_days() {
     drop(device);
     let device = alice_restarted(&app, &kds, &clock);
     assert_eq!(device.group_invited("group-4"), Ok(false));
+
+    // nor, once waited for, one whose MLS group went otherwise, its Commit
+    // not to be dropped then
+    block_on(device.create_group("group-5", IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    device.store().delete_conversation(b"group-5").unwrap();
+    clock.advance(30 * DAY);
+    block_on(device.create_group("group-6", IMPU, FACTORY, vec![recipient(BOB_TEL)])).unwrap();
+    assert_eq!(device.unanswered().all(), ["group-6"]);
 }
 
 #[test]
