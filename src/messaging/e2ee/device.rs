@@ -40,6 +40,7 @@ use super::notes::{put, Notes, Reader};
 use super::provisioning;
 use super::replace::Replacements;
 use super::store::{MlsStore, SaveState, StoreError};
+use super::unanswered::Unanswered;
 use super::upgrade::Upgrades;
 
 /// The Cipher Suite the device enrols in: Client Certificates are ECDSA
@@ -209,6 +210,11 @@ impl E2eeDevice {
         groups.extend(self.control_messages().groups());
         groups.sort();
         groups.dedup();
+        // but the first Commit of a new group or chat whose INVITE was not
+        // answered, which the Focus may have taken: kept until the Focus
+        // invites the device into it (RCC.16 section 8.2.1)
+        let unanswered = self.unanswered().all();
+        groups.retain(|conversation_id| !unanswered.contains(conversation_id));
         for conversation_id in groups {
             if let Err(e) = self.discard_unaccepted(&conversation_id) {
                 platform_log(
@@ -299,6 +305,13 @@ impl E2eeDevice {
 
     pub(super) fn descriptions(&self) -> Descriptions<'_> {
         Descriptions {
+            notes: &self.notes,
+            store: &self.store,
+        }
+    }
+
+    pub(super) fn unanswered(&self) -> Unanswered<'_> {
+        Unanswered {
             notes: &self.notes,
             store: &self.store,
         }

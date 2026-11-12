@@ -394,6 +394,13 @@ pub trait GroupEncryption: Send + Sync {
     /// (section 11.1)
     fn invite_accepted(&self, conversation_id: &str) -> bool;
 
+    /// Applies the first Commit of the MLS group `conversation_id`, which its
+    /// Conversation Focus invites this client into without a Welcome, if the
+    /// INVITE starting the group got no answer before the client stopped:
+    /// the Focus has the group, which it made only once it validated that
+    /// Commit (RCC.16 section 8.2.1); whether it was
+    fn invited(&self, conversation_id: &str) -> bool;
+
     /// Joins the MLS group of the group chat `conversation_id` an invitation
     /// carries, as the `message/mls-rcs-server` `server_message` with the
     /// Welcome of the Conversation Focus (RCC.16 sections 6.2.6, 7.9.3, 8.1);
@@ -604,6 +611,14 @@ pub trait GroupEncryption: Send + Sync {
     /// `contact`, and the MLS-Opaque-Token its Conversation Focus gave if it
     /// did (RCC.16 sections 6.1.3, 8.1.1)
     fn chat_group(&self, contact: &str) -> Option<(String, Option<String>)>;
+
+    /// The ID of the MLS group of the encrypted 1-to-1 chat `contact` invites
+    /// this client into without a Welcome, if none is kept with the contact
+    /// but this client started one whose INVITE got no answer before it
+    /// stopped: its first Commit applied, as the contact taking part shows
+    /// the Conversation Focus made it (RCC.16 section 8.2.1), and the chat
+    /// kept with `mls_opaque_token` (section 6.1.3)
+    fn chat_invited(&self, contact: &str, mls_opaque_token: Option<String>) -> Option<String>;
 
     /// A new MLS group for an encrypted 1-to-1 chat of the user `from` with
     /// `contact`, if the contact advertises E2EE v1 and the Home KDS has its
