@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use rust_rcs_core::ffi::log::platform_log;
-use rust_rcs_core::mls::{self, IncomingMessage, MlsClient, MlsConversation};
+use rust_rcs_core::mls::{self, CommitOutput, IncomingMessage, MlsClient, MlsConversation};
 
 use super::device::E2eeDevice;
 use super::group::GroupError;
@@ -358,6 +358,49 @@ impl E2eeDevice {
                 .committed(conversation_id, self.store().now());
             self.sent_as(conversation_id, from, to, message_id, &client_message)
         }))
+    }
+
+    /// The External Commit `rejoined` the device rejoined the group chat
+    /// `conversation_id` with, as it is to go to the Conversation Focus: the
+    /// keys of the device checked against the group `conversation` it
+    /// rejoined, and asked for in the same CommitList, after the External
+    /// Commit, if they are out of sync and may be asked for still (RCC.16
+    /// sections 10.5.1, 10.5.2); with whether the check is done with, and
+    /// whether the keys are asked for, which keys_checked() takes note of
+    ///
+    /// Called while the store is in use, it changes nothing else. The
+    /// External Commit goes alone if the group asks for the keys already.
+    pub(super) fn asking_with(
+        &self,
+        conversation_id: &str,
+        conversation: &mut MlsConversation,
+        client: &MlsClient,
+        rejoined: CommitOutput,
+    ) -> (CommitOutput, bool, bool) {
+        let (due, checked) = self.keys_due_in(conversation_id, conversation, client);
+        if !matches!(due, Some(KeysDue::Request)) {
+            return (rejoined, checked, false);
+        }
+        match conversation.request_group_metadata_keys_with(client, &rejoined) {
+            Ok(asking) => (asking, true, true),
+            Err(e) => {
+                platform_log(LOG_TAG, format!("metadata keys not asked for: {:?}", e));
+                (rejoined, checked, false)
+            }
+        }
+    }
+
+    /// Takes note of the check of the keys of the group chat
+    /// `conversation_id` done with, if `checked`, and of a Commit asking for
+    /// them made, if `asked`, as asking_with() tells
+    pub(super) fn keys_checked(&self, conversation_id: &str, checked: bool, asked: bool) {
+        if checked {
+            self.recoveries().checked(conversation_id);
+        }
+        if asked {
+            self.recoveries()
+                .committed(conversation_id, self.store().now());
+        }
     }
 
     /// Whether the continuity token kept for the group chat

@@ -146,6 +146,7 @@ The client advertises E2EE in its capabilities only once enrolled. If enrolling 
   - its key is used once, so download it once.
 - **Keeping groups in step:**
   - self-healing when the device misses something (section 10.1);
+  - recovering the keys of the encrypted subject and icon, and the continuity token (section 10.5): asking the other members for those the device misses, along with the External Commit when it self-heals, and sending them those they miss;
   - key updates (section 9.5.2);
   - replacing members whose keys are old or whose certificates expired (section 9.5.4);
   - new Eras when healing fails (section 8.3);

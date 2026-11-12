@@ -3482,6 +3482,8 @@ fn the_group_info_of_another_group_is_not_rejoined_in_its_stead() {
         )))
     );
     assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    // nor are the metadata keys asked for in the other group
+    assert_eq!(epoch(&device, "another group"), Ok((2, false)));
 }
 
 /// Why the group `conversation_id` of `device` was moved to unencrypted, if
@@ -7780,8 +7782,15 @@ fn rejoined(groups: &DeviceGroups, answers: Vec<Option<(u16, Vec<u8>)>>) -> Vec<
     .expect("an External Commit")
 }
 
+/// How many Commits the CommitList of the control message `cpim` carries
+fn commits_of(cpim: &[u8]) -> usize {
+    wire::decode_message_list(&commit_bundle_of(cpim).commit_list)
+        .unwrap()
+        .len()
+}
+
 #[test]
-fn the_device_asks_for_the_metadata_keys_it_misses_once_it_rejoined_the_group() {
+fn the_device_asks_for_the_metadata_keys_it_misses_with_the_external_commit_it_rejoins_with() {
     let (device, bob, mut bobs_group) = alice_and_bob();
     let (query, _) = answering(&[]);
     let groups = DeviceGroups::new(&device, query);
@@ -7795,29 +7804,44 @@ fn the_device_asks_for_the_metadata_keys_it_misses_once_it_rejoined_the_group() 
     forgotten_metadata(&device);
     device.heals().want(CONVERSATION);
 
-    // the GroupInfo pulled (RCC.16 sections 10.1.1, 10.5.1)
+    // the GroupInfo pulled (RCC.16 sections 10.1.1, 10.5.1): asked for in
+    // the CommitList of the External Commit, after it (section 10.5.2)
     let cpim = rejoined(&groups, vec![None, group_info_answer(group_info)]);
     assert!(!metadata_in_sync(&device));
-    // not asked for while the External Commit waits for the Focus
+    assert_eq!(commits_of(&cpim), 2);
+    assert!(commit_bundle_of(&cpim).private_message.is_empty());
+    let (era, healed) = epoch(&device, CONVERSATION)
+        .map(|(epoch, pending)| {
+            assert!(pending);
+            (epoch_identifier(&device, CONVERSATION).era_id, epoch)
+        })
+        .unwrap();
+    // nor again while it waits for the Focus
     assert!(!device.metadata_keys_due(CONVERSATION));
     assert_eq!(metadata_keys(&device), None);
     bobs_group
         .process_server_message(&bob, &forwarded_commit(&cpim))
         .unwrap();
-    accepted_from_device(&device);
-
-    // then with a Commit of its own (section 10.5.2)
-    assert!(device.metadata_keys_due(CONVERSATION));
-    let cpim = metadata_keys(&device).expect("the keys asked for");
-    assert!(commit_bundle_of(&cpim).private_message.is_empty());
-    assert_eq!(epoch(&device, CONVERSATION), Ok((4, true)));
-    bobs_group
-        .process_server_message(&bob, &forwarded_commit(&cpim))
-        .unwrap();
     assert!(bobs_group.group_metadata_keys_requested());
-    accepted_from_device(&device);
+
+    // the request applied as the Focus accepts the CommitList, in the epoch
+    // the External Commit was made in, whose authenticator the device knows
+    // not
+    device
+        .on_server_message(
+            CONVERSATION,
+            &accepted(EpochIdentifier {
+                era_id: era,
+                epoch_id: healed - 1,
+                epoch_authenticator: b"before the External Commit".to_vec(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(epoch(&device, CONVERSATION), Ok((healed + 1, false)));
+    assert!(!device.control_messages().contains(CONVERSATION));
     // not again, nor sent by the device, while they are asked for
     assert!(!device.metadata_keys_due(CONVERSATION));
+    assert_eq!(metadata_keys(&device), None);
 
     // Bob sends them, which the device keeps (section 10.5.4)
     let output = bobs_group
@@ -7835,21 +7859,25 @@ fn the_device_asks_for_the_metadata_keys_it_misses_once_it_rejoined_the_group() 
 #[test]
 fn the_metadata_keys_are_asked_for_5_times_a_day_at_most() {
     let (device, bob, mut bobs_group) = alice_and_bob();
-    let (query, _) = answering(&[]);
-    let groups = DeviceGroups::new(&device, query);
     let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
     forgotten_metadata(&device);
-    device.heals().want(CONVERSATION);
-    rejoined(&groups, vec![None, group_info_answer(group_info)]);
-    accepted_from_device(&device);
+    let rejoined = || {
+        device
+            .rejoin_group(CONVERSATION, IMPU, GROUP_URI, &group_info, None)
+            .unwrap()
+    };
 
-    // the Focus refusing each request, as when another member's Commit came
-    // first, it is asked for again
+    // the Focus refusing each CommitList, as when another member's Commit
+    // came first, the device rejoins and asks again
     for _ in 0..5 {
-        assert!(device.metadata_keys_due(CONVERSATION));
-        assert!(metadata_keys(&device).is_some());
+        assert_eq!(commits_of(&rejoined()), 2);
         device.discard_pending(CONVERSATION, false).unwrap();
+        // not with a Commit of its own then, the group to be healed again
+        assert!(!device.metadata_keys_due(CONVERSATION));
     }
+    // the External Commit alone then, and no Commit of its own after it
+    assert_eq!(commits_of(&rejoined()), 1);
+    accepted_from_device(&device);
     assert!(!device.metadata_keys_due(CONVERSATION));
     assert_eq!(metadata_keys(&device), None);
 }
@@ -7877,24 +7905,28 @@ fn the_device_asks_for_the_metadata_keys_if_its_continuity_token_is_not_the_one_
             mls_group_info: Some(group_info),
             ..MlsEnhancedGroupInfo::default()
         });
+        // asked for with the External Commit if the token kept is not the
+        // group's (section 10.5.2)
         let cpim = rejoined(&groups, vec![Some((200, enhanced))]);
+        assert_eq!(commits_of(&cpim), if renewed { 2 } else { 1 });
+        // the check done with as it rejoins, whether it asks or not
+        assert!(!device.notes().read(|data| data
+            .recoveries
+            .get(CONVERSATION)
+            .is_some_and(|recovery| recovery.check)));
         bobs_group
             .process_server_message(&bob, &forwarded_commit(&cpim))
             .unwrap();
         accepted_from_device(&device);
         assert!(metadata_in_sync(&device));
-        assert_eq!(device.metadata_keys_due(CONVERSATION), renewed);
+        assert_eq!(bobs_group.group_metadata_keys_requested(), renewed);
+        assert!(!device.metadata_keys_due(CONVERSATION));
         if !renewed {
             continue;
         }
 
-        // asked for, the device keeps its own token when Bob sends another
-        // (section 10.5.4), and has none to send
-        let cpim = metadata_keys(&device).expect("the keys asked for");
-        bobs_group
-            .process_server_message(&bob, &forwarded_commit(&cpim))
-            .unwrap();
-        accepted_from_device(&device);
+        // the device keeps its own token when Bob sends another (section
+        // 10.5.4), and has none to send
         let output = bobs_group
             .send_group_metadata_keys(&bob, b"bob-keys")
             .unwrap();

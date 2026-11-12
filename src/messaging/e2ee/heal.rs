@@ -420,13 +420,14 @@ impl E2eeDevice {
     /// Unlike other Commits, the External Commit is applied at once. A Focus
     /// refusing it leaves the group to be self-healed again.
     ///
-    /// The Group Metadata keys of the device are then to be checked, and
-    /// asked for if out of sync once the Focus took the External Commit
-    /// (sections 10.1.1, 10.5.1): if it misses the key of the icon or subject
-    /// the group commits to, if it keeps no continuity token, or if the one
-    /// it keeps is not the one the GroupInfo commits to. That is told by the
-    /// epoch authenticator of the GroupInfo, `epoch_authenticator`, which
-    /// the enhanced GroupInfo of the Focus gives alone.
+    /// The Group Metadata keys of the device are checked against the group
+    /// rejoined, and asked for if out of sync, in the same CommitList, with
+    /// a Commit after the External Commit (sections 10.1.1, 10.5.1, 10.5.2):
+    /// if it misses the key of the icon or subject the group commits to, if
+    /// it keeps no continuity token, or if the one it keeps is not the one
+    /// the GroupInfo commits to. That is told by the epoch authenticator of
+    /// the GroupInfo, `epoch_authenticator`, which the enhanced GroupInfo of
+    /// the Focus gives alone.
     pub fn rejoin_group(
         &self,
         conversation_id: &str,
@@ -438,12 +439,19 @@ impl E2eeDevice {
         let token_mismatch = epoch_authenticator.is_some_and(|epoch_authenticator| {
             self.token_mismatched(conversation_id, &group_info.group_info, epoch_authenticator)
         });
-        let (group_id, client_message) = self
+        self.recoveries().check(conversation_id, token_mismatch);
+        let (group_id, (client_message, checked, asked)) = self
             .store()
             .add_conversation(|client| {
-                let (conversation, output) = client.rejoin_conversation(group_info)?;
+                let (mut conversation, output) = client.rejoin_conversation(group_info)?;
+                let (output, checked, asked) = match conversation.group_id()
+                    == conversation_id.as_bytes()
+                {
+                    true => self.asking_with(conversation_id, &mut conversation, client, output),
+                    false => (output, false, false),
+                };
                 let client_message = output.to_client_message()?;
-                Ok((conversation, client_message))
+                Ok((conversation, (client_message, checked, asked)))
             })
             .map_err(GroupError::Store)?;
         // the GroupInfo of another group, which no control message is sent for
@@ -452,7 +460,7 @@ impl E2eeDevice {
                 ErrorKind::UnexpectedMessage,
             )));
         }
-        self.recoveries().check(conversation_id, token_mismatch);
+        self.keys_checked(conversation_id, checked, asked);
         Ok(self.sent_in(conversation_id, from, to, &client_message))
     }
 }
