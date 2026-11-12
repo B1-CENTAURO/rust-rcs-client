@@ -7870,6 +7870,8 @@ fn the_metadata_keys_are_asked_for_5_times_a_day_at_most() {
     for _ in 0..5 {
         assert_eq!(commits_of(&rejoined()), 2);
         device.discard_pending(CONVERSATION, false).unwrap();
+        // not with a Commit of its own then, the group to be healed again
+        assert!(!device.metadata_keys_due(CONVERSATION));
     }
     // the External Commit alone then, and no Commit of its own after it
     assert_eq!(commits_of(&rejoined()), 1);
