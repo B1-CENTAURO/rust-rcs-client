@@ -201,5 +201,5 @@ Nothing is written unless it returns 0.
 
 ## Not covered yet
 
-- **A new Era of a group or chat whose INVITE wasn't answered before the client stopped** is dropped as other changes are, and the group heals once another member's message shows it out of step. Only a new group or chat is kept waiting for the Focus.
-- **RCS Video encryption** (section 9.8).
+- **A new Era of a group or chat whose INVITE wasn't answered before the client stopped** is dropped as other changes are, and the group heals once another member's message shows it out of step. Unlike a new group or chat, it can't wait for the Focus: the group was there before the new Era, so the Focus inviting the client in again doesn't show whether it took the new Era.
+- **RCS Video encryption** (section 9.8). rust-rcs-core encrypts the media of Group RCS Video Chats with SFrame, keyed from the MLS group, but the client has no video calls to use it in.
