@@ -3482,6 +3482,8 @@ fn the_group_info_of_another_group_is_not_rejoined_in_its_stead() {
         )))
     );
     assert_eq!(epoch(&device, CONVERSATION), Ok((1, false)));
+    // nor are the metadata keys asked for in the other group
+    assert_eq!(epoch(&device, "another group"), Ok((2, false)));
 }
 
 /// Why the group `conversation_id` of `device` was moved to unencrypted, if
@@ -7907,6 +7909,11 @@ fn the_device_asks_for_the_metadata_keys_if_its_continuity_token_is_not_the_one_
         // group's (section 10.5.2)
         let cpim = rejoined(&groups, vec![Some((200, enhanced))]);
         assert_eq!(commits_of(&cpim), if renewed { 2 } else { 1 });
+        // the check done with as it rejoins, whether it asks or not
+        assert!(!device.notes().read(|data| data
+            .recoveries
+            .get(CONVERSATION)
+            .is_some_and(|recovery| recovery.check)));
         bobs_group
             .process_server_message(&bob, &forwarded_commit(&cpim))
             .unwrap();
