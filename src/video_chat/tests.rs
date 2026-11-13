@@ -289,6 +289,9 @@ fn the_caller_is_told_the_callee_is_alerted_and_answers() {
         device.told(),
         [(call_id.clone(), String::from(BOB), VideoChatEvent::Alerting)]
     );
+    // told once, though acknowledged again
+    device.receive(BOB, &call_id, Signal::AckInvitation(AckInvitation {}));
+    assert!(device.told().is_empty());
     device.receive(BOB, &call_id, accept("bob's answer"));
     assert_eq!(
         device.told(),
@@ -571,6 +574,25 @@ fn a_call_offered_is_rejected_by_the_user_or_while_another_goes_on() {
 }
 
 #[test]
+fn a_call_hung_up_by_the_callee_before_it_answers_ends_without_a_hangup_in_turn() {
+    let (device, call_id) = calling_bob();
+    device.receive(BOB, &call_id, hangup(HangupReason::UserInitiated));
+    assert_eq!(
+        device.told(),
+        [(
+            call_id.clone(),
+            String::from(BOB),
+            VideoChatEvent::Ended(HangupReason::UserInitiated as i32)
+        )]
+    );
+    assert!(device.sent().is_empty());
+    assert!(device.reports().is_empty());
+    device.after(ANSWERED_WITHIN + MS);
+    assert!(device.sent().is_empty());
+    assert!(!device.service.hang_up(&call_id));
+}
+
+#[test]
 fn a_call_is_cancelled_before_it_is_answered() {
     // section 3.7.5.4.6
     let (device, call_id) = calling_bob();
@@ -781,6 +803,42 @@ fn ice_candidates_are_updated_the_media_connecting_again_within_timer_delta() {
             }
         )]
     );
+    // nor before the media first connects, which Timer_Delta waits for
+    // still
+    device.service.accept_call("bob-call", "answer");
+    device.after(CONNECTED_WITHIN / 2);
+    device.receive(
+        BOB,
+        "bob-call",
+        Signal::IceCandidatesUpdate(IceCandidatesUpdate {
+            add_ice_candidates: vec![String::from("candidate:3")],
+            remove_ice_candidates: Vec::new(),
+        }),
+    );
+    assert_eq!(
+        device.told(),
+        [(
+            String::from("bob-call"),
+            String::from(BOB),
+            VideoChatEvent::IceCandidates {
+                add: vec![String::from("candidate:3")],
+                remove: Vec::new(),
+                reconnecting: false,
+            }
+        )]
+    );
+    device.sent();
+    device.after(CONNECTED_WITHIN / 2 + MS);
+    assert_eq!(
+        device.sent(),
+        [(
+            String::from(BOB),
+            String::from("bob-call"),
+            hangup(HangupReason::ClientTimeout)
+        )]
+    );
+
+    let device = called_by_bob();
     device.service.accept_call("bob-call", "answer");
     device.service.media_connected("bob-call");
     device.sent();
