@@ -23,6 +23,7 @@ pub mod ffi;
 pub mod messaging;
 pub mod provisioning;
 pub mod rcs_engine;
+pub mod video_chat;
 
 use std::ffi::{CStr, CString};
 use std::ptr::{self, null_mut, NonNull};

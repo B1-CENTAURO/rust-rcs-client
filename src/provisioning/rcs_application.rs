@@ -179,6 +179,79 @@ impl Messaging<'_> {
 
         None
     }
+
+    /// The configuration of Messaging-Initiated Video Calls, if the Service
+    /// Provider enables them (RCC.07 sections 3.7.2, A.2.4)
+    pub fn get_mivc_config(&self) -> Option<Mivc<'_>> {
+        self.root
+            .get_child_characteristic("MIVC")
+            .map(|root| Mivc { root })
+    }
+}
+
+/// The MIVC configuration of RCC.07 section A.2.4
+pub struct Mivc<'a> {
+    root: &'a Characteristic,
+}
+
+impl Mivc<'_> {
+    /// MIVC TECHNOLOGY: 0 none, 1 ViLTE, 2 ViLTE preferred with RCS Video
+    /// Chat as fallback, the default, or 3 RCS Video Chat
+    pub fn get_mivc_technology(&self) -> i32 {
+        self.root
+            .get_parameter("mivcTechnology")
+            .and_then(|p| p.parse::<i32>().ok())
+            .unwrap_or(2)
+    }
+
+    /// RCS VIDEO CHAT TURN: whether only the TURN servers of the Service
+    /// Provider are to be used, 0 by default
+    pub fn get_rcs_video_chat_turn(&self) -> i32 {
+        self.root
+            .get_parameter("rcsVideoChatTurn")
+            .and_then(|p| p.parse::<i32>().ok())
+            .unwrap_or(0)
+    }
+
+    /// The TurnCredentials: the URIs of the TURN servers of each, with the
+    /// username and password they share
+    pub fn get_turn_credentials(&self) -> Vec<(Vec<String>, Option<String>, Option<String>)> {
+        self.root
+            .child_characteristics
+            .iter()
+            .filter(|c| c.characteristic_type == "TurnCredentials")
+            .map(|c| {
+                // spelt rcsVideoChatTurnURI in the XML structure of section
+                // A.2.4 and rcsVideoChatTurnUri in its node definitions
+                let uris = c
+                    .characteristic_parameters
+                    .iter()
+                    .filter(|p| p.name.eq_ignore_ascii_case("rcsVideoChatTurnUri"))
+                    .map(|p| p.value.clone())
+                    .collect();
+                let parameter = |name: &str| {
+                    c.characteristic_parameters
+                        .iter()
+                        .find(|p| p.name.eq_ignore_ascii_case(name))
+                        .map(|p| p.value.clone())
+                };
+                (
+                    uris,
+                    parameter("rcsVideoChatTurnUsername"),
+                    parameter("rcsVideoChatTurnPassword"),
+                )
+            })
+            .collect()
+    }
+
+    /// MIVC REPORTING URI: where the client tells it joined or left an RCS
+    /// Video Chat
+    pub fn get_mivc_reporting_uri(&self) -> Option<String> {
+        self.root
+            .get_parameter("mivcReportingUri")
+            .filter(|uri| !uri.is_empty())
+            .map(String::from)
+    }
 }
 
 pub struct Chat<'a> {

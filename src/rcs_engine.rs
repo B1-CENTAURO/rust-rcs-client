@@ -25,6 +25,7 @@ use std::net::Ipv6Addr;
 use std::net::{SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::time::Duration;
 
@@ -42,13 +43,18 @@ use rust_rcs_core::io::network::ohos_socket::OhosTcpStream;
 use rust_rcs_core::io::network::stream::ClientSocket;
 use rust_rcs_core::io::network::stream::ClientStream;
 
+use rust_rcs_core::cpim::CPIMInfo;
+use rust_rcs_core::internet::{Body, Header};
 use rust_rcs_core::msrp::info::MsrpInfo;
 use rust_rcs_core::msrp::info::MsrpInterfaceType;
 use rust_rcs_core::msrp::info::MsrpSetupMethod;
 use rust_rcs_core::security::gba::GbaContext;
 use rust_rcs_core::security::SecurityContext;
+use rust_rcs_core::sip::sip_transaction::client_transaction::ClientTransactionNilCallbacks;
 use rust_rcs_core::sip::SipCore;
+use rust_rcs_core::sip::SipMessage;
 use rust_rcs_core::sip::SipTransactionManager;
+use rust_rcs_core::util::rand::create_raw_alpha_numeric_string;
 
 use rust_rcs_core::sip::sip_subscription::SubscriptionManager;
 use rust_rcs_core::sip::sip_transport::setup_sip_transport;
@@ -106,9 +112,11 @@ use crate::messaging::cpm::imdn::{
     acknowledge_delivery, acknowledge_session_delivery, app_message_id, send_imdn, ImdnService,
     ReceivedMessages, Refusal,
 };
+use crate::messaging::cpm::is_media_type;
 use crate::messaging::cpm::new_message_id;
 use crate::messaging::cpm::session::CPMSessionServiceWrapper;
 use crate::messaging::cpm::session::{CPMGroupEvent, CPMSessionService};
+use crate::messaging::cpm::sip::cpm_contact::CPMServiceType;
 use crate::messaging::cpm::standalone_messaging::StandaloneMessagingServiceWrapper;
 use crate::messaging::cpm::standalone_messaging::{self, StandaloneMessagingService};
 use crate::messaging::cpm::AliasListener;
@@ -122,6 +130,7 @@ use crate::messaging::ft_http::upload_sealed_file;
 use crate::messaging::ft_http::FileInfo;
 use crate::messaging::ft_http::FileTransferOverHTTPService;
 use crate::messaging::ft_http::{ContentServer, Credentials};
+use crate::video_chat::{self, VideoChatConfig, VideoChatLink, VideoChatService};
 
 use super::provisioning::characteristic::Characteristic;
 use super::provisioning::ims_application::ImsApplication;
@@ -132,6 +141,8 @@ const LOG_TAG: &str = "librust_rcs_client";
 type GroupChatListener = Arc<dyn Fn(CPMGroupEvent) + Send + Sync>;
 type GroupChatInvitationListener = Arc<dyn Fn(GroupInvitation) + Send + Sync>;
 type GroupChatIdsListener = Arc<dyn Fn(GroupIds) + Send + Sync>;
+/// Feature tags told in OPTIONS exchanges while they apply, `;` separated
+type FeatureTagSource = Box<dyn Fn() -> Option<String> + Send + Sync>;
 
 pub enum RcsEngineConnectionState {
     IDLE,
@@ -184,6 +195,12 @@ pub struct RcsEngine {
     /// The messages to contacts waiting for an encrypted 1-to-1 chat to
     /// start or not (RCC.16 section 8.1.1)
     preparing_chats: PreparingChats,
+
+    /// The RCS Video Chats of the client (RCC.07 section 3.7.5)
+    video_chat_service: Arc<VideoChatService>,
+
+    /// The feature tags of E2EE, told besides that of RCS Video Chat
+    extra_feature_tags: Arc<Mutex<Option<FeatureTagSource>>>,
 
     // msrp_channels: Arc<MsrpChannelManager>,
     core: Arc<SipCore>,
@@ -552,8 +569,23 @@ impl RcsEngine {
             Arc::clone(&received_messages),
             Arc::clone(&rt),
         );
+        // the RCS Video Chats, once made, the signalling of which goes to
+        // them and not to the app (RCC.07 section 3.7.5.2.3.1)
+        let video_chat: Arc<OnceLock<Weak<VideoChatService>>> = Arc::new(OnceLock::new());
+        let video_chat_1 = Arc::clone(&video_chat);
+        let video_chat_2 = Arc::clone(&video_chat);
         let standalone_messaging_service = StandaloneMessagingService::new(
             move |contact_uri, cpim_info, content_type, message_body| {
+                if taken_by_video_chat(
+                    &video_chat_1,
+                    || false,
+                    contact_uri,
+                    cpim_info,
+                    content_type,
+                    message_body,
+                ) {
+                    return;
+                }
                 if let (Ok(contact_uri), Ok(content_type), Ok(message_body)) = (
                     std::str::from_utf8(contact_uri),
                     std::str::from_utf8(content_type),
@@ -615,6 +647,26 @@ impl RcsEngine {
         );
         let cpm_session_service = CPMSessionService::new(
             move |session, contact_uri, cpim_info, content_type, message_body| {
+                let in_group = || {
+                    matches!(
+                        session
+                            .get_inner()
+                            .get_session_info()
+                            .cpm_contact
+                            .service_type,
+                        CPMServiceType::Group
+                    )
+                };
+                if taken_by_video_chat(
+                    &video_chat_2,
+                    in_group,
+                    contact_uri,
+                    cpim_info,
+                    content_type,
+                    message_body,
+                ) {
+                    return;
+                }
                 if let (Ok(contact_uri), Ok(content_type), Ok(message_body)) = (
                     std::str::from_utf8(contact_uri),
                     std::str::from_utf8(content_type),
@@ -762,6 +814,45 @@ impl RcsEngine {
 
         cpm_session_service.attach_core(&core, &rt);
 
+        let preparing_chats: PreparingChats = Arc::new(Mutex::new(HashMap::new()));
+        let video_chat_service = VideoChatService::new(
+            Arc::new(EngineVideoChatLink {
+                route: MessageRoute {
+                    state: Arc::clone(&state),
+                    messaging_config: Arc::clone(&messaging_config),
+                    cpm_session_service: Arc::clone(&cpm_session_service),
+                    standalone_messaging_service: Arc::clone(&standalone_messaging_service),
+                    core: Arc::clone(&core),
+                },
+                preparing: Arc::clone(&preparing_chats),
+                tm: Arc::clone(&tm),
+                rt: Arc::clone(&rt),
+            }),
+            rt.handle().clone(),
+        );
+        let _ = video_chat.set(Arc::downgrade(&video_chat_service));
+
+        // those of E2EE once set, and that of RCS Video Chat while it applies
+        // (RCC.07 section 3.7.3.6)
+        let extra_feature_tags: Arc<Mutex<Option<FeatureTagSource>>> = Arc::new(Mutex::new(None));
+        {
+            let e2ee = Arc::clone(&extra_feature_tags);
+            let video_chat = Arc::downgrade(&video_chat_service);
+            capability_service.set_extra_feature_tags(move || {
+                let e2ee = e2ee.lock().unwrap().as_ref().and_then(|e2ee| e2ee());
+                let video_chat = video_chat
+                    .upgrade()
+                    .and_then(|video_chat| video_chat.feature_tag())
+                    .map(String::from);
+                let tags: Vec<String> = e2ee
+                    .into_iter()
+                    .chain(video_chat)
+                    .filter(|tags| !tags.is_empty())
+                    .collect();
+                (!tags.is_empty()).then(|| tags.join(";"))
+            });
+        }
+
         let connector = Arc::new_cyclic(|connector: &Weak<Connector>| {
             let connector = Weak::clone(connector);
 
@@ -846,7 +937,11 @@ impl RcsEngine {
             group_chat_invitation_listener,
 
             group_chat_ids_listener,
-            preparing_chats: Arc::new(Mutex::new(HashMap::new())),
+            preparing_chats,
+
+            video_chat_service,
+
+            extra_feature_tags,
 
             // msrp_channels,
             core,
@@ -969,7 +1064,10 @@ impl RcsEngine {
                 .unwrap()
                 .update_configuration(&rcs_app);
 
-            self.ft_http_configs.update_configuration(&rcs_app)
+            self.ft_http_configs.update_configuration(&rcs_app);
+
+            self.video_chat_service
+                .set_config(VideoChatConfig::of(&rcs_app));
         }
     }
 
@@ -1043,7 +1141,7 @@ impl RcsEngine {
             if let (true, Some(encryption)) = (chat_auth, encryption) {
                 let message = PendingMessage {
                     message_type: String::from(message_type),
-                    message_content: String::from(message_content),
+                    content: Content::App(String::from(message_content)),
                     message_id,
                     recipient: String::from(recipient),
                     callback: Box::new(message_result_callback),
@@ -1477,7 +1575,12 @@ impl RcsEngine {
         &self,
         extra: impl Fn() -> Option<String> + Send + Sync + 'static,
     ) {
-        self.capability_service.set_extra_feature_tags(extra);
+        *self.extra_feature_tags.lock().unwrap() = Some(Box::new(extra));
+    }
+
+    /// The RCS Video Chats of the client (RCC.07 section 3.7.5)
+    pub fn video_chat(&self) -> &Arc<VideoChatService> {
+        &self.video_chat_service
     }
 
     /// The feature tags told in OPTIONS exchanges as they apply now
@@ -3177,7 +3280,7 @@ mod tests {
         let id_ = String::from(id);
         super::PendingMessage {
             message_type: String::from("text/plain"),
-            message_content: String::from("hi"),
+            content: super::Content::App(String::from("hi")),
             message_id: String::from(id),
             recipient: String::from(recipient),
             callback: Box::new(move |status_code, _| {
@@ -3343,11 +3446,30 @@ pub enum UploadFor {
     Chat(String),
 }
 
+/// What a message to a contact carries
+enum Content {
+    /// The app's, sent as it would be without E2EE if no encrypted chat
+    /// takes it
+    App(String),
+    /// A VideoChatMessage, which goes in the 1-to-1 chat alone, encrypted if
+    /// the chat is (RCC.07 section 3.7.5.2.2, RCC.16 section 9.8.1)
+    VideoChat(Vec<u8>),
+}
+
+impl Content {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Content::App(text) => text.as_bytes(),
+            Content::VideoChat(message) => message,
+        }
+    }
+}
+
 /// A message to a contact waiting for the MLS group of the encrypted 1-to-1
 /// chat it is to go in, or for the contact found not to take one
 struct PendingMessage {
     message_type: String,
-    message_content: String,
+    content: Content,
     message_id: String,
     recipient: String,
     callback: Box<dyn FnOnce(u16, String) + Send + Sync>,
@@ -3427,7 +3549,7 @@ fn send_to_contact(
                 if let (Some(group_id), Some(bundle)) = (&group_id, &bundle) {
                     route.cpm_session_service.send_in_new_chat(
                         &message.message_type,
-                        &message.message_content,
+                        message.content.bytes(),
                         &message.message_id,
                         &message.recipient,
                         group_id,
@@ -3444,14 +3566,18 @@ fn send_to_contact(
             // as before E2EE; or, the Era of a chat not made, in a new
             // session of the chat as it is
             |message| {
-                if era_due {
-                    send_in_chat(&route, message, &rt_);
-                    return;
-                }
+                // a video chat message in the chat as well, never
+                // standalone (RCC.07 section 3.7.5.2.2)
+                let text = match (&message.content, era_due) {
+                    (Content::App(text), false) => text.clone(),
+                    _ => {
+                        send_in_chat(&route, message, &rt_);
+                        return;
+                    }
+                };
                 // not a file sealed for the chat, which could not be opened
                 if is_file_transfer(&message.message_type)
-                    && unsealing
-                        .sealed_for_chat(&message.recipient, message.message_content.as_bytes())
+                    && unsealing.sealed_for_chat(&message.recipient, text.as_bytes())
                 {
                     (message.callback)(488, String::from("Not Acceptable Here"));
                     return;
@@ -3459,7 +3585,7 @@ fn send_to_contact(
                 route_message(
                     &route,
                     &message.message_type,
-                    &message.message_content,
+                    &text,
                     &message.message_id,
                     &message.recipient,
                     RecipientType::Contact,
@@ -3555,11 +3681,149 @@ fn is_file_transfer(message_type: &str) -> bool {
     })
 }
 
+/// What RCS Video Chats signal through: the 1-to-1 chat with each contact,
+/// and SIP MESSAGEs to the MIVC REPORTING URI
+struct EngineVideoChatLink {
+    route: MessageRoute,
+    preparing: PreparingChats,
+    tm: Arc<SipTransactionManager>,
+    rt: Arc<Runtime>,
+}
+
+impl VideoChatLink for EngineVideoChatLink {
+    fn send(&self, contact: &str, message: Vec<u8>, sent: Box<dyn FnOnce(u16) + Send + Sync>) {
+        send_video_chat_message(
+            &self.route,
+            &self.preparing,
+            contact,
+            message,
+            sent,
+            &self.rt,
+        );
+    }
+
+    fn report(&self, reporting_uri: &str, notification: Vec<u8>) {
+        report_video_chat_event(&self.route, &self.tm, reporting_uri, notification, &self.rt);
+    }
+
+    fn registered_uri(&self) -> Option<String> {
+        registered_identity(&self.route.state).map(|(_, public_user_identity)| public_user_identity)
+    }
+}
+
+/// Sends the VideoChatMessage `message` to `contact` in the 1-to-1 chat with
+/// it, as a CPIM message of its own content type (RCC.07 sections 3.7.5.2.2,
+/// 3.7.5.2.3.1): with E2EE, in the encrypted chat if the contact takes one,
+/// as any message to it (RCC.16 section 9.8.1); never standalone
+fn send_video_chat_message(
+    route: &MessageRoute,
+    preparing: &PreparingChats,
+    contact: &str,
+    message: Vec<u8>,
+    sent: Box<dyn FnOnce(u16) + Send + Sync>,
+    rt: &Arc<Runtime>,
+) {
+    let message = PendingMessage {
+        message_type: String::from(video_chat::CONTENT_TYPE),
+        content: Content::VideoChat(message),
+        message_id: new_message_id(),
+        recipient: String::from(contact),
+        callback: Box::new(move |status_code, _| sent(status_code)),
+    };
+    if route.messaging_config.lock().unwrap().chat_auth != 1 {
+        (message.callback)(403, String::from("Forbidden"));
+        return;
+    }
+    match route.cpm_session_service.group_encryption() {
+        Some(encryption) => send_to_contact(route, preparing, encryption, message, rt),
+        None => send_in_chat(route, message, rt),
+    }
+}
+
+/// Sends the VideoChatEventNotification `notification` to `reporting_uri` in
+/// a SIP MESSAGE (RCC.07 section 3.7.5.2.5), as `rcs/video-chat+proto`, the
+/// content type of the other protocol buffers of RCS Video Chat, as RCC.07
+/// gives none for it
+fn report_video_chat_event(
+    route: &MessageRoute,
+    tm: &Arc<SipTransactionManager>,
+    reporting_uri: &str,
+    notification: Vec<u8>,
+    rt: &Arc<Runtime>,
+) {
+    let Some((transport, public_user_identity)) = registered_identity(&route.state) else {
+        return;
+    };
+    let mut req_message = SipMessage::new_request(MESSAGE, reporting_uri.as_bytes());
+    req_message.add_header(Header::new(
+        b"Call-ID",
+        String::from(
+            Uuid::new_v4()
+                .as_hyphenated()
+                .encode_lower(&mut Uuid::encode_buffer()),
+        ),
+    ));
+    req_message.add_header(Header::new(b"CSeq", b"1 MESSAGE"));
+    let tag = create_raw_alpha_numeric_string(8);
+    req_message.add_header(Header::new(
+        b"From",
+        format!(
+            "<{}>;tag={}",
+            public_user_identity,
+            String::from_utf8_lossy(&tag)
+        ),
+    ));
+    req_message.add_header(Header::new(b"To", format!("<{}>", reporting_uri)));
+    req_message.add_header(Header::new(b"P-Preferred-Identity", public_user_identity));
+    req_message.add_header(Header::new(b"Content-Type", video_chat::CONTENT_TYPE));
+    req_message.add_header(Header::new(
+        b"Content-Length",
+        format!("{}", notification.len()),
+    ));
+    req_message.set_body(Arc::new(Body::Raw(notification)));
+    tm.send_request(
+        req_message,
+        &transport,
+        ClientTransactionNilCallbacks {},
+        rt,
+    );
+}
+
+/// Whether the message `body` of `content_type` from `contact_uri` is the
+/// signalling of an RCS Video Chat, which is not for the app (RCC.07 section
+/// 3.7.5.2.3.1): taken by `video_chat` from a 1-to-1 chat, sent at the CPIM
+/// DateTime of `cpim_info`, but not yet from a group, as `in_group` tells
+fn taken_by_video_chat(
+    video_chat: &OnceLock<Weak<VideoChatService>>,
+    in_group: impl FnOnce() -> bool,
+    contact_uri: &[u8],
+    cpim_info: &CPIMInfo,
+    content_type: &[u8],
+    body: &[u8],
+) -> bool {
+    if !is_media_type(content_type, video_chat::CONTENT_TYPE) {
+        return false;
+    }
+    let service = video_chat.get().and_then(Weak::upgrade);
+    match (service, in_group()) {
+        (Some(service), false) => {
+            if let (Ok(contact_uri), Ok(date)) = (
+                std::str::from_utf8(contact_uri),
+                std::str::from_utf8(cpim_info.date),
+            ) {
+                service.on_message(contact_uri, date, body);
+            }
+        }
+        _ => platform_log(LOG_TAG, "video chat message not taken"),
+    }
+    true
+}
+
 /// Sends `message` to its contact through the 1-to-1 chat service
 fn send_in_chat(route: &MessageRoute, message: PendingMessage, rt: &Arc<Runtime>) {
     route.cpm_session_service.send_message(
         &message.message_type,
-        &message.message_content,
+        message.content.bytes(),
         &message.message_id,
         &message.recipient,
         &RecipientType::Contact,

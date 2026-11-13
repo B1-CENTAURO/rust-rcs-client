@@ -902,7 +902,7 @@ impl StandaloneMessagingService {
 
                     let cpim_body = make_cpim_message_content_body(
                         message_type,
-                        "",
+                        b"",
                         &recipient_type,
                         recipient_uri,
                         message_id,
@@ -2324,7 +2324,7 @@ pub fn send_message_from<F>(
 
     let cpim_body = make_cpim_message_content_body(
         message_type,
-        message_content,
+        message_content.as_bytes(),
         &recipient_type,
         recipient_uri,
         message_id,
