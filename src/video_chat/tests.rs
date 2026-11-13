@@ -136,11 +136,11 @@ impl Device {
     }
 
     /// `signal` of the call `call_id` from `contact`, sent now
-    fn from(&self, contact: &str, call_id: &str, signal: Signal) {
-        self.from_sent(contact, call_id, signal, &date(Duration::ZERO));
+    fn receive(&self, contact: &str, call_id: &str, signal: Signal) {
+        self.receive_sent(contact, call_id, signal, &date(Duration::ZERO));
     }
 
-    fn from_sent(&self, contact: &str, call_id: &str, signal: Signal, date: &str) {
+    fn receive_sent(&self, contact: &str, call_id: &str, signal: Signal, date: &str) {
         let message = VideoChatMessage {
             call_id: String::from(call_id),
             event: Some(signal),
@@ -201,7 +201,7 @@ fn calling_bob() -> (Device, String) {
     let device = a_device();
     let call_id = device.service.start_call(BOB, "offer").unwrap();
     device.sent();
-    device.from(BOB, &call_id, Signal::AckInvitation(AckInvitation {}));
+    device.receive(BOB, &call_id, Signal::AckInvitation(AckInvitation {}));
     device.told();
     (device, call_id)
 }
@@ -209,7 +209,7 @@ fn calling_bob() -> (Device, String) {
 /// A device in a call with Bob that Bob offered, ringing
 fn called_by_bob() -> Device {
     let device = a_device();
-    device.from(BOB, "bob-call", offer("bob's offer"));
+    device.receive(BOB, "bob-call", offer("bob's offer"));
     device.sent();
     device.told();
     device
@@ -284,12 +284,12 @@ fn the_caller_is_told_the_callee_is_alerted_and_answers() {
     device.sent();
 
     // RCC.07 v18.0 sections 3.7.5.4.2, 3.7.5.4.3
-    device.from(BOB, &call_id, Signal::AckInvitation(AckInvitation {}));
+    device.receive(BOB, &call_id, Signal::AckInvitation(AckInvitation {}));
     assert_eq!(
         device.told(),
         [(call_id.clone(), String::from(BOB), VideoChatEvent::Alerting)]
     );
-    device.from(BOB, &call_id, accept("bob's answer"));
+    device.receive(BOB, &call_id, accept("bob's answer"));
     assert_eq!(
         device.told(),
         [(
@@ -319,7 +319,7 @@ fn the_caller_is_told_the_callee_is_alerted_and_answers() {
     );
     assert_eq!(device.reports(), [(LEAVE, String::from(BOB))]);
     // Bob's Hangup in turn is let go of
-    device.from(BOB, &call_id, hangup(HangupReason::UserInitiated));
+    device.receive(BOB, &call_id, hangup(HangupReason::UserInitiated));
     assert!(device.sent().is_empty());
     assert!(device.told().is_empty());
     assert!(!device.service.hang_up(&call_id));
@@ -330,7 +330,7 @@ fn the_caller_is_told_the_callee_is_alerted_and_answers() {
         technology: 3,
         ..VideoChatConfig::default()
     });
-    device.from(BOB, &call_id, accept("bob's answer"));
+    device.receive(BOB, &call_id, accept("bob's answer"));
     assert!(device.service.media_connected(&call_id));
     assert!(device.service.hang_up(&call_id));
     assert!(device.reports().is_empty());
@@ -339,7 +339,7 @@ fn the_caller_is_told_the_callee_is_alerted_and_answers() {
 #[test]
 fn a_call_offered_is_acknowledged_and_answered_with_the_sdp_answer_of_the_app() {
     let device = a_device();
-    device.from(BOB, "bob-call", offer("bob's offer"));
+    device.receive(BOB, "bob-call", offer("bob's offer"));
     assert_eq!(
         device.sent(),
         [(
@@ -359,7 +359,7 @@ fn a_call_offered_is_acknowledged_and_answered_with_the_sdp_answer_of_the_app() 
         )]
     );
     // sent again, let go of
-    device.from(BOB, "bob-call", offer("bob's offer"));
+    device.receive(BOB, "bob-call", offer("bob's offer"));
     assert!(device.sent().is_empty());
     assert!(device.told().is_empty());
 
@@ -381,7 +381,7 @@ fn a_call_offered_is_acknowledged_and_answered_with_the_sdp_answer_of_the_app() 
     assert_eq!(device.reports(), [(JOIN, String::from(ME))]);
 
     // Bob hangs up, which is answered in turn with the same reason
-    device.from(BOB, "bob-call", hangup(HangupReason::UserInitiated));
+    device.receive(BOB, "bob-call", hangup(HangupReason::UserInitiated));
     assert_eq!(
         device.sent(),
         [(
@@ -454,7 +454,7 @@ fn a_call_not_acknowledged_or_not_answered_in_time_is_cancelled() {
     // answered in time
     let (device, call_id) = calling_bob();
     device.after(ANSWERED_WITHIN - MS);
-    device.from(BOB, &call_id, accept("answer"));
+    device.receive(BOB, &call_id, accept("answer"));
     device.told();
     device.after(2 * MS);
     assert!(device.sent().is_empty());
@@ -466,7 +466,7 @@ fn a_call_offered_rings_until_too_old_to_answer() {
     // sent 20 s ago: rings 12 s more (Timer_Gamma, section 3.7.5.2.4.3)
     let device = a_device();
     let sent = Duration::from_secs(20);
-    device.from_sent(BOB, "bob-call", offer("offer"), &date(sent));
+    device.receive_sent(BOB, "bob-call", offer("offer"), &date(sent));
     assert_eq!(device.sent().len(), 1, "acknowledged");
     device.told();
     device.after(ANSWERED_WITHIN - sent - Duration::from_millis(100));
@@ -486,7 +486,7 @@ fn a_call_offered_rings_until_too_old_to_answer() {
     // stored and forwarded too long ago: missed, not acknowledged (section
     // 3.7.5.4.8.1.4)
     let device = a_device();
-    device.from_sent(BOB, "bob-call", offer("offer"), &date(ANSWERED_WITHIN + MS));
+    device.receive_sent(BOB, "bob-call", offer("offer"), &date(ANSWERED_WITHIN + MS));
     assert!(device.sent().is_empty());
     assert_eq!(
         device.told(),
@@ -504,7 +504,7 @@ fn a_call_offered_rings_until_too_old_to_answer() {
         String::from("not a date"),
     ] {
         let device = a_device();
-        device.from_sent(BOB, "bob-call", offer("offer"), &date);
+        device.receive_sent(BOB, "bob-call", offer("offer"), &date);
         device.told();
         device.after(ANSWERED_WITHIN - MS);
         assert!(device.told().is_empty(), "{}", date);
@@ -531,7 +531,7 @@ fn a_call_offered_is_rejected_by_the_user_or_while_another_goes_on() {
 
     // REJECT_REASON_ALREADY_IN_PROGRESS, the call missed
     let device = called_by_bob();
-    device.from("tel:+15550003", "carol-call", offer("offer"));
+    device.receive("tel:+15550003", "carol-call", offer("offer"));
     assert_eq!(
         device.sent(),
         [(
@@ -554,7 +554,7 @@ fn a_call_offered_is_rejected_by_the_user_or_while_another_goes_on() {
     // the caller told
     let device = a_device();
     let call_id = device.service.start_call(BOB, "offer").unwrap();
-    device.from(BOB, &call_id, reject(RejectReason::UserReject));
+    device.receive(BOB, &call_id, reject(RejectReason::UserReject));
     assert_eq!(
         device.told(),
         [(
@@ -589,7 +589,7 @@ fn a_call_is_cancelled_before_it_is_answered() {
         hangup(HangupReason::UserInitiated),
     ] {
         let device = called_by_bob();
-        device.from(BOB, "bob-call", signal);
+        device.receive(BOB, "bob-call", signal);
         assert_eq!(
             device.told(),
             [(
@@ -607,7 +607,7 @@ fn a_call_is_cancelled_before_it_is_answered() {
 fn a_call_whose_media_does_not_connect_in_time_fails() {
     // Timer_Delta of the caller (section 3.7.5.4.8.1.2)
     let (device, call_id) = calling_bob();
-    device.from(BOB, &call_id, accept("answer"));
+    device.receive(BOB, &call_id, accept("answer"));
     device.told();
     device.after(CONNECTED_WITHIN - MS);
     assert!(device.sent().is_empty());
@@ -658,7 +658,7 @@ fn a_call_whose_media_does_not_connect_in_time_fails() {
     let device = called_by_bob();
     device.service.accept_call("bob-call", "answer");
     device.sent();
-    device.from(BOB, "bob-call", hangup(HangupReason::ClientTimeout));
+    device.receive(BOB, "bob-call", hangup(HangupReason::ClientTimeout));
     assert_eq!(
         device.sent(),
         [(
@@ -681,7 +681,7 @@ fn a_call_whose_media_does_not_connect_in_time_fails() {
 fn a_call_whose_media_does_not_connect_again_in_time_fails() {
     // Timer_Epsilon (section 3.7.5.4.8.1.6)
     let (device, call_id) = calling_bob();
-    device.from(BOB, &call_id, accept("answer"));
+    device.receive(BOB, &call_id, accept("answer"));
     device.service.media_connected(&call_id);
     device.told();
     device.reports();
@@ -709,7 +709,7 @@ fn a_call_whose_media_does_not_connect_again_in_time_fails() {
 
     // connected again in time, joined once
     let (device, call_id) = calling_bob();
-    device.from(BOB, &call_id, accept("answer"));
+    device.receive(BOB, &call_id, accept("answer"));
     device.service.media_connected(&call_id);
     device.reports();
     device.service.media_disconnected(&call_id);
@@ -730,7 +730,7 @@ fn a_call_whose_media_does_not_connect_again_in_time_fails() {
 fn ice_candidates_are_updated_the_media_connecting_again_within_timer_delta() {
     // after an IP address change (section 3.7.5.4.8.2)
     let (device, call_id) = calling_bob();
-    device.from(BOB, &call_id, accept("answer"));
+    device.receive(BOB, &call_id, accept("answer"));
     device.service.media_connected(&call_id);
     device.told();
     assert!(device.service.update_ice_candidates(
@@ -761,7 +761,7 @@ fn ice_candidates_are_updated_the_media_connecting_again_within_timer_delta() {
 
     // Bob's, told as reconnecting once the media connected
     let device = called_by_bob();
-    device.from(
+    device.receive(
         BOB,
         "bob-call",
         Signal::IceCandidatesUpdate(IceCandidatesUpdate {
@@ -784,7 +784,7 @@ fn ice_candidates_are_updated_the_media_connecting_again_within_timer_delta() {
     device.service.accept_call("bob-call", "answer");
     device.service.media_connected("bob-call");
     device.sent();
-    device.from(
+    device.receive(
         BOB,
         "bob-call",
         Signal::IceCandidatesUpdate(IceCandidatesUpdate {
@@ -841,7 +841,7 @@ fn media_updates_go_both_ways() {
             Signal::UpdateMedia(update.clone())
         )]
     );
-    device.from(BOB, &call_id, Signal::UpdateMedia(update.clone()));
+    device.receive(BOB, &call_id, Signal::UpdateMedia(update.clone()));
     assert_eq!(
         device.told(),
         [(
@@ -857,13 +857,13 @@ fn media_updates_go_both_ways() {
 fn the_signals_of_a_call_are_taken_from_its_contact_alone() {
     let device = a_device();
     let call_id = device.service.start_call(BOB, "offer").unwrap();
-    device.from("tel:+15550003", &call_id, accept("carol's answer"));
+    device.receive("tel:+15550003", &call_id, accept("carol's answer"));
     assert!(device.told().is_empty());
     // nor for another call
-    device.from(BOB, "another call", accept("answer"));
+    device.receive(BOB, "another call", accept("answer"));
     assert!(device.told().is_empty());
     // the contact known by a SIP URI of its number
-    device.from(
+    device.receive(
         "sip:+15550002@ims.example.com;user=phone",
         &call_id,
         accept("bob's answer"),
@@ -1005,4 +1005,45 @@ fn contacts_are_the_same_by_their_uri_or_global_number() {
         "tel:5550002;phone-context=example.com",
         "tel:5550002"
     ));
+}
+
+#[test]
+fn the_app_is_told_each_event_by_its_code() {
+    use super::ffi::video_chat_event_code;
+
+    let code = |event| {
+        video_chat_event_code(&event)
+            .map(|(code, sdp, reason)| (code, sdp.map(String::from), reason))
+    };
+    assert_eq!(
+        code(VideoChatEvent::Incoming {
+            sdp_offer: String::from("offer")
+        }),
+        Some((0, Some(String::from("offer")), 0))
+    );
+    assert_eq!(code(VideoChatEvent::Alerting), Some((1, None, 0)));
+    assert_eq!(
+        code(VideoChatEvent::Answered {
+            sdp_answer: String::from("answer")
+        }),
+        Some((2, Some(String::from("answer")), 0))
+    );
+    assert_eq!(code(VideoChatEvent::Rejected(2)), Some((3, None, 2)));
+    assert_eq!(code(VideoChatEvent::NotAnswered), Some((4, None, 0)));
+    assert_eq!(code(VideoChatEvent::Missed), Some((5, None, 0)));
+    assert_eq!(code(VideoChatEvent::Ended(2)), Some((6, None, 2)));
+    assert_eq!(code(VideoChatEvent::Failed(480)), Some((7, None, 480)));
+    // told by callbacks of their own
+    assert_eq!(
+        code(VideoChatEvent::IceCandidates {
+            add: Vec::new(),
+            remove: Vec::new(),
+            reconnecting: false
+        }),
+        None
+    );
+    assert_eq!(
+        code(VideoChatEvent::MediaUpdate(UpdateMedia::default())),
+        None
+    );
 }

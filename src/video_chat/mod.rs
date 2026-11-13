@@ -287,9 +287,7 @@ impl VideoChatService {
     /// section 3.7.5.4.1): the call_id of the call, or None if the client
     /// takes no calls, or another goes on
     pub fn start_call(&self, contact: &str, sdp_offer: &str) -> Option<String> {
-        if self.feature_tag().is_none() {
-            return None;
-        }
+        self.feature_tag()?;
         let call_id = new_call_id();
         let actions = {
             let mut calls = self.calls.lock().unwrap();

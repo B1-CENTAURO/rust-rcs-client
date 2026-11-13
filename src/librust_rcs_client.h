@@ -263,6 +263,85 @@ extern void rcs_client_set_group_chat_ids_listener(struct rcs_client *client, gr
 extern void rcs_client_set_group_chat_ids(struct rcs_client *client, const char *conference_uri, const char *conversation_id,
                                 const char *contribution_id, const char *mls_opaque_token);
 
+// RCS Video Chat (RCC.07 section 3.7.5): the client signals 1-to-1 calls in the chat with the contact, and keeps their timers;
+// the media is the app's WebRTC stack's, which makes the SDP offers and answers and the ICE candidates the client carries
+
+// told of each TurnCredential of the configuration: the URIs of its TURN servers (RFC 7065), and its username and password,
+// NULL if none
+typedef void (*video_chat_turn_server_callback) (const char *const *uris, size_t uri_count, const char *username,
+                                const char *password, void *context);
+
+// gives the MIVC configuration (RCC.07 section A.1.3): the MIVC TECHNOLOGY in technology, 0 none, 1 ViLTE, 2 ViLTE preferred with
+// RCS Video Chat as fallback, 3 RCS Video Chat; turn_mandatory 1 if the ICE candidates offered are to be those of the TURN servers
+// given alone; and each TurnCredential to cb, at once (NULL for none)
+extern void rcs_client_get_video_chat_config(struct rcs_client *client, int32_t *technology, int32_t *turn_mandatory,
+                                video_chat_turn_server_callback cb, void *context);
+
+// told of a call: incoming (event 0) with the SDP offer in sdp, the callee alerted already; alerting (1); answered (2) with the SDP
+// answer in sdp, the media to connect; rejected (3), reason the RejectReason, 1 by the user, 2 as another call went on; not answered
+// in time, and cancelled (4); missed (5), as cancelled, not answered in time, too old, or while another call went on; ended (6),
+// reason the HangupReason: 1 hung up by the contact, 2 failed as the media did not connect in time; failed (7), reason the status
+// code of the chat message that could not be sent; sdp NULL but for 0 and 2; the call is over after 3 to 7
+typedef void (*video_chat_callback) (int32_t event, const char *call_id, const char *contact_uri, const char *sdp,
+                                int32_t reason, void *context);
+
+// told of ICE candidates of the contact of a call to add and remove; reconnecting != 0 if the media had connected, and is to
+// connect again within Timer_Delta (RCC.07 section 3.7.5.4.8.2)
+typedef void (*video_chat_ice_candidates_callback) (const char *call_id, const char *const *add, size_t add_count,
+                                const char *const *remove, size_t remove_count, int32_t reconnecting, void *context);
+
+// a view preferred (RCC.07 section 3.7.5.2.3.2.8): media_type 1 audio, 2 video; height, width and frame_rate 0 for audio
+struct rcs_video_chat_view_request {
+    const char *media_stream_id;
+    int32_t media_type;
+    int32_t height;
+    int32_t width;
+    int32_t frame_rate;
+};
+
+// told of the views the contact of a call prefers, and the bandwidth it can take in kbps, 0 each if it gave none
+typedef void (*video_chat_media_update_callback) (const char *call_id, const struct rcs_video_chat_view_request *view_requests,
+                                size_t view_request_count, int32_t max_bandwidth_kbps, int32_t min_bandwidth_kbps,
+                                int32_t start_bandwidth_kbps, void *context);
+
+// sets the video chat listener, which has the client take calls, and tell it does in OPTIONS exchanges (+g.gsma.rcs.videochat)
+// while the configuration enables RCS Video Chat (technology 2 or 3); the context of one set before is released
+extern void rcs_client_set_video_chat_listener(struct rcs_client *client, video_chat_callback cb,
+                                video_chat_ice_candidates_callback ice_cb, video_chat_media_update_callback media_cb,
+                                void *context);
+
+// calls contact_uri with the SDP offer of the app (full ICE, UDP candidates, DTLS fingerprints: RCC.07 section 3.7.5.2.1), in
+// the 1-to-1 chat with it, encrypted if the chat is (RCC.16 section 9.8.1); writes the call_id, NUL terminated, to call_id,
+// of call_id_size bytes, 37 at least; 0 if called, -1 if the listener is not set, RCS Video Chat not enabled, or another call
+// goes on
+extern int32_t rcs_client_start_video_chat(struct rcs_client *client, const char *contact_uri, const char *sdp_offer,
+                                char *call_id, size_t call_id_size);
+
+// answers the call offered with the SDP answer of the app; 0 if it was offered still, -1 otherwise
+extern int32_t rcs_client_accept_video_chat(struct rcs_client *client, const char *call_id, const char *sdp_answer);
+
+// ends the call as the user chose: cancels it if not answered yet, rejects it if offered, hangs it up otherwise; 0 if it went on
+extern int32_t rcs_client_hang_up_video_chat(struct rcs_client *client, const char *call_id);
+
+// sends the contact of the call ICE candidates to add and remove, as after an IP address change, the media to connect again
+// within Timer_Delta if it had connected; 0 if the call goes on
+extern int32_t rcs_client_update_video_chat_ice_candidates(struct rcs_client *client, const char *call_id,
+                                const char *const *add, size_t add_count, const char *const *remove, size_t remove_count);
+
+// sends the contact of the call the views the app prefers, and the bandwidth it can take in kbps, none if all three are 0;
+// 0 if the call goes on
+extern int32_t rcs_client_update_video_chat_media(struct rcs_client *client, const char *call_id,
+                                const struct rcs_video_chat_view_request *view_requests, size_t view_request_count,
+                                int32_t max_bandwidth_kbps, int32_t min_bandwidth_kbps, int32_t start_bandwidth_kbps);
+
+// tells the client the media of an answered call connected, or connected again, which stops Timer_Delta or Timer_Epsilon; the
+// first time, the client reports it joined to the MIVC REPORTING URI if configured; 0 if the call goes on and was answered
+extern int32_t rcs_client_video_chat_media_connected(struct rcs_client *client, const char *call_id);
+
+// tells the client the media of an answered call went down, for it to connect again within Timer_Epsilon; 0 if the call goes on
+// and was answered
+extern int32_t rcs_client_video_chat_media_disconnected(struct rcs_client *client, const char *call_id);
+
 // accepts (accept != 0) or declines the invitation to the group chat that waits for the user's answer: 404 if there is none
 extern void rcs_client_answer_group_chat_invitation(struct rcs_runtime *runtime, struct rcs_client *client, const char *conference_uri,
                                 int accept, message_result_callback cb, void *context);
