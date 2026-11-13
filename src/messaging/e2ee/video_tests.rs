@@ -28,17 +28,21 @@ use crate::video_chat::proto::{
 };
 
 use super::device::E2eeDevice;
+use super::group::DeviceGroups;
 use super::group_tests::{
-    accepted, alice_and_bob, alice_and_bob_in_time, alice_and_bob_in_time_with_kds, bundle_of,
-    commit_bundle_of, cpim_message, epoch, epoch_identifier, focus_commit, header_names, joined,
-    missed_by_the_device, notification_cpim, notification_xml, recipient, uploaded_key_package,
-    Clock, CONVERSATION, DAY, GROUP_URI, IMPU,
+    accepted, alice_and_bob, alice_and_bob_in_time, alice_and_bob_in_time_with_kds, answering,
+    bundle_of, commit_bundle_of, cpim_message, epoch, epoch_identifier, focus_commit, header_names,
+    joined, missed_by_the_device, notification_cpim, notification_xml, recipient,
+    uploaded_key_package, Clock, CONVERSATION, DAY, FACTORY, GROUP_URI, IMPU,
 };
 use super::kds_tests::certificates::*;
 use super::kds_tests::{credential, BOB_TEL};
 use super::message::MessageError;
 use super::store::StoreError;
-use super::video::{FrameError, COMMITTER_WAIT, FRAME_OVERHEAD, RECEIPTS_WAIT, SUITE};
+use super::video::{
+    same_participant, FrameError, ASKED_KEPT, COMMITTER_WAIT, FRAME_OVERHEAD, RECEIPTS_WAIT, SUITE,
+};
+use crate::messaging::cpm::encryption::{GroupEncryption, Verified};
 
 /// A VideoChatMessage of the call `call_id`, encoded
 fn video_chat_message(call_id: &str) -> Vec<u8> {
@@ -802,4 +806,186 @@ fn the_keys_of_a_call_are_made_anew_as_a_new_era_of_the_device_is_accepted() {
         .encrypt_call_frame("call-1", b"meta", b"frame 2")
         .unwrap();
     assert_eq!(bob_decrypts(&mut bobs_keys, &encrypted).1, b"frame 2");
+}
+
+#[test]
+fn participants_are_the_same_by_their_number_or_their_uri() {
+    assert!(same_participant(
+        BOB_TEL,
+        "sip:+491707654321@ims.example.com"
+    ));
+    assert!(same_participant("tel:+491707654321", BOB_TEL));
+    assert!(!same_participant(BOB_TEL, "tel:+491700000009"));
+    // without a number, by the URI
+    assert!(same_participant(
+        "sip:bob@example.com",
+        "SIP:bob@example.com"
+    ));
+    assert!(!same_participant(
+        "sip:bob@example.com",
+        "sip:carol@example.com"
+    ));
+    assert!(!same_participant("sip:bob@example.com", BOB_TEL));
+}
+
+#[test]
+fn the_group_encryption_of_the_device_signs_checks_and_keys_group_calls() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (device, bob, mut bobs_group, clock) = alice_and_bob_in_time();
+    let (query, _) = answering(&[]);
+    let groups = DeviceGroups::new(&device, query);
+
+    // signed as a video chat message, without the Era-ID
+    let message = video_chat_message("call-1");
+    let cpim = video_chat_cpim(IMPU, "video-20", "", &client_message(&message));
+    let signed = rt.block_on(groups.sign(CONVERSATION, &cpim)).unwrap();
+    assert!(!header_names(&cpim_message(&signed))
+        .contains(&String::from("<http://www.gsma.com/rcs/mls>.Era-ID")));
+    // Bob's checked
+    let checked = |cpim: &[u8]| {
+        groups.verify_video_chat(
+            CONVERSATION,
+            &cpim_message(cpim).get_info().unwrap(),
+            &message,
+        )
+    };
+    let by_bob = signed_by_bob(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "video-21",
+        "video-21",
+        &message,
+    );
+    assert_eq!(checked(&by_bob), Verified::Signed);
+    assert_eq!(
+        checked(&video_chat_cpim(BOB_TEL, "video-22", "", b"relayed")),
+        Verified::Unsigned
+    );
+    let forged = signed_by_bob(
+        &bob,
+        &mut bobs_group,
+        BOB_TEL,
+        "video-23",
+        "video-24",
+        &message,
+    );
+    assert_eq!(checked(&forged), Verified::Forged);
+
+    // the keys of a call made, told its participants, and let go of
+    assert_eq!(groups.start_call_keys(CONVERSATION, "call-1"), Some(true));
+    assert_eq!(groups.start_call_keys("another", "call-2"), Some(false));
+    assert!(device.encrypts_call("call-1"));
+    groups.call_participants("call-1", vec![String::from(BOB_TEL)]);
+    let switched = switches(&device);
+    let (_, message_id) = device_commits(&device, &clock);
+    let xml = notification_xml(&message_id, "delivery-notification", "<delivered/>");
+    let receipt = notification_cpim(BOB_TEL, "imdn-30", "", &xml);
+    assert!(groups.commit_delivered(
+        CONVERSATION,
+        &cpim_message(&receipt).get_info().unwrap(),
+        xml.as_bytes()
+    ));
+    assert_eq!(*switched.lock().unwrap(), [(String::from("call-1"), 2)]);
+    groups.end_call_keys("call-1");
+    assert!(!device.encrypts_call("call-1"));
+}
+
+#[test]
+fn a_commit_not_delivered_is_not_given_to_the_app_but_switches_nothing() {
+    let (device, _, _, clock) = alice_and_bob_in_time();
+    let switched = switches(&device);
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    device.call_participants("call-1", vec![String::from(BOB_TEL)]);
+    let (_, message_id) = device_commits(&device, &clock);
+    assert!(delivered_by_bob(
+        &device,
+        &message_id,
+        "<failed><mls-client-failure-reason><invalid-commit/></mls-client-failure-reason></failed>"
+    ));
+    assert!(switched.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_commit_asks_to_be_told_of_its_delivery_only_during_a_call_of_its_own_group() {
+    let (device, kds, bob, _, clock) = alice_and_bob_in_time_with_kds();
+    // a call of another group of the device
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        super::kds::Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    futures::executor::block_on(device.create_group(
+        "conversation-2",
+        IMPU,
+        FACTORY,
+        vec![recipient(BOB_TEL)],
+    ))
+    .unwrap();
+    let previous = epoch_identifier(&device, "conversation-2");
+    device
+        .on_server_message("conversation-2", &accepted(previous))
+        .unwrap();
+    assert_eq!(device.start_call_keys("call-2", "conversation-2"), Ok(true));
+
+    clock.advance(31 * DAY);
+    let cpim = device
+        .update_keys(CONVERSATION, IMPU, GROUP_URI)
+        .unwrap()
+        .expect("a control message");
+    assert_eq!(
+        cpim_message(&cpim)
+            .get_info()
+            .unwrap()
+            .disposition_notification,
+        Some(&b"negative-delivery"[..])
+    );
+}
+
+#[test]
+fn the_keys_of_a_call_made_again_in_the_same_epoch_send_under_other_key_ids() {
+    // their counters starting again, as a counter is never to be used twice
+    // with the same key (RFC 9605 section 9.1)
+    let (device, bob, bobs_group) = alice_and_bob();
+    let mut bobs_keys = keys_of_bob(&bob, &bobs_group);
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    let first = device
+        .encrypt_call_frame("call-1", b"meta", b"frame 1")
+        .unwrap();
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    let second = device
+        .encrypt_call_frame("call-1", b"meta", b"frame 2")
+        .unwrap();
+    assert_eq!(bob_decrypts(&mut bobs_keys, &first).1, b"frame 1");
+    assert_eq!(bob_decrypts(&mut bobs_keys, &second).1, b"frame 2");
+}
+
+#[test]
+fn the_receipts_of_the_latest_commits_asked_for_are_known_alone() {
+    let (device, _, _, clock) = alice_and_bob_in_time();
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    device.call_participants("call-1", vec![String::from(BOB_TEL)]);
+    let (_, first) = device_commits(&device, &clock);
+    let mut last = first.clone();
+    for _ in 0..ASKED_KEPT {
+        let (cpim, message_id) = {
+            clock.advance(31 * DAY);
+            let cpim = device
+                .update_keys(CONVERSATION, IMPU, GROUP_URI)
+                .unwrap()
+                .expect("a control message");
+            let message_id =
+                String::from_utf8_lossy(cpim_message(&cpim).get_info().unwrap().imdn_message_id)
+                    .into_owned();
+            (cpim, message_id)
+        };
+        let _ = cpim;
+        let previous = epoch_identifier(&device, CONVERSATION);
+        device
+            .on_server_message(CONVERSATION, &accepted(previous))
+            .unwrap();
+        last = message_id;
+    }
+    // the first one's for the app then
+    assert!(!delivered_by_bob(&device, &first, "<delivered/>"));
+    assert!(delivered_by_bob(&device, &last, "<delivered/>"));
 }

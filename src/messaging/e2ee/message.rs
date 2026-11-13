@@ -873,18 +873,12 @@ impl E2eeDevice {
     /// `conversation_id` in the CPIM message `cpim_info` tells of, is signed
     /// over it and the Message-ID of that CPIM message by the participant of
     /// its CPIM From (RCC.16 sections 7.6.2, 7.6.3.4, 9.8.2)
-    ///
-    /// Any may come unsigned once the group chat is unencrypted (section
-    /// 11.2).
     pub fn verify_video_chat(
         &self,
         conversation_id: &str,
         cpim_info: &CPIMInfo,
         video_chat_message: &[u8],
     ) -> Result<(), MessageError> {
-        if self.encryption_ended(conversation_id) {
-            return Ok(());
-        }
         let signature = cpim_info
             .mls_derived_content_signature
             .ok_or(MessageError::NotSigned)?;

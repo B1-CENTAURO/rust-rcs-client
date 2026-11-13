@@ -3171,6 +3171,19 @@ impl ScriptedEncryption {
         })
     }
 
+    /// As in_encrypted_group(), the group moved to unencrypted (RCC.16
+    /// section 11.2)
+    pub(crate) fn in_group_moved_to_unencrypted() -> Arc<ScriptedEncryption> {
+        Arc::new(ScriptedEncryption {
+            cpim: Some(MLS_GROUP_CPIM.to_vec()),
+            joining: true,
+            encrypting: vec![String::from("conversation-1")],
+            signature: Some(String::from("signed")),
+            unencrypted: true,
+            ..ScriptedEncryption::default()
+        })
+    }
+
     /// The encryption of the groups `encrypting`, making the keys of their
     /// calls as `made`
     pub(crate) fn keying_calls(

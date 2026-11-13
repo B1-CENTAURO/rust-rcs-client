@@ -104,8 +104,6 @@ struct CallKeys {
     /// this client in it, which the session sends as
     era: Option<u32>,
     leaf_index: u32,
-    /// The latest epoch of the group the session took
-    latest: u64,
     /// The participants of the call besides this client, as the
     /// Controlling Function tells them
     participants: Vec<String>,
@@ -171,7 +169,7 @@ fn cpim_from(cpim_info: &CPIMInfo) -> String {
 
 /// Whether the URIs `a` and `b` are of the same participant, by the tel URI
 /// of each, or the same otherwise
-fn same_participant(a: &str, b: &str) -> bool {
+pub(super) fn same_participant(a: &str, b: &str) -> bool {
     let tel_uri = |uri: &str| participant_tel_uri(std::iter::once(uri), None);
     match (tel_uri(a), tel_uri(b)) {
         (Some(a), Some(b)) => same_tel_uri(&a, &b),
@@ -189,7 +187,7 @@ fn context_id() -> u64 {
 
 /// How many of the Commits sent asking for receipts are known by their
 /// Message-ID, for their receipts not to go to the app
-const ASKED_KEPT: usize = 16;
+pub(super) const ASKED_KEPT: usize = 16;
 
 /// The keys of the calls of the device, by call_id
 #[derive(Default)]
@@ -282,17 +280,12 @@ impl E2eeDevice {
     /// New keys of a call of the group `conversation_id`, from the epoch it
     /// is in, of no participants yet
     fn call_keys_of(&self, conversation_id: &str) -> Result<CallKeys, StoreError> {
-        let (session, era, leaf_index, epoch) = self
+        let (session, era, leaf_index) = self
             .store()
             .peek_conversation(conversation_id.as_bytes(), |conversation, client| {
                 let session =
                     SframeSession::of(conversation, client, SUITE, DEFAULT_LAYOUT, context_id())?;
-                Ok::<_, ErrorKind>((
-                    session,
-                    conversation.era(),
-                    conversation.own_leaf_index(),
-                    conversation.epoch(),
-                ))
+                Ok::<_, ErrorKind>((session, conversation.era(), conversation.own_leaf_index()))
             })?
             .map_err(StoreError::Mls)?;
         Ok(CallKeys {
@@ -300,7 +293,6 @@ impl E2eeDevice {
             session,
             era,
             leaf_index,
-            latest: epoch,
             participants: Vec::new(),
             switch: None,
         })
@@ -399,7 +391,6 @@ impl E2eeDevice {
                 // one that left in it can send no frame of it
                 let committer = committer.unwrap_or(u32::MAX);
                 call.session.epoch_advanced(epoch, base_key, committer);
-                call.latest = epoch;
                 call.switch = Some(match committer == leaf_index {
                     true => Switch {
                         deadline: now + RECEIPTS_WAIT,
@@ -548,10 +539,6 @@ impl E2eeDevice {
             let call = calls.get_mut(call_id).ok_or(FrameError::NoKeys)?;
             let switched = call.switch_if_due(now);
             let decrypted = call.session.decrypt(metadata, encrypted);
-            // switched as the committer's frame came
-            if call.session.pending_epoch().is_none() {
-                call.switch = None;
-            }
             let decrypted = decrypted.map(|frame| frame.frame).map_err(|e| match e {
                 ErrorKind::Replayed => FrameError::Replayed,
                 _ => FrameError::Rejected,

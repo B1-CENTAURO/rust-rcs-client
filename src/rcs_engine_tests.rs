@@ -1166,6 +1166,28 @@ fn the_cpim_from_of_a_group_message_gives_its_participant() {
 }
 
 #[test]
+fn a_group_video_chat_message_goes_unsigned_once_the_group_moved_to_unencrypted() {
+    // RCC.16 section 11.2
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let engine = Engine::over(&client, configured_for_groups());
+    let encryption = ScriptedEncryption::in_group_moved_to_unencrypted();
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-video-ended");
+
+    let sent = engine.group_video_chat(VIDEO_CHAT);
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_content(&send.body), VIDEO_CHAT);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(told(&sent), 200);
+    assert!(encryption.signed_messages().is_empty());
+    connection.quiet(&rt);
+    peer.silence();
+}
+
+#[test]
 fn the_media_keys_of_a_group_call_are_those_of_the_encryption_of_its_group() {
     // RCC.16 section 9.8.2, by the Conversation-ID of the group
     let (client, mut peer) = start(true);

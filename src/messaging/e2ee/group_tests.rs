@@ -69,7 +69,7 @@ use super::verification::VerificationError;
 
 pub(super) const CONVERSATION: &str = "4f0e8b9c-3a71-4d2e-9b6a-2c5d8e1f7a30";
 pub(super) const IMPU: &str = "sip:+491701234567@ims.example.com";
-const FACTORY: &str = "sip:conference-factory@conf.example.com";
+pub(super) const FACTORY: &str = "sip:conference-factory@conf.example.com";
 /// A Participant the Home KDS has no Client of
 const CAROL_TEL: &str = "tel:+491700000001";
 
@@ -93,7 +93,9 @@ fn answered(status_code: u16, feature_tags: &str) -> Capabilities {
 
 /// Contacts answering as `answers` say, 404 if not among them, and those
 /// asked
-fn answering(answers: &[(&str, Capabilities)]) -> (CapabilityQuery, Arc<Mutex<Vec<String>>>) {
+pub(super) fn answering(
+    answers: &[(&str, Capabilities)],
+) -> (CapabilityQuery, Arc<Mutex<Vec<String>>>) {
     let answers: Vec<(String, Capabilities)> = answers
         .iter()
         .map(|(contact, capabilities)| (String::from(*contact), capabilities.clone()))

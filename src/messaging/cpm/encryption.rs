@@ -833,11 +833,10 @@ pub trait GroupEncryption: Send + Sync {
     }
 
     /// Whether the VideoChatMessage `video_chat_message`, which the
-    /// Controlling Function of the group chat `conversation_id` relays in a
-    /// ServerGroupVideoMessage, in the CPIM message `cpim_info` tells of, is
-    /// signed over it by the participant of the CPIM From (RCC.16 sections
-    /// 7.6.2, 9.8.2), as any may not be once the group chat is unencrypted
-    /// (section 11.2)
+    /// Controlling Function of the group chat `conversation_id`, encrypted
+    /// end to end, relays in a ServerGroupVideoMessage, in the CPIM message
+    /// `cpim_info` tells of, is signed over it by the participant of the CPIM
+    /// From (RCC.16 sections 7.6.2, 9.8.2)
     fn verify_video_chat(
         &self,
         conversation_id: &str,
