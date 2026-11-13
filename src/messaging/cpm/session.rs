@@ -3133,7 +3133,7 @@ impl CPMSessionService {
     pub fn send_message<F>(
         &self,
         message_type: &str,
-        message_content: &str,
+        message_content: impl AsRef<[u8]>,
         message_id: &str,
         recipient: &str,
         recipient_type: &RecipientType,
@@ -3158,7 +3158,7 @@ impl CPMSessionService {
         let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
         let message = CPMMessageParam::new(
             String::from(message_type),
-            String::from(message_content),
+            message_content.as_ref(),
             String::from(message_id),
             recipient,
             recipient_type,
@@ -3326,7 +3326,7 @@ impl CPMSessionService {
     pub fn send_in_new_chat<F>(
         &self,
         message_type: &str,
-        message_content: &str,
+        message_content: impl AsRef<[u8]>,
         message_id: &str,
         recipient: &str,
         group_id: &str,
@@ -3373,7 +3373,7 @@ impl CPMSessionService {
         let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
         let message = CPMMessageParam::new(
             String::from(message_type),
-            String::from(message_content),
+            message_content.as_ref(),
             String::from(message_id),
             recipient,
             &RecipientType::Contact,

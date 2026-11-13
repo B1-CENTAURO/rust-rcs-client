@@ -23,6 +23,7 @@ pub mod ffi;
 pub mod messaging;
 pub mod provisioning;
 pub mod rcs_engine;
+pub mod video_chat;
 
 use std::ffi::{CStr, CString};
 use std::ptr::{self, null_mut, NonNull};
@@ -100,6 +101,11 @@ use provisioning::ims_application::ImsApplication;
 use provisioning::rcs_application::RcsApplication;
 #[cfg(feature = "e2ee")]
 use rust_rcs_core::mls::rcs::certificate::RcsCredentialValidator;
+use video_chat::ffi::{
+    video_chat_event_code, VideoChatCallback, VideoChatIceCandidatesCallback,
+    VideoChatMediaUpdateCallback, VideoChatTurnServerCallback, VideoChatViewRequest, CALL_ID_SIZE,
+};
+use video_chat::VideoChatEvent;
 
 use rcs_engine::{DownloadOrigin, RcsEngine, UploadFor};
 
@@ -1388,6 +1394,346 @@ pub unsafe extern "C" fn rcs_client_set_alias_listener(
                 );
             });
     }
+}
+
+/// Gives the MIVC configuration of the Service Provider (RCC.07 sections
+/// 3.7.2, A.1.3): the MIVC TECHNOLOGY in `technology` (0 none, 1 ViLTE, 2
+/// ViLTE preferred with RCS Video Chat as fallback, 3 RCS Video Chat), in
+/// `turn_mandatory` 1 if only the TURN servers given are to be used, and each
+/// TurnCredential to `cb`, at once
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_get_video_chat_config(
+    client: *mut RcsClient,
+    technology: *mut i32,
+    turn_mandatory: *mut i32,
+    cb: Option<VideoChatTurnServerCallback>,
+    cb_context: *mut libc::c_void,
+) {
+    let Some(client) = client.as_ref() else {
+        return;
+    };
+    let config = client.engine.video_chat().config();
+    if let Some(technology) = technology.as_mut() {
+        *technology = config.technology;
+    }
+    if let Some(turn_mandatory) = turn_mandatory.as_mut() {
+        *turn_mandatory = i32::from(config.turn_mandatory);
+    }
+    let Some(cb) = cb else {
+        return;
+    };
+    for credential in &config.turn_credentials {
+        let uris: Vec<CString> = credential
+            .uris
+            .iter()
+            .map(|uri| c_string(uri.as_str()))
+            .collect();
+        let uri_pointers: Vec<*const c_char> = uris.iter().map(|uri| uri.as_ptr()).collect();
+        let username = credential.username.as_deref().map(c_string);
+        let password = credential.password.as_deref().map(c_string);
+        cb(
+            uri_pointers.as_ptr(),
+            uri_pointers.len(),
+            username
+                .as_ref()
+                .map_or(ptr::null(), |username| username.as_ptr()),
+            password
+                .as_ref()
+                .map_or(ptr::null(), |password| password.as_ptr()),
+            cb_context,
+        );
+    }
+}
+
+/// Sets what is told of RCS Video Chats (RCC.07 section 3.7.5), which the
+/// app takes from then on, the client telling it does in OPTIONS exchanges
+/// while the Service Provider enables them: their events to `cb`, the ICE
+/// candidates of their contacts to `ice_cb`, and the media those prefer to
+/// `media_cb`. The context of one set before is let go of.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_video_chat_listener(
+    client: *mut RcsClient,
+    cb: Option<VideoChatCallback>,
+    ice_cb: Option<VideoChatIceCandidatesCallback>,
+    media_cb: Option<VideoChatMediaUpdateCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_set_video_chat_listener()");
+
+    let cb_context = NonNull::new(cb_context)
+        .map(|cb_context| Arc::new(Mutex::new(MessageResultCallbackContextWrapper(cb_context))));
+
+    let (Some(client), Some(cb), Some(ice_cb), Some(media_cb)) =
+        (client.as_ref(), cb, ice_cb, media_cb)
+    else {
+        return;
+    };
+    client
+        .engine
+        .video_chat()
+        .set_listener(Arc::new(move |call_id, contact_uri, event| {
+            let cb_context = cb_context
+                .as_ref()
+                .map(|cb_context| cb_context.lock().unwrap());
+            let context = cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr());
+            let call_id = c_string(call_id);
+            match &event {
+                VideoChatEvent::IceCandidates {
+                    add,
+                    remove,
+                    reconnecting,
+                } => {
+                    let add: Vec<CString> = add.iter().map(|c| c_string(c.as_str())).collect();
+                    let remove: Vec<CString> =
+                        remove.iter().map(|c| c_string(c.as_str())).collect();
+                    let add_pointers: Vec<*const c_char> = add.iter().map(|c| c.as_ptr()).collect();
+                    let remove_pointers: Vec<*const c_char> =
+                        remove.iter().map(|c| c.as_ptr()).collect();
+                    ice_cb(
+                        call_id.as_ptr(),
+                        add_pointers.as_ptr(),
+                        add_pointers.len(),
+                        remove_pointers.as_ptr(),
+                        remove_pointers.len(),
+                        i32::from(*reconnecting),
+                        context,
+                    );
+                }
+                VideoChatEvent::MediaUpdate(update) => {
+                    let stream_ids: Vec<CString> = update
+                        .view_request
+                        .iter()
+                        .map(|request| {
+                            c_string(
+                                request
+                                    .stream_id
+                                    .as_ref()
+                                    .map_or("", |stream_id| stream_id.media_stream_id.as_str()),
+                            )
+                        })
+                        .collect();
+                    let view_requests: Vec<VideoChatViewRequest> = update
+                        .view_request
+                        .iter()
+                        .zip(&stream_ids)
+                        .map(|(request, stream_id)| {
+                            let resolution = request.resolution.clone().unwrap_or_default();
+                            VideoChatViewRequest {
+                                media_stream_id: stream_id.as_ptr(),
+                                media_type: request
+                                    .stream_id
+                                    .as_ref()
+                                    .map_or(0, |stream_id| stream_id.media_type),
+                                height: resolution.height,
+                                width: resolution.width,
+                                frame_rate: resolution.frame_rate,
+                            }
+                        })
+                        .collect();
+                    let bandwidth = update.bandwidth_constraints.clone().unwrap_or_default();
+                    media_cb(
+                        call_id.as_ptr(),
+                        view_requests.as_ptr(),
+                        view_requests.len(),
+                        bandwidth.max_bandwidth_kbps,
+                        bandwidth.min_bandwidth_kbps,
+                        bandwidth.start_bandwidth_kbps,
+                        context,
+                    );
+                }
+                event => {
+                    if let Some((code, sdp, reason)) = video_chat_event_code(event) {
+                        let contact_uri = c_string(contact_uri);
+                        let sdp = sdp.map(c_string);
+                        cb(
+                            code,
+                            call_id.as_ptr(),
+                            contact_uri.as_ptr(),
+                            sdp.as_ref().map_or(ptr::null(), |sdp| sdp.as_ptr()),
+                            reason,
+                            context,
+                        );
+                    }
+                }
+            }
+        }));
+}
+
+/// Calls `contact_uri` with the SDP offer `sdp_offer` of the app's WebRTC
+/// stack (RCC.07 section 3.7.5.4.1), writing the call_id of the call to
+/// `call_id`, `call_id_size` bytes, at least 37; 0 if it was called, -1 if
+/// the listener is not set, the Service Provider does not enable RCS Video
+/// Chat, or another call goes on
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_start_video_chat(
+    client: *mut RcsClient,
+    contact_uri: *const c_char,
+    sdp_offer: *const c_char,
+    call_id: *mut c_char,
+    call_id_size: usize,
+) -> i32 {
+    let (Some(client), Some(contact_uri), Some(sdp_offer), false) = (
+        client.as_ref(),
+        optional_string(contact_uri),
+        optional_string(sdp_offer),
+        call_id.is_null() || call_id_size < CALL_ID_SIZE,
+    ) else {
+        return -1;
+    };
+    let Some(started) = client
+        .engine
+        .video_chat()
+        .start_call(&contact_uri, &sdp_offer)
+    else {
+        return -1;
+    };
+    let started = c_string(started);
+    let bytes = started.as_bytes_with_nul();
+    std::ptr::copy_nonoverlapping(
+        bytes.as_ptr() as *const c_char,
+        call_id,
+        bytes.len().min(call_id_size),
+    );
+    0
+}
+
+/// The call `call_id`, and what the client does with it as `act` says: 0 if
+/// it went on, -1 otherwise
+unsafe fn with_video_chat(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+    act: impl FnOnce(&video_chat::VideoChatService, &str) -> bool,
+) -> i32 {
+    match (client.as_ref(), optional_string(call_id)) {
+        (Some(client), Some(call_id)) if act(client.engine.video_chat(), &call_id) => 0,
+        _ => -1,
+    }
+}
+
+/// Answers the call `call_id` offered with the SDP answer `sdp_answer` of
+/// the app's WebRTC stack (RCC.07 section 3.7.5.4.3); 0 if it was offered
+/// still, -1 otherwise
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_accept_video_chat(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+    sdp_answer: *const c_char,
+) -> i32 {
+    let Some(sdp_answer) = optional_string(sdp_answer) else {
+        return -1;
+    };
+    with_video_chat(client, call_id, |service, call_id| {
+        service.accept_call(call_id, &sdp_answer)
+    })
+}
+
+/// Ends the call `call_id` as the user chose: cancels it if it is not
+/// answered yet, rejects it if it is offered, and hangs it up otherwise
+/// (RCC.07 sections 3.7.5.4.4 to 3.7.5.4.6); 0 if it went on, -1 otherwise
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_hang_up_video_chat(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+) -> i32 {
+    with_video_chat(client, call_id, |service, call_id| service.hang_up(call_id))
+}
+
+/// Sends the contact of the call `call_id` the `add_count` ICE candidates at
+/// `add` to add and the `remove_count` at `remove` to remove, as after an IP
+/// address change, the media to connect again within Timer_Delta if it had
+/// connected (RCC.07 section 3.7.5.4.8.2); 0 if the call goes on, -1
+/// otherwise
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_update_video_chat_ice_candidates(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+    add: *const *const c_char,
+    add_count: usize,
+    remove: *const *const c_char,
+    remove_count: usize,
+) -> i32 {
+    let (add, remove) = (
+        participant_list(add, add_count),
+        participant_list(remove, remove_count),
+    );
+    with_video_chat(client, call_id, |service, call_id| {
+        service.update_ice_candidates(call_id, add, remove)
+    })
+}
+
+/// Sends the contact of the call `call_id` the `view_request_count` views at
+/// `view_requests` the app prefers to receive, and the bandwidth it can
+/// take, none if all three are 0 (RCC.07 section 3.7.5.4.8.3); 0 if the call
+/// goes on, -1 otherwise
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_update_video_chat_media(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+    view_requests: *const VideoChatViewRequest,
+    view_request_count: usize,
+    max_bandwidth_kbps: i32,
+    min_bandwidth_kbps: i32,
+    start_bandwidth_kbps: i32,
+) -> i32 {
+    let view_requests = match view_requests.is_null() {
+        true => &[][..],
+        false => std::slice::from_raw_parts(view_requests, view_request_count),
+    };
+    let update = video_chat::proto::UpdateMedia {
+        view_request: view_requests
+            .iter()
+            .map(|request| video_chat::proto::ViewRequest {
+                stream_id: Some(video_chat::proto::MediaStreamId {
+                    media_stream_id: optional_string(request.media_stream_id).unwrap_or_default(),
+                    media_type: request.media_type,
+                }),
+                // for video alone (section 3.7.5.2.3.2.8.1)
+                resolution: (request.media_type == video_chat::proto::MediaType::Video as i32)
+                    .then_some(video_chat::proto::VideoResolution {
+                        height: request.height,
+                        width: request.width,
+                        frame_rate: request.frame_rate,
+                    }),
+            })
+            .collect(),
+        bandwidth_constraints: (max_bandwidth_kbps != 0
+            || min_bandwidth_kbps != 0
+            || start_bandwidth_kbps != 0)
+            .then_some(video_chat::proto::BandwidthConstraints {
+                max_bandwidth_kbps,
+                min_bandwidth_kbps,
+                start_bandwidth_kbps,
+            }),
+    };
+    with_video_chat(client, call_id, |service, call_id| {
+        service.update_media(call_id, update)
+    })
+}
+
+/// Tells the client the media of the call `call_id` connected, or connected
+/// again (RCC.07 sections 3.7.5.2.4.4, 3.7.5.2.4.5); 0 if the call goes on
+/// and was answered, -1 otherwise
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_video_chat_media_connected(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+) -> i32 {
+    with_video_chat(client, call_id, |service, call_id| {
+        service.media_connected(call_id)
+    })
+}
+
+/// Tells the client the media of the call `call_id` went down, for it to
+/// connect again within Timer_Epsilon (RCC.07 section 3.7.5.4.8.1.6); 0 if
+/// the call goes on and was answered, -1 otherwise
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_video_chat_media_disconnected(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+) -> i32 {
+    with_video_chat(client, call_id, |service, call_id| {
+        service.media_disconnected(call_id)
+    })
 }
 
 /// Sets what is told of the invitations to group chats not known before. The

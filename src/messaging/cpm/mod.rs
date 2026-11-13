@@ -35,6 +35,7 @@ use uuid::Uuid;
 use self::session::CPMSession;
 
 use super::ffi::RecipientType;
+use crate::video_chat;
 
 const LOG_TAG: &str = "messaging";
 
@@ -81,7 +82,8 @@ pub struct MessagingSessionHandle {
 
 pub struct CPMMessageParam {
     message_type: String,
-    message_content: String,
+    /// Text, or not, as a video chat message is
+    message_content: Vec<u8>,
     /// The imdn.Message-ID it is sent with, which notifications of it give
     message_id: String,
     /// Sent as it is, of the type `message_type`, not in a CPIM message
@@ -100,7 +102,7 @@ pub struct CPMMessageParam {
 impl CPMMessageParam {
     pub fn new<F>(
         message_type: String,
-        message_content: String,
+        message_content: impl Into<Vec<u8>>,
         message_id: String,
         recipient: &str,
         recipient_type: &RecipientType,
@@ -112,7 +114,7 @@ impl CPMMessageParam {
     {
         CPMMessageParam {
             message_type,
-            message_content,
+            message_content: message_content.into(),
             message_id,
             raw: None,
             signed: false,
@@ -133,7 +135,7 @@ impl CPMMessageParam {
 
     /// The message sent as it is, not in a CPIM message
     pub fn raw(mut self) -> CPMMessageParam {
-        self.raw = Some(self.message_content.as_bytes().to_vec());
+        self.raw = Some(self.message_content.clone());
         self
     }
 
@@ -265,14 +267,17 @@ pub fn is_composing_document(active: bool) -> String {
 }
 
 /// Whether a message of `message_type` asks to be told of its delivery and
-/// display, as all but an is-composing indication do (RFC 3994 section 4)
+/// display, as all but an is-composing indication (RFC 3994 section 4) and
+/// the signalling of an RCS Video Chat do, which tells of its own delivery
+/// (RCC.07 section 3.7.5.2.3.2.2)
 fn asks_for_notifications(message_type: &str) -> bool {
     !is_media_type(message_type.as_bytes(), IS_COMPOSING)
+        && !is_media_type(message_type.as_bytes(), video_chat::CONTENT_TYPE)
 }
 
 pub fn make_cpim_message_content_body(
     message_type: &str,
-    message_content: &str,
+    message_content: &[u8],
     recipient_type: &RecipientType,
     recipient_uri: &str,
     message_imdn_id: &str,

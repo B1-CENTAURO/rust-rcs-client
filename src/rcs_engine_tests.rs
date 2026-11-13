@@ -18,8 +18,10 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+use rust_rcs_core::cpim::CPIMInfo;
 
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
@@ -33,8 +35,12 @@ use crate::messaging::cpm::session_tests::{
 use crate::messaging::ffi::RecipientType;
 
 use super::{
-    route_message, sealing_of, send_to_contact, MessageRoute, PendingMessage, PreparingChats,
-    RcsEngineConnectionState, RcsEngineRegistrationState, UploadFor,
+    joined_feature_tags, report_video_chat_event, route_message, sealing_of, send_to_contact,
+    send_video_chat_message, taken_by_video_chat, Content, MessageRoute, PendingMessage,
+    PreparingChats, RcsEngineConnectionState, RcsEngineRegistrationState, UploadFor,
+};
+use crate::video_chat::{
+    VideoChatConfig, VideoChatEvent, VideoChatLink, VideoChatService, CONTENT_TYPE,
 };
 
 /// The type of file transfer messages (RCC.07 section 3.2.5)
@@ -138,7 +144,7 @@ impl Engine {
             let (message_type, message_content, message_id) = message;
             let message = PendingMessage {
                 message_type,
-                message_content,
+                content: Content::App(message_content),
                 message_id,
                 recipient: String::from(PEER),
                 callback: Box::new(told),
@@ -146,6 +152,40 @@ impl Engine {
             send_to_contact(&route, &preparing, encryption, message, &rt)
         })
     }
+}
+
+impl Engine {
+    /// Sends the VideoChatMessage `message` to PEER as RCS Video Chat does,
+    /// returning as send_video_chat_message() does, and a receiver of its
+    /// result
+    fn video_chat(&self, message: &[u8]) -> Receiver<(u16, String)> {
+        let route = self.route.clone();
+        let preparing = Arc::clone(&self.preparing);
+        let rt = Arc::clone(&self.rt);
+        let message = message.to_vec();
+        returning(move |told| {
+            send_video_chat_message(
+                &route,
+                &preparing,
+                PEER,
+                message,
+                Box::new(move |status_code| told(status_code, String::new())),
+                &rt,
+            )
+        })
+    }
+}
+
+/// A VideoChatMessage as RCS Video Chat sends it, encoded: not text
+const VIDEO_CHAT: &[u8] = b"\x0a\x04call\xaa\x06\x02\x0a\x00\xff";
+
+/// The content of the CPIM message `cpim`, base64 decoded
+fn cpim_content(cpim: &[u8]) -> Vec<u8> {
+    use base64::{engine::general_purpose, Engine as _};
+
+    let cpim = String::from_utf8_lossy(cpim).into_owned();
+    let content = cpim.rsplit("\r\n\r\n").next().unwrap_or("");
+    general_purpose::STANDARD.decode(content.trim()).unwrap()
 }
 
 /// Runs `send` on a thread of its own, with what tells its result, waiting
@@ -744,4 +784,279 @@ Content-Length: {}\r\n\
         cpim.len(),
         cpim
     )
+}
+
+#[test]
+fn a_video_chat_message_goes_in_a_chat_never_standalone() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let engine = Engine::over(&client, configured(true, true));
+    let msrp = MsrpPeer::listen(&rt);
+
+    // in a new chat, where a message of the app would go standalone (RCC.07
+    // v18.0 section 3.7.5.2.2)
+    let sent = engine.video_chat(VIDEO_CHAT);
+    let invite = peer.next_request("INVITE");
+    assert_eq!(request_uri(&invite), PEER);
+    peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
+    peer.next_request("ACK");
+    let mut connection = msrp.accept(&rt);
+    let send = connection.next_message(&rt);
+    let cpim = String::from_utf8_lossy(&send.body).into_owned();
+    // of its own content type (section 3.7.5.2.3.1.1), asking for no
+    // notification, as AckInvitation tells of its delivery
+    assert!(
+        cpim.contains("Content-Type: rcs/video-chat+proto"),
+        "{}",
+        cpim
+    );
+    assert!(!cpim.contains("Disposition-Notification"), "{}", cpim);
+    assert_eq!(cpim_content(&send.body), VIDEO_CHAT);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(told(&sent), 200);
+
+    // the next in it
+    let next = engine.video_chat(VIDEO_CHAT);
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_content(&send.body), VIDEO_CHAT);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(told(&next), 200);
+
+    // not without chats, though it could go standalone
+    engine.configure(configured(false, true));
+    assert_eq!(told(&engine.video_chat(VIDEO_CHAT)), 403);
+    connection.quiet(&rt);
+    peer.silence();
+}
+
+#[test]
+fn a_video_chat_message_goes_in_the_encrypted_chat_kept_with_the_contact() {
+    // RCC.16 section 9.8.1
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = encrypting(
+        &client,
+        ChatScript {
+            kept: vec![(
+                String::from(PEER),
+                String::from("chat-1"),
+                Some(String::from(TOKEN)),
+            )],
+            encrypting: vec![String::from("chat-1")],
+            ciphertext: Some(String::from("ciphertext")),
+            ..ChatScript::default()
+        },
+    );
+    let engine = Engine::over(&client, configured(true, true));
+    let msrp = MsrpPeer::listen(&rt);
+
+    let sent = engine.video_chat(VIDEO_CHAT);
+    let invite = peer.next_request("INVITE");
+    assert_eq!(header_value(&invite, "MLS-Opaque-Token"), TOKEN);
+    peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
+    peer.next_request("ACK");
+    let mut connection = msrp.accept(&rt);
+    let send = connection.next_message(&rt);
+    assert_eq!(send.body, b"ciphertext");
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(told(&sent), 200);
+    let encrypted = encryption.encrypted();
+    assert_eq!(encrypted.len(), 1);
+    assert_eq!(encrypted[0].0, "chat-1");
+    assert_eq!(cpim_content(&encrypted[0].1), VIDEO_CHAT);
+    peer.silence();
+}
+
+#[test]
+fn a_video_chat_message_to_a_contact_not_taking_an_encrypted_chat_goes_in_one_not_encrypted() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let held = Arc::new(Notify::new());
+    let encryption = encrypting(
+        &client,
+        ChatScript {
+            held: Some(Arc::clone(&held)),
+            ..ChatScript::default()
+        },
+    );
+    let engine = Engine::over(&client, configured(true, true));
+    let msrp = MsrpPeer::listen(&rt);
+
+    // an encrypted chat asked for, then a chat not encrypted, not
+    // standalone as a message of the app would go
+    let sent = engine.video_chat(VIDEO_CHAT);
+    held.notify_one();
+    let invite = peer.next_request("INVITE");
+    assert_eq!(request_uri(&invite), PEER);
+    peer.send(&answer(&invite, "200 OK", Some(&msrp.sdp("sendrecv"))));
+    peer.next_request("ACK");
+    let mut connection = msrp.accept(&rt);
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_content(&send.body), VIDEO_CHAT);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(told(&sent), 200);
+    assert_eq!(
+        encryption.chats_prepared(),
+        [(String::from(PEER), String::from(IMPU))]
+    );
+    assert!(encryption.encrypted().is_empty());
+    peer.silence();
+}
+
+/// Takes nothing, a link for a service to take signals with
+struct Unlinked;
+
+impl VideoChatLink for Unlinked {
+    fn send(&self, _: &str, _: Vec<u8>, sent: Box<dyn FnOnce(u16) + Send + Sync>) {
+        sent(200);
+    }
+
+    fn report(&self, _: &str, _: Vec<u8>) {}
+
+    fn registered_uri(&self) -> Option<String> {
+        None
+    }
+}
+
+#[test]
+fn video_chat_messages_go_to_the_video_chats_not_to_the_app() {
+    let rt = Runtime::new().unwrap();
+    let service = VideoChatService::new(Arc::new(Unlinked), rt.handle().clone());
+    service.set_config(VideoChatConfig {
+        technology: 3,
+        ..VideoChatConfig::default()
+    });
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let telling = Arc::clone(&told);
+    service.set_listener(Arc::new(move |call_id, contact, event| {
+        telling
+            .lock()
+            .unwrap()
+            .push((String::from(call_id), String::from(contact), event));
+    }));
+    let video_chat = OnceLock::new();
+    let _ = video_chat.set(Arc::downgrade(&service));
+
+    let invitation = crate::video_chat::proto::VideoChatMessage {
+        call_id: String::from("bob-call"),
+        event: Some(
+            crate::video_chat::proto::video_chat_message::Event::CallInvitation(
+                crate::video_chat::proto::CallInvitation {
+                    sdp_offer: String::from("offer"),
+                },
+            ),
+        ),
+    };
+    let body = prost::Message::encode_to_vec(&invitation);
+    let date = chrono::Utc::now().to_rfc3339();
+    let cpim_info = CPIMInfo {
+        imdn_message_id: b"m1",
+        from: b"<tel:+15550002>",
+        to: b"<tel:+15550001>",
+        date: date.as_bytes(),
+        from_uri: None,
+        to_uri: None,
+        payload_type: None,
+        disposition_notification: None,
+        mls_derived_content_signature: None,
+        mls_original_message_id: None,
+    };
+
+    // not a video chat message: the app's
+    assert!(!taken_by_video_chat(
+        &video_chat,
+        || false,
+        PEER.as_bytes(),
+        &cpim_info,
+        b"text/plain",
+        b"hi"
+    ));
+    // of a group: taken, though not yet by the video chats
+    assert!(taken_by_video_chat(
+        &video_chat,
+        || true,
+        PEER.as_bytes(),
+        &cpim_info,
+        CONTENT_TYPE.as_bytes(),
+        &body
+    ));
+    assert!(told.lock().unwrap().is_empty());
+    // of a 1-to-1 chat, with parameters too
+    assert!(taken_by_video_chat(
+        &video_chat,
+        || false,
+        PEER.as_bytes(),
+        &cpim_info,
+        b"rcs/video-chat+proto; charset=binary",
+        &body
+    ));
+    assert_eq!(
+        *told.lock().unwrap(),
+        [(
+            String::from("bob-call"),
+            String::from(PEER),
+            VideoChatEvent::Incoming {
+                sdp_offer: String::from("offer")
+            }
+        )]
+    );
+    // the video chats gone, not the app's all the same
+    drop(service);
+    assert!(taken_by_video_chat(
+        &video_chat,
+        || false,
+        PEER.as_bytes(),
+        &cpim_info,
+        CONTENT_TYPE.as_bytes(),
+        &body
+    ));
+}
+
+#[test]
+fn joining_or_leaving_a_video_chat_is_reported_in_a_sip_message() {
+    // RCC.07 v18.0 section 3.7.5.2.5
+    let (client, mut peer) = start(true);
+    let engine = Engine::over(&client, configured(true, true));
+    let tm = client.core.get_transaction_manager();
+    report_video_chat_event(
+        &engine.route,
+        &tm,
+        "sip:mivc@example.com",
+        VIDEO_CHAT.to_vec(),
+        &client.rt,
+    );
+    let message = peer.next_request("MESSAGE");
+    assert_eq!(request_uri(&message), "sip:mivc@example.com");
+    assert_eq!(header_value(&message, "Content-Type"), CONTENT_TYPE);
+    assert!(header_value(&message, "From").starts_with(&format!("<{}>;tag=", IMPU)));
+    assert_eq!(header_value(&message, "P-Preferred-Identity"), IMPU);
+    assert_eq!(body_data(&message), VIDEO_CHAT);
+    peer.send(&answer(&message, "200 OK", None));
+
+    // nothing while not registered
+    engine.unregister();
+    report_video_chat_event(
+        &engine.route,
+        &tm,
+        "sip:mivc@example.com",
+        VIDEO_CHAT.to_vec(),
+        &client.rt,
+    );
+    peer.silence();
+}
+
+#[test]
+fn the_feature_tag_of_video_chat_is_told_besides_those_of_e2ee() {
+    let e2ee = || Some(String::from("+g.gsma.rcs.msg.e2ee=\"1\""));
+    assert_eq!(
+        joined_feature_tags(e2ee(), Some("+g.gsma.rcs.videochat")).as_deref(),
+        Some("+g.gsma.rcs.msg.e2ee=\"1\";+g.gsma.rcs.videochat")
+    );
+    assert_eq!(
+        joined_feature_tags(None, Some("+g.gsma.rcs.videochat")).as_deref(),
+        Some("+g.gsma.rcs.videochat")
+    );
+    assert_eq!(joined_feature_tags(e2ee(), None), e2ee());
+    assert_eq!(joined_feature_tags(Some(String::new()), None), None);
+    assert_eq!(joined_feature_tags(None, None), None);
 }

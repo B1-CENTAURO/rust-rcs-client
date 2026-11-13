@@ -58,6 +58,13 @@ Built with the `e2ee` feature, the library encrypts chats end to end as GSMA RCC
 使用 `e2ee` 特性编译时，本库按照 GSMA RCC.16 对聊天进行端到端加密，使用方法见 [docs/e2ee.md](docs/e2ee.md)。
 
 
+### RCS Video Chat 视频通话
+
+The library signals 1-to-1 RCS Video Chats (GSMA RCC.07 section 3.7.5) in the chat with the contact, for the app's WebRTC stack to carry the media. See [docs/video-chat.md](docs/video-chat.md).
+
+本库在与联系人的聊天中完成一对一 RCS Video Chat（GSMA RCC.07 第 3.7.5 节）的信令，媒体由应用的 WebRTC 处理，使用方法见 [docs/video-chat.md](docs/video-chat.md)。
+
+
 ### What's missing 缺失部分
 
 Although this library will work under most RCS network, I do have to point out there are features missing　that might cause problems under a different network coniguration.
