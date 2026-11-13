@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! The Protocol Buffer messages of RCS Video Chat signalling (RCC.07 v18.0
-//! sections 3.7.5.2.3.2 and 3.7.5.2.3.4)
+//! sections 3.7.5.2.3.2 to 3.7.5.2.3.4)
 
 /// The container of each event of a 1-to-1 RCS Video Chat, the body of an
 /// `rcs/video-chat+proto` CPIM message (RCC.07 section 3.7.5.2.3.2)
@@ -190,6 +190,112 @@ pub struct BandwidthConstraints {
     pub min_bandwidth_kbps: i32,
     #[prost(int32, tag = "3")]
     pub start_bandwidth_kbps: i32,
+}
+
+/// What a client sends the Controlling Function of a Group RCS Video Chat
+/// (RCC.07 section 3.7.5.2.3.3.1)
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ClientGroupVideoMessage {
+    /// The VideoChatMessage, encoded, which goes end to end as it is
+    #[prost(bytes = "vec", tag = "1")]
+    pub video_chat_message: Vec<u8>,
+    /// The SDP offer or answer of the client
+    #[prost(string, tag = "2")]
+    pub sdp: String,
+    /// For the Controlling Function alone
+    #[prost(oneof = "client_group_video_message::Event", tags = "101, 102")]
+    pub event: Option<client_group_video_message::Event>,
+}
+
+pub mod client_group_video_message {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "101")]
+        UpdateMedia(super::UpdateMedia),
+        #[prost(message, tag = "102")]
+        IceCandidatesUpdate(super::IceCandidatesUpdate),
+    }
+}
+
+/// What the Controlling Function of a Group RCS Video Chat sends a client
+/// (section 3.7.5.2.3.3.2)
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ServerGroupVideoMessage {
+    /// The VideoChatMessage of a client, encoded, as it sent it
+    #[prost(bytes = "vec", tag = "1")]
+    pub video_chat_message: Vec<u8>,
+    /// The SDP offer or answer of the SFU
+    #[prost(string, tag = "2")]
+    pub sdp: String,
+    #[prost(message, repeated, tag = "3")]
+    pub member_info: Vec<MemberInfo>,
+    /// With a CallInvitation alone
+    #[prost(enumeration = "CallInviteType", tag = "4")]
+    pub call_invite_type: i32,
+    /// Of the Controlling Function
+    #[prost(oneof = "server_group_video_message::Event", tags = "101, 102")]
+    pub event: Option<server_group_video_message::Event>,
+}
+
+pub mod server_group_video_message {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "101")]
+        UpdateMedia(super::UpdateMedia),
+        #[prost(message, tag = "102")]
+        IceCandidatesUpdate(super::IceCandidatesUpdate),
+    }
+}
+
+/// A participant of a Group RCS Video Chat (section 3.7.5.2.3.3.2.1)
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct MemberInfo {
+    #[prost(message, optional, tag = "1")]
+    pub user_id: Option<RcsId>,
+    #[prost(message, optional, tag = "2")]
+    pub sfu_user_id: Option<SfuUserId>,
+    #[prost(message, optional, tag = "3")]
+    pub stream_identifiers: Option<StreamIdentifiers>,
+    #[prost(enumeration = "UserCallState", tag = "4")]
+    pub user_call_state: i32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RcsId {
+    /// E.164
+    #[prost(string, tag = "1")]
+    pub msisdn: String,
+}
+
+/// What the SFU knows the streams of a participant by, for the call
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SfuUserId {
+    #[prost(string, tag = "1")]
+    pub sfu_user_id: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct StreamIdentifiers {
+    #[prost(message, repeated, tag = "1")]
+    pub media_stream_ids: Vec<MediaStreamId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum UserCallState {
+    Unspecified = 0,
+    Joined = 1,
+    NotJoined = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum CallInviteType {
+    Unspecified = 0,
+    /// A new call, which rings
+    Ring = 1,
+    /// A call going on, which does not ring
+    Ongoing = 2,
 }
 
 /// The body of the SIP MESSAGE telling the Service Provider Network that the

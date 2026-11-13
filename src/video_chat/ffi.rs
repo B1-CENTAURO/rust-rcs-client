@@ -80,13 +80,16 @@ pub type VideoChatMediaUpdateCallback = extern "C" fn(
 );
 
 /// The event code of `event` as the app is told it, with its SDP and its
-/// reason: incoming 0 with the SDP offer, alerting 1, answered 2 with the
-/// SDP answer, rejected 3 with a RejectReason, not answered 4, missed 5,
-/// ended 6 with a HangupReason, failed 7 with the status code; None for
-/// those told otherwise
+/// reason: incoming 0 with the SDP offer, 1 if a group call ongoing not to
+/// ring, alerting 1, answered 2 with the SDP answer, rejected 3 with a
+/// RejectReason, not answered 4, missed 5, ended 6 with a HangupReason,
+/// failed 7 with the status code, connect 8 with the SDP answer of the SFU;
+/// None for those told otherwise
 pub fn video_chat_event_code(event: &VideoChatEvent) -> Option<(i32, Option<&str>, i32)> {
     match event {
-        VideoChatEvent::Incoming { sdp_offer } => Some((0, Some(sdp_offer), 0)),
+        VideoChatEvent::Incoming { sdp_offer, ongoing } => {
+            Some((0, Some(sdp_offer), i32::from(*ongoing)))
+        }
         VideoChatEvent::Alerting => Some((1, None, 0)),
         VideoChatEvent::Answered { sdp_answer } => Some((2, Some(sdp_answer), 0)),
         VideoChatEvent::Rejected(reason) => Some((3, None, *reason)),
@@ -94,6 +97,7 @@ pub fn video_chat_event_code(event: &VideoChatEvent) -> Option<(i32, Option<&str
         VideoChatEvent::Missed => Some((5, None, 0)),
         VideoChatEvent::Ended(reason) => Some((6, None, *reason)),
         VideoChatEvent::Failed(status_code) => Some((7, None, i32::from(*status_code))),
+        VideoChatEvent::Connect { sdp_answer } => Some((8, Some(sdp_answer), 0)),
         VideoChatEvent::IceCandidates { .. } | VideoChatEvent::MediaUpdate(_) => None,
     }
 }

@@ -35,9 +35,10 @@ use crate::messaging::cpm::session_tests::{
 use crate::messaging::ffi::RecipientType;
 
 use super::{
-    joined_feature_tags, report_video_chat_event, route_message, sealing_of, send_to_contact,
-    send_video_chat_message, taken_by_video_chat, Content, MessageRoute, PendingMessage,
-    PreparingChats, RcsEngineConnectionState, RcsEngineRegistrationState, UploadFor,
+    cpim_from, joined_feature_tags, report_video_chat_event, route_message, sealing_of,
+    send_to_contact, send_video_chat_message, taken_by_video_chat, Content, MessageRoute,
+    PendingMessage, PreparingChats, RcsEngineConnectionState, RcsEngineRegistrationState,
+    UploadFor,
 };
 use crate::video_chat::{
     VideoChatConfig, VideoChatEvent, VideoChatLink, VideoChatService, CONTENT_TYPE,
@@ -903,8 +904,11 @@ fn a_video_chat_message_to_a_contact_not_taking_an_encrypted_chat_goes_in_one_no
     peer.silence();
 }
 
-/// Takes nothing, a link for a service to take signals with
-struct Unlinked;
+/// Takes nothing, a link for a service to take signals with; the group
+/// messages it sends noted
+struct Unlinked {
+    group_sent: Mutex<Vec<String>>,
+}
 
 impl VideoChatLink for Unlinked {
     fn send(&self, _: &str, _: Vec<u8>, sent: Box<dyn FnOnce(u16) + Send + Sync>) {
@@ -916,12 +920,39 @@ impl VideoChatLink for Unlinked {
     fn registered_uri(&self) -> Option<String> {
         None
     }
+
+    fn send_to_group(
+        &self,
+        conference_uri: &str,
+        _: Vec<u8>,
+        sent: Box<dyn FnOnce(u16) + Send + Sync>,
+    ) {
+        self.group_sent
+            .lock()
+            .unwrap()
+            .push(String::from(conference_uri));
+        sent(200);
+    }
+
+    fn group_conversation_id(&self, _: &str) -> Option<String> {
+        None
+    }
 }
 
 #[test]
 fn video_chat_messages_go_to_the_video_chats_not_to_the_app() {
+    use crate::video_chat::proto::{
+        video_chat_message, CallInvitation, ServerGroupVideoMessage, VideoChatMessage,
+    };
+
     let rt = Runtime::new().unwrap();
-    let service = VideoChatService::new(Arc::new(Unlinked), rt.handle().clone());
+    let link = Arc::new(Unlinked {
+        group_sent: Mutex::new(Vec::new()),
+    });
+    let service = VideoChatService::new(
+        Arc::clone(&link) as Arc<dyn VideoChatLink>,
+        rt.handle().clone(),
+    );
     service.set_config(VideoChatConfig {
         technology: 3,
         ..VideoChatConfig::default()
@@ -937,17 +968,13 @@ fn video_chat_messages_go_to_the_video_chats_not_to_the_app() {
     let video_chat = OnceLock::new();
     let _ = video_chat.set(Arc::downgrade(&service));
 
-    let invitation = crate::video_chat::proto::VideoChatMessage {
-        call_id: String::from("bob-call"),
-        event: Some(
-            crate::video_chat::proto::video_chat_message::Event::CallInvitation(
-                crate::video_chat::proto::CallInvitation {
-                    sdp_offer: String::from("offer"),
-                },
-            ),
-        ),
+    let invitation = |call_id: &str, sdp_offer: &str| VideoChatMessage {
+        call_id: String::from(call_id),
+        event: Some(video_chat_message::Event::CallInvitation(CallInvitation {
+            sdp_offer: String::from(sdp_offer),
+        })),
     };
-    let body = prost::Message::encode_to_vec(&invitation);
+    let body = prost::Message::encode_to_vec(&invitation("bob-call", "offer"));
     let date = chrono::Utc::now().to_rfc3339();
     let cpim_info = CPIMInfo {
         imdn_message_id: b"m1",
@@ -965,51 +992,105 @@ fn video_chat_messages_go_to_the_video_chats_not_to_the_app() {
     // not a video chat message: the app's
     assert!(!taken_by_video_chat(
         &video_chat,
-        || false,
+        || None,
         PEER.as_bytes(),
         &cpim_info,
         b"text/plain",
         b"hi"
     ));
-    // of a group: taken, though not yet by the video chats
+    // of an encrypted group: taken, though not yet by the video chats, as
+    // RCC.16 section 9.8.2 has it signed
+    let group = ServerGroupVideoMessage {
+        video_chat_message: prost::Message::encode_to_vec(&invitation("carol-call", "")),
+        sdp: String::from("sfu offer"),
+        ..ServerGroupVideoMessage::default()
+    };
+    let group = prost::Message::encode_to_vec(&group);
     assert!(taken_by_video_chat(
         &video_chat,
-        || true,
-        PEER.as_bytes(),
+        || Some(true),
+        b"sip:group@conf.example.com",
         &cpim_info,
         CONTENT_TYPE.as_bytes(),
-        &body
+        &group
     ));
     assert!(told.lock().unwrap().is_empty());
     // of a 1-to-1 chat, with parameters too
     assert!(taken_by_video_chat(
         &video_chat,
-        || false,
+        || None,
         PEER.as_bytes(),
         &cpim_info,
         b"rcs/video-chat+proto; charset=binary",
         &body
     ));
     assert_eq!(
-        *told.lock().unwrap(),
+        std::mem::take(&mut *told.lock().unwrap()),
         [(
             String::from("bob-call"),
             String::from(PEER),
             VideoChatEvent::Incoming {
-                sdp_offer: String::from("offer")
+                sdp_offer: String::from("offer"),
+                ongoing: false,
             }
         )]
+    );
+    service.hang_up("bob-call");
+    // of a group not encrypted, from the participant of its CPIM From
+    assert!(taken_by_video_chat(
+        &video_chat,
+        || Some(false),
+        b"sip:group@conf.example.com",
+        &cpim_info,
+        CONTENT_TYPE.as_bytes(),
+        &group
+    ));
+    assert_eq!(
+        *told.lock().unwrap(),
+        [(
+            String::from("carol-call"),
+            String::from("sip:group@conf.example.com"),
+            VideoChatEvent::Incoming {
+                sdp_offer: String::from("sfu offer"),
+                ongoing: false,
+            }
+        )]
+    );
+    assert_eq!(
+        *link.group_sent.lock().unwrap(),
+        ["sip:group@conf.example.com"]
     );
     // the video chats gone, not the app's all the same
     drop(service);
     assert!(taken_by_video_chat(
         &video_chat,
-        || false,
+        || None,
         PEER.as_bytes(),
         &cpim_info,
         CONTENT_TYPE.as_bytes(),
         &body
     ));
+}
+
+#[test]
+fn the_cpim_from_of_a_group_message_gives_its_participant() {
+    let cpim_info = |from: &'static [u8]| CPIMInfo {
+        imdn_message_id: b"m1",
+        from,
+        to: b"<sip:group@conf.example.com>",
+        date: b"2026-11-13T00:00:00Z",
+        from_uri: None,
+        to_uri: None,
+        payload_type: None,
+        disposition_notification: None,
+        mls_derived_content_signature: None,
+        mls_original_message_id: None,
+    };
+    assert_eq!(
+        cpim_from(&cpim_info(b"Bob <tel:+15550002>")),
+        "tel:+15550002"
+    );
+    assert_eq!(cpim_from(&cpim_info(b" tel:+15550002 ")), "tel:+15550002");
 }
 
 #[test]
