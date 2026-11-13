@@ -16,6 +16,9 @@ The declarations are in [`src/librust_rcs_client.h`](../src/librust_rcs_client.h
 - **Delivery and display notifications** in those chats are signed (sections 9.1.3, 9.1.4). Those that come are checked, and a forged one is dropped.
 - **Files sent in those chats**: they are encrypted before upload, and decrypted as they are downloaded (section 9.1.2).
 - **The subject and icon of encrypted groups** (section 9.7.1).
+- **RCS Video Chats** (section 9.8):
+  - a 1-to-1 call's messages go encrypted in an encrypted chat (section 9.8.1);
+  - a group call's signalling is signed in an encrypted group, and its media is encrypted with SFrame by the app, with keys the client makes from the MLS group (section 9.8.2). See [video-chat.md](video-chat.md).
 
 Not encrypted:
 - standalone messages (pager and large mode);
@@ -30,7 +33,7 @@ Build the library with the `e2ee` feature:
 cargo build --features e2ee
 ```
 
-The functions `rcs_client_set_e2ee`, `rcs_client_e2ee_enrol`, `rcs_client_identity_verification_code` and `rcs_kds_request_*` exist only in a library built with it. Without them, chats go unencrypted as before.
+The functions `rcs_client_set_e2ee`, `rcs_client_e2ee_enrol`, `rcs_client_identity_verification_code`, `rcs_kds_request_*` and those for the media of group calls (`rcs_client_video_chat_encrypts_media`, `rcs_client_encrypt_video_chat_frame`, `rcs_client_decrypt_video_chat_frame`, `rcs_client_set_video_chat_keys_listener`) exist only in a library built with it. Without them, chats go unencrypted as before.
 
 ## What the app provides
 
@@ -155,6 +158,7 @@ The client advertises E2EE in its capabilities only once enrolled. If enrolling 
 
   None of this needs the app.
 - **Moving back to encrypted** is also checked on schedule while the engine runs: about weekly for unencrypted groups with a message in the last 30 days (section 11.1.1).
+- **Group calls:** in an encrypted group, the client signs the call's signalling and checks the signatures of the others (section 9.8.2). It makes the keys of the call's media as it starts or is answered, and moves them to each new epoch as RCC.16 has it. The app encrypts and decrypts each frame with them; see [video-chat.md](video-chat.md).
 
 ## User aliases
 
@@ -203,4 +207,3 @@ Nothing is written unless it returns 0.
 ## Not covered yet
 
 - **A new Era of a group or chat whose INVITE wasn't answered before the client stopped** is dropped as other changes are, and the group heals once another member's message shows it out of step. Unlike a new group or chat, it can't wait for the Focus: the group was there before the new Era, so the Focus inviting the client in again doesn't show whether it took the new Era.
-- **Group RCS Video Chats in encrypted groups** (section 9.8.2): their signalling signed, and their media encrypted with SFrame, which rust-rcs-core keys from the MLS group. The client takes group calls in groups not encrypted end to end for now; a 1-to-1 call's messages go encrypted in an encrypted chat (section 9.8.1). See [video-chat.md](video-chat.md).

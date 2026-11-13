@@ -60,9 +60,9 @@ Built with the `e2ee` feature, the library encrypts chats end to end as GSMA RCC
 
 ### RCS Video Chat 视频通话
 
-The library signals RCS Video Chats (GSMA RCC.07 section 3.7.5), 1-to-1 in the chat with the contact and in group chats through their Controlling Function, for the app's WebRTC stack to carry the media. See [docs/video-chat.md](docs/video-chat.md).
+The library signals RCS Video Chats (GSMA RCC.07 section 3.7.5), 1-to-1 in the chat with the contact and in group chats through their Controlling Function, for the app's WebRTC stack to carry the media. With E2EE, it signs a group call's signalling in an encrypted group, and keys its media for the app to encrypt with SFrame (GSMA RCC.16 section 9.8.2). See [docs/video-chat.md](docs/video-chat.md).
 
-本库完成 RCS Video Chat（GSMA RCC.07 第 3.7.5 节）的信令：一对一通话在与联系人的聊天中，群组通话经群聊的控制功能，媒体由应用的 WebRTC 处理，使用方法见 [docs/video-chat.md](docs/video-chat.md)。
+本库完成 RCS Video Chat（GSMA RCC.07 第 3.7.5 节）的信令：一对一通话在与联系人的聊天中，群组通话经群聊的控制功能，媒体由应用的 WebRTC 处理。启用 E2EE 时，在加密群组中对群组通话的信令签名，并为其媒体提供密钥，由应用以 SFrame 加密（GSMA RCC.16 第 9.8.2 节）。使用方法见 [docs/video-chat.md](docs/video-chat.md)。
 
 
 ### What's missing 缺失部分

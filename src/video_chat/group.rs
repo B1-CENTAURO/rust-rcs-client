@@ -22,6 +22,11 @@
 //! own (sections 3.7.5.2.3.3). The call goes on for the others as one
 //! participant hangs up; Timer_Zeta, which the SFU keeps, takes the place of
 //! Timer_Epsilon.
+//!
+//! In a group encrypted end to end (RCC.16 section 9.8.2), the link signs
+//! what is sent, the signals of the others are taken signed by them alone,
+//! and the keys of the call's media are made through the link as it starts
+//! or is answered, and let go of as it ends.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
