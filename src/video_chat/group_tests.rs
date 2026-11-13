@@ -236,6 +236,17 @@ fn a_group_call_is_offered_and_answered_through_the_controlling_function() {
         )]
     );
     assert_eq!(device.group_reports(), [(JOIN, String::from(CONVERSATION))]);
+    // answered once
+    device.relayed("tel:+15550004", relaying(&call_id, accept(""), ""));
+    assert!(device.told().is_empty());
+    assert_eq!(
+        device.group_told(),
+        [tell_group(
+            &call_id,
+            GroupVideoChatEvent::Joined(String::from("tel:+15550004"))
+        )]
+    );
+    assert!(device.group_reports().is_empty());
 
     // Carol rejects, Bob hangs up, the call going on (sections 3.7.5.5.4,
     // 3.7.5.5.6), nothing sent in turn
@@ -353,6 +364,7 @@ fn a_group_call_offered_is_acknowledged_and_answered_with_the_sdp_answer_of_the_
     // the SDP answer in the ClientGroupVideoMessage, as the user answers,
     // which the SFU needs to connect
     assert!(!device.service.media_connected("bob-call"));
+    assert!(!device.service.media_disconnected("bob-call"));
     assert!(device.service.accept_call("bob-call", "my answer"));
     assert_eq!(
         device.group_sent(),
@@ -827,4 +839,29 @@ fn the_app_is_told_each_participant_event_by_its_code() {
         }),
         Some((8, Some("sfu answer"), 0))
     );
+}
+
+#[test]
+fn the_caller_joins_once_answered_and_connected_to_the_sfu() {
+    let device = a_device();
+    let call_id = device.service.start_group_call(GROUP, "offer").unwrap();
+    // the participants told, without the SFU's answer
+    device.relayed(
+        ME,
+        ServerGroupVideoMessage {
+            member_info: vec![member(BOB, "sfu-bob", false)],
+            ..relaying(&call_id, invitation(), "")
+        },
+    );
+    assert!(device.told().is_empty());
+    assert!(!device.service.media_connected(&call_id));
+    device.relayed(ME, relaying(&call_id, invitation(), "sfu answer"));
+    assert_eq!(device.told().len(), 1, "connect");
+
+    // answered before the media connected: joined once it does
+    device.relayed(BOB, relaying(&call_id, accept(""), ""));
+    device.told();
+    assert!(device.group_reports().is_empty());
+    assert!(device.service.media_connected(&call_id));
+    assert_eq!(device.group_reports(), [(JOIN, String::from(CONVERSATION))]);
 }

@@ -1205,11 +1205,25 @@ fn a_group_video_chat_message_goes_in_the_group_chat() {
     encrypting(
         &client,
         ChatScript {
-            encrypting: vec![conversation_id],
+            encrypting: vec![conversation_id.clone()],
             ..ChatScript::default()
         },
     );
     assert_eq!(told(&engine.group_video_chat(VIDEO_CHAT)), 488);
+
+    // but as in one not encrypted once it moved to unencrypted (RCC.16
+    // section 11.2)
+    client
+        .sessions
+        .set_group_encryption(
+            ScriptedEncryption::moved_to_unencrypted(vec![conversation_id])
+                as Arc<dyn GroupEncryption>,
+        );
+    let sent = engine.group_video_chat(VIDEO_CHAT);
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_content(&send.body), VIDEO_CHAT);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(told(&sent), 200);
     connection.quiet(&rt);
     peer.silence();
 }

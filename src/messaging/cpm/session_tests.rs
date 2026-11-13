@@ -3143,6 +3143,16 @@ impl ScriptedEncryption {
         })
     }
 
+    /// The encryption of the groups `encrypting`, moved to unencrypted
+    /// (RCC.16 section 11.2)
+    pub(crate) fn moved_to_unencrypted(encrypting: Vec<String>) -> Arc<ScriptedEncryption> {
+        Arc::new(ScriptedEncryption {
+            encrypting,
+            unencrypted: true,
+            ..ScriptedEncryption::default()
+        })
+    }
+
     /// The contact and from each new chat was asked for with
     pub(crate) fn chats_prepared(&self) -> Vec<(String, String)> {
         self.chats_prepared.lock().unwrap().clone()

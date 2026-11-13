@@ -83,9 +83,9 @@ enum Media {
     Connecting {
         delta: u64,
     },
+    /// Connected, or gone down for the SFU to wait for it to connect again
+    /// (Timer_Zeta), which is alike to the client
     Connected,
-    /// Gone down, the SFU waiting for it to connect again (Timer_Zeta)
-    Down,
 }
 
 impl VideoChatService {
@@ -247,7 +247,7 @@ impl VideoChatService {
                 return false;
             };
             match call.media {
-                Media::Connecting { .. } | Media::Down => call.media = Media::Connected,
+                Media::Connecting { .. } => call.media = Media::Connected,
                 Media::Connected => {}
                 Media::Idle => return false,
             }
@@ -257,21 +257,14 @@ impl VideoChatService {
         true
     }
 
-    /// Takes note of the media of the group call `call_id` gone down, for
-    /// the SFU to wait for it to connect again (Timer_Zeta, RCC.07 section
-    /// 3.7.5.2.4.6)
+    /// Whether the media of the group call `call_id` gone down is of a call
+    /// answered, for the SFU, not the client, to wait for it to connect again
+    /// (Timer_Zeta, RCC.07 section 3.7.5.2.4.6)
     pub(super) fn group_media_disconnected(&self, call_id: &str) -> bool {
-        let mut group_calls = self.group_calls.lock().unwrap();
-        let Some(call) = group_calls.get_mut(call_id) else {
-            return false;
-        };
-        match call.media {
-            Media::Connected => call.media = Media::Down,
-            // the timer running, or down already
-            Media::Connecting { .. } | Media::Down => {}
-            Media::Idle => return false,
-        }
-        true
+        let group_calls = self.group_calls.lock().unwrap();
+        group_calls
+            .get(call_id)
+            .is_some_and(|call| call.media != Media::Idle)
     }
 
     /// Takes the ServerGroupVideoMessage `body` of the group chat at

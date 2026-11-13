@@ -327,6 +327,22 @@ fn calls_are_taken_while_the_service_provider_enables_rcs_video_chat_and_the_app
     };
     service.on_message(BOB, &date(Duration::ZERO), &message.encode_to_vec());
     assert!(link.sent.lock().unwrap().is_empty());
+    let message = ServerGroupVideoMessage {
+        video_chat_message: VideoChatMessage {
+            call_id: String::from("carol-call"),
+            event: Some(offer("")),
+        }
+        .encode_to_vec(),
+        sdp: String::from("sfu offer"),
+        ..ServerGroupVideoMessage::default()
+    };
+    service.on_group_message(
+        GROUP,
+        "tel:+15550003",
+        &date(Duration::ZERO),
+        &message.encode_to_vec(),
+    );
+    assert!(link.group_sent.lock().unwrap().is_empty());
 }
 
 #[test]
