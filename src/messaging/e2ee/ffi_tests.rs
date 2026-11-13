@@ -31,9 +31,10 @@ use uuid::Uuid;
 use crate::capability::FEATURE_TAGS;
 use crate::messaging::ffi::{MessageResultCallbackContext, MessageResultCallbackContextWrapper};
 use crate::{
-    destroy_rcs_client, new_rcs_client, rcs_client_e2ee_enrol,
-    rcs_client_identity_verification_code, rcs_client_query_capabilities, rcs_client_set_e2ee,
-    rcs_client_setup, RcsRuntime,
+    destroy_rcs_client, new_rcs_client, rcs_client_decrypt_video_chat_frame, rcs_client_e2ee_enrol,
+    rcs_client_encrypt_video_chat_frame, rcs_client_identity_verification_code,
+    rcs_client_query_capabilities, rcs_client_set_e2ee, rcs_client_set_video_chat_keys_listener,
+    rcs_client_setup, rcs_client_video_chat_encrypts_media, RcsRuntime,
 };
 
 use super::device::{DeviceError, Enrolled};
@@ -43,11 +44,13 @@ use super::ffi::{
     app_save_state, enrolment_status, rcs_kds_request_add_key_packages, rcs_kds_request_enrolled,
     rcs_kds_request_failed, rcs_kds_request_fetched, rcs_kds_request_uploaded, AppKds, KdsRequest,
 };
-use super::group_tests::{alice_and_bob, code_bob_is_shown, CONVERSATION};
+use super::group_tests::{alice_and_bob, alice_and_bob_in_time, code_bob_is_shown, CONVERSATION};
 use super::kds::{Enrolment, EnrolmentError, Fetched, KdsError, KeyDistribution, Recipient};
 use super::kds_tests::certificates::*;
 use super::kds_tests::{bytes, App as Keeping, Kds, ALICE_TEL, TODAY};
 use super::store::StoreError;
+use super::video::FRAME_OVERHEAD;
+use super::video_tests::{device_commits, keys_of_bob};
 
 /// How the app answers
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -821,4 +824,136 @@ fn an_identity_verification_code_is_asked_through_the_client() {
     let written = unsafe { CStr::from_ptr(code.as_ptr()) };
     assert_eq!(written.to_str().unwrap(), code_bob_is_shown(&device, &bob));
     assert_eq!(written.to_bytes().len(), 80);
+}
+
+/// The keys switches told through the C interface
+static SWITCHED: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+extern "C" fn switched(
+    call_id: *const c_char,
+    epoch: u64,
+    context: *mut MessageResultCallbackContext,
+) {
+    assert!(context.is_null());
+    let call_id = unsafe { CStr::from_ptr(call_id) }
+        .to_string_lossy()
+        .into_owned();
+    SWITCHED.lock().unwrap().push((call_id, epoch));
+}
+
+#[test]
+fn the_frames_of_a_group_call_are_encrypted_and_decrypted_through_the_client() {
+    let client = Client::new();
+    let raw = client.client;
+    let call = CString::new("call-1").unwrap();
+    let call_id = call.as_ptr();
+    let (meta, frame) = (b"meta", b"frame");
+    let mut out = [0u8; 64];
+    let encrypt = move |out: &mut [u8]| unsafe {
+        rcs_client_encrypt_video_chat_frame(
+            raw,
+            call_id,
+            meta.as_ptr(),
+            meta.len(),
+            frame.as_ptr(),
+            frame.len(),
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    let decrypt = move |encrypted: &[u8], out: &mut [u8]| unsafe {
+        rcs_client_decrypt_video_chat_frame(
+            raw,
+            call_id,
+            meta.as_ptr(),
+            meta.len(),
+            encrypted.as_ptr(),
+            encrypted.len(),
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    let encrypts =
+        move |call_id: *const c_char| unsafe { rcs_client_video_chat_encrypts_media(raw, call_id) };
+
+    // E2EE not set
+    assert_eq!(encrypts(call.as_ptr()), 0);
+    assert_eq!(encrypt(&mut out), -1);
+
+    // no keys for the call, then made
+    let (device, bob, bobs_group) = alice_and_bob();
+    unsafe { (*raw).e2ee = Some(Arc::clone(&device)) };
+    assert_eq!(encrypt(&mut out), -1);
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    assert_eq!(encrypts(call.as_ptr()), 1);
+    assert_eq!(encrypts(ptr::null()), 0);
+
+    // encrypted, Bob decrypting it, in no more than the overhead more
+    let written = encrypt(&mut out);
+    assert!(written > 0 && written as usize <= frame.len() + FRAME_OVERHEAD);
+    let mut bobs_keys = keys_of_bob(&bob, &bobs_group);
+    assert_eq!(
+        bobs_keys
+            .decrypt(meta, &out[..written as usize])
+            .unwrap()
+            .frame,
+        frame
+    );
+    // with no room for it
+    assert_eq!(encrypt(&mut out[..frame.len()]), -2);
+
+    // Bob's decrypted, once
+    let from_bob = bobs_keys.encrypt(meta, frame).unwrap();
+    assert_eq!(decrypt(&from_bob, &mut out), frame.len() as i64);
+    assert_eq!(&out[..frame.len()], frame);
+    assert_eq!(decrypt(&from_bob, &mut out), -4);
+    assert_eq!(decrypt(b"not a frame", &mut out), -3);
+    let from_bob = bobs_keys.encrypt(meta, frame).unwrap();
+    assert_eq!(decrypt(&from_bob, &mut out[..2]), -2);
+    // an empty one too, with no room needed
+    let empty = bobs_keys.encrypt(meta, b"").unwrap();
+    assert_eq!(
+        unsafe {
+            rcs_client_decrypt_video_chat_frame(
+                raw,
+                call.as_ptr(),
+                meta.as_ptr(),
+                meta.len(),
+                empty.as_ptr(),
+                empty.len(),
+                ptr::null_mut(),
+                0,
+            )
+        },
+        0
+    );
+
+    device.end_call_keys("call-1");
+    assert_eq!(encrypts(call.as_ptr()), 0);
+    assert_eq!(decrypt(&from_bob, &mut out), -1);
+}
+
+#[test]
+fn the_app_is_told_the_keys_of_a_group_call_switched_through_the_client() {
+    let client = Client::new();
+    let raw = client.client;
+    // without E2EE, nothing to set
+    unsafe { rcs_client_set_video_chat_keys_listener(raw, Some(switched), ptr::null_mut()) };
+
+    let (device, _, _, clock) = alice_and_bob_in_time();
+    unsafe { (*raw).e2ee = Some(Arc::clone(&device)) };
+    unsafe { rcs_client_set_video_chat_keys_listener(raw, Some(switched), ptr::null_mut()) };
+    device.start_call_keys("call-9", CONVERSATION).unwrap();
+    // alone in the call, the Commit of the device switches its keys at once
+    device_commits(&device, &clock);
+    assert_eq!(
+        SWITCHED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(call_id, _)| call_id == "call-9")
+            .cloned()
+            .collect::<Vec<_>>(),
+        [(String::from("call-9"), 2)]
+    );
 }

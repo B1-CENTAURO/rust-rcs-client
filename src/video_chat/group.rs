@@ -42,6 +42,10 @@ use super::{
     Reported, VideoChatEvent, VideoChatService, ANSWERED_WITHIN, CONNECTED_WITHIN, LOG_TAG,
 };
 
+/// Whether a VideoChatMessage relayed in a group encrypted end to end is
+/// signed by the participant it is of (RCC.16 section 9.8.2)
+pub type SignedBy<'a> = &'a dyn Fn(&[u8]) -> bool;
+
 /// A call of a group chat
 pub(super) struct GroupCall {
     conference_uri: String,
@@ -112,7 +116,7 @@ impl VideoChatService {
                 self.link.end_media_keys(&call_id);
                 return None;
             }
-            if keys.is_err() {
+            if keys.is_none() {
                 drop((calls, group_calls));
                 self.act(vec![Action::Tell(
                     call_id.clone(),
@@ -178,7 +182,7 @@ impl VideoChatService {
             if self
                 .link
                 .start_media_keys(call_id, &call.conference_uri)
-                .is_err()
+                .is_none()
             {
                 let call = group_calls.remove(call_id).unwrap();
                 drop(group_calls);
@@ -312,7 +316,7 @@ impl VideoChatService {
         from: &str,
         date: &str,
         body: &[u8],
-        signed: Option<&dyn Fn(&[u8]) -> bool>,
+        signed: Option<SignedBy>,
     ) {
         let message = match ServerGroupVideoMessage::decode(body) {
             Ok(message) => message,

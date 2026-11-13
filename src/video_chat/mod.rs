@@ -231,11 +231,12 @@ pub trait VideoChatLink: Send + Sync {
     fn group_conversation_id(&self, conference_uri: &str) -> Option<String>;
 
     /// Makes the keys of the media of the group call `call_id` of the group
-    /// chat at `conference_uri`: Ok(true) if the media is to be encrypted
+    /// chat at `conference_uri`: Some(true) if the media is to be encrypted
     /// with them, as in a group encrypted end to end (RCC.16 section
-    /// 9.8.2), Ok(false) if not, Err if it is to be and they cannot be made
-    fn start_media_keys(&self, _call_id: &str, _conference_uri: &str) -> Result<bool, ()> {
-        Ok(false)
+    /// 9.8.2), Some(false) if not, None if it is to be and they cannot be
+    /// made
+    fn start_media_keys(&self, _call_id: &str, _conference_uri: &str) -> Option<bool> {
+        Some(false)
     }
 
     /// Lets go of the keys of the media of the group call `call_id`, which

@@ -28,7 +28,7 @@ use rust_rcs_core::mls::rcs::proto::{
 use rust_rcs_core::mls::rcs::{
     INFO_PACKAGE_MLS_ENHANCED_GROUP_INFO_PULL, INFO_PACKAGE_MLS_GROUP_INFO_PULL,
 };
-use rust_rcs_core::mls::ErrorKind;
+use rust_rcs_core::mls::{ErrorKind, IncomingMessage};
 
 use crate::messaging::cpm::encryption::GroupInfoPull;
 
@@ -393,6 +393,8 @@ impl E2eeDevice {
         conversation_id: &str,
         body: &[u8],
     ) -> Result<(SelfHealProgress, Vec<u8>), StoreError> {
+        // the Commit of the device, if one waits, as it may be applied
+        let commit_id = self.control_messages().get(conversation_id);
         let (healed, pending) = self.store().with_conversation(
             conversation_id.as_bytes(),
             |conversation, client| {
@@ -407,6 +409,17 @@ impl E2eeDevice {
         let healed = healed.map_err(StoreError::Mls)?;
         for (_, taken) in &healed.applied {
             self.metadata_keys_received(conversation_id, taken);
+        }
+        // the keys of the calls of the group moved to the epoch of the last
+        // Commit applied (section 9.8.2)
+        let committer = healed.applied.iter().rev().find_map(|(_, taken)| {
+            taken.iter().rev().find_map(|message| match message {
+                IncomingMessage::Commit { sender, .. } => Some(sender.clone()),
+                _ => None,
+            })
+        });
+        if let Some(committer) = committer {
+            self.call_keys_advanced(conversation_id, &committer, commit_id.as_deref());
         }
         Ok((healed.progress, healed.latest_epoch.epoch_authenticator))
     }
@@ -461,7 +474,11 @@ impl E2eeDevice {
             )));
         }
         self.keys_checked(conversation_id, checked, asked);
-        Ok(self.sent_in(conversation_id, from, to, &client_message))
+        let cpim = self.sent_in(conversation_id, from, to, &client_message);
+        // the keys of the calls of the group made anew, the device at
+        // another leaf (section 9.8.2)
+        self.call_keys_remade(conversation_id);
+        Ok(cpim)
     }
 }
 

@@ -38,8 +38,8 @@ use crate::messaging::ffi::RecipientType;
 use super::{
     cpim_from, joined_feature_tags, report_video_chat_event, route_message, sealing_of,
     send_group_video_chat_message, send_to_contact, send_video_chat_message, taken_by_video_chat,
-    Content, MessageRoute, PendingMessage, PreparingChats, RcsEngineConnectionState,
-    RcsEngineRegistrationState, UploadFor,
+    Content, EngineVideoChatLink, MessageRoute, PendingMessage, PreparingChats,
+    RcsEngineConnectionState, RcsEngineRegistrationState, UploadFor,
 };
 use crate::video_chat::{
     VideoChatConfig, VideoChatEvent, VideoChatLink, VideoChatService, CONTENT_TYPE,
@@ -1163,6 +1163,46 @@ fn the_cpim_from_of_a_group_message_gives_its_participant() {
         "tel:+15550002"
     );
     assert_eq!(cpim_from(&cpim_info(b" tel:+15550002 ")), "tel:+15550002");
+}
+
+#[test]
+fn the_media_keys_of_a_group_call_are_those_of_the_encryption_of_its_group() {
+    // RCC.16 section 9.8.2, by the Conversation-ID of the group
+    let (client, mut peer) = start(true);
+    let engine = Engine::over(&client, configured_for_groups());
+    let (mut connection, _, _, _) = new_group(&client, &mut peer);
+    let conversation_id = client.sessions.group_conversation_id(GROUP).unwrap();
+    let link = EngineVideoChatLink {
+        route: engine.route.clone(),
+        preparing: Arc::clone(&engine.preparing),
+        tm: client.core.get_transaction_manager(),
+        rt: Arc::clone(&client.rt),
+    };
+    // without E2EE, or of no group known, none
+    assert_eq!(link.start_media_keys("call-1", GROUP), Some(false));
+    for made in [Some(true), None] {
+        let encryption = ScriptedEncryption::keying_calls(vec![conversation_id.clone()], made);
+        client
+            .sessions
+            .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+        assert_eq!(link.start_media_keys("call-1", GROUP), made, "{:?}", made);
+        assert_eq!(
+            link.start_media_keys("call-2", "sip:unknown@conf.example.com"),
+            Some(false)
+        );
+        link.media_participants("call-1", vec![String::from(PEER)]);
+        link.end_media_keys("call-1");
+        assert_eq!(
+            encryption.call_keys(),
+            [
+                format!("start {} call-1", conversation_id),
+                format!("participants call-1 {}", PEER),
+                String::from("end call-1"),
+            ]
+        );
+    }
+    connection.quiet(&client.rt);
+    peer.silence();
 }
 
 #[test]

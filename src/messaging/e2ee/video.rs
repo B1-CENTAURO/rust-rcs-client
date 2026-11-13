@@ -383,15 +383,7 @@ impl E2eeDevice {
                     }
                 };
                 if leaf_index != call.leaf_index || epoch < call.latest {
-                    match self.call_keys_of(conversation_id) {
-                        Ok(mut made) => {
-                            made.participants = std::mem::take(&mut call.participants);
-                            *call = made;
-                        }
-                        Err(e) => {
-                            platform_log(LOG_TAG, format!("call keys not made again: {:?}", e));
-                        }
-                    }
+                    self.remake(call);
                     continue;
                 }
                 if epoch == call.latest {
@@ -450,6 +442,31 @@ impl E2eeDevice {
             self.call_keys_delivered(conversation_id, &notification.message_id, &from);
         }
         true
+    }
+
+    /// Makes the keys of the calls of the group `conversation_id` anew, from
+    /// the epoch it is in, as once the device joined it again, at another
+    /// leaf: frames are sent in it at once
+    pub(super) fn call_keys_remade(&self, conversation_id: &str) {
+        let mut calls = self.video_calls().calls.lock().unwrap();
+        for call in calls
+            .values_mut()
+            .filter(|call| call.conversation_id == conversation_id)
+        {
+            self.remake(call);
+        }
+    }
+
+    /// Makes the keys `call` anew, from the epoch its group is in, keeping
+    /// its participants
+    fn remake(&self, call: &mut CallKeys) {
+        match self.call_keys_of(&call.conversation_id) {
+            Ok(mut made) => {
+                made.participants = std::mem::take(&mut call.participants);
+                *call = made;
+            }
+            Err(e) => platform_log(LOG_TAG, format!("call keys not made again: {:?}", e)),
+        }
     }
 
     /// Takes the delivery of the message `message_id` in the group

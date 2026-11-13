@@ -40,6 +40,18 @@ pub(super) struct Link {
     pub(super) group_sent: Mutex<Vec<(String, ClientGroupVideoMessage)>>,
     reports: Mutex<Vec<VideoChatEventNotification>>,
     pub(super) status_code: Mutex<u16>,
+    /// What the keys of the media of the group calls were asked
+    pub(super) keys: Mutex<Vec<Keys>>,
+    /// What making them gives
+    pub(super) making_keys: Mutex<Option<bool>>,
+}
+
+/// What the keys of the media of a group call are asked
+#[derive(Debug, PartialEq)]
+pub(super) enum Keys {
+    Started(String, String),
+    Ended(String),
+    Participants(String, Vec<String>),
 }
 
 /// The URI of a group chat, and its Conversation-ID
@@ -85,6 +97,28 @@ impl VideoChatLink for Link {
     fn group_conversation_id(&self, conference_uri: &str) -> Option<String> {
         (conference_uri == GROUP).then(|| String::from(CONVERSATION))
     }
+
+    fn start_media_keys(&self, call_id: &str, conference_uri: &str) -> Option<bool> {
+        self.keys.lock().unwrap().push(Keys::Started(
+            String::from(call_id),
+            String::from(conference_uri),
+        ));
+        *self.making_keys.lock().unwrap()
+    }
+
+    fn end_media_keys(&self, call_id: &str) {
+        self.keys
+            .lock()
+            .unwrap()
+            .push(Keys::Ended(String::from(call_id)));
+    }
+
+    fn media_participants(&self, call_id: &str, participants: Vec<String>) {
+        self.keys
+            .lock()
+            .unwrap()
+            .push(Keys::Participants(String::from(call_id), participants));
+    }
 }
 
 /// What the app is told of the participants of group calls
@@ -113,6 +147,8 @@ fn device_with(technology: i32) -> Device {
         group_sent: Mutex::new(Vec::new()),
         reports: Mutex::new(Vec::new()),
         status_code: Mutex::new(200),
+        keys: Mutex::new(Vec::new()),
+        making_keys: Mutex::new(Some(false)),
     });
     let service = VideoChatService::new(
         Arc::clone(&link) as Arc<dyn VideoChatLink>,
@@ -310,6 +346,8 @@ fn calls_are_taken_while_the_service_provider_enables_rcs_video_chat_and_the_app
         group_sent: Mutex::new(Vec::new()),
         reports: Mutex::new(Vec::new()),
         status_code: Mutex::new(200),
+        keys: Mutex::new(Vec::new()),
+        making_keys: Mutex::new(Some(false)),
     });
     let service = VideoChatService::new(
         Arc::clone(&link) as Arc<dyn VideoChatLink>,

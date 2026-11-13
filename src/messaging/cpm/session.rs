@@ -3253,6 +3253,7 @@ impl CPMSessionService {
     /// if the group chat it goes to is encrypted end to end, as the
     /// signalling of a Group RCS Video Chat is (RCC.16 section 9.8.2): it
     /// fails with 500 if it cannot be signed
+    #[allow(clippy::too_many_arguments)]
     pub fn send_signed_message<F>(
         &self,
         message_type: &str,
@@ -3281,6 +3282,7 @@ impl CPMSessionService {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_message_signed_or_not<F>(
         &self,
         message_type: &str,

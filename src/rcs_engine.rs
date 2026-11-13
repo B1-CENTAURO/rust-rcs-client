@@ -3737,16 +3737,16 @@ impl VideoChatLink for EngineVideoChatLink {
             .group_conversation_id(conference_uri)
     }
 
-    fn start_media_keys(&self, call_id: &str, conference_uri: &str) -> Result<bool, ()> {
+    fn start_media_keys(&self, call_id: &str, conference_uri: &str) -> Option<bool> {
         let sessions = &self.route.cpm_session_service;
         match sessions
             .group_encryption()
             .zip(sessions.group_conversation_id(conference_uri))
         {
-            Some((encryption, conversation_id)) => encryption
-                .start_call_keys(&conversation_id, call_id)
-                .ok_or(()),
-            None => Ok(false),
+            Some((encryption, conversation_id)) => {
+                encryption.start_call_keys(&conversation_id, call_id)
+            }
+            None => Some(false),
         }
     }
 

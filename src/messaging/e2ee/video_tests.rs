@@ -30,8 +30,8 @@ use crate::video_chat::proto::{
 use super::device::E2eeDevice;
 use super::group_tests::{
     accepted, alice_and_bob, alice_and_bob_in_time, commit_bundle_of, cpim_message, epoch,
-    epoch_identifier, focus_commit, header_names, notification_cpim, notification_xml, Clock,
-    CONVERSATION, DAY, GROUP_URI, IMPU,
+    epoch_identifier, focus_commit, header_names, missed_by_the_device, notification_cpim,
+    notification_xml, Clock, CONVERSATION, DAY, GROUP_URI, IMPU,
 };
 use super::kds_tests::certificates::*;
 use super::kds_tests::{credential, BOB_TEL};
@@ -276,7 +276,7 @@ fn a_video_chat_message_relayed_is_taken_signed_by_its_participant() {
 }
 
 /// The keys of the call `call_id` Bob has in `bobs_group`
-fn keys_of_bob(bob: &MlsClient, bobs_group: &MlsConversation) -> SframeSession {
+pub(super) fn keys_of_bob(bob: &MlsClient, bobs_group: &MlsConversation) -> SframeSession {
     SframeSession::of(bobs_group, bob, SUITE, DEFAULT_LAYOUT, 7).unwrap()
 }
 
@@ -345,7 +345,7 @@ fn the_media_of_a_group_call_is_encrypted_with_the_keys_of_its_mls_group() {
 
 /// The Commit of a key update of the device, its control message and
 /// Message-ID, accepted by the Focus, the group in epoch 2
-fn device_commits(device: &E2eeDevice, clock: &Clock) -> (Vec<u8>, String) {
+pub(super) fn device_commits(device: &E2eeDevice, clock: &Clock) -> (Vec<u8>, String) {
     clock.advance(31 * DAY);
     let cpim = device
         .update_keys(CONVERSATION, IMPU, GROUP_URI)
@@ -423,7 +423,7 @@ fn the_committer_sends_in_the_new_epoch_once_the_others_in_the_call_delivered_it
         .unwrap();
     assert_eq!(bob_decrypts(&mut bobs_keys, &encrypted).0, 1);
     // but taking frames of the new epoch at once
-    let mut ahead = bobs_keys_in(&bob, &bobs_group);
+    let mut ahead = keys_of_bob_in(&bob, &bobs_group);
     let from_bob = ahead.encrypt(b"meta", b"frame 3").unwrap();
     assert_eq!(
         device.decrypt_call_frame("call-1", b"meta", &from_bob),
@@ -462,7 +462,7 @@ fn the_committer_sends_in_the_new_epoch_once_the_others_in_the_call_delivered_it
 }
 
 /// Keys of Bob's sending in the epoch his group is in
-fn bobs_keys_in(bob: &MlsClient, bobs_group: &MlsConversation) -> SframeSession {
+fn keys_of_bob_in(bob: &MlsClient, bobs_group: &MlsConversation) -> SframeSession {
     SframeSession::of(bobs_group, bob, SUITE, DEFAULT_LAYOUT, 9).unwrap()
 }
 
@@ -621,4 +621,89 @@ fn a_commit_asks_to_be_told_of_its_delivery_only_during_a_call_of_its_group() {
     // nor are notifications of it taken
     let message_id = String::from_utf8_lossy(info.imdn_message_id).into_owned();
     assert!(!delivered_by_bob(&device, &message_id, "<delivered/>"));
+}
+
+#[test]
+fn the_keys_of_a_call_take_the_epochs_its_group_is_healed_into() {
+    use rust_rcs_core::mls::rcs::proto::{
+        self, server_mls_rcs_message, EpochControlMessages, MlsEnhancedGroupInfo,
+        ServerCommitBundle, ServerMlsRcsMessage,
+    };
+    use rust_rcs_core::mls::rcs::wire::encode_message_list;
+
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    device.call_participants("call-1", vec![String::from(BOB_TEL)]);
+    let (commit, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+
+    // the Commit the device missed, the Focus kept (RCC.16 section 10.1.2)
+    let latest = bobs_group.epoch_identifier();
+    let enhanced = proto::encode(&MlsEnhancedGroupInfo {
+        latest_epoch_identifier: Some(latest.clone()),
+        mls_group_info: Some(group_info),
+        committed_control_messages: vec![EpochControlMessages {
+            rcs_message_id: String::from("focus-commit-1"),
+            server_mls_rcs_message: Some(ServerMlsRcsMessage {
+                payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+                    ServerCommitBundle {
+                        commit_list: encode_message_list(&[&commit]).unwrap(),
+                        ..ServerCommitBundle::default()
+                    },
+                )),
+            }),
+        }],
+        paginated_epoch_identifier: Some(latest),
+    });
+    device
+        .process_enhanced_group_info(CONVERSATION, &enhanced)
+        .unwrap();
+    assert_eq!(epoch(&device, CONVERSATION), Ok((2, false)));
+
+    // its keys taken, Bob the committer
+    let mut bobs_keys = keys_of_bob_in(&bob, &bobs_group);
+    let from_bob = bobs_keys.encrypt(b"meta", b"frame 1").unwrap();
+    assert_eq!(
+        device.decrypt_call_frame("call-1", b"meta", &from_bob),
+        Ok(b"frame 1".to_vec())
+    );
+    let encrypted = device
+        .encrypt_call_frame("call-1", b"meta", b"frame 2")
+        .unwrap();
+    assert_eq!(bob_decrypts(&mut bobs_keys, &encrypted).0, 2);
+}
+
+#[test]
+fn the_keys_of_a_call_are_made_anew_as_the_device_rejoins_its_group() {
+    let (device, bob, mut bobs_group) = alice_and_bob();
+    let switched = switches(&device);
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    device.call_participants("call-1", vec![String::from(BOB_TEL)]);
+    let (_, group_info) = missed_by_the_device(&bob, &mut bobs_group);
+
+    // with an External Commit, at another leaf (RCC.16 section 10.1.1)
+    let cpim = device
+        .rejoin_group(CONVERSATION, IMPU, GROUP_URI, &group_info, None)
+        .unwrap();
+    bobs_group
+        .process_commit_bundle(
+            &bob,
+            &rust_rcs_core::mls::rcs::proto::ServerCommitBundle {
+                commit_list: commit_bundle_of(&cpim).commit_list,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(bobs_group.epoch(), 3);
+
+    // sending in the epoch it rejoined in at once, its participants kept
+    let mut bobs_keys = keys_of_bob_in(&bob, &bobs_group);
+    let encrypted = device
+        .encrypt_call_frame("call-1", b"meta", b"frame 1")
+        .unwrap();
+    assert_eq!(
+        bob_decrypts(&mut bobs_keys, &encrypted),
+        (3, b"frame 1".to_vec())
+    );
+    assert!(switched.lock().unwrap().is_empty());
+    assert!(device.encrypts_call("call-1"));
 }

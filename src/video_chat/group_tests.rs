@@ -22,8 +22,8 @@ use prost::Message;
 use super::proto::video_chat_message::Event as Signal;
 use super::proto::*;
 use super::tests::{
-    a_device, accept, cancel, date, hangup, reject, Device, CONVERSATION, GROUP, JOIN, LEAVE, ME,
-    MS,
+    a_device, accept, cancel, date, hangup, reject, Device, Keys, CONVERSATION, GROUP, JOIN, LEAVE,
+    ME, MS,
 };
 use super::{ForServer, GroupVideoChatEvent, VideoChatEvent, ANSWERED_WITHIN, CONNECTED_WITHIN};
 
@@ -866,4 +866,213 @@ fn the_caller_joins_once_answered_and_connected_to_the_sfu() {
     assert!(device.group_reports().is_empty());
     assert!(device.service.media_connected(&call_id));
     assert_eq!(device.group_reports(), [(JOIN, String::from(CONVERSATION))]);
+}
+
+impl Device {
+    /// What the keys of the media of group calls were asked since last asked
+    fn keys(&self) -> Vec<Keys> {
+        std::mem::take(&mut *self.link.keys.lock().unwrap())
+    }
+}
+
+fn started(call_id: &str) -> Keys {
+    Keys::Started(String::from(call_id), String::from(GROUP))
+}
+
+fn ended(call_id: &str) -> Keys {
+    Keys::Ended(String::from(call_id))
+}
+
+#[test]
+fn the_media_keys_of_a_group_call_are_made_as_it_starts_or_is_answered() {
+    // RCC.16 section 9.8.2: those the app encrypts the media with in a group
+    // encrypted end to end, made before the media connects
+    let device = a_device();
+    let call_id = device.service.start_group_call(GROUP, "offer").unwrap();
+    assert_eq!(device.keys(), [started(&call_id)]);
+    assert!(device.service.hang_up(&call_id));
+    assert_eq!(device.keys(), [ended(&call_id)]);
+
+    // not while offered, the user not having answered
+    let device = called_in_the_group();
+    assert!(device.keys().is_empty());
+    assert!(device.service.accept_call("bob-call", "answer"));
+    assert_eq!(device.keys(), [started("bob-call")]);
+    // let go of as the call ends for this client, not for another
+    device.relayed(
+        BOB,
+        relaying("bob-call", hangup(HangupReason::UserInitiated), ""),
+    );
+    assert!(device.keys().is_empty());
+    assert!(device.service.hang_up("bob-call"));
+    assert_eq!(device.keys(), [ended("bob-call")]);
+
+    // nor for a call rejected
+    let device = called_in_the_group();
+    assert!(device.service.hang_up("bob-call"));
+    assert_eq!(device.keys(), [ended("bob-call")]);
+
+    // one started while another goes on not kept
+    let (device, _) = calling_the_group();
+    device.keys();
+    assert!(device.service.start_group_call(GROUP, "offer").is_none());
+    match device.keys().as_slice() {
+        [Keys::Started(call_id, _), Keys::Ended(ended)] => assert_eq!(call_id, ended),
+        other => panic!("{:?}", other),
+    }
+}
+
+#[test]
+fn the_media_keys_of_a_group_call_are_let_go_of_however_it_ends() {
+    // not answered in time
+    let device = a_device();
+    let call_id = device.service.start_group_call(GROUP, "offer").unwrap();
+    device.keys();
+    device.after(ANSWERED_WITHIN + MS);
+    assert_eq!(device.keys(), [ended(&call_id)]);
+
+    // the media not connected in time
+    let device = called_in_the_group();
+    device.service.accept_call("bob-call", "answer");
+    device.keys();
+    device.after(CONNECTED_WITHIN + MS);
+    assert_eq!(device.keys(), [ended("bob-call")]);
+
+    // found disconnected by the SFU
+    let (device, call_id) = calling_the_group();
+    device.keys();
+    device.relayed(
+        ME,
+        relaying(&call_id, hangup(HangupReason::ServerDetectedDisconnect), ""),
+    );
+    assert_eq!(device.keys(), [ended(&call_id)]);
+
+    // what it needed not sent
+    let device = called_in_the_group();
+    *device.link.status_code.lock().unwrap() = 403;
+    device.service.accept_call("bob-call", "answer");
+    assert_eq!(device.keys(), [started("bob-call"), ended("bob-call")]);
+}
+
+#[test]
+fn a_group_call_whose_media_keys_cannot_be_made_fails() {
+    let device = a_device();
+    *device.link.making_keys.lock().unwrap() = None;
+    let call_id = device.service.start_group_call(GROUP, "offer").unwrap();
+    assert_eq!(device.told(), [tell(&call_id, VideoChatEvent::Failed(488))]);
+    assert!(device.group_sent().is_empty());
+    assert!(!device.service.hang_up(&call_id), "no call");
+
+    // nor answered
+    let device = called_in_the_group();
+    *device.link.making_keys.lock().unwrap() = None;
+    assert!(device.service.accept_call("bob-call", "answer"));
+    assert_eq!(
+        device.told(),
+        [tell("bob-call", VideoChatEvent::Failed(488))]
+    );
+    assert!(device.group_sent().is_empty());
+    assert!(!device.service.hang_up("bob-call"), "no call");
+    // another call goes on then
+    assert!(device.service.start_group_call(GROUP, "offer").is_some());
+}
+
+#[test]
+fn the_media_keys_are_told_the_participants_joined_but_this_client() {
+    // whose delivery of a Commit of this client they wait for (RCC.16
+    // section 9.8.2)
+    let (device, call_id) = calling_the_group();
+    device.keys();
+    let members = vec![
+        member("+15550001", "sfu-me", true),
+        member("+15550002", "sfu-bob", true),
+        member("+15550003", "sfu-carol", false),
+        member("", "sfu-unknown", true),
+    ];
+    device.relayed(
+        BOB,
+        ServerGroupVideoMessage {
+            member_info: members,
+            ..ServerGroupVideoMessage::default()
+        },
+    );
+    assert_eq!(
+        device.keys(),
+        [Keys::Participants(
+            call_id.clone(),
+            vec![String::from("tel:+15550002")]
+        )]
+    );
+    // and none, without the participants
+    device.relayed(BOB, relaying(&call_id, ack(), ""));
+    assert!(device.keys().is_empty());
+}
+
+#[test]
+fn the_signals_of_the_others_in_an_encrypted_group_are_taken_signed_alone() {
+    // RCC.16 section 9.8.2
+    let (device, call_id) = calling_the_group();
+    let signed_by = |signed: bool| {
+        let checked = std::sync::Mutex::new(Vec::new());
+        let check = |video_chat_message: &[u8]| {
+            checked.lock().unwrap().push(video_chat_message.to_vec());
+            signed
+        };
+        device.service.on_group_message(
+            GROUP,
+            BOB,
+            &date(Duration::ZERO),
+            &relaying(&call_id, ack(), "").encode_to_vec(),
+            Some(&check),
+        );
+        checked.into_inner().unwrap()
+    };
+    let ack_of_bob = VideoChatMessage {
+        call_id: call_id.clone(),
+        event: Some(ack()),
+    }
+    .encode_to_vec();
+
+    assert_eq!(signed_by(false), std::slice::from_ref(&ack_of_bob));
+    assert!(device.told().is_empty());
+    assert!(device.group_told().is_empty());
+    assert_eq!(signed_by(true), [ack_of_bob]);
+    assert_eq!(device.told(), [tell(&call_id, VideoChatEvent::Alerting)]);
+    assert_eq!(
+        device.group_told(),
+        [tell_group(
+            &call_id,
+            GroupVideoChatEvent::Ringing(String::from(BOB))
+        )]
+    );
+
+    // what the Controlling Function adds of its own, and what it relays of
+    // this client, which cannot be signed by another
+    let unsigned = |_: &[u8]| false;
+    device.service.on_group_message(
+        GROUP,
+        BOB,
+        &date(Duration::ZERO),
+        &ServerGroupVideoMessage {
+            member_info: vec![member("+15550002", "sfu-bob", true)],
+            ..ServerGroupVideoMessage::default()
+        }
+        .encode_to_vec(),
+        Some(&unsigned),
+    );
+    assert_eq!(device.group_told().len(), 1);
+    device.service.on_group_message(
+        GROUP,
+        ME,
+        &date(Duration::ZERO),
+        &relaying(&call_id, hangup(HangupReason::ServerDetectedDisconnect), "").encode_to_vec(),
+        Some(&unsigned),
+    );
+    assert_eq!(
+        device.told(),
+        [tell(
+            &call_id,
+            VideoChatEvent::Ended(HangupReason::ServerDetectedDisconnect as i32)
+        )]
+    );
 }

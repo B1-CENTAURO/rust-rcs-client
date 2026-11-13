@@ -3017,6 +3017,13 @@ pub(crate) struct ScriptedEncryption {
     signed: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     /// Whether what the focus sends of its groups carries a Commit
     focus_committing: bool,
+    /// The Message-IDs of the Commits whose delivery the keys of a call
+    /// wait for
+    commit_receipts: Vec<String>,
+    /// What the keys of calls were asked
+    call_keys: std::sync::Mutex<Vec<String>>,
+    /// What making the keys of a call of its groups gives
+    call_keys_made: Option<bool>,
     /// Whether the notifications received in its groups are for the app
     verifying: bool,
     /// Whether they are not signed
@@ -3162,6 +3169,24 @@ impl ScriptedEncryption {
             signature: signature.map(String::from),
             ..ScriptedEncryption::default()
         })
+    }
+
+    /// The encryption of the groups `encrypting`, making the keys of their
+    /// calls as `made`
+    pub(crate) fn keying_calls(
+        encrypting: Vec<String>,
+        made: Option<bool>,
+    ) -> Arc<ScriptedEncryption> {
+        Arc::new(ScriptedEncryption {
+            encrypting,
+            call_keys_made: made,
+            ..ScriptedEncryption::default()
+        })
+    }
+
+    /// What the keys of calls were asked
+    pub(crate) fn call_keys(&self) -> Vec<String> {
+        std::mem::take(&mut *self.call_keys.lock().unwrap())
     }
 
     /// The Conversation-ID and CPIM message of each message it was asked to
@@ -3841,6 +3866,36 @@ impl GroupEncryption for ScriptedEncryption {
         video_chat_message: &[u8],
     ) -> Verified {
         self.verify(conversation_id, cpim_info, video_chat_message)
+    }
+
+    fn start_call_keys(&self, conversation_id: &str, call_id: &str) -> Option<bool> {
+        self.call_keys
+            .lock()
+            .unwrap()
+            .push(format!("start {} {}", conversation_id, call_id));
+        match self.encrypting.iter().any(|group| group == conversation_id) {
+            true => self.call_keys_made,
+            false => Some(false),
+        }
+    }
+
+    fn end_call_keys(&self, call_id: &str) {
+        self.call_keys
+            .lock()
+            .unwrap()
+            .push(format!("end {}", call_id));
+    }
+
+    fn call_participants(&self, call_id: &str, participants: Vec<String>) {
+        self.call_keys.lock().unwrap().push(format!(
+            "participants {} {}",
+            call_id,
+            participants.join(",")
+        ));
+    }
+
+    fn commit_delivered(&self, _conversation_id: &str, _cpim_info: &CPIMInfo, imdn: &[u8]) -> bool {
+        Imdn::from_xml(imdn).is_some_and(|imdn| self.commit_receipts.contains(&imdn.message_id))
     }
 
     fn decrypt(
@@ -5446,6 +5501,132 @@ fn the_notifications_of_an_encrypted_group_are_sent_signed() {
         encryption.encrypted.lock().unwrap().is_empty(),
         "nor encrypted"
     );
+}
+
+#[test]
+fn the_delivery_of_a_commit_asking_for_it_is_told_its_committer_signed() {
+    // as a Commit of a client in a Group RCS Video Chat asks for, for the
+    // keys of the call to switch (RCC.16 section 9.8.2)
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        signature: Some(String::from(SIGNED)),
+        focus_committing: true,
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-commit-delivered");
+
+    // not asked for
+    connection.send_cpim(&rt, &focus_path, &our_path, &from_the_focus("a Commit"));
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    // asked for
+    let asking = from_the_focus("a Commit")
+        .replace(
+            "From: <sip:conf1@conf.example.com>",
+            "From: <tel:+15550002>",
+        )
+        .replace(
+            "imdn.Message-ID: focus-1\r\n",
+            "imdn.Message-ID: commit-1\r\nimdn.Disposition-Notification: positive-delivery, negative-delivery\r\n",
+        );
+    connection.send_cpim(&rt, &focus_path, &our_path, &asking);
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let send = connection.next_message(&rt);
+    assert_eq!(String::from_utf8_lossy(&send.body), SIGNED);
+    connection.respond(&rt, &send, "200 OK");
+    let signed = signed_from(&encryption, 0);
+    assert_eq!(signed.len(), 1);
+    assert_eq!(signed[0].0, "<tel:+15550002>");
+    let imdn = Imdn::from_xml(signed[0].2.as_bytes()).unwrap();
+    assert_eq!(
+        (imdn.notification, imdn.status, imdn.message_id.as_str()),
+        (Notification::Delivery, Status::Delivered, "commit-1")
+    );
+    assert!(client.received.try_recv().is_err());
+    connection.quiet(&rt);
+    peer.silence();
+}
+
+#[test]
+fn no_delivery_is_told_of_what_the_focus_sends_without_a_commit() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        signature: Some(String::from(SIGNED)),
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-no-commit");
+    let asking = from_the_focus("Proposals").replace(
+        "imdn.Message-ID: focus-1\r\n",
+        "imdn.Message-ID: focus-1\r\nimdn.Disposition-Notification: positive-delivery\r\n",
+    );
+    connection.send_cpim(&rt, &focus_path, &our_path, &asking);
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    connection.quiet(&rt);
+    assert!(encryption.signed.lock().unwrap().is_empty());
+    peer.silence();
+}
+
+#[test]
+fn the_delivery_of_a_commit_the_keys_of_a_call_wait_for_is_not_given_to_the_app() {
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let encryption = Arc::new(ScriptedEncryption {
+        cpim: Some(MLS_GROUP_CPIM.to_vec()),
+        joining: true,
+        encrypting: vec![String::from("conversation-1")],
+        verifying: true,
+        commit_receipts: vec![String::from("commit-1")],
+        ..ScriptedEncryption::default()
+    });
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, focus_path, our_path) =
+        joined_encrypted_group(&client, &mut peer, "group-commit-receipt");
+
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &group_imdn_cpim("commit-1", "<delivered/>"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    // the next taken first
+    connection.send_cpim(
+        &rt,
+        &focus_path,
+        &our_path,
+        &group_imdn_cpim("message-1", "<delivered/>"),
+    );
+    assert!(connection.next_response(&rt).first_line.contains(" 200"));
+    let received = client
+        .received
+        .recv_timeout(Duration::from_secs(5))
+        .map(|r| r.2)
+        .unwrap();
+    assert!(
+        received.contains("<message-id>message-1</message-id>"),
+        "{}",
+        received
+    );
+    assert!(client.received.try_recv().is_err());
+    // both checked first
+    assert_eq!(encryption.verified.lock().unwrap().len(), 2);
 }
 
 /// The CPIM messages signed by `encryption`, from the first `from` on: of

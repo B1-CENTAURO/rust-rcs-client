@@ -3079,7 +3079,7 @@ fn focus_answering(
 
 /// Bob's Commit of a key update, which the Focus accepted and the device
 /// missed, and the GroupInfo the Focus keeps since
-fn missed_by_the_device(
+pub(super) fn missed_by_the_device(
     bob: &MlsClient,
     bobs_group: &mut MlsConversation,
 ) -> (Vec<u8>, MlsGroupInfo) {
