@@ -102,10 +102,12 @@ use provisioning::rcs_application::RcsApplication;
 #[cfg(feature = "e2ee")]
 use rust_rcs_core::mls::rcs::certificate::RcsCredentialValidator;
 use video_chat::ffi::{
-    video_chat_event_code, VideoChatCallback, VideoChatIceCandidatesCallback,
-    VideoChatMediaUpdateCallback, VideoChatTurnServerCallback, VideoChatViewRequest, CALL_ID_SIZE,
+    group_video_chat_event_code, video_chat_event_code, VideoChatCallback,
+    VideoChatIceCandidatesCallback, VideoChatMediaUpdateCallback, VideoChatMember,
+    VideoChatMembersCallback, VideoChatParticipantCallback, VideoChatStream,
+    VideoChatTurnServerCallback, VideoChatViewRequest, CALL_ID_SIZE,
 };
-use video_chat::VideoChatEvent;
+use video_chat::{GroupVideoChatEvent, VideoChatEvent};
 
 use rcs_engine::{DownloadOrigin, RcsEngine, UploadFor};
 
@@ -1572,19 +1574,60 @@ pub unsafe extern "C" fn rcs_client_start_video_chat(
     call_id: *mut c_char,
     call_id_size: usize,
 ) -> i32 {
-    let (Some(client), Some(contact_uri), Some(sdp_offer), false) = (
+    start_video_chat(
+        client,
+        contact_uri,
+        sdp_offer,
+        call_id,
+        call_id_size,
+        |service, to, sdp| service.start_call(to, sdp),
+    )
+}
+
+/// Calls the participants of the group chat at `conference_uri`, not
+/// encrypted end to end, with the SDP offer `sdp_offer` of the app's WebRTC
+/// stack to the SFU of its Controlling Function (RCC.07 section 3.7.5.5.1),
+/// writing the call_id of the call to `call_id`, `call_id_size` bytes, at
+/// least 37; 0 if it was called, -1 otherwise, as for
+/// rcs_client_start_video_chat()
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_start_group_video_chat(
+    client: *mut RcsClient,
+    conference_uri: *const c_char,
+    sdp_offer: *const c_char,
+    call_id: *mut c_char,
+    call_id_size: usize,
+) -> i32 {
+    start_video_chat(
+        client,
+        conference_uri,
+        sdp_offer,
+        call_id,
+        call_id_size,
+        |service, to, sdp| service.start_group_call(to, sdp),
+    )
+}
+
+/// A call started to `to` with `sdp_offer`, as `start` starts it, its
+/// call_id written to `call_id`, `call_id_size` bytes; 0 if started, -1
+/// otherwise
+unsafe fn start_video_chat(
+    client: *mut RcsClient,
+    to: *const c_char,
+    sdp_offer: *const c_char,
+    call_id: *mut c_char,
+    call_id_size: usize,
+    start: impl FnOnce(&video_chat::VideoChatService, &str, &str) -> Option<String>,
+) -> i32 {
+    let (Some(client), Some(to), Some(sdp_offer), false) = (
         client.as_ref(),
-        optional_string(contact_uri),
+        optional_string(to),
         optional_string(sdp_offer),
         call_id.is_null() || call_id_size < CALL_ID_SIZE,
     ) else {
         return -1;
     };
-    let Some(started) = client
-        .engine
-        .video_chat()
-        .start_call(&contact_uri, &sdp_offer)
-    else {
+    let Some(started) = start(client.engine.video_chat(), &to, &sdp_offer) else {
         return -1;
     };
     let started = c_string(started);
@@ -1595,6 +1638,114 @@ pub unsafe extern "C" fn rcs_client_start_video_chat(
         bytes.len().min(call_id_size),
     );
     0
+}
+
+/// Sets what is told of the participants of group calls (RCC.07 section
+/// 3.7.5.5): each alerted, answering, rejecting or leaving to `cb`, and the
+/// participants as the Controlling Function has them to `members_cb`. The
+/// context of one set before is let go of.
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_group_video_chat_listener(
+    client: *mut RcsClient,
+    cb: Option<VideoChatParticipantCallback>,
+    members_cb: Option<VideoChatMembersCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(
+        LOG_TAG,
+        "calling rcs_client_set_group_video_chat_listener()",
+    );
+
+    let cb_context = NonNull::new(cb_context)
+        .map(|cb_context| Arc::new(Mutex::new(MessageResultCallbackContextWrapper(cb_context))));
+
+    let (Some(client), Some(cb), Some(members_cb)) = (client.as_ref(), cb, members_cb) else {
+        return;
+    };
+    client.engine.video_chat().set_group_listener(Arc::new(
+        move |call_id, conference_uri, event| {
+            let cb_context = cb_context
+                .as_ref()
+                .map(|cb_context| cb_context.lock().unwrap());
+            let context = cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr());
+            let (call_id, conference_uri) = (c_string(call_id), c_string(conference_uri));
+            if let GroupVideoChatEvent::Members(members) = &event {
+                // what each points to kept until told
+                let texts: Vec<(CString, CString, Vec<CString>)> = members
+                    .iter()
+                    .map(|member| {
+                        (
+                            c_string(
+                                member
+                                    .user_id
+                                    .as_ref()
+                                    .map_or("", |user_id| user_id.msisdn.as_str()),
+                            ),
+                            c_string(
+                                member
+                                    .sfu_user_id
+                                    .as_ref()
+                                    .map_or("", |sfu_user_id| sfu_user_id.sfu_user_id.as_str()),
+                            ),
+                            member
+                                .stream_identifiers
+                                .iter()
+                                .flat_map(|streams| &streams.media_stream_ids)
+                                .map(|stream| c_string(stream.media_stream_id.as_str()))
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                let streams: Vec<Vec<VideoChatStream>> = members
+                    .iter()
+                    .zip(&texts)
+                    .map(|(member, (_, _, ids))| {
+                        member
+                            .stream_identifiers
+                            .iter()
+                            .flat_map(|streams| &streams.media_stream_ids)
+                            .zip(ids)
+                            .map(|(stream, id)| VideoChatStream {
+                                media_stream_id: id.as_ptr(),
+                                media_type: stream.media_type,
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let told: Vec<VideoChatMember> = members
+                    .iter()
+                    .zip(&texts)
+                    .zip(&streams)
+                    .map(
+                        |((member, (msisdn, sfu_user_id, _)), streams)| VideoChatMember {
+                            msisdn: msisdn.as_ptr(),
+                            sfu_user_id: sfu_user_id.as_ptr(),
+                            call_state: member.user_call_state,
+                            streams: streams.as_ptr(),
+                            stream_count: streams.len(),
+                        },
+                    )
+                    .collect();
+                members_cb(
+                    call_id.as_ptr(),
+                    conference_uri.as_ptr(),
+                    told.as_ptr(),
+                    told.len(),
+                    context,
+                );
+            } else if let Some((code, participant, reason)) = group_video_chat_event_code(&event) {
+                let participant = c_string(participant);
+                cb(
+                    code,
+                    call_id.as_ptr(),
+                    conference_uri.as_ptr(),
+                    participant.as_ptr(),
+                    reason,
+                    context,
+                );
+            }
+        },
+    ));
 }
 
 /// The call `call_id`, and what the client does with it as `act` says: 0 if

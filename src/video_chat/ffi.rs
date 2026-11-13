@@ -18,7 +18,7 @@ use libc::{c_char, c_void};
 
 use crate::messaging::ffi::MessageResultCallbackContext;
 
-use super::VideoChatEvent;
+use super::{GroupVideoChatEvent, VideoChatEvent};
 
 /// The size of the buffer a call_id is written to, with its NUL: a UUID
 pub const CALL_ID_SIZE: usize = 37;
@@ -80,13 +80,16 @@ pub type VideoChatMediaUpdateCallback = extern "C" fn(
 );
 
 /// The event code of `event` as the app is told it, with its SDP and its
-/// reason: incoming 0 with the SDP offer, alerting 1, answered 2 with the
-/// SDP answer, rejected 3 with a RejectReason, not answered 4, missed 5,
-/// ended 6 with a HangupReason, failed 7 with the status code; None for
-/// those told otherwise
+/// reason: incoming 0 with the SDP offer, 1 if a group call ongoing not to
+/// ring, alerting 1, answered 2 with the SDP answer, rejected 3 with a
+/// RejectReason, not answered 4, missed 5, ended 6 with a HangupReason,
+/// failed 7 with the status code, connect 8 with the SDP answer of the SFU;
+/// None for those told otherwise
 pub fn video_chat_event_code(event: &VideoChatEvent) -> Option<(i32, Option<&str>, i32)> {
     match event {
-        VideoChatEvent::Incoming { sdp_offer } => Some((0, Some(sdp_offer), 0)),
+        VideoChatEvent::Incoming { sdp_offer, ongoing } => {
+            Some((0, Some(sdp_offer), i32::from(*ongoing)))
+        }
         VideoChatEvent::Alerting => Some((1, None, 0)),
         VideoChatEvent::Answered { sdp_answer } => Some((2, Some(sdp_answer), 0)),
         VideoChatEvent::Rejected(reason) => Some((3, None, *reason)),
@@ -94,6 +97,63 @@ pub fn video_chat_event_code(event: &VideoChatEvent) -> Option<(i32, Option<&str
         VideoChatEvent::Missed => Some((5, None, 0)),
         VideoChatEvent::Ended(reason) => Some((6, None, *reason)),
         VideoChatEvent::Failed(status_code) => Some((7, None, i32::from(*status_code))),
+        VideoChatEvent::Connect { sdp_answer } => Some((8, Some(sdp_answer), 0)),
         VideoChatEvent::IceCandidates { .. } | VideoChatEvent::MediaUpdate(_) => None,
+    }
+}
+
+/// Told of a participant of a group call: the event as
+/// group_video_chat_event_code() has it, the call_id, the URI of the group,
+/// the participant, and a reason
+pub type VideoChatParticipantCallback = extern "C" fn(
+    event: i32,
+    call_id: *const c_char,
+    conference_uri: *const c_char,
+    participant_uri: *const c_char,
+    reason: i32,
+    context: *mut MessageResultCallbackContext,
+);
+
+/// A stream of a participant, as the SFU knows it (RCC.07 section
+/// 3.7.5.2.3.2.8.1.1)
+#[repr(C)]
+pub struct VideoChatStream {
+    pub media_stream_id: *const c_char,
+    /// A MediaType: 1 audio, 2 video
+    pub media_type: i32,
+}
+
+/// A participant of a group call, as the Controlling Function has it
+/// (RCC.07 section 3.7.5.2.3.3.2.1)
+#[repr(C)]
+pub struct VideoChatMember {
+    /// E.164
+    pub msisdn: *const c_char,
+    pub sfu_user_id: *const c_char,
+    /// A UserCallState: 1 joined, 2 not joined
+    pub call_state: i32,
+    pub streams: *const VideoChatStream,
+    pub stream_count: usize,
+}
+
+/// Told of the participants of a group call
+pub type VideoChatMembersCallback = extern "C" fn(
+    call_id: *const c_char,
+    conference_uri: *const c_char,
+    members: *const VideoChatMember,
+    member_count: usize,
+    context: *mut MessageResultCallbackContext,
+);
+
+/// The event code of the participant event `event`, with its participant
+/// and its reason: ringing 0, joined 1, rejected 2 with a RejectReason, left
+/// 3 with a HangupReason; None for the participants, told otherwise
+pub fn group_video_chat_event_code(event: &GroupVideoChatEvent) -> Option<(i32, &str, i32)> {
+    match event {
+        GroupVideoChatEvent::Ringing(participant) => Some((0, participant, 0)),
+        GroupVideoChatEvent::Joined(participant) => Some((1, participant, 0)),
+        GroupVideoChatEvent::Rejected(participant, reason) => Some((2, participant, *reason)),
+        GroupVideoChatEvent::Left(participant, reason) => Some((3, participant, *reason)),
+        GroupVideoChatEvent::Members(_) => None,
     }
 }

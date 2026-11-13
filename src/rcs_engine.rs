@@ -578,7 +578,7 @@ impl RcsEngine {
             move |contact_uri, cpim_info, content_type, message_body| {
                 if taken_by_video_chat(
                     &video_chat_1,
-                    || false,
+                    || None,
                     contact_uri,
                     cpim_info,
                     content_type,
@@ -647,19 +647,22 @@ impl RcsEngine {
         );
         let cpm_session_service = CPMSessionService::new(
             move |session, contact_uri, cpim_info, content_type, message_body| {
-                let in_group = || {
-                    matches!(
-                        session
-                            .get_inner()
-                            .get_session_info()
-                            .cpm_contact
-                            .service_type,
-                        CPMServiceType::Group
-                    )
+                // a group, encrypted end to end unless it moved to
+                // unencrypted (RCC.16 section 11.2)
+                let group = || {
+                    let inner = session.get_inner();
+                    let info = inner.get_session_info();
+                    matches!(info.cpm_contact.service_type, CPMServiceType::Group).then(|| {
+                        info.encryption.as_ref().zip(info.mls_group()).is_some_and(
+                            |(encryption, conversation_id)| {
+                                !encryption.encryption_ended(conversation_id)
+                            },
+                        )
+                    })
                 };
                 if taken_by_video_chat(
                     &video_chat_2,
-                    in_group,
+                    group,
                     contact_uri,
                     cpim_info,
                     content_type,
@@ -3714,6 +3717,60 @@ impl VideoChatLink for EngineVideoChatLink {
     fn registered_uri(&self) -> Option<String> {
         registered_identity(&self.route.state).map(|(_, public_user_identity)| public_user_identity)
     }
+
+    fn send_to_group(
+        &self,
+        conference_uri: &str,
+        message: Vec<u8>,
+        sent: Box<dyn FnOnce(u16) + Send + Sync>,
+    ) {
+        send_group_video_chat_message(&self.route, conference_uri, message, sent, &self.rt);
+    }
+
+    fn group_conversation_id(&self, conference_uri: &str) -> Option<String> {
+        self.route
+            .cpm_session_service
+            .group_conversation_id(conference_uri)
+    }
+}
+
+/// Sends the ClientGroupVideoMessage `message` to the Controlling Function
+/// of the group chat at `conference_uri`, in the group chat (RCC.07 section
+/// 3.7.5.5); refused with 488 in a group encrypted end to end, where it is
+/// to be signed (RCC.16 section 9.8.2), which is not done yet
+fn send_group_video_chat_message(
+    route: &MessageRoute,
+    conference_uri: &str,
+    message: Vec<u8>,
+    sent: Box<dyn FnOnce(u16) + Send + Sync>,
+    rt: &Arc<Runtime>,
+) {
+    if route.messaging_config.lock().unwrap().group_chat_auth != 1 {
+        sent(403);
+        return;
+    }
+    let sessions = &route.cpm_session_service;
+    let encrypted = sessions
+        .group_encryption()
+        .zip(sessions.group_conversation_id(conference_uri))
+        .is_some_and(|(encryption, conversation_id)| {
+            encryption.encrypts(&conversation_id) && !encryption.encryption_ended(&conversation_id)
+        });
+    if encrypted {
+        sent(488);
+        return;
+    }
+    sessions.send_message(
+        video_chat::CONTENT_TYPE,
+        message,
+        &new_message_id(),
+        conference_uri,
+        &RecipientType::Group,
+        conference_uri,
+        move |status_code, _| sent(status_code),
+        &route.core,
+        rt,
+    );
 }
 
 /// Sends the VideoChatMessage `message` to `contact` in the 1-to-1 chat with
@@ -3796,11 +3853,14 @@ fn report_video_chat_event(
 
 /// Whether the message `body` of `content_type` from `contact_uri` is the
 /// signalling of an RCS Video Chat, which is not for the app (RCC.07 section
-/// 3.7.5.2.3.1): taken by `video_chat` from a 1-to-1 chat, sent at the CPIM
-/// DateTime of `cpim_info`, but not yet from a group, as `in_group` tells
+/// 3.7.5.2.3.1): taken by `video_chat`, sent at the CPIM DateTime of
+/// `cpim_info`, from a 1-to-1 chat, or from a group chat as `group` tells,
+/// Some(encrypted), of the participant its CPIM From is of; but not from a
+/// group encrypted end to end, where it is to be signed (RCC.16 section
+/// 9.8.2), which is not done yet
 fn taken_by_video_chat(
     video_chat: &OnceLock<Weak<VideoChatService>>,
-    in_group: impl FnOnce() -> bool,
+    group: impl FnOnce() -> Option<bool>,
     contact_uri: &[u8],
     cpim_info: &CPIMInfo,
     content_type: &[u8],
@@ -3810,18 +3870,42 @@ fn taken_by_video_chat(
         return false;
     }
     let service = video_chat.get().and_then(Weak::upgrade);
-    match (service, in_group()) {
-        (Some(service), false) => {
-            if let (Ok(contact_uri), Ok(date)) = (
-                std::str::from_utf8(contact_uri),
-                std::str::from_utf8(cpim_info.date),
-            ) {
-                service.on_message(contact_uri, date, body);
-            }
-        }
-        _ => platform_log(LOG_TAG, "video chat message not taken"),
+    let (Some(service), Ok(contact_uri), Ok(date)) = (
+        service,
+        std::str::from_utf8(contact_uri),
+        std::str::from_utf8(cpim_info.date),
+    ) else {
+        platform_log(LOG_TAG, "video chat message not taken");
+        return true;
+    };
+    match group() {
+        None => service.on_message(contact_uri, date, body),
+        Some(false) => service.on_group_message(contact_uri, &cpim_from(cpim_info), date, body),
+        Some(true) => platform_log(
+            LOG_TAG,
+            "video chat message of an encrypted group not taken",
+        ),
     }
     true
+}
+
+/// The URI of the CPIM From of `cpim_info`
+fn cpim_from(cpim_info: &CPIMInfo) -> String {
+    match &cpim_info.from_uri {
+        Some(uri) => {
+            String::from_utf8_lossy(&uri.string_representation_without_query_and_fragment())
+                .into_owned()
+        }
+        None => {
+            let from = String::from_utf8_lossy(cpim_info.from);
+            let from = from.trim();
+            let uri = match (from.find('<'), from.rfind('>')) {
+                (Some(start), Some(end)) if start < end => &from[start + 1..end],
+                _ => from,
+            };
+            String::from(uri)
+        }
+    }
 }
 
 /// Sends `message` to its contact through the 1-to-1 chat service

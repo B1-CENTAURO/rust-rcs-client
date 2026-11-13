@@ -23,8 +23,11 @@
 //! codecs are the app's (sections 3.7.5.2.1, 3.7.5.3).
 
 pub mod ffi;
+mod group;
 pub mod proto;
 
+#[cfg(test)]
+mod group_tests;
 #[cfg(test)]
 mod tests;
 
@@ -43,6 +46,8 @@ use rust_rcs_core::sip::sip_transaction::T1;
 
 use crate::provisioning::rcs_application::RcsApplication;
 
+use self::group::GroupCall;
+use self::proto::client_group_video_message::Event as ForServer;
 use self::proto::video_chat_message::Event as Signal;
 use self::proto::{
     AcceptInvitation, AckInvitation, CallInvitation, CancelInvitation, CancelReason, Hangup,
@@ -131,8 +136,12 @@ impl VideoChatConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub enum VideoChatEvent {
     /// A call offered by the contact, its callee alerted (RCC.07 section
-    /// 3.7.5.4.2)
-    Incoming { sdp_offer: String },
+    /// 3.7.5.4.2): for a group, with the SDP offer of the SFU, and `ongoing`
+    /// if it goes on already, not to ring (section 3.7.5.5.7)
+    Incoming { sdp_offer: String, ongoing: bool },
+    /// The SDP answer of the SFU of a group call offered, the media to
+    /// connect to it (section 3.7.5.5.1)
+    Connect { sdp_answer: String },
     /// The callee is alerted (section 3.7.5.4.2)
     Alerting,
     /// The callee answered, the media to be connected (section 3.7.5.4.3)
@@ -165,8 +174,31 @@ pub enum VideoChatEvent {
     MediaUpdate(UpdateMedia),
 }
 
-/// Told of each call: its call_id, the contact, and what happened
+/// Told of each call: its call_id, the contact, or the URI of the group,
+/// and what happened
 pub type VideoChatListener = Arc<dyn Fn(&str, &str, VideoChatEvent) + Send + Sync>;
+
+/// What the app is told of the participants of a group call (RCC.07
+/// section 3.7.5.5)
+#[derive(Clone, Debug, PartialEq)]
+pub enum GroupVideoChatEvent {
+    /// A participant is alerted
+    Ringing(String),
+    /// A participant answered
+    Joined(String),
+    /// A participant rejected the call, with a RejectReason
+    Rejected(String, i32),
+    /// A participant hung up, or was found disconnected, with a
+    /// HangupReason
+    Left(String, i32),
+    /// The participants as the Controlling Function has them, with the
+    /// streams the SFU knows of each (section 3.7.5.2.3.3.2.1)
+    Members(Vec<proto::MemberInfo>),
+}
+
+/// Told of the participants of each group call: its call_id, the URI of the
+/// group, and what happened
+pub type GroupVideoChatListener = Arc<dyn Fn(&str, &str, GroupVideoChatEvent) + Send + Sync>;
 
 /// What the signalling of RCS Video Chat goes through
 pub trait VideoChatLink: Send + Sync {
@@ -183,6 +215,20 @@ pub trait VideoChatLink: Send + Sync {
 
     /// The public user identity the client is registered with
     fn registered_uri(&self) -> Option<String>;
+
+    /// Sends the ClientGroupVideoMessage `message`, encoded, to the
+    /// Controlling Function of the group chat at `conference_uri`, in it
+    /// (RCC.07 section 3.7.5.5), telling `sent` the status code it was sent
+    /// with
+    fn send_to_group(
+        &self,
+        conference_uri: &str,
+        message: Vec<u8>,
+        sent: Box<dyn FnOnce(u16) + Send + Sync>,
+    );
+
+    /// The Conversation-ID of the group chat at `conference_uri`, if known
+    fn group_conversation_id(&self, conference_uri: &str) -> Option<String>;
 }
 
 /// Where a call stands; each timer known by a token, which it fires with
@@ -230,17 +276,37 @@ enum Action {
         fatal: bool,
     },
     Tell(String, String, VideoChatEvent),
-    /// A JOIN or LEAVE of the call reported, with its callee if not this
-    /// client
-    Report(proto::VideoChatEvent, Option<String>),
+    /// What a group call sends its Controlling Function: a signal of the
+    /// call, an SDP, and an event for the Controlling Function alone
+    SendGroup {
+        call_id: String,
+        conference_uri: String,
+        signal: Option<Signal>,
+        sdp: String,
+        event: Option<ForServer>,
+        fatal: bool,
+    },
+    TellGroup(String, String, GroupVideoChatEvent),
+    /// A JOIN or LEAVE of the call reported
+    Report(proto::VideoChatEvent, Reported),
     Schedule(String, u64, Duration),
+}
+
+/// What a JOIN or LEAVE is of: a 1-to-1 call, with its callee if not this
+/// client, or a group call, with its Conversation-ID if known
+enum Reported {
+    Callee(Option<String>),
+    Group(Option<String>),
 }
 
 /// The RCS Video Chats of the client
 pub struct VideoChatService {
+    /// The 1-to-1 calls, held before the group calls when both are
     calls: Mutex<HashMap<String, Call>>,
+    group_calls: Mutex<HashMap<String, GroupCall>>,
     config: Mutex<VideoChatConfig>,
     listener: Mutex<Option<VideoChatListener>>,
+    group_listener: Mutex<Option<GroupVideoChatListener>>,
     link: Arc<dyn VideoChatLink>,
     next_timer: AtomicU64,
     rt: Handle,
@@ -252,8 +318,10 @@ impl VideoChatService {
     pub fn new(link: Arc<dyn VideoChatLink>, rt: Handle) -> Arc<VideoChatService> {
         Arc::new_cyclic(|this| VideoChatService {
             calls: Mutex::new(HashMap::new()),
+            group_calls: Mutex::new(HashMap::new()),
             config: Mutex::new(VideoChatConfig::default()),
             listener: Mutex::new(None),
+            group_listener: Mutex::new(None),
             link,
             next_timer: AtomicU64::new(0),
             rt,
@@ -275,6 +343,12 @@ impl VideoChatService {
         *self.listener.lock().unwrap() = Some(listener);
     }
 
+    /// Has what goes on with the participants of group calls told to
+    /// `listener`
+    pub fn set_group_listener(&self, listener: GroupVideoChatListener) {
+        *self.group_listener.lock().unwrap() = Some(listener);
+    }
+
     /// The feature tag of RCS Video Chat, while the Service Provider enables
     /// it and the app takes calls (RCC.07 section 3.7.3.6)
     pub fn feature_tag(&self) -> Option<&'static str> {
@@ -291,7 +365,7 @@ impl VideoChatService {
         let call_id = new_call_id();
         let actions = {
             let mut calls = self.calls.lock().unwrap();
-            if !calls.is_empty() {
+            if !calls.is_empty() || !self.group_calls.lock().unwrap().is_empty() {
                 return None;
             }
             let (alpha, beta) = (self.new_timer(), self.new_timer());
@@ -327,6 +401,9 @@ impl VideoChatService {
     /// Answers the call `call_id` offered, with the SDP answer `sdp_answer`
     /// of the app (RCC.07 section 3.7.5.4.3); whether it was offered still
     pub fn accept_call(&self, call_id: &str, sdp_answer: &str) -> bool {
+        if self.is_group_call(call_id) {
+            return self.accept_group_call(call_id, sdp_answer);
+        }
         let actions = {
             let mut calls = self.calls.lock().unwrap();
             let Some(call) = calls.get_mut(call_id) else {
@@ -357,6 +434,9 @@ impl VideoChatService {
     /// answered yet, rejects it if it is offered, hangs it up otherwise
     /// (RCC.07 sections 3.7.5.4.4 to 3.7.5.4.6); whether it went on
     pub fn hang_up(&self, call_id: &str) -> bool {
+        if self.is_group_call(call_id) {
+            return self.hang_up_group_call(call_id);
+        }
         let actions = {
             let mut calls = self.calls.lock().unwrap();
             let Some(call) = calls.remove(call_id) else {
@@ -396,6 +476,15 @@ impl VideoChatService {
         add: Vec<String>,
         remove: Vec<String>,
     ) -> bool {
+        if self.is_group_call(call_id) {
+            return self.tell_group_server(
+                call_id,
+                ForServer::IceCandidatesUpdate(IceCandidatesUpdate {
+                    add_ice_candidates: add,
+                    remove_ice_candidates: remove,
+                }),
+            );
+        }
         let actions = {
             let mut calls = self.calls.lock().unwrap();
             let Some(call) = calls.get_mut(call_id) else {
@@ -421,6 +510,9 @@ impl VideoChatService {
     /// receive, and the bandwidth it can take (RCC.07 section 3.7.5.4.8.3);
     /// whether the call goes on
     pub fn update_media(&self, call_id: &str, update: UpdateMedia) -> bool {
+        if self.is_group_call(call_id) {
+            return self.tell_group_server(call_id, ForServer::UpdateMedia(update));
+        }
         let actions = {
             let calls = self.calls.lock().unwrap();
             let Some(call) = calls.get(call_id) else {
@@ -442,6 +534,9 @@ impl VideoChatService {
     /// first time (RCC.07 sections 3.7.5.2.5, 3.7.5.4.3); whether the call
     /// goes on
     pub fn media_connected(&self, call_id: &str) -> bool {
+        if self.is_group_call(call_id) {
+            return self.group_media_connected(call_id);
+        }
         let actions = {
             let mut calls = self.calls.lock().unwrap();
             let Some(call) = calls.get_mut(call_id) else {
@@ -459,7 +554,10 @@ impl VideoChatService {
                 return true;
             }
             call.joined = true;
-            vec![Action::Report(proto::VideoChatEvent::Join, callee(call))]
+            vec![Action::Report(
+                proto::VideoChatEvent::Join,
+                Reported::Callee(callee(call)),
+            )]
         };
         self.act(actions);
         true
@@ -469,6 +567,9 @@ impl VideoChatService {
     /// connect again within Timer_Epsilon (RCC.07 section 3.7.5.4.8.1.6);
     /// whether the call goes on
     pub fn media_disconnected(&self, call_id: &str) -> bool {
+        if self.is_group_call(call_id) {
+            return self.group_media_disconnected(call_id);
+        }
         let actions = {
             let mut calls = self.calls.lock().unwrap();
             let Some(call) = calls.get_mut(call_id) else {
@@ -554,7 +655,7 @@ impl VideoChatService {
         let Some(ringing_for) = ringing_for(date, SystemTime::now()) else {
             return vec![missed];
         };
-        if !calls.is_empty() {
+        if !calls.is_empty() || !self.group_calls.lock().unwrap().is_empty() {
             return vec![
                 Action::Send {
                     call_id,
@@ -590,6 +691,7 @@ impl VideoChatService {
                 String::from(contact),
                 VideoChatEvent::Incoming {
                     sdp_offer: invitation.sdp_offer,
+                    ongoing: false,
                 },
             ),
         ]
@@ -694,6 +796,9 @@ impl VideoChatService {
     /// The timer `timer` of the call `call_id` run out, if the call still
     /// waits for it (RCC.07 section 3.7.5.2.4)
     fn timed_out(&self, call_id: &str, timer: u64) {
+        if self.is_group_call(call_id) {
+            return self.group_timed_out(call_id, timer);
+        }
         let actions = {
             let mut calls = self.calls.lock().unwrap();
             let Some(call) = calls.get(call_id) else {
@@ -744,6 +849,9 @@ impl VideoChatService {
     /// The call `call_id` failed, as what it needed sending was not sent,
     /// with `status_code`
     fn failed(&self, call_id: &str, status_code: u16) {
+        if self.is_group_call(call_id) {
+            return self.group_failed(call_id, status_code);
+        }
         let actions = {
             let mut calls = self.calls.lock().unwrap();
             let Some(call) = calls.remove(call_id) else {
@@ -802,18 +910,68 @@ impl VideoChatService {
                         listener(&call_id, &contact, event);
                     }
                 }
+                Action::SendGroup {
+                    call_id,
+                    conference_uri,
+                    signal,
+                    sdp,
+                    event,
+                    fatal,
+                } => {
+                    // the call_id alone with an event for the Controlling
+                    // Function, for it to know the call
+                    let video_chat_message = VideoChatMessage {
+                        call_id: call_id.clone(),
+                        event: signal,
+                    };
+                    let message = proto::ClientGroupVideoMessage {
+                        video_chat_message: video_chat_message.encode_to_vec(),
+                        sdp,
+                        event,
+                    };
+                    let this = Weak::clone(&self.this);
+                    self.link.send_to_group(
+                        &conference_uri,
+                        message.encode_to_vec(),
+                        Box::new(move |status_code| {
+                            if (200..300).contains(&status_code) {
+                                return;
+                            }
+                            platform_log(
+                                LOG_TAG,
+                                format!("group video chat message not sent: {}", status_code),
+                            );
+                            if let (true, Some(this)) = (fatal, this.upgrade()) {
+                                this.failed(&call_id, status_code);
+                            }
+                        }),
+                    );
+                }
+                Action::TellGroup(call_id, conference_uri, event) => {
+                    let listener = self.group_listener.lock().unwrap().clone();
+                    if let Some(listener) = listener {
+                        listener(&call_id, &conference_uri, event);
+                    }
+                }
                 // if the configuration has where to
-                Action::Report(event, callee) => {
+                Action::Report(event, reported) => {
                     let Some(reporting_uri) = self.config.lock().unwrap().reporting_uri.clone()
                     else {
                         continue;
                     };
-                    let Some(callee) = callee.or_else(|| self.link.registered_uri()) else {
-                        continue;
+                    let (callee, conversation_id) = match reported {
+                        Reported::Callee(callee) => {
+                            let Some(callee) = callee.or_else(|| self.link.registered_uri()) else {
+                                continue;
+                            };
+                            (callee, String::new())
+                        }
+                        Reported::Group(Some(conversation_id)) => (String::new(), conversation_id),
+                        Reported::Group(None) => continue,
                     };
                     let notification = VideoChatEventNotification {
                         one_to_one_participant_uri: callee,
-                        group_conversation_id: String::new(),
+                        group_conversation_id: conversation_id,
                         video_chat_event: event as i32,
                     };
                     self.link
@@ -837,7 +995,10 @@ impl VideoChatService {
 /// section 3.7.5.2.5)
 fn left(call: &Call) -> Vec<Action> {
     match call.joined {
-        true => vec![Action::Report(proto::VideoChatEvent::Leave, callee(call))],
+        true => vec![Action::Report(
+            proto::VideoChatEvent::Leave,
+            Reported::Callee(callee(call)),
+        )],
         false => Vec::new(),
     }
 }

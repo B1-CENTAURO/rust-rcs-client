@@ -29,16 +29,22 @@ use super::*;
 use super::VideoChatEvent;
 
 const BOB: &str = "tel:+15550002";
-const ME: &str = "tel:+15550001";
+pub(super) const ME: &str = "tel:+15550001";
 const REPORTING_URI: &str = "sip:mivc@example.com";
 
 /// What the service sent and reported, the status code sends are answered
 /// with
-struct Link {
+pub(super) struct Link {
     sent: Mutex<Vec<(String, VideoChatMessage)>>,
+    /// To the Controlling Function of each group
+    pub(super) group_sent: Mutex<Vec<(String, ClientGroupVideoMessage)>>,
     reports: Mutex<Vec<VideoChatEventNotification>>,
-    status_code: Mutex<u16>,
+    pub(super) status_code: Mutex<u16>,
 }
+
+/// The URI of a group chat, and its Conversation-ID
+pub(super) const GROUP: &str = "sip:group-1@conf.example.com";
+pub(super) const CONVERSATION: &str = "conversation-1";
 
 impl VideoChatLink for Link {
     fn send(&self, contact: &str, message: Vec<u8>, sent: Box<dyn FnOnce(u16) + Send + Sync>) {
@@ -60,14 +66,37 @@ impl VideoChatLink for Link {
     fn registered_uri(&self) -> Option<String> {
         Some(String::from(ME))
     }
+
+    fn send_to_group(
+        &self,
+        conference_uri: &str,
+        message: Vec<u8>,
+        sent: Box<dyn FnOnce(u16) + Send + Sync>,
+    ) {
+        let message = ClientGroupVideoMessage::decode(&message[..]).unwrap();
+        self.group_sent
+            .lock()
+            .unwrap()
+            .push((String::from(conference_uri), message));
+        let status_code = *self.status_code.lock().unwrap();
+        sent(status_code);
+    }
+
+    fn group_conversation_id(&self, conference_uri: &str) -> Option<String> {
+        (conference_uri == GROUP).then(|| String::from(CONVERSATION))
+    }
 }
+
+/// What the app is told of the participants of group calls
+pub(super) type GroupTold = Arc<Mutex<Vec<(String, String, GroupVideoChatEvent)>>>;
 
 type Told = Arc<Mutex<Vec<(String, String, VideoChatEvent)>>>;
 
-struct Device {
-    service: Arc<VideoChatService>,
-    link: Arc<Link>,
+pub(super) struct Device {
+    pub(super) service: Arc<VideoChatService>,
+    pub(super) link: Arc<Link>,
     told: Told,
+    pub(super) group_told: GroupTold,
     rt: Runtime,
 }
 
@@ -81,6 +110,7 @@ fn device_with(technology: i32) -> Device {
         .unwrap();
     let link = Arc::new(Link {
         sent: Mutex::new(Vec::new()),
+        group_sent: Mutex::new(Vec::new()),
         reports: Mutex::new(Vec::new()),
         status_code: Mutex::new(200),
     });
@@ -101,15 +131,24 @@ fn device_with(technology: i32) -> Device {
             .unwrap()
             .push((String::from(call_id), String::from(contact), event));
     }));
+    let group_told: GroupTold = Arc::new(Mutex::new(Vec::new()));
+    let telling = Arc::clone(&group_told);
+    service.set_group_listener(Arc::new(move |call_id, conference_uri, event| {
+        telling
+            .lock()
+            .unwrap()
+            .push((String::from(call_id), String::from(conference_uri), event));
+    }));
     Device {
         service,
         link,
         told,
+        group_told,
         rt,
     }
 }
 
-fn a_device() -> Device {
+pub(super) fn a_device() -> Device {
     device_with(3)
 }
 
@@ -123,7 +162,7 @@ impl Device {
     }
 
     /// The events told since last asked
-    fn told(&self) -> Vec<(String, String, VideoChatEvent)> {
+    pub(super) fn told(&self) -> Vec<(String, String, VideoChatEvent)> {
         std::mem::take(&mut *self.told.lock().unwrap())
     }
 
@@ -132,6 +171,18 @@ impl Device {
         std::mem::take(&mut *self.link.reports.lock().unwrap())
             .into_iter()
             .map(|report| (report.video_chat_event, report.one_to_one_participant_uri))
+            .collect()
+    }
+
+    /// The JOINs and LEAVEs reported since last asked, of groups, with
+    /// their Conversation-ID
+    pub(super) fn group_reports(&self) -> Vec<(i32, String)> {
+        std::mem::take(&mut *self.link.reports.lock().unwrap())
+            .into_iter()
+            .map(|report| {
+                assert!(report.one_to_one_participant_uri.is_empty());
+                (report.video_chat_event, report.group_conversation_id)
+            })
             .collect()
     }
 
@@ -150,18 +201,18 @@ impl Device {
     }
 
     /// The clock moved on by `by`, the timers due run
-    fn after(&self, by: Duration) {
+    pub(super) fn after(&self, by: Duration) {
         self.rt
             .block_on(async move { tokio::time::sleep(by).await });
     }
 }
 
 /// The CPIM DateTime of a message sent `ago`
-fn date(ago: Duration) -> String {
+pub(super) fn date(ago: Duration) -> String {
     DateTime::<Utc>::from(SystemTime::now() - ago).to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-const MS: Duration = Duration::from_millis(1);
+pub(super) const MS: Duration = Duration::from_millis(1);
 
 fn offer(sdp: &str) -> Signal {
     Signal::CallInvitation(CallInvitation {
@@ -169,32 +220,32 @@ fn offer(sdp: &str) -> Signal {
     })
 }
 
-fn accept(sdp: &str) -> Signal {
+pub(super) fn accept(sdp: &str) -> Signal {
     Signal::AcceptInvitation(AcceptInvitation {
         sdp_answer: String::from(sdp),
     })
 }
 
-fn hangup(reason: HangupReason) -> Signal {
+pub(super) fn hangup(reason: HangupReason) -> Signal {
     Signal::Hangup(Hangup {
         hangup_reason: reason as i32,
     })
 }
 
-fn cancel(reason: CancelReason) -> Signal {
+pub(super) fn cancel(reason: CancelReason) -> Signal {
     Signal::CancelInvitation(CancelInvitation {
         cancel_reason: reason as i32,
     })
 }
 
-fn reject(reason: RejectReason) -> Signal {
+pub(super) fn reject(reason: RejectReason) -> Signal {
     Signal::RejectInvitation(RejectInvitation {
         reject_reason: reason as i32,
     })
 }
 
-const JOIN: i32 = proto::VideoChatEvent::Join as i32;
-const LEAVE: i32 = proto::VideoChatEvent::Leave as i32;
+pub(super) const JOIN: i32 = proto::VideoChatEvent::Join as i32;
+pub(super) const LEAVE: i32 = proto::VideoChatEvent::Leave as i32;
 
 /// A device in a call with Bob it started, Bob alerted
 fn calling_bob() -> (Device, String) {
@@ -256,6 +307,7 @@ fn calls_are_taken_while_the_service_provider_enables_rcs_video_chat_and_the_app
     let rt = Builder::new_current_thread().enable_time().build().unwrap();
     let link = Arc::new(Link {
         sent: Mutex::new(Vec::new()),
+        group_sent: Mutex::new(Vec::new()),
         reports: Mutex::new(Vec::new()),
         status_code: Mutex::new(200),
     });
@@ -275,6 +327,22 @@ fn calls_are_taken_while_the_service_provider_enables_rcs_video_chat_and_the_app
     };
     service.on_message(BOB, &date(Duration::ZERO), &message.encode_to_vec());
     assert!(link.sent.lock().unwrap().is_empty());
+    let message = ServerGroupVideoMessage {
+        video_chat_message: VideoChatMessage {
+            call_id: String::from("carol-call"),
+            event: Some(offer("")),
+        }
+        .encode_to_vec(),
+        sdp: String::from("sfu offer"),
+        ..ServerGroupVideoMessage::default()
+    };
+    service.on_group_message(
+        GROUP,
+        "tel:+15550003",
+        &date(Duration::ZERO),
+        &message.encode_to_vec(),
+    );
+    assert!(link.group_sent.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -357,7 +425,8 @@ fn a_call_offered_is_acknowledged_and_answered_with_the_sdp_answer_of_the_app() 
             String::from("bob-call"),
             String::from(BOB),
             VideoChatEvent::Incoming {
-                sdp_offer: String::from("bob's offer")
+                sdp_offer: String::from("bob's offer"),
+                ongoing: false
             }
         )]
     );
@@ -1075,7 +1144,8 @@ fn the_app_is_told_each_event_by_its_code() {
     };
     assert_eq!(
         code(VideoChatEvent::Incoming {
-            sdp_offer: String::from("offer")
+            sdp_offer: String::from("offer"),
+            ongoing: false
         }),
         Some((0, Some(String::from("offer")), 0))
     );
