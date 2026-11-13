@@ -842,14 +842,8 @@ impl RcsEngine {
                 let e2ee = e2ee.lock().unwrap().as_ref().and_then(|e2ee| e2ee());
                 let video_chat = video_chat
                     .upgrade()
-                    .and_then(|video_chat| video_chat.feature_tag())
-                    .map(String::from);
-                let tags: Vec<String> = e2ee
-                    .into_iter()
-                    .chain(video_chat)
-                    .filter(|tags| !tags.is_empty())
-                    .collect();
-                (!tags.is_empty()).then(|| tags.join(";"))
+                    .and_then(|video_chat| video_chat.feature_tag());
+                joined_feature_tags(e2ee, video_chat)
             });
         }
 
@@ -3679,6 +3673,17 @@ fn is_file_transfer(message_type: &str) -> bool {
             .trim()
             .eq_ignore_ascii_case("application/vnd.gsma.rcs-ft-http+xml")
     })
+}
+
+/// The feature tags `e2ee` of E2EE and `video_chat` of RCS Video Chat, `;`
+/// separated, of those that apply
+fn joined_feature_tags(e2ee: Option<String>, video_chat: Option<&str>) -> Option<String> {
+    let tags: Vec<String> = e2ee
+        .into_iter()
+        .chain(video_chat.map(String::from))
+        .filter(|tags| !tags.is_empty())
+        .collect();
+    (!tags.is_empty()).then(|| tags.join(";"))
 }
 
 /// What RCS Video Chats signal through: the 1-to-1 chat with each contact,

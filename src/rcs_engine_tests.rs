@@ -35,9 +35,9 @@ use crate::messaging::cpm::session_tests::{
 use crate::messaging::ffi::RecipientType;
 
 use super::{
-    route_message, sealing_of, send_to_contact, send_video_chat_message, taken_by_video_chat,
-    Content, MessageRoute, PendingMessage, PreparingChats, RcsEngineConnectionState,
-    RcsEngineRegistrationState, UploadFor,
+    joined_feature_tags, report_video_chat_event, route_message, sealing_of, send_to_contact,
+    send_video_chat_message, taken_by_video_chat, Content, MessageRoute, PendingMessage,
+    PreparingChats, RcsEngineConnectionState, RcsEngineRegistrationState, UploadFor,
 };
 use crate::video_chat::{
     VideoChatConfig, VideoChatEvent, VideoChatLink, VideoChatService, CONTENT_TYPE,
@@ -1010,4 +1010,53 @@ fn video_chat_messages_go_to_the_video_chats_not_to_the_app() {
         CONTENT_TYPE.as_bytes(),
         &body
     ));
+}
+
+#[test]
+fn joining_or_leaving_a_video_chat_is_reported_in_a_sip_message() {
+    // RCC.07 v18.0 section 3.7.5.2.5
+    let (client, mut peer) = start(true);
+    let engine = Engine::over(&client, configured(true, true));
+    let tm = client.core.get_transaction_manager();
+    report_video_chat_event(
+        &engine.route,
+        &tm,
+        "sip:mivc@example.com",
+        VIDEO_CHAT.to_vec(),
+        &client.rt,
+    );
+    let message = peer.next_request("MESSAGE");
+    assert_eq!(request_uri(&message), "sip:mivc@example.com");
+    assert_eq!(header_value(&message, "Content-Type"), CONTENT_TYPE);
+    assert!(header_value(&message, "From").starts_with(&format!("<{}>;tag=", IMPU)));
+    assert_eq!(header_value(&message, "P-Preferred-Identity"), IMPU);
+    assert_eq!(body_data(&message), VIDEO_CHAT);
+    peer.send(&answer(&message, "200 OK", None));
+
+    // nothing while not registered
+    engine.unregister();
+    report_video_chat_event(
+        &engine.route,
+        &tm,
+        "sip:mivc@example.com",
+        VIDEO_CHAT.to_vec(),
+        &client.rt,
+    );
+    peer.silence();
+}
+
+#[test]
+fn the_feature_tag_of_video_chat_is_told_besides_those_of_e2ee() {
+    let e2ee = || Some(String::from("+g.gsma.rcs.msg.e2ee=\"1\""));
+    assert_eq!(
+        joined_feature_tags(e2ee(), Some("+g.gsma.rcs.videochat")).as_deref(),
+        Some("+g.gsma.rcs.msg.e2ee=\"1\";+g.gsma.rcs.videochat")
+    );
+    assert_eq!(
+        joined_feature_tags(None, Some("+g.gsma.rcs.videochat")).as_deref(),
+        Some("+g.gsma.rcs.videochat")
+    );
+    assert_eq!(joined_feature_tags(e2ee(), None), e2ee());
+    assert_eq!(joined_feature_tags(Some(String::new()), None), None);
+    assert_eq!(joined_feature_tags(None, None), None);
 }
