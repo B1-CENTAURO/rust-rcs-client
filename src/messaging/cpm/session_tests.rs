@@ -2662,12 +2662,15 @@ fn a_chat_session_ended_on_request_is_ended_with_a_bye() {
 }
 
 const FACTORY: &str = "sip:conference-factory@conf.example.com";
-const GROUP: &str = "sip:conf1@conf.example.com";
+pub(crate) const GROUP: &str = "sip:conf1@conf.example.com";
 
 /// A group chat the client started with two participants, its MSRP
 /// connection up, with the INVITE and the SUBSCRIBE to its conference
 /// events, answered
-fn new_group(client: &Client, peer: &mut Peer) -> (MsrpConnection, SipMessage, SipMessage, String) {
+pub(crate) fn new_group(
+    client: &Client,
+    peer: &mut Peer,
+) -> (MsrpConnection, SipMessage, SipMessage, String) {
     new_group_with(client, peer, "")
 }
 

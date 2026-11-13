@@ -263,8 +263,9 @@ extern void rcs_client_set_group_chat_ids_listener(struct rcs_client *client, gr
 extern void rcs_client_set_group_chat_ids(struct rcs_client *client, const char *conference_uri, const char *conversation_id,
                                 const char *contribution_id, const char *mls_opaque_token);
 
-// RCS Video Chat (RCC.07 section 3.7.5): the client signals 1-to-1 calls in the chat with the contact, and keeps their timers;
-// the media is the app's WebRTC stack's, which makes the SDP offers and answers and the ICE candidates the client carries
+// RCS Video Chat (RCC.07 section 3.7.5): the client signals 1-to-1 calls in the chat with the contact, and group calls in the
+// group chat through its Controlling Function, and keeps their timers; the media is the app's WebRTC stack's, which makes the
+// SDP offers and answers and the ICE candidates the client carries, to the contact or to the SFU of the group
 
 // told of each TurnCredential of the configuration: the URIs of its TURN servers (RFC 7065), and its username and password,
 // NULL if none
@@ -277,11 +278,15 @@ typedef void (*video_chat_turn_server_callback) (const char *const *uris, size_t
 extern void rcs_client_get_video_chat_config(struct rcs_client *client, int32_t *technology, int32_t *turn_mandatory,
                                 video_chat_turn_server_callback cb, void *context);
 
-// told of a call: incoming (event 0) with the SDP offer in sdp, the callee alerted already; alerting (1); answered (2) with the SDP
-// answer in sdp, the media to connect; rejected (3), reason the RejectReason, 1 by the user, 2 as another call went on; not answered
-// in time, and cancelled (4); missed (5), as cancelled, not answered in time, too old, or while another call went on; ended (6),
-// reason the HangupReason: 1 hung up by the contact, 2 failed as the media did not connect in time; failed (7), reason the status
-// code of the chat message that could not be sent; sdp NULL but for 0 and 2; the call is over after 3 to 7
+// told of a call, contact_uri the URI of the group for a group call: incoming (event 0) with the SDP offer in sdp, the SFU's for a
+// group call, the callee alerted already, reason 1 for a group call going on already, not to ring (RCC.07 section 3.7.5.5.7);
+// alerting (1), the first participant of a group call; answered (2) with the SDP answer in sdp, the media to connect, for a group
+// call as its first participant answers; rejected (3), reason the RejectReason, 1 by the user, 2 as another call went on; not
+// answered in time, and cancelled (4); missed (5), as cancelled, not answered in time, too old, or while another call went on;
+// ended (6), reason the HangupReason: 1 hung up by the contact, 2 failed as the media did not connect in time, 3 found
+// disconnected by the SFU of a group; failed (7), reason the status code of the chat message that could not be sent; connect (8)
+// with the SDP answer of the SFU to a group call the client offers, the media to connect to it; sdp NULL but for 0, 2 and 8; the
+// call is over after 3 to 7, a group call going on for the others
 typedef void (*video_chat_callback) (int32_t event, const char *call_id, const char *contact_uri, const char *sdp,
                                 int32_t reason, void *context);
 
@@ -338,9 +343,46 @@ extern int32_t rcs_client_update_video_chat_media(struct rcs_client *client, con
 // first time, the client reports it joined to the MIVC REPORTING URI if configured; 0 if the call goes on and was answered
 extern int32_t rcs_client_video_chat_media_connected(struct rcs_client *client, const char *call_id);
 
-// tells the client the media of an answered call went down, for it to connect again within Timer_Epsilon; 0 if the call goes on
-// and was answered
+// tells the client the media of an answered call went down, for it to connect again within Timer_Epsilon, or for a group call for
+// the SFU to wait for it (Timer_Zeta); 0 if the call goes on and was answered
 extern int32_t rcs_client_video_chat_media_disconnected(struct rcs_client *client, const char *call_id);
+
+// calls the participants of the group chat at conference_uri, not encrypted end to end, with the SDP offer of the app to the SFU
+// of its Controlling Function (RCC.07 section 3.7.5.5.1): event 8 gives the SFU's answer, and the call is answered (2) as its
+// first participant answers; the call_id written as for rcs_client_start_video_chat; 0 if called, -1 if the listener is not set,
+// RCS Video Chat not enabled, or another call goes on; event 7 (488) if the group is encrypted end to end, whose calls are not
+// taken yet; the other functions above take a group call's call_id too, its ICE candidates and media updates going to the
+// Controlling Function alone
+extern int32_t rcs_client_start_group_video_chat(struct rcs_client *client, const char *conference_uri, const char *sdp_offer,
+                                char *call_id, size_t call_id_size);
+
+// told of a participant of a group call: alerted (event 0), answered (1), rejected it (2), reason the RejectReason, or left it
+// (3), reason the HangupReason, 3 if the SFU found it disconnected; the call goes on
+typedef void (*video_chat_participant_callback) (int32_t event, const char *call_id, const char *conference_uri,
+                                const char *participant_uri, int32_t reason, void *context);
+
+// a stream of a participant, as the SFU knows it: media_type 1 audio, 2 video
+struct rcs_video_chat_stream {
+    const char *media_stream_id;
+    int32_t media_type;
+};
+
+// a participant of a group call, as its Controlling Function has it: call_state 1 joined, 2 not joined
+struct rcs_video_chat_member {
+    const char *msisdn;
+    const char *sfu_user_id;
+    int32_t call_state;
+    const struct rcs_video_chat_stream *streams;
+    size_t stream_count;
+};
+
+// told of the participants of a group call, as its Controlling Function gives them, which the streams of the SFU are known by
+typedef void (*video_chat_members_callback) (const char *call_id, const char *conference_uri,
+                                const struct rcs_video_chat_member *members, size_t member_count, void *context);
+
+// sets the group video chat listener; the context of one set before is released
+extern void rcs_client_set_group_video_chat_listener(struct rcs_client *client, video_chat_participant_callback cb,
+                                video_chat_members_callback members_cb, void *context);
 
 // accepts (accept != 0) or declines the invitation to the group chat that waits for the user's answer: 404 if there is none
 extern void rcs_client_answer_group_chat_invitation(struct rcs_runtime *runtime, struct rcs_client *client, const char *conference_uri,

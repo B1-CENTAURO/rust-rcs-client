@@ -798,3 +798,33 @@ fn a_group_call_is_reported_by_the_conversation_id_of_its_group() {
     device.service.hang_up("bob-call");
     assert!(device.group_reports().is_empty());
 }
+
+#[test]
+fn the_app_is_told_each_participant_event_by_its_code() {
+    use super::ffi::group_video_chat_event_code as code;
+
+    assert_eq!(
+        code(&GroupVideoChatEvent::Ringing(String::from(BOB))),
+        Some((0, BOB, 0))
+    );
+    assert_eq!(
+        code(&GroupVideoChatEvent::Joined(String::from(BOB))),
+        Some((1, BOB, 0))
+    );
+    assert_eq!(
+        code(&GroupVideoChatEvent::Rejected(String::from(BOB), 2)),
+        Some((2, BOB, 2))
+    );
+    assert_eq!(
+        code(&GroupVideoChatEvent::Left(String::from(BOB), 3)),
+        Some((3, BOB, 3))
+    );
+    // told by a callback of their own
+    assert_eq!(code(&GroupVideoChatEvent::Members(Vec::new())), None);
+    assert_eq!(
+        super::ffi::video_chat_event_code(&VideoChatEvent::Connect {
+            sdp_answer: String::from("sfu answer")
+        }),
+        Some((8, Some("sfu answer"), 0))
+    );
+}

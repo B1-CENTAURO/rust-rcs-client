@@ -60,9 +60,9 @@ Built with the `e2ee` feature, the library encrypts chats end to end as GSMA RCC
 
 ### RCS Video Chat 视频通话
 
-The library signals 1-to-1 RCS Video Chats (GSMA RCC.07 section 3.7.5) in the chat with the contact, for the app's WebRTC stack to carry the media. See [docs/video-chat.md](docs/video-chat.md).
+The library signals RCS Video Chats (GSMA RCC.07 section 3.7.5), 1-to-1 in the chat with the contact and in group chats through their Controlling Function, for the app's WebRTC stack to carry the media. See [docs/video-chat.md](docs/video-chat.md).
 
-本库在与联系人的聊天中完成一对一 RCS Video Chat（GSMA RCC.07 第 3.7.5 节）的信令，媒体由应用的 WebRTC 处理，使用方法见 [docs/video-chat.md](docs/video-chat.md)。
+本库完成 RCS Video Chat（GSMA RCC.07 第 3.7.5 节）的信令：一对一通话在与联系人的聊天中，群组通话经群聊的控制功能，媒体由应用的 WebRTC 处理，使用方法见 [docs/video-chat.md](docs/video-chat.md)。
 
 
 ### What's missing 缺失部分

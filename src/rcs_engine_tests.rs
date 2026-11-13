@@ -29,16 +29,17 @@ use tokio::sync::Notify;
 use crate::messaging::config::MessagingConfigs;
 use crate::messaging::cpm::encryption::GroupEncryption;
 use crate::messaging::cpm::session_tests::{
-    answer, body_data, cpim_text, header_value, request_uri, start, status_code, ChatScript,
-    Client, MsrpPeer, Peer, ScriptedEncryption, CHAT_BUNDLE, IMPU, PEER, TOKEN, TRANSPORT_ADDRESS,
+    answer, body_data, cpim_text, header_value, new_group, request_uri, start, status_code,
+    ChatScript, Client, MsrpPeer, Peer, ScriptedEncryption, CHAT_BUNDLE, GROUP, IMPU, PEER, TOKEN,
+    TRANSPORT_ADDRESS,
 };
 use crate::messaging::ffi::RecipientType;
 
 use super::{
     cpim_from, joined_feature_tags, report_video_chat_event, route_message, sealing_of,
-    send_to_contact, send_video_chat_message, taken_by_video_chat, Content, MessageRoute,
-    PendingMessage, PreparingChats, RcsEngineConnectionState, RcsEngineRegistrationState,
-    UploadFor,
+    send_group_video_chat_message, send_to_contact, send_video_chat_message, taken_by_video_chat,
+    Content, MessageRoute, PendingMessage, PreparingChats, RcsEngineConnectionState,
+    RcsEngineRegistrationState, UploadFor,
 };
 use crate::video_chat::{
     VideoChatConfig, VideoChatEvent, VideoChatLink, VideoChatService, CONTENT_TYPE,
@@ -175,6 +176,33 @@ impl Engine {
             )
         })
     }
+}
+
+impl Engine {
+    /// Sends the ClientGroupVideoMessage `message` to GROUP as Group RCS
+    /// Video Chat does, returning as send_group_video_chat_message() does,
+    /// and a receiver of its result
+    fn group_video_chat(&self, message: &[u8]) -> Receiver<(u16, String)> {
+        let route = self.route.clone();
+        let rt = Arc::clone(&self.rt);
+        let message = message.to_vec();
+        returning(move |told| {
+            send_group_video_chat_message(
+                &route,
+                GROUP,
+                message,
+                Box::new(move |status_code| told(status_code, String::new())),
+                &rt,
+            )
+        })
+    }
+}
+
+/// The configuration with chats and group chats
+fn configured_for_groups() -> MessagingConfigs {
+    let mut messaging = configured(true, true);
+    messaging.group_chat_auth = 1;
+    messaging
 }
 
 /// A VideoChatMessage as RCS Video Chat sends it, encoded: not text
@@ -1140,4 +1168,48 @@ fn the_feature_tag_of_video_chat_is_told_besides_those_of_e2ee() {
     assert_eq!(joined_feature_tags(e2ee(), None), e2ee());
     assert_eq!(joined_feature_tags(Some(String::new()), None), None);
     assert_eq!(joined_feature_tags(None, None), None);
+}
+
+#[test]
+fn a_group_video_chat_message_goes_in_the_group_chat() {
+    // RCC.07 v18.0 section 3.7.5.5
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let engine = Engine::over(&client, configured_for_groups());
+    let (mut connection, _, _, _) = new_group(&client, &mut peer);
+
+    let sent = engine.group_video_chat(VIDEO_CHAT);
+    let send = connection.next_message(&rt);
+    let cpim = String::from_utf8_lossy(&send.body).into_owned();
+    assert!(cpim.contains(&format!("To: <{}>", GROUP)), "{}", cpim);
+    assert!(
+        cpim.contains("Content-Type: rcs/video-chat+proto"),
+        "{}",
+        cpim
+    );
+    assert!(!cpim.contains("Disposition-Notification"), "{}", cpim);
+    assert_eq!(cpim_content(&send.body), VIDEO_CHAT);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(told(&sent), 200);
+
+    // not without group chats
+    let mut messaging = configured_for_groups();
+    messaging.group_chat_auth = 0;
+    engine.configure(messaging);
+    assert_eq!(told(&engine.group_video_chat(VIDEO_CHAT)), 403);
+
+    // nor yet in a group encrypted end to end, where it is to be signed
+    // (RCC.16 section 9.8.2)
+    engine.configure(configured_for_groups());
+    let conversation_id = client.sessions.group_conversation_id(GROUP).unwrap();
+    encrypting(
+        &client,
+        ChatScript {
+            encrypting: vec![conversation_id],
+            ..ChatScript::default()
+        },
+    );
+    assert_eq!(told(&engine.group_video_chat(VIDEO_CHAT)), 488);
+    connection.quiet(&rt);
+    peer.silence();
 }
