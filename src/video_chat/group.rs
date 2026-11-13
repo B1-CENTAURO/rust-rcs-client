@@ -34,8 +34,8 @@ use super::proto::server_group_video_message::Event as FromServer;
 use super::proto::video_chat_message::Event as Signal;
 use super::proto::{
     AcceptInvitation, AckInvitation, CallInvitation, CallInviteType, CancelInvitation,
-    CancelReason, Hangup, HangupReason, RejectInvitation, RejectReason, ServerGroupVideoMessage,
-    VideoChatMessage,
+    CancelReason, Hangup, HangupReason, MemberInfo, RejectInvitation, RejectReason,
+    ServerGroupVideoMessage, UserCallState, VideoChatMessage,
 };
 use super::{
     new_call_id, proto, ringing_for, same_contact, Action, Call, ForServer, GroupVideoChatEvent,
@@ -101,11 +101,25 @@ impl VideoChatService {
         self.feature_tag()?;
         let call_id = new_call_id();
         let conversation_id = self.link.group_conversation_id(conference_uri);
+        // the keys of its media, in a group encrypted end to end (RCC.16
+        // section 9.8.2): the call failing without them
+        let keys = self.link.start_media_keys(&call_id, conference_uri);
         let actions = {
             let calls = self.calls.lock().unwrap();
             let mut group_calls = self.group_calls.lock().unwrap();
             if !calls.is_empty() || !group_calls.is_empty() {
+                drop((calls, group_calls));
+                self.link.end_media_keys(&call_id);
                 return None;
+            }
+            if keys.is_err() {
+                drop((calls, group_calls));
+                self.act(vec![Action::Tell(
+                    call_id.clone(),
+                    String::from(conference_uri),
+                    VideoChatEvent::Failed(488),
+                )]);
+                return Some(call_id);
             }
             let (alpha, beta) = (self.new_timer(), self.new_timer());
             group_calls.insert(
@@ -159,6 +173,22 @@ impl VideoChatService {
             let Answer::Ringing { .. } = call.answer else {
                 return false;
             };
+            // the keys of its media, in a group encrypted end to end (RCC.16
+            // section 9.8.2): the call failing without them
+            if self
+                .link
+                .start_media_keys(call_id, &call.conference_uri)
+                .is_err()
+            {
+                let call = group_calls.remove(call_id).unwrap();
+                drop(group_calls);
+                self.act(vec![Action::Tell(
+                    String::from(call_id),
+                    call.conference_uri,
+                    VideoChatEvent::Failed(488),
+                )]);
+                return true;
+            }
             let delta = self.new_timer();
             call.answer = Answer::Answered;
             call.media = Media::Connecting { delta };
@@ -207,7 +237,7 @@ impl VideoChatService {
                 "",
                 false,
             )];
-            actions.extend(group_left(&call));
+            actions.extend(group_left(call_id, &call));
             actions
         };
         self.act(actions);
@@ -270,7 +300,20 @@ impl VideoChatService {
     /// Takes the ServerGroupVideoMessage `body` of the group chat at
     /// `conference_uri`, from `from`, the participant its VideoChatMessage
     /// is of, its CPIM DateTime `date`
-    pub fn on_group_message(&self, conference_uri: &str, from: &str, date: &str, body: &[u8]) {
+    ///
+    /// In a group encrypted end to end, `signed` tells whether the
+    /// VideoChatMessage it relays is signed by `from`: that of another
+    /// participant is taken only if it is (RCC.16 section 9.8.2). What the
+    /// Controlling Function adds of its own, and what it relays of this
+    /// client, as the Hangup of the SFU finding it disconnected, cannot be.
+    pub fn on_group_message(
+        &self,
+        conference_uri: &str,
+        from: &str,
+        date: &str,
+        body: &[u8],
+        signed: Option<&dyn Fn(&[u8]) -> bool>,
+    ) {
         let message = match ServerGroupVideoMessage::decode(body) {
             Ok(message) => message,
             Err(e) => {
@@ -295,10 +338,22 @@ impl VideoChatService {
             },
         };
         // of this client, as the Controlling Function sends it
-        let own = self
-            .link
-            .registered_uri()
-            .is_some_and(|registered| same_contact(&registered, from));
+        let registered = self.link.registered_uri();
+        let own = registered
+            .as_deref()
+            .is_some_and(|registered| same_contact(registered, from));
+        if let Some(signed) = signed {
+            if !own
+                && !message.video_chat_message.is_empty()
+                && !signed(&message.video_chat_message)
+            {
+                platform_log(
+                    LOG_TAG,
+                    "group video chat message not taken, not signed by its participant",
+                );
+                return;
+            }
+        }
         let conversation_id = self.link.group_conversation_id(conference_uri);
         let actions = {
             let calls = self.calls.lock().unwrap();
@@ -373,6 +428,9 @@ impl VideoChatService {
                     ));
                 }
                 if !message.member_info.is_empty() {
+                    // the keys of its media told who is in the call
+                    let participants = joined_besides(&message.member_info, registered.as_deref());
+                    actions.push(Action::Participants(call_id.clone(), participants));
                     actions.push(Action::TellGroup(
                         call_id.clone(),
                         call.conference_uri.clone(),
@@ -481,7 +539,7 @@ impl VideoChatService {
             // a Hangup of this client's but its own: the SFU found it
             // disconnected
             Signal::Hangup(hangup) if own => {
-                let mut actions = group_left(call);
+                let mut actions = group_left(call_id, call);
                 actions.push(tell(VideoChatEvent::Ended(hangup.hangup_reason)));
                 (actions, true)
             }
@@ -605,6 +663,7 @@ impl VideoChatService {
                         send(Signal::CancelInvitation(CancelInvitation {
                             cancel_reason: CancelReason::Timeout as i32,
                         })),
+                        Action::EndKeys(String::from(call_id)),
                         tell(VideoChatEvent::NotAnswered),
                     ]
                 }
@@ -624,7 +683,7 @@ impl VideoChatService {
                         }),
                     };
                     let mut actions = vec![send(signal)];
-                    actions.extend(group_left(call));
+                    actions.extend(group_left(call_id, call));
                     actions.push(tell(VideoChatEvent::Ended(
                         HangupReason::ClientTimeout as i32,
                     )));
@@ -646,7 +705,7 @@ impl VideoChatService {
             let Some(call) = group_calls.remove(call_id) else {
                 return;
             };
-            let mut actions = group_left(&call);
+            let mut actions = group_left(call_id, &call);
             actions.push(Action::Tell(
                 String::from(call_id),
                 call.conference_uri,
@@ -691,13 +750,28 @@ fn group_joined(call: &mut GroupCall) -> Vec<Action> {
     )]
 }
 
-/// The LEAVE of `call` to report as it ends, if it was joined
-fn group_left(call: &GroupCall) -> Vec<Action> {
-    match call.joined {
-        true => vec![Action::Report(
+/// The tel URIs of the participants `members` has joined to the call, but
+/// this client, registered as `registered`
+fn joined_besides(members: &[MemberInfo], registered: Option<&str>) -> Vec<String> {
+    members
+        .iter()
+        .filter(|member| member.user_call_state == UserCallState::Joined as i32)
+        .filter_map(|member| member.user_id.as_ref())
+        .filter(|id| !id.msisdn.is_empty())
+        .map(|id| format!("tel:{}", id.msisdn))
+        .filter(|uri| !registered.is_some_and(|registered| same_contact(registered, uri)))
+        .collect()
+}
+
+/// What the group call `call_id`, `call`, ending takes: the keys of its
+/// media let go of, and its LEAVE reported if it was joined
+fn group_left(call_id: &str, call: &GroupCall) -> Vec<Action> {
+    let mut actions = vec![Action::EndKeys(String::from(call_id))];
+    if call.joined {
+        actions.push(Action::Report(
             proto::VideoChatEvent::Leave,
             Reported::Group(call.conversation_id.clone()),
-        )],
-        false => Vec::new(),
+        ));
     }
+    actions
 }

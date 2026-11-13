@@ -3015,6 +3015,8 @@ pub(crate) struct ScriptedEncryption {
     signature: Option<String>,
     /// The Conversation-ID and CPIM message of each notification to sign
     signed: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    /// Whether what the focus sends of its groups carries a Commit
+    focus_committing: bool,
     /// Whether the notifications received in its groups are for the app
     verifying: bool,
     /// Whether they are not signed
@@ -3125,6 +3127,10 @@ pub(crate) struct ChatScript {
     pub(crate) sealing_chat_files: bool,
     /// Whether those sent were
     pub(crate) sealed_for_chats: bool,
+    /// What it signs messages as, if it can
+    pub(crate) signature: Option<String>,
+    /// Whether the signed messages received in its groups are
+    pub(crate) verifying: bool,
 }
 
 impl ScriptedEncryption {
@@ -3139,8 +3145,41 @@ impl ScriptedEncryption {
             ciphertext: script.ciphertext,
             sealing_chat_files: script.sealing_chat_files,
             sealed_for_chats: script.sealed_for_chats,
+            signature: script.signature,
+            verifying: script.verifying,
             ..ScriptedEncryption::default()
         })
+    }
+
+    /// The encryption of the encrypted group joined_encrypted_group()
+    /// joins, signing messages as `signature` if it can
+    pub(crate) fn in_encrypted_group(signature: Option<&str>) -> Arc<ScriptedEncryption> {
+        Arc::new(ScriptedEncryption {
+            cpim: Some(MLS_GROUP_CPIM.to_vec()),
+            joining: true,
+            encrypting: vec![String::from("conversation-1")],
+            ciphertext: Some(String::from("encrypted")),
+            signature: signature.map(String::from),
+            ..ScriptedEncryption::default()
+        })
+    }
+
+    /// The Conversation-ID and CPIM message of each message it was asked to
+    /// encrypt
+    pub(crate) fn encrypted_messages(&self) -> Vec<(String, Vec<u8>)> {
+        self.encrypted.lock().unwrap().clone()
+    }
+
+    /// The Conversation-ID and CPIM message of each message it was asked to
+    /// sign
+    pub(crate) fn signed_messages(&self) -> Vec<(String, Vec<u8>)> {
+        self.signed.lock().unwrap().clone()
+    }
+
+    /// The Conversation-ID, CPIM From and content of each signed message it
+    /// was asked to check
+    pub(crate) fn verified_messages(&self) -> Vec<(String, String, Vec<u8>)> {
+        self.verified.lock().unwrap().clone()
     }
 
     /// The encryption of the groups `encrypting`, moved to unencrypted
@@ -3313,6 +3352,7 @@ impl GroupEncryption for ScriptedEncryption {
             proposals: self.proposing,
             encryption_ended: self.ending_by_focus,
             encryption_resumed: self.resuming_by_focus,
+            commit: self.focus_committing,
         }
     }
 
@@ -3792,6 +3832,15 @@ impl GroupEncryption for ScriptedEncryption {
         } else {
             Verified::Forged
         }
+    }
+
+    fn verify_video_chat(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        video_chat_message: &[u8],
+    ) -> Verified {
+        self.verify(conversation_id, cpim_info, video_chat_message)
     }
 
     fn decrypt(
@@ -4743,6 +4792,16 @@ impl GroupEncryption for EncryptingPrepared {
         self.0.verify(conversation_id, cpim_info, imdn)
     }
 
+    fn verify_video_chat(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        video_chat_message: &[u8],
+    ) -> Verified {
+        self.0
+            .verify_video_chat(conversation_id, cpim_info, video_chat_message)
+    }
+
     fn decrypt(
         &self,
         conversation_id: &str,
@@ -4790,7 +4849,7 @@ fn a_message_that_cannot_be_encrypted_is_not_sent() {
 
 /// The group joined encrypted, its session up, with the MSRP connection,
 /// the path of the focus and the client's
-fn joined_encrypted_group(
+pub(crate) fn joined_encrypted_group(
     client: &Client,
     peer: &mut Peer,
     call_id: &str,
@@ -8162,7 +8221,8 @@ fn what_is_not_an_rcs_message_does_not_move_the_group_to_unencrypted() {
 
     // an is-composing, a notification signed, nor what the focus sends,
     // nor a file transfer message carrying the keys of its files encrypted
-    // (RCC.16 section 7.8.2), which it does not decrypt
+    // (RCC.16 section 7.8.2), which it does not decrypt, nor the signalling
+    // of a Group RCS Video Chat, signed and not encrypted (section 9.8.2)
     for (content_type, content) in [
         (
             "application/im-iscomposing+xml",
@@ -8171,11 +8231,15 @@ fn what_is_not_an_rcs_message_does_not_move_the_group_to_unencrypted() {
         ("message/cpim", group_imdn_cpim("message-1", "<delivered/>")),
         ("message/cpim", from_the_focus("a control message")),
         ("message/cpim", encrypted_file_transfer()),
+        (
+            "message/cpim",
+            group_cpim(ALICE, "", "AAEC").replace("text/plain", "rcs/video-chat+proto"),
+        ),
     ] {
         connection.send_content(&rt, &msrp_path, &our_path, content_type, &content);
         assert!(connection.next_response(&rt).first_line.contains(" 200"));
     }
-    for _ in 0..2 {
+    for _ in 0..3 {
         assert!(client.received.recv_timeout(Duration::from_secs(5)).is_ok());
     }
 

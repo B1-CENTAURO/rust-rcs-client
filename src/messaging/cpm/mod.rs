@@ -88,7 +88,8 @@ pub struct CPMMessageParam {
     message_id: String,
     /// Sent as it is, of the type `message_type`, not in a CPIM message
     raw: Option<Vec<u8>>,
-    /// A CPIM message carrying a notification, signed in a group chat
+    /// A CPIM message carrying a notification, or the signalling of a Group
+    /// RCS Video Chat, signed rather than encrypted in a group chat
     /// encrypted end to end
     signed: bool,
     recipient: String,
@@ -144,6 +145,14 @@ impl CPMMessageParam {
     /// section 9.5.1)
     pub(crate) fn raw_data(mut self, data: Vec<u8>) -> CPMMessageParam {
         self.raw = Some(data);
+        self
+    }
+
+    /// The message signed rather than encrypted if the group chat it goes
+    /// to is encrypted end to end, as the signalling of a Group RCS Video
+    /// Chat is (RCC.16 section 9.8.2)
+    pub(crate) fn signed(mut self) -> CPMMessageParam {
+        self.signed = true;
         self
     }
 

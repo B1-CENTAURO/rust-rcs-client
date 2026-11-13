@@ -229,6 +229,23 @@ pub trait VideoChatLink: Send + Sync {
 
     /// The Conversation-ID of the group chat at `conference_uri`, if known
     fn group_conversation_id(&self, conference_uri: &str) -> Option<String>;
+
+    /// Makes the keys of the media of the group call `call_id` of the group
+    /// chat at `conference_uri`: Ok(true) if the media is to be encrypted
+    /// with them, as in a group encrypted end to end (RCC.16 section
+    /// 9.8.2), Ok(false) if not, Err if it is to be and they cannot be made
+    fn start_media_keys(&self, _call_id: &str, _conference_uri: &str) -> Result<bool, ()> {
+        Ok(false)
+    }
+
+    /// Lets go of the keys of the media of the group call `call_id`, which
+    /// ended
+    fn end_media_keys(&self, _call_id: &str) {}
+
+    /// Tells the keys of the media of the group call `call_id` of the
+    /// participants in the call besides this client, by their tel URIs, the
+    /// clients a Commit of this client waits for (RCC.16 section 9.8.2)
+    fn media_participants(&self, _call_id: &str, _participants: Vec<String>) {}
 }
 
 /// Where a call stands; each timer known by a token, which it fires with
@@ -290,6 +307,10 @@ enum Action {
     /// A JOIN or LEAVE of the call reported
     Report(proto::VideoChatEvent, Reported),
     Schedule(String, u64, Duration),
+    /// The keys of the media of the group call let go of, as it ended
+    EndKeys(String),
+    /// The participants in the group call told its keys
+    Participants(String, Vec<String>),
 }
 
 /// What a JOIN or LEAVE is of: a 1-to-1 call, with its callee if not this
@@ -985,6 +1006,10 @@ impl VideoChatService {
                             this.timed_out(&call_id, timer);
                         }
                     });
+                }
+                Action::EndKeys(call_id) => self.link.end_media_keys(&call_id),
+                Action::Participants(call_id, participants) => {
+                    self.link.media_participants(&call_id, participants)
                 }
             }
         }

@@ -341,6 +341,7 @@ fn calls_are_taken_while_the_service_provider_enables_rcs_video_chat_and_the_app
         "tel:+15550003",
         &date(Duration::ZERO),
         &message.encode_to_vec(),
+        None,
     );
     assert!(link.group_sent.lock().unwrap().is_empty());
 }

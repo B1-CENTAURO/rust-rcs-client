@@ -396,7 +396,10 @@ fn group_of_the_two(alice: &Party, bob: &Party) {
         alice
             .groups
             .on_server_message(CONVERSATION, &accepted(previous)),
-        Taken::default()
+        Taken {
+            commit: true,
+            ..Taken::default()
+        }
     );
 }
 

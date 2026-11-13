@@ -68,7 +68,7 @@ use super::store::StoreError;
 use super::verification::VerificationError;
 
 pub(super) const CONVERSATION: &str = "4f0e8b9c-3a71-4d2e-9b6a-2c5d8e1f7a30";
-const IMPU: &str = "sip:+491701234567@ims.example.com";
+pub(super) const IMPU: &str = "sip:+491701234567@ims.example.com";
 const FACTORY: &str = "sip:conference-factory@conf.example.com";
 /// A Participant the Home KDS has no Client of
 const CAROL_TEL: &str = "tel:+491700000001";
@@ -155,7 +155,7 @@ fn enrolled_in_time(
 
 /// The time a device of the tests tells, which they move on
 #[derive(Clone)]
-struct Clock(Arc<Mutex<SystemTime>>);
+pub(super) struct Clock(Arc<Mutex<SystemTime>>);
 
 impl Clock {
     fn new() -> Clock {
@@ -166,12 +166,12 @@ impl Clock {
         *self.0.lock().unwrap()
     }
 
-    fn advance(&self, by: Duration) {
+    pub(super) fn advance(&self, by: Duration) {
         *self.0.lock().unwrap() += by;
     }
 }
 
-const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+pub(super) const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Bob, and a KeyPackage of his
 fn bob_with_key_package() -> (MlsClient, Vec<u8>) {
@@ -190,7 +190,7 @@ fn ciphertext(sealed: Sealed) -> Option<Vec<u8>> {
 
 /// The epoch of the group `conversation_id` of `device`, and whether a
 /// Commit of it is pending
-fn epoch(device: &E2eeDevice, conversation_id: &str) -> Result<(u64, bool), StoreError> {
+pub(super) fn epoch(device: &E2eeDevice, conversation_id: &str) -> Result<(u64, bool), StoreError> {
     device
         .store()
         .with_conversation(conversation_id.as_bytes(), |conversation, _| {
@@ -221,7 +221,7 @@ fn joined(bob: &MlsClient, bundle: &WelcomeCommitBundle) -> MlsConversation {
 
 /// What the Conversation Focus sends once it accepts what was sent in the
 /// epoch `previous`
-fn accepted(previous: EpochIdentifier) -> Vec<u8> {
+pub(super) fn accepted(previous: EpochIdentifier) -> Vec<u8> {
     proto::encode(&ServerMlsRcsMessage {
         payload: Some(server_mls_rcs_message::Payload::AcceptedMlsRcsMessage(
             AcceptedMlsRcsMessage {
@@ -232,7 +232,7 @@ fn accepted(previous: EpochIdentifier) -> Vec<u8> {
     })
 }
 
-fn epoch_identifier(device: &E2eeDevice, conversation_id: &str) -> EpochIdentifier {
+pub(super) fn epoch_identifier(device: &E2eeDevice, conversation_id: &str) -> EpochIdentifier {
     device
         .store()
         .with_conversation(conversation_id.as_bytes(), |conversation, _| {
@@ -851,7 +851,7 @@ pub(super) fn alice_and_bob() -> (Arc<E2eeDevice>, MlsClient, MlsConversation) {
     (device, bob, bobs_group)
 }
 
-const GROUP_URI: &str = "sip:conf1@conf.example.com";
+pub(super) const GROUP_URI: &str = "sip:conf1@conf.example.com";
 
 /// A CPIM message from Alice to the group as the client sends one, asking
 /// to be told of `disposition`
@@ -882,7 +882,7 @@ hello Bob",
     .into_bytes()
 }
 
-fn header_names(message: &CPIMMessage) -> Vec<String> {
+pub(super) fn header_names(message: &CPIMMessage) -> Vec<String> {
     let CPIMHeaders::Inflated(headers) = &message.headers else {
         panic!("headers not inflated");
     };
@@ -1307,7 +1307,7 @@ fn the_groups_of_a_device_restored_are_encrypted() {
 
 /// What the Conversation Focus forwards of the Commit `commit` it accepted
 /// (RCC.16 section 7.9.3)
-fn focus_commit(commit_list: &[&[u8]]) -> Vec<u8> {
+pub(super) fn focus_commit(commit_list: &[&[u8]]) -> Vec<u8> {
     proto::encode(&ServerMlsRcsMessage {
         payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
             ServerCommitBundle {
@@ -1690,7 +1690,7 @@ fn messages_waiting_for_a_commit_the_focus_refuses_are_not_sent() {
 
 /// An IMDN document of `message_id`, its notification `notification` with
 /// `status`
-fn notification_xml(message_id: &str, notification: &str, status: &str) -> String {
+pub(super) fn notification_xml(message_id: &str, notification: &str, status: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <imdn xmlns=\"urn:ietf:params:xml:ns:imdn\">\
@@ -1704,7 +1704,7 @@ fn notification_xml(message_id: &str, notification: &str, status: &str) -> Strin
 
 /// The CPIM message of Message-ID `cpim_id` carrying the notification `xml`,
 /// from `from`, as the client sends one, with `extra` headers
-fn notification_cpim(from: &str, cpim_id: &str, extra: &str, xml: &str) -> Vec<u8> {
+pub(super) fn notification_cpim(from: &str, cpim_id: &str, extra: &str, xml: &str) -> Vec<u8> {
     format!(
         "From: <{}>\r\n\
 To: <{}>\r\n\
@@ -2339,7 +2339,7 @@ fn the_groups_of_the_device_are_added_to_once_its_commit_is_accepted() {
 }
 
 /// The bundle of a Commit without Welcome the CPIM message `cpim` carries
-fn commit_bundle_of(cpim: &[u8]) -> CommitBundle {
+pub(super) fn commit_bundle_of(cpim: &[u8]) -> CommitBundle {
     let message = cpim_message(cpim);
     let (content_type, content, _) = message.get_message_body().unwrap();
     assert_eq!(content_type, Some(CONTENT_TYPE_MLS_RCS_CLIENT));
@@ -3032,7 +3032,10 @@ fn the_participants_the_server_removed_from_groups_of_the_device_are_committed_o
             CONVERSATION,
             &accepted(epoch_identifier(&device, CONVERSATION)),
         ),
-        Taken::default()
+        Taken {
+            commit: true,
+            ..Taken::default()
+        }
     );
     let cpim = rt
         .block_on(removing)
@@ -3618,7 +3621,10 @@ fn the_groups_of_the_device_are_moved_to_unencrypted_once_its_commit_is_accepted
             CONVERSATION,
             &accepted(epoch_identifier(&device, CONVERSATION)),
         ),
-        Taken::default()
+        Taken {
+            commit: true,
+            ..Taken::default()
+        }
     );
     let cpim = rt.block_on(ending).unwrap().expect("ended once accepted");
     assert_eq!(epoch(&device, CONVERSATION), Ok((1, true)));
@@ -3641,6 +3647,7 @@ fn the_groups_of_the_device_are_moved_to_unencrypted_once_its_commit_is_accepted
             proposals: false,
             encryption_ended: true,
             encryption_resumed: false,
+            commit: true,
         }
     );
     assert!(groups.encryption_ended(CONVERSATION));
@@ -3686,7 +3693,10 @@ fn a_group_another_member_moves_to_unencrypted_is_unencrypted() {
     bobs_group.merge_pending_commit(&bob).unwrap();
     assert_eq!(
         groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
-        Taken::default()
+        Taken {
+            commit: true,
+            ..Taken::default()
+        }
     );
 
     let output = bobs_group
@@ -3699,6 +3709,7 @@ fn a_group_another_member_moves_to_unencrypted_is_unencrypted() {
             proposals: false,
             encryption_ended: true,
             encryption_resumed: false,
+            commit: true,
         }
     );
     assert_eq!(
@@ -3720,7 +3731,10 @@ fn a_group_another_member_moves_to_unencrypted_is_unencrypted() {
     let output = bobs_group.update_keys(&bob).unwrap();
     assert_eq!(
         groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
-        Taken::default()
+        Taken {
+            commit: true,
+            ..Taken::default()
+        }
     );
     assert_eq!(epoch(&device, CONVERSATION), Ok((4, false)));
 }
@@ -3789,7 +3803,10 @@ fn a_group_moved_to_unencrypted_stays_so_once_the_device_is_restored() {
     let groups = DeviceGroups::new(&restored, query.clone());
     assert_eq!(
         groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
-        Taken::default()
+        Taken {
+            commit: true,
+            ..Taken::default()
+        }
     );
     assert_eq!(epoch(&restored, CONVERSATION), Ok((3, false)));
 
@@ -3839,7 +3856,7 @@ fn a_recipient_unable_to_decrypt_is_told_apart_from_other_failures() {
 }
 
 /// As alice_and_bob(), the device telling the time of the clock given back
-fn alice_and_bob_in_time() -> (Arc<E2eeDevice>, MlsClient, MlsConversation, Clock) {
+pub(super) fn alice_and_bob_in_time() -> (Arc<E2eeDevice>, MlsClient, MlsConversation, Clock) {
     let (device, _, bob, bobs_group, clock) = alice_and_bob_in_time_with_kds();
     (device, bob, bobs_group, clock)
 }
@@ -5181,6 +5198,7 @@ fn an_unencrypted_singleton_era_is_made_for_a_participant_not_e2ee_capable() {
             proposals: false,
             encryption_ended: true,
             encryption_resumed: false,
+            commit: true,
         }
     );
     assert_eq!(
@@ -5680,6 +5698,7 @@ fn a_group_moved_to_unencrypted_is_moved_back_two_hours_on_with_one_commit() {
     assert_eq!(
         groups.on_server_message(CONVERSATION, &forwarded_commit(&cpim)),
         Taken {
+            commit: true,
             encryption_resumed: true,
             ..Taken::default()
         }
@@ -6107,7 +6126,10 @@ fn a_group_whose_focus_has_no_mls_group_is_unencrypted_until_moved_back_with_an_
     bobs_group.merge_pending_commit(&bob).unwrap();
     assert_eq!(
         groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
-        Taken::default()
+        Taken {
+            commit: true,
+            ..Taken::default()
+        }
     );
     assert!(groups.encryption_ended(CONVERSATION));
 
@@ -6150,6 +6172,7 @@ fn a_group_whose_focus_has_no_mls_group_is_unencrypted_until_moved_back_with_an_
         ),
         Taken {
             encryption_resumed: true,
+            commit: true,
             ..Taken::default()
         }
     );
@@ -6238,7 +6261,10 @@ fn an_era_moving_a_group_back_to_encrypted_is_applied_once_the_focus_answers_its
     bobs_group.merge_pending_commit(&bob).unwrap();
     assert_eq!(
         groups.on_server_message(CONVERSATION, &focus_commit(&[&output.commit])),
-        Taken::default()
+        Taken {
+            commit: true,
+            ..Taken::default()
+        }
     );
     assert!(groups.encryption_ended(CONVERSATION));
 
@@ -6334,6 +6360,7 @@ fn a_group_never_encrypted_is_made_encrypted_with_its_first_era() {
             &accepted(epoch_identifier(&device, CONVERSATION)),
         ),
         Taken {
+            commit: true,
             encryption_resumed: true,
             ..Taken::default()
         }

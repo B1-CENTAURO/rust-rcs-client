@@ -347,12 +347,12 @@ extern int32_t rcs_client_video_chat_media_connected(struct rcs_client *client, 
 // the SFU to wait for it (Timer_Zeta); 0 if the call goes on and was answered
 extern int32_t rcs_client_video_chat_media_disconnected(struct rcs_client *client, const char *call_id);
 
-// calls the participants of the group chat at conference_uri, not encrypted end to end, with the SDP offer of the app to the SFU
-// of its Controlling Function (RCC.07 section 3.7.5.5.1): event 8 gives the SFU's answer, and the call is answered (2) as its
-// first participant answers; the call_id written as for rcs_client_start_video_chat; 0 if called, -1 if the listener is not set,
-// RCS Video Chat not enabled, or another call goes on; event 7 (488) if the group is encrypted end to end, whose calls are not
-// taken yet; the other functions above take a group call's call_id too, its ICE candidates and media updates going to the
-// Controlling Function alone
+// calls the participants of the group chat at conference_uri with the SDP offer of the app to the SFU of its Controlling Function
+// (RCC.07 section 3.7.5.5.1): event 8 gives the SFU's answer, and the call is answered (2) as its first participant answers; the
+// call_id written as for rcs_client_start_video_chat; 0 if called, -1 if the listener is not set, RCS Video Chat not enabled, or
+// another call goes on; in a group encrypted end to end, the signalling is signed, and the media is to be encrypted with SFrame
+// (RCC.16 section 9.8.2, rcs_client_video_chat_encrypts_media), event 7 (488) if its keys cannot be made; the other functions
+// above take a group call's call_id too, its ICE candidates and media updates going to the Controlling Function alone
 extern int32_t rcs_client_start_group_video_chat(struct rcs_client *client, const char *conference_uri, const char *sdp_offer,
                                 char *call_id, size_t call_id_size);
 
@@ -383,6 +383,40 @@ typedef void (*video_chat_members_callback) (const char *call_id, const char *co
 // sets the group video chat listener; the context of one set before is released
 extern void rcs_client_set_group_video_chat_listener(struct rcs_client *client, video_chat_participant_callback cb,
                                 video_chat_members_callback members_cb, void *context);
+
+// the media of the group calls of groups encrypted end to end (RCC.16 section 9.8.2), in a library built with the e2ee
+// feature: each frame encrypted with SFrame (RFC 9605) with the keys of its call, which the client keys from the MLS group
+
+// 1 if the media of the group call call_id is to be encrypted with the functions below, from the call started or answered
+// until it ends; 0 if not
+extern int32_t rcs_client_video_chat_encrypts_media(struct rcs_client *client, const char *call_id);
+
+// how many bytes SFrame adds to a frame at most
+#define RCS_VIDEO_CHAT_FRAME_OVERHEAD 33
+
+// encrypts the frame of the group call call_id, the metadata authenticated with it (RFC 9605 section 4.4.3), into out, which
+// has room for out_capacity bytes, frame_len + RCS_VIDEO_CHAT_FRAME_OVERHEAD at most: the length written, or -1 if the call
+// has no keys, -2 if out has no room for it, -3 if not encrypted; until a Commit of this client is delivered to the others of
+// the call, frames go in the keys of the epoch before
+extern int64_t rcs_client_encrypt_video_chat_frame(struct rcs_client *client, const char *call_id,
+                                const uint8_t *metadata, size_t metadata_len, const uint8_t *frame, size_t frame_len,
+                                uint8_t *out, size_t out_capacity);
+
+// decrypts the SFrame frame of the group call call_id, the metadata authenticated with it (RFC 9605 section 4.4.4), into out,
+// which has room for out_capacity bytes, encrypted_len at most: the length written, or -1 if the call has no keys, -2 if out
+// has no room for it, -3 if it is of no epoch the keys have or does not open, -4 if it came already or is too old to tell; a
+// frame not written is not to be played
+extern int64_t rcs_client_decrypt_video_chat_frame(struct rcs_client *client, const char *call_id,
+                                const uint8_t *metadata, size_t metadata_len, const uint8_t *encrypted, size_t encrypted_len,
+                                uint8_t *out, size_t out_capacity);
+
+// told when the keys of a group call switch to the epoch a Commit of this client moved its group to, the others in the call
+// having it: send an empty frame then, encrypted with rcs_client_encrypt_video_chat_frame, if no media is sent, for the others
+// to switch too
+typedef void (*video_chat_keys_callback) (const char *call_id, uint64_t epoch, void *context);
+
+// sets the video chat keys listener; the context of one set before is released
+extern void rcs_client_set_video_chat_keys_listener(struct rcs_client *client, video_chat_keys_callback cb, void *context);
 
 // accepts (accept != 0) or declines the invitation to the group chat that waits for the user's answer: 404 if there is none
 extern void rcs_client_answer_group_chat_invitation(struct rcs_runtime *runtime, struct rcs_client *client, const char *conference_uri,

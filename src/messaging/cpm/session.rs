@@ -24,6 +24,7 @@ use futures::Future;
 
 use rust_rcs_core::cpim::{CPIMInfo, CPIMMessage};
 use rust_rcs_core::ffi::log::platform_log;
+use rust_rcs_core::imdn::notification::{Dispositions, Imdn, Notification, Status};
 use rust_rcs_core::internet::body::message_body::MessageBody;
 use rust_rcs_core::internet::body::multipart_body::MultipartBody;
 use rust_rcs_core::internet::body::VectorReader;
@@ -80,6 +81,7 @@ use uuid::Uuid;
 
 use crate::contact::ContactKnownIdentities;
 use crate::messaging::ffi::RecipientType;
+use crate::video_chat;
 
 use super::encryption::encrypted_alias;
 use super::encryption::{
@@ -991,11 +993,35 @@ impl CPMSession {
                                         Err(_) => {} // to-do: early failure
                                     }
 
-                                    // and never sent unencrypted in an
-                                    // encrypted one (RCC.16 section 9.1.1),
-                                    // unless it moved to unencrypted
-                                    // (section 11.2)
-                                    if let Some((encryption, conversation_id)) = &encryption {
+                                    // the signalling of a Group RCS Video
+                                    // Chat signed in an encrypted one, not
+                                    // encrypted, for the Controlling Function
+                                    // to read (RCC.16 section 9.8.2), and
+                                    // not sent unsigned
+                                    let signing = encryption.as_ref().filter(
+                                        |(encryption, conversation_id)| {
+                                            message.signed
+                                                && !encryption.encryption_ended(conversation_id)
+                                        },
+                                    );
+                                    if let Some((encryption, conversation_id)) = signing {
+                                        match encryption.sign(conversation_id, &data).await {
+                                            Some(signed) => data = signed,
+                                            None => {
+                                                (message.message_result_callback)(
+                                                    500,
+                                                    String::from("Internal Error"),
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    // and anything else never sent
+                                    // unencrypted in an encrypted one (RCC.16
+                                    // section 9.1.1), unless it moved to
+                                    // unencrypted (section 11.2)
+                                    else if let Some((encryption, conversation_id)) = &encryption
+                                    {
                                         match encryption.encrypt(conversation_id, &data).await {
                                             Sealed::Encrypted(encrypted) => {
                                                 data = encrypted;
@@ -1589,6 +1615,53 @@ impl SessionEnd {
             }
             FtdAnswer::NotOne | FtdAnswer::Ignored => false,
         }
+    }
+
+    /// Tells the sender of the message `cpim_info` tells of that it was
+    /// delivered, if it asks for that, with a delivery notification sent in
+    /// the session, signed (RCC.16 section 7.7.1), as for a Commit the
+    /// Conversation Focus delivers
+    pub(crate) fn tell_delivered(&self, cpim_info: &CPIMInfo) {
+        let dispositions = cpim_info
+            .disposition_notification
+            .map(Dispositions::parse)
+            .unwrap_or_default();
+        if !dispositions.ask_for(Notification::Delivery, Status::Delivered) {
+            return;
+        }
+        let Some(public_user_identity) = self.public_user_identity() else {
+            return;
+        };
+        let Some(xml) = (Imdn {
+            message_id: String::from_utf8_lossy(cpim_info.imdn_message_id).into_owned(),
+            datetime: String::from_utf8_lossy(cpim_info.date).into_owned(),
+            recipient_uri: None,
+            original_recipient_uri: None,
+            notification: Notification::Delivery,
+            status: Status::Delivered,
+        })
+        .to_xml() else {
+            return;
+        };
+        let sender = cpim_sender(cpim_info);
+        send_imdn_in_session(
+            &self.sip_session.get_inner(),
+            &RecipientType::Group,
+            &xml,
+            &sender,
+            None,
+            &public_user_identity,
+            |status_code, reason_phrase| {
+                platform_log(
+                    LOG_TAG,
+                    format!(
+                        "delivery of a Commit told with {} {}",
+                        status_code, reason_phrase
+                    ),
+                );
+            },
+            &self.rt,
+        );
     }
 
     /// Tells the senders of the messages of the group chat of the session
@@ -2379,6 +2452,12 @@ impl CPMSessionService {
                                 return;
                             }
                         }
+                        // nor is the delivery of a Commit of this client,
+                        // which the keys of a Group RCS Video Chat wait for
+                        // (section 9.8.2)
+                        if encryption.commit_delivered(conversation_id, cpim_info, content_body) {
+                            return;
+                        }
                         // one of a Re-Sent Message of this client telling
                         // of its Original Message, the one the app knows
                         // (section 10.4)
@@ -2386,7 +2465,9 @@ impl CPMSessionService {
                             for_app = Some(telling_of(content_body, original_message_id));
                         }
                     }
-                } else if is_plaintext_message(content_type) {
+                } else if is_plaintext_message(content_type)
+                    && !is_group_video_chat(session, content_type)
+                {
                     note_group_used(session, &encryption);
                     // as does a message sent unencrypted in an encrypted
                     // group (RCC.16 section 11.2), which the app takes all
@@ -2422,6 +2503,15 @@ impl CPMSessionService {
                 let conversation_id = session.get_inner().get_session_info().mls_group().cloned();
                 if let (Some(encryption), Some(conversation_id)) = (encryption, conversation_id) {
                     let taken = encryption.on_server_message(&conversation_id, content_body);
+                    // the delivery of a Commit told its committer if it
+                    // asks for it, as it does during a Group RCS Video Chat,
+                    // for the keys of the call to switch to the new epoch
+                    // once all have it (RCC.16 section 9.8.2)
+                    if taken.commit {
+                        if let Some(session_end) = session.get_inner().session_end() {
+                            session_end.tell_delivered(cpim_info);
+                        }
+                    }
                     // a member's leave for this client to commit (RCC.16
                     // section 9.4)
                     if taken.proposals {
@@ -3145,6 +3235,67 @@ impl CPMSessionService {
     ) where
         F: FnOnce(u16, String) + Send + Sync + 'static,
     {
+        self.send_message_signed_or_not(
+            message_type,
+            message_content.as_ref(),
+            message_id,
+            recipient,
+            recipient_type,
+            recipient_uri,
+            false,
+            message_result_callback,
+            core,
+            rt,
+        );
+    }
+
+    /// Sends a message as send_message() does, signed rather than encrypted
+    /// if the group chat it goes to is encrypted end to end, as the
+    /// signalling of a Group RCS Video Chat is (RCC.16 section 9.8.2): it
+    /// fails with 500 if it cannot be signed
+    pub fn send_signed_message<F>(
+        &self,
+        message_type: &str,
+        message_content: impl AsRef<[u8]>,
+        message_id: &str,
+        recipient: &str,
+        recipient_type: &RecipientType,
+        recipient_uri: &str,
+        message_result_callback: F,
+        core: &Arc<SipCore>,
+        rt: &Arc<Runtime>,
+    ) where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
+        self.send_message_signed_or_not(
+            message_type,
+            message_content.as_ref(),
+            message_id,
+            recipient,
+            recipient_type,
+            recipient_uri,
+            true,
+            message_result_callback,
+            core,
+            rt,
+        );
+    }
+
+    fn send_message_signed_or_not<F>(
+        &self,
+        message_type: &str,
+        message_content: &[u8],
+        message_id: &str,
+        recipient: &str,
+        recipient_type: &RecipientType,
+        recipient_uri: &str,
+        signed: bool,
+        message_result_callback: F,
+        core: &Arc<SipCore>,
+        rt: &Arc<Runtime>,
+    ) where
+        F: FnOnce(u16, String) + Send + Sync + 'static,
+    {
         // a group used, as long as which its Participants' capabilities are
         // refreshed if it is unencrypted (RCC.16 sections 1.3, 11.1.1)
         if matches!(recipient_type, RecipientType::Group) {
@@ -3158,7 +3309,7 @@ impl CPMSessionService {
         let message_result_callback = Arc::new(Mutex::new(Some(message_result_callback)));
         let message = CPMMessageParam::new(
             String::from(message_type),
-            message_content.as_ref(),
+            message_content,
             String::from(message_id),
             recipient,
             recipient_type,
@@ -3170,6 +3321,10 @@ impl CPMSessionService {
                 }
             },
         );
+        let message = match signed {
+            true => message.signed(),
+            false => message,
+        };
         // in a group chat, with the user alias as the formal name of its
         // CPIM From (RCC.07 section 2.5.3.3), encrypted with the message in
         // an encrypted group
@@ -4403,6 +4558,41 @@ fn carries_mls_file(content_type: &[u8], content: &[u8]) -> bool {
 fn is_plaintext_message(content_type: &[u8]) -> bool {
     !is_media_type(content_type, IS_COMPOSING)
         && !content_type.eq_ignore_ascii_case(CONTENT_TYPE_MLS_RCS_SERVER)
+}
+
+/// The URI of the CPIM From of `cpim_info`
+fn cpim_sender(cpim_info: &CPIMInfo) -> String {
+    match &cpim_info.from_uri {
+        Some(uri) => {
+            String::from_utf8_lossy(&uri.string_representation_without_query_and_fragment())
+                .into_owned()
+        }
+        None => {
+            let from = String::from_utf8_lossy(cpim_info.from);
+            let from = from.trim();
+            let uri = match (from.find('<'), from.rfind('>')) {
+                (Some(start), Some(end)) if start < end => &from[start + 1..end],
+                _ => from,
+            };
+            String::from(uri)
+        }
+    }
+}
+
+/// Whether a message of `content_type` is the signalling of a Group RCS
+/// Video Chat, which is signed and not encrypted in a group encrypted end to
+/// end, its signature checked by the video chats (RCC.16 section 9.8.2), in
+/// a session of a group
+fn is_group_video_chat(session: &SipSession<CPMSession>, content_type: &[u8]) -> bool {
+    is_media_type(content_type, video_chat::CONTENT_TYPE)
+        && matches!(
+            session
+                .get_inner()
+                .get_session_info()
+                .cpm_contact
+                .service_type,
+            CPMServiceType::Group
+        )
 }
 
 /// What ending the session with the group at `conference_uri` takes, if

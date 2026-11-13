@@ -65,7 +65,7 @@ impl Device {
 
     fn relayed_sent(&self, from: &str, message: ServerGroupVideoMessage, date: &str) {
         self.service
-            .on_group_message(GROUP, from, date, &message.encode_to_vec());
+            .on_group_message(GROUP, from, date, &message.encode_to_vec(), None);
     }
 }
 
@@ -743,6 +743,7 @@ fn the_signals_of_a_group_call_are_taken_from_its_group_alone() {
         BOB,
         &date(Duration::ZERO),
         &message.encode_to_vec(),
+        None,
     );
     assert!(device.told().is_empty());
     assert!(device.group_told().is_empty());
@@ -752,7 +753,7 @@ fn the_signals_of_a_group_call_are_taken_from_its_group_alone() {
     // nor what cannot be read
     device
         .service
-        .on_group_message(GROUP, BOB, &date(Duration::ZERO), b"\xff\xff");
+        .on_group_message(GROUP, BOB, &date(Duration::ZERO), b"\xff\xff", None);
     device.relayed(
         BOB,
         ServerGroupVideoMessage {
@@ -804,6 +805,7 @@ fn a_group_call_is_reported_by_the_conversation_id_of_its_group() {
         BOB,
         &date(Duration::ZERO),
         &relaying("bob-call", invitation(), "sfu offer").encode_to_vec(),
+        None,
     );
     device.service.accept_call("bob-call", "answer");
     assert!(device.service.media_connected("bob-call"));

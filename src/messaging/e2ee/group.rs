@@ -384,7 +384,15 @@ impl E2eeDevice {
         client_message: &[u8],
         group_data: Option<&[u8]>,
     ) -> Vec<u8> {
-        let cpim = control_message(from, to, &message_id, client_message, group_data);
+        // during a Group RCS Video Chat of the group, its delivery asked to
+        // be told of, for the keys of the call to switch to the epoch of a
+        // Commit it carries once all the others have it (RCC.16 section
+        // 9.8.2)
+        let receipts = self.video_calls().in_call(conversation_id);
+        if receipts {
+            self.video_calls().asked(conversation_id, &message_id);
+        }
+        let cpim = control_message(from, to, &message_id, client_message, group_data, receipts);
         self.control_messages().insert(conversation_id, message_id);
         cpim
     }
@@ -534,6 +542,8 @@ impl E2eeDevice {
         conversation_id: &str,
         body: &[u8],
     ) -> Result<Vec<IncomingMessage>, StoreError> {
+        // the Commit of the device, if one waits, as it is accepted
+        let commit_id = self.control_messages().get(conversation_id);
         let (taken, pending, active) = self.store().with_conversation(
             conversation_id.as_bytes(),
             |conversation, client| {
@@ -558,6 +568,17 @@ impl E2eeDevice {
         match &taken {
             Ok(taken) => self.metadata_keys_received(conversation_id, taken),
             Err(_) => self.heals().want(conversation_id),
+        }
+        // the keys of the calls of the group moved to the new epoch, as of
+        // the last Commit applied (section 9.8.2)
+        let committer = taken.as_ref().ok().and_then(|taken| {
+            taken.iter().rev().find_map(|message| match message {
+                IncomingMessage::Commit { sender, .. } => Some(sender.clone()),
+                _ => None,
+            })
+        });
+        if let Some(committer) = committer {
+            self.call_keys_advanced(conversation_id, &committer, commit_id.as_deref());
         }
         // the leaf of the device replaced by a KeyPackage Update, it joins
         // again with the Welcome along (section 9.5.4)
@@ -830,13 +851,14 @@ pub(super) fn new_message_id() -> String {
 /// A CPIM message carrying the `message/mls-rcs-client` `client_message`,
 /// its Message-ID `message_id`, with only the headers left unencrypted,
 /// asking to be told if it is refused (RCC.16 sections 6.2.5, 7.5.6, 7.5.7,
-/// 7.9)
+/// 7.9), and if it is delivered too if `receipts`
 fn control_message(
     from: &str,
     to: &str,
     message_id: &str,
     client_message: &[u8],
     group_data: Option<&[u8]>,
+    receipts: bool,
 ) -> Vec<u8> {
     let client_part = MessageBody {
         headers: vec![
@@ -888,7 +910,13 @@ fn control_message(
                 Local::now().to_rfc3339_opts(SecondsFormat::Millis, false),
             ),
             Header::new(b"imdn.Message-ID", String::from(message_id)),
-            Header::new(b"imdn.Disposition-Notification", b"negative-delivery"),
+            Header::new(
+                b"imdn.Disposition-Notification",
+                match receipts {
+                    true => &b"positive-delivery, negative-delivery"[..],
+                    false => &b"negative-delivery"[..],
+                },
+            ),
         ],
         Body::Message(body),
     );
@@ -1218,20 +1246,22 @@ impl GroupEncryption for DeviceGroups {
         let taken = match self.device.upgrade() {
             Some(device) => {
                 let ended = device.encryption_ended(conversation_id);
-                let proposals = match device.on_server_message(conversation_id, body) {
-                    Ok(taken) => taken
-                        .iter()
-                        .any(|message| matches!(message, IncomingMessage::Proposal { .. })),
-                    Err(e) => {
+                let taken = device
+                    .on_server_message(conversation_id, body)
+                    .unwrap_or_else(|e| {
                         platform_log(LOG_TAG, format!("message of the focus not taken: {:?}", e));
-                        false
-                    }
-                };
+                        Vec::new()
+                    });
                 let ended_now = device.encryption_ended(conversation_id);
                 let taken = Taken {
-                    proposals,
+                    proposals: taken
+                        .iter()
+                        .any(|message| matches!(message, IncomingMessage::Proposal { .. })),
                     encryption_ended: ended_now && !ended,
                     encryption_resumed: !ended_now && ended,
+                    commit: taken
+                        .iter()
+                        .any(|message| matches!(message, IncomingMessage::Commit { .. })),
                 };
                 // not moved back for two hours (section 11.2)
                 if taken.encryption_ended {
@@ -1738,8 +1768,8 @@ impl GroupEncryption for DeviceGroups {
         let signing = self.once_accepted(
             conversation_id,
             cpim,
-            E2eeDevice::sign_notification,
-            "notification not signed",
+            E2eeDevice::sign_message,
+            "message not signed",
         );
         Box::pin(async move { signing.await.ok() })
     }
@@ -1753,6 +1783,51 @@ impl GroupEncryption for DeviceGroups {
             Err(MessageError::NotSigned) => Verified::Unsigned,
             Err(e) => {
                 platform_log(LOG_TAG, format!("notification not verified: {:?}", e));
+                Verified::Forged
+            }
+        }
+    }
+
+    fn start_call_keys(&self, conversation_id: &str, call_id: &str) -> Option<bool> {
+        let device = self.device.upgrade()?;
+        device
+            .start_call_keys(call_id, conversation_id)
+            .map_err(|e| platform_log(LOG_TAG, format!("call keys not made: {:?}", e)))
+            .ok()
+    }
+
+    fn end_call_keys(&self, call_id: &str) {
+        if let Some(device) = self.device.upgrade() {
+            device.end_call_keys(call_id);
+        }
+    }
+
+    fn call_participants(&self, call_id: &str, participants: Vec<String>) {
+        if let Some(device) = self.device.upgrade() {
+            device.call_participants(call_id, participants);
+        }
+    }
+
+    fn commit_delivered(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> bool {
+        self.device
+            .upgrade()
+            .is_some_and(|device| device.commit_delivered(conversation_id, cpim_info, imdn))
+    }
+
+    fn verify_video_chat(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        video_chat_message: &[u8],
+    ) -> Verified {
+        let Some(device) = self.device.upgrade() else {
+            return Verified::Forged;
+        };
+        match device.verify_video_chat(conversation_id, cpim_info, video_chat_message) {
+            Ok(()) => Verified::Signed,
+            Err(MessageError::NotSigned) => Verified::Unsigned,
+            Err(e) => {
+                platform_log(LOG_TAG, format!("video chat message not verified: {:?}", e));
                 Verified::Forged
             }
         }

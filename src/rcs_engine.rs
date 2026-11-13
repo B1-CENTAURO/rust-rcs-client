@@ -106,7 +106,7 @@ use crate::connectivity::retry::Reconnect;
 use crate::connectivity::{flow::FlowManager, registration::Registration};
 use crate::context::Context;
 use crate::messaging::config::MessagingConfigs;
-use crate::messaging::cpm::encryption::{GroupEncryption, MetadataChange, UploadedIcon};
+use crate::messaging::cpm::encryption::{GroupEncryption, MetadataChange, UploadedIcon, Verified};
 use crate::messaging::cpm::group_chat::{GroupIds, GroupInvitation};
 use crate::messaging::cpm::imdn::{
     acknowledge_delivery, acknowledge_session_delivery, app_message_id, send_imdn, ImdnService,
@@ -653,11 +653,15 @@ impl RcsEngine {
                     let inner = session.get_inner();
                     let info = inner.get_session_info();
                     matches!(info.cpm_contact.service_type, CPMServiceType::Group).then(|| {
-                        info.encryption.as_ref().zip(info.mls_group()).is_some_and(
-                            |(encryption, conversation_id)| {
+                        info.encryption
+                            .as_ref()
+                            .zip(info.mls_group())
+                            .filter(|(encryption, conversation_id)| {
                                 !encryption.encryption_ended(conversation_id)
-                            },
-                        )
+                            })
+                            .map(|(encryption, conversation_id)| {
+                                (Arc::clone(encryption), conversation_id.clone())
+                            })
                     })
                 };
                 if taken_by_video_chat(
@@ -3732,12 +3736,37 @@ impl VideoChatLink for EngineVideoChatLink {
             .cpm_session_service
             .group_conversation_id(conference_uri)
     }
+
+    fn start_media_keys(&self, call_id: &str, conference_uri: &str) -> Result<bool, ()> {
+        let sessions = &self.route.cpm_session_service;
+        match sessions
+            .group_encryption()
+            .zip(sessions.group_conversation_id(conference_uri))
+        {
+            Some((encryption, conversation_id)) => encryption
+                .start_call_keys(&conversation_id, call_id)
+                .ok_or(()),
+            None => Ok(false),
+        }
+    }
+
+    fn end_media_keys(&self, call_id: &str) {
+        if let Some(encryption) = self.route.cpm_session_service.group_encryption() {
+            encryption.end_call_keys(call_id);
+        }
+    }
+
+    fn media_participants(&self, call_id: &str, participants: Vec<String>) {
+        if let Some(encryption) = self.route.cpm_session_service.group_encryption() {
+            encryption.call_participants(call_id, participants);
+        }
+    }
 }
 
 /// Sends the ClientGroupVideoMessage `message` to the Controlling Function
 /// of the group chat at `conference_uri`, in the group chat (RCC.07 section
-/// 3.7.5.5); refused with 488 in a group encrypted end to end, where it is
-/// to be signed (RCC.16 section 9.8.2), which is not done yet
+/// 3.7.5.5): signed in a group encrypted end to end, rather than encrypted,
+/// as the Controlling Function reads it (RCC.16 section 9.8.2)
 fn send_group_video_chat_message(
     route: &MessageRoute,
     conference_uri: &str,
@@ -3749,18 +3778,7 @@ fn send_group_video_chat_message(
         sent(403);
         return;
     }
-    let sessions = &route.cpm_session_service;
-    let encrypted = sessions
-        .group_encryption()
-        .zip(sessions.group_conversation_id(conference_uri))
-        .is_some_and(|(encryption, conversation_id)| {
-            encryption.encrypts(&conversation_id) && !encryption.encryption_ended(&conversation_id)
-        });
-    if encrypted {
-        sent(488);
-        return;
-    }
-    sessions.send_message(
+    route.cpm_session_service.send_signed_message(
         video_chat::CONTENT_TYPE,
         message,
         &new_message_id(),
@@ -3851,16 +3869,20 @@ fn report_video_chat_event(
     );
 }
 
+/// The encryption of a group chat encrypted end to end, and its
+/// Conversation-ID
+type GroupEncrypted = (Arc<dyn GroupEncryption>, String);
+
 /// Whether the message `body` of `content_type` from `contact_uri` is the
 /// signalling of an RCS Video Chat, which is not for the app (RCC.07 section
 /// 3.7.5.2.3.1): taken by `video_chat`, sent at the CPIM DateTime of
 /// `cpim_info`, from a 1-to-1 chat, or from a group chat as `group` tells,
-/// Some(encrypted), of the participant its CPIM From is of; but not from a
-/// group encrypted end to end, where it is to be signed (RCC.16 section
-/// 9.8.2), which is not done yet
+/// with its encryption if it is encrypted end to end, of the participant its
+/// CPIM From is of; in such a group, the signals of the others are taken
+/// signed by them alone (RCC.16 section 9.8.2)
 fn taken_by_video_chat(
     video_chat: &OnceLock<Weak<VideoChatService>>,
-    group: impl FnOnce() -> Option<bool>,
+    group: impl FnOnce() -> Option<Option<GroupEncrypted>>,
     contact_uri: &[u8],
     cpim_info: &CPIMInfo,
     content_type: &[u8],
@@ -3880,11 +3902,22 @@ fn taken_by_video_chat(
     };
     match group() {
         None => service.on_message(contact_uri, date, body),
-        Some(false) => service.on_group_message(contact_uri, &cpim_from(cpim_info), date, body),
-        Some(true) => platform_log(
-            LOG_TAG,
-            "video chat message of an encrypted group not taken",
-        ),
+        Some(None) => {
+            service.on_group_message(contact_uri, &cpim_from(cpim_info), date, body, None)
+        }
+        Some(Some((encryption, conversation_id))) => {
+            let signed = |video_chat_message: &[u8]| {
+                encryption.verify_video_chat(&conversation_id, cpim_info, video_chat_message)
+                    == Verified::Signed
+            };
+            service.on_group_message(
+                contact_uri,
+                &cpim_from(cpim_info),
+                date,
+                body,
+                Some(&signed),
+            )
+        }
     }
     true
 }

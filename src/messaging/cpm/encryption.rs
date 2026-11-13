@@ -69,8 +69,9 @@ pub enum Sealed {
     Failed,
 }
 
-/// What the signature of a notification received in an encrypted group chat
-/// tells (RCC.16 section 7.6.2)
+/// What the signature of a notification, or of the signalling of a Group RCS
+/// Video Chat, received in an encrypted group chat tells (RCC.16 section
+/// 7.6.2)
 #[derive(Debug, PartialEq)]
 pub enum Verified {
     /// Signed by the participant it is from, or a negative delivery, which
@@ -106,6 +107,8 @@ pub struct Taken {
     pub encryption_ended: bool,
     /// The group chat moved back to encrypted (section 11.1.2)
     pub encryption_resumed: bool,
+    /// A Commit applied, the group in a new epoch
+    pub commit: bool,
 }
 
 /// How a group chat is moved back to encrypted (RCC.16 section 11.1)
@@ -785,8 +788,10 @@ pub trait GroupEncryption: Send + Sync {
 
     /// The CPIM message `cpim` carrying a notification of the group chat
     /// `conversation_id`, signed over what it tells of (RCC.16 sections
-    /// 7.6.1, 9.1.3, 9.1.4), once a Commit of this client the Conversation
-    /// Focus is yet to accept is; None if it cannot be
+    /// 7.6.1, 9.1.3, 9.1.4), or carrying the signalling of a Group RCS Video
+    /// Chat, signed over the VideoChatMessage it carries (sections 7.6.3.4,
+    /// 9.8.2), once a Commit of this client the Conversation Focus is yet to
+    /// accept is; None if it cannot be
     fn sign(&self, conversation_id: &str, cpim: &[u8]) -> BoxFuture<'static, Option<Vec<u8>>>;
 
     /// Whether the `message/imdn+xml` `imdn` received in the group chat
@@ -795,6 +800,50 @@ pub trait GroupEncryption: Send + Sync {
     /// negative delivery, which may come unsigned (RCC.16 sections 7.6.2,
     /// 7.7), as any may once the group chat is unencrypted (section 11.2)
     fn verify(&self, conversation_id: &str, cpim_info: &CPIMInfo, imdn: &[u8]) -> Verified;
+
+    /// Makes the keys of the media of the Group RCS Video Chat `call_id` of
+    /// the group chat `conversation_id`: Some(true) if the group chat is
+    /// encrypted end to end, the media then to be encrypted with them, as
+    /// RCC.16 section 9.8.2 has it, Some(false) if not, None if they cannot
+    /// be made
+    fn start_call_keys(&self, _conversation_id: &str, _call_id: &str) -> Option<bool> {
+        Some(false)
+    }
+
+    /// Lets go of the keys of the media of the Group RCS Video Chat
+    /// `call_id`, which ended
+    fn end_call_keys(&self, _call_id: &str) {}
+
+    /// Tells the keys of the media of the Group RCS Video Chat `call_id` of
+    /// the participants in the call besides this client, by their tel URIs
+    fn call_participants(&self, _call_id: &str, _participants: Vec<String>) {}
+
+    /// Whether the notification `imdn` received in the group chat
+    /// `conversation_id`, in the CPIM message `cpim_info` tells of, and
+    /// signed by whom it is from, tells of the delivery of a Commit of this
+    /// client the keys of a Group RCS Video Chat wait for (RCC.16 section
+    /// 9.8.2): it is taken, and not for the app
+    fn commit_delivered(
+        &self,
+        _conversation_id: &str,
+        _cpim_info: &CPIMInfo,
+        _imdn: &[u8],
+    ) -> bool {
+        false
+    }
+
+    /// Whether the VideoChatMessage `video_chat_message`, which the
+    /// Controlling Function of the group chat `conversation_id` relays in a
+    /// ServerGroupVideoMessage, in the CPIM message `cpim_info` tells of, is
+    /// signed over it by the participant of the CPIM From (RCC.16 sections
+    /// 7.6.2, 9.8.2), as any may not be once the group chat is unencrypted
+    /// (section 11.2)
+    fn verify_video_chat(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        video_chat_message: &[u8],
+    ) -> Verified;
 
     /// What the notification `imdn` received in the group chat
     /// `conversation_id`, in the CPIM message `cpim_info` tells of, brings as

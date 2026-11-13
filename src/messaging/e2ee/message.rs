@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The messages of the encrypted group chats, and their signed notifications
-//! (RCC.16 sections 7.5, 7.6, 9.1.1, 9.1.3, 9.1.4)
+//! The messages of the encrypted group chats, their signed notifications,
+//! and the signed signalling of their RCS Video Chats (RCC.16 sections 7.5,
+//! 7.6, 9.1.1, 9.1.3, 9.1.4, 9.8.2)
 
 use std::collections::BTreeMap;
 use std::io::Read;
 
 use base64::{engine::general_purpose, Engine as _};
+use prost::Message as _;
 use rust_rcs_core::cpim::cpim_namespace::CPIMNamespace;
 use rust_rcs_core::cpim::{CPIMHeaders, CPIMInfo, CPIMMessage};
 use rust_rcs_core::imdn::notification::{Imdn, Notification, Status};
@@ -28,6 +30,7 @@ use rust_rcs_core::mls::rcs::proto;
 use rust_rcs_core::mls::rcs::wire::{
     self, AuthenticatedData, DeliveryNotificationStatus, DisplayNotificationStatus,
     VerifiableDeliveryImdn, VerifiableDerivedContent, VerifiableDisplayImdn,
+    VerifiableVideoChatMessage,
 };
 use rust_rcs_core::mls::rcs::{
     credential_tel_uris, is_unencrypted_cpim_header, ClientFailureReason, ResentFailure,
@@ -41,6 +44,8 @@ use super::device::{is_of, participant_tel_uri, E2eeDevice};
 use super::file::{file_urls, with_mls_file, CONTENT_TYPE_FT_HTTP};
 use super::sent::{members_besides, note_sent};
 use super::store::StoreError;
+use crate::video_chat::proto::ClientGroupVideoMessage;
+use crate::video_chat::CONTENT_TYPE as VIDEO_CHAT_CONTENT_TYPE;
 
 const IMDN_NAMESPACE: &[u8] = b"urn:ietf:params:imdn";
 const RCS_NAMESPACE: &[u8] = b"http://www.gsma.com/rcs";
@@ -270,6 +275,20 @@ fn signed_content(
         (Notification::Processing, _) => return None,
     };
     wire::encode(&AuthenticatedData::new(message_id, b"", era, content)).ok()
+}
+
+/// What the signature of the VideoChatMessage `video_chat_message` of a Group
+/// RCS Video Chat, sent in the CPIM message of Message-ID `message_id`,
+/// covers: the VerifiableVideoChatMessage of the two (RCC.16 section 7.6.3.4)
+///
+/// RCC.16 gives no case of the AuthenticatedData for it, as it does for the
+/// notifications (section 7.5.3.2): it is signed as it is (section 7.6.1).
+fn video_chat_content(message_id: &[u8], video_chat_message: &[u8]) -> Option<Vec<u8>> {
+    wire::encode(&VerifiableVideoChatMessage::new(
+        video_chat_message,
+        message_id,
+    ))
+    .ok()
 }
 
 impl E2eeDevice {
@@ -645,6 +664,72 @@ impl E2eeDevice {
         conversation_id: &str,
         cpim: &[u8],
     ) -> Result<Vec<u8>, MessageError> {
+        self.sign_cpim(conversation_id, cpim, |info, imdn, era| {
+            let content = signed_content(
+                info.imdn_message_id,
+                info.mls_original_message_id.unwrap_or_default(),
+                era,
+                imdn,
+            )?;
+            Some((content, Some(era)))
+        })
+    }
+
+    /// The CPIM message `cpim` carrying a ClientGroupVideoMessage, the
+    /// signalling of a Group RCS Video Chat, signed in the MLS group
+    /// `conversation_id` over the VideoChatMessage it carries end to end and
+    /// its Message-ID (RCC.16 sections 7.6.1, 7.6.3.4, 9.8.2)
+    ///
+    /// Not while a Commit of this client waits for the Conversation Focus to
+    /// accept it, nor once the Focus refused the Commit that made the group.
+    pub fn sign_video_chat(
+        &self,
+        conversation_id: &str,
+        cpim: &[u8],
+    ) -> Result<Vec<u8>, MessageError> {
+        self.sign_cpim(conversation_id, cpim, |info, body, _| {
+            let message = ClientGroupVideoMessage::decode(body).ok()?;
+            let content = video_chat_content(info.imdn_message_id, &message.video_chat_message)?;
+            Some((content, None))
+        })
+    }
+
+    /// The CPIM message `cpim` signed in the MLS group `conversation_id`, as
+    /// sign_video_chat() has the signalling of a Group RCS Video Chat, and
+    /// sign_notification() anything else
+    pub fn sign_message(
+        &self,
+        conversation_id: &str,
+        cpim: &[u8],
+    ) -> Result<Vec<u8>, MessageError> {
+        let video_chat = Body::construct_message(cpim)
+            .ok()
+            .and_then(|body| {
+                let message = CPIMMessage::try_from(&body).ok()?;
+                let (content_type, _, _) = message.get_message_body()?;
+                Some(is_of_type(
+                    content_type?,
+                    VIDEO_CHAT_CONTENT_TYPE.as_bytes(),
+                ))
+            })
+            .unwrap_or(false);
+        match video_chat {
+            true => self.sign_video_chat(conversation_id, cpim),
+            false => self.sign_notification(conversation_id, cpim),
+        }
+    }
+
+    /// The CPIM message `cpim` signed in the MLS group `conversation_id`
+    /// over what `derive` makes of its CPIM headers, its MIME body, Base64
+    /// decoded if it is so encoded, and the Era-ID of the group, with that
+    /// Era-ID if `derive` gives it too (RCC.16 section 7.6.1); NotCpim if
+    /// `derive` makes nothing of it
+    fn sign_cpim(
+        &self,
+        conversation_id: &str,
+        cpim: &[u8],
+        derive: impl FnOnce(&CPIMInfo, &[u8], u32) -> Option<(Vec<u8>, Option<u32>)>,
+    ) -> Result<Vec<u8>, MessageError> {
         if self.heals().ongoing(conversation_id) {
             return Err(MessageError::Pending);
         }
@@ -654,8 +739,14 @@ impl E2eeDevice {
         let body = Body::construct_message(cpim).map_err(|_| MessageError::NotCpim)?;
         let message = CPIMMessage::try_from(&body).map_err(|_| MessageError::NotCpim)?;
         let info = message.get_info().map_err(|_| MessageError::NotCpim)?;
-        // as the client makes them, not Base64 encoded
-        let (_, imdn, _) = message.get_message_body().ok_or(MessageError::NotCpim)?;
+        let (_, content, base64_encoded) =
+            message.get_message_body().ok_or(MessageError::NotCpim)?;
+        let content = match base64_encoded {
+            true => general_purpose::STANDARD
+                .decode(content)
+                .map_err(|_| MessageError::NotCpim)?,
+            false => content.to_vec(),
+        };
         // the end of the headers, after which the MIME body comes
         let end = cpim
             .windows(4)
@@ -687,13 +778,7 @@ impl E2eeDevice {
         let era = era.ok_or(MessageError::Store(StoreError::Mls(
             ErrorKind::InvalidState,
         )))?;
-        let content = signed_content(
-            info.imdn_message_id,
-            info.mls_original_message_id.unwrap_or_default(),
-            era,
-            imdn,
-        )
-        .ok_or(MessageError::NotCpim)?;
+        let (content, told_era) = derive(&info, &content, era).ok_or(MessageError::NotCpim)?;
         let signature = self
             .store()
             .with_conversation(conversation_id.as_bytes(), |conversation, client| {
@@ -708,11 +793,13 @@ impl E2eeDevice {
             &[&b"mls."[..], CPIM_HEADER_DERIVED_CONTENT_SIGNATURE].concat(),
             general_purpose::STANDARD.encode(signature).as_bytes(),
         );
-        header_line(
-            &mut data,
-            &[&b"mls."[..], CPIM_HEADER_ERA_ID].concat(),
-            era.to_string().as_bytes(),
-        );
+        if let Some(era) = told_era {
+            header_line(
+                &mut data,
+                &[&b"mls."[..], CPIM_HEADER_ERA_ID].concat(),
+                era.to_string().as_bytes(),
+            );
+        }
         data.extend_from_slice(&cpim[end..]);
         Ok(data)
     }
@@ -777,6 +864,44 @@ impl E2eeDevice {
             .map_err(MessageError::Store)?;
         match told_sender(cpim_info) {
             Some(told) if is_of(&signer, &told) => Ok(signer),
+            _ => Err(MessageError::NotFromSigner),
+        }
+    }
+
+    /// Whether the VideoChatMessage `video_chat_message` of a Group RCS
+    /// Video Chat, relayed by the Controlling Function of the MLS group
+    /// `conversation_id` in the CPIM message `cpim_info` tells of, is signed
+    /// over it and the Message-ID of that CPIM message by the participant of
+    /// its CPIM From (RCC.16 sections 7.6.2, 7.6.3.4, 9.8.2)
+    ///
+    /// Any may come unsigned once the group chat is unencrypted (section
+    /// 11.2).
+    pub fn verify_video_chat(
+        &self,
+        conversation_id: &str,
+        cpim_info: &CPIMInfo,
+        video_chat_message: &[u8],
+    ) -> Result<(), MessageError> {
+        if self.encryption_ended(conversation_id) {
+            return Ok(());
+        }
+        let signature = cpim_info
+            .mls_derived_content_signature
+            .ok_or(MessageError::NotSigned)?;
+        let signature = general_purpose::STANDARD
+            .decode(signature)
+            .map_err(|_| MessageError::Store(StoreError::Mls(ErrorKind::BadFormat)))?;
+        let content = video_chat_content(cpim_info.imdn_message_id, video_chat_message)
+            .ok_or(MessageError::NotCpim)?;
+
+        let signer = self
+            .store()
+            .with_conversation(conversation_id.as_bytes(), |conversation, client| {
+                conversation.verify_signature(client, &signature, &content)
+            })
+            .map_err(MessageError::Store)?;
+        match told_sender(cpim_info) {
+            Some(told) if is_of(&signer, &told) => Ok(()),
             _ => Err(MessageError::NotFromSigner),
         }
     }

@@ -35,6 +35,7 @@ pub mod store;
 pub mod unanswered;
 pub mod upgrade;
 pub mod verification;
+pub mod video;
 
 #[cfg(test)]
 mod device_tests;
@@ -50,3 +51,5 @@ mod kds_tests;
 mod provisioning_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod video_tests;
