@@ -501,6 +501,9 @@ impl E2eeDevice {
         })?;
         // in place of one the device started, whose INVITE went unanswered
         self.unanswered().forget(conversation_id);
+        // the keys of its calls made anew, of the new Era (RCC.16 section
+        // 9.8.2)
+        self.call_keys_remade(conversation_id);
         // a new Era of a group the device had has its keys checked, its
         // continuity token mismatched if the Welcome brought another
         // (RCC.16 section 10.5.1)
@@ -613,6 +616,9 @@ impl E2eeDevice {
         if applied {
             self.control_messages().remove(conversation_id);
             self.upgrades().restart_ended(conversation_id, true);
+            // the keys of its calls made anew, of the new Era (section
+            // 9.8.2)
+            self.call_keys_remade(conversation_id);
         }
         Ok(())
     }

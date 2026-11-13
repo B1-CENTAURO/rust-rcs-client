@@ -111,7 +111,7 @@ fn answering(answers: &[(&str, Capabilities)]) -> (CapabilityQuery, Arc<Mutex<Ve
     (query, asked)
 }
 
-fn recipient(tel_uri: &str) -> Recipient {
+pub(super) fn recipient(tel_uri: &str) -> Recipient {
     Recipient {
         tel_uri: String::from(tel_uri),
         home_kds: String::from("42"),
@@ -214,7 +214,7 @@ pub(super) fn bundle_of(cpim: &[u8]) -> WelcomeCommitBundle {
 }
 
 /// The group Bob joins with `bundle`
-fn joined(bob: &MlsClient, bundle: &WelcomeCommitBundle) -> MlsConversation {
+pub(super) fn joined(bob: &MlsClient, bundle: &WelcomeCommitBundle) -> MlsConversation {
     bob.join_conversation(&bundle.welcome, &bundle.ratchet_tree)
         .unwrap()
 }
@@ -639,7 +639,7 @@ fn the_groups_of_the_device_are_not_encrypted_when_they_cannot_be() {
 }
 
 /// A KeyPackage of the device that the Home KDS holds, the `n`th uploaded
-fn uploaded_key_package(kds: &Kds, n: usize) -> Vec<u8> {
+pub(super) fn uploaded_key_package(kds: &Kds, n: usize) -> Vec<u8> {
     kds.uploads()[0].0[n].clone()
 }
 
@@ -3862,8 +3862,8 @@ pub(super) fn alice_and_bob_in_time() -> (Arc<E2eeDevice>, MlsClient, MlsConvers
 }
 
 /// As alice_and_bob_in_time(), with the Home KDS of the device
-fn alice_and_bob_in_time_with_kds() -> (Arc<E2eeDevice>, Arc<Kds>, MlsClient, MlsConversation, Clock)
-{
+pub(super) fn alice_and_bob_in_time_with_kds(
+) -> (Arc<E2eeDevice>, Arc<Kds>, MlsClient, MlsConversation, Clock) {
     let clock = Clock::new();
     let (bob, bobs) = bob_with_key_package();
     let (device, kds, _) = enrolled_in_time(

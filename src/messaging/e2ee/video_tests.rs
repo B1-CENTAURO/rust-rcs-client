@@ -29,9 +29,10 @@ use crate::video_chat::proto::{
 
 use super::device::E2eeDevice;
 use super::group_tests::{
-    accepted, alice_and_bob, alice_and_bob_in_time, commit_bundle_of, cpim_message, epoch,
-    epoch_identifier, focus_commit, header_names, missed_by_the_device, notification_cpim,
-    notification_xml, Clock, CONVERSATION, DAY, GROUP_URI, IMPU,
+    accepted, alice_and_bob, alice_and_bob_in_time, alice_and_bob_in_time_with_kds, bundle_of,
+    commit_bundle_of, cpim_message, epoch, epoch_identifier, focus_commit, header_names, joined,
+    missed_by_the_device, notification_cpim, notification_xml, recipient, uploaded_key_package,
+    Clock, CONVERSATION, DAY, GROUP_URI, IMPU,
 };
 use super::kds_tests::certificates::*;
 use super::kds_tests::{credential, BOB_TEL};
@@ -706,4 +707,99 @@ fn the_keys_of_a_call_are_made_anew_as_the_device_rejoins_its_group() {
     );
     assert!(switched.lock().unwrap().is_empty());
     assert!(device.encrypts_call("call-1"));
+}
+
+#[test]
+fn the_keys_of_a_call_are_made_anew_as_the_device_joins_a_new_era_of_its_group() {
+    use rust_rcs_core::mls::rcs::era::EraBase;
+    use rust_rcs_core::mls::rcs::proto::{
+        self, server_mls_rcs_message, ServerCommitBundle, ServerMlsRcsMessage,
+    };
+    use rust_rcs_core::mls::rcs::wire::encode_message_list;
+
+    let (device, kds, bob, bobs_group, _) = alice_and_bob_in_time_with_kds();
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    device.call_participants("call-1", vec![String::from(BOB_TEL)]);
+
+    // Bob's new Era, in place of the group (RCC.16 section 8.3)
+    let mut next = bob
+        .create_next_era(&EraBase::of_conversation(&bobs_group), false)
+        .unwrap();
+    let output = next
+        .add_members(&bob, &[&uploaded_key_package(&kds, 0)])
+        .unwrap();
+    next.merge_pending_commit(&bob).unwrap();
+    let server_message = proto::encode(&ServerMlsRcsMessage {
+        payload: Some(server_mls_rcs_message::Payload::ServerCommitBundle(
+            ServerCommitBundle {
+                commit_list: encode_message_list(&[&output.commit]).unwrap(),
+                welcome: output.welcome.unwrap(),
+                private_message: Vec::new(),
+                ratchet_tree: output.ratchet_tree.unwrap(),
+            },
+        )),
+    });
+    device.join_group(CONVERSATION, &server_message).unwrap();
+
+    // frames in it at once
+    let mut bobs_keys = keys_of_bob_in(&bob, &next);
+    let encrypted = device
+        .encrypt_call_frame("call-1", b"meta", b"frame 1")
+        .unwrap();
+    assert_eq!(
+        bob_decrypts(&mut bobs_keys, &encrypted),
+        (next.epoch(), b"frame 1".to_vec())
+    );
+}
+
+/// The device making a new Era of its group with Bob, the control message
+/// carrying it, and the new Era Bob joins
+fn device_makes_a_new_era(
+    device: &E2eeDevice,
+    kds: &super::kds_tests::Kds,
+    bob: &MlsClient,
+) -> (Vec<u8>, MlsConversation) {
+    use super::kds::Fetched;
+    kds.now_knowing(vec![(
+        BOB_TEL,
+        Fetched::KeyPackages(vec![bob.generate_key_package(false).unwrap()]),
+    )]);
+    let cpim = futures::executor::block_on(device.create_next_era(
+        CONVERSATION,
+        IMPU,
+        GROUP_URI,
+        vec![recipient(BOB_TEL)],
+        None,
+    ))
+    .unwrap();
+    let next = joined(bob, &bundle_of(&cpim));
+    (cpim, next)
+}
+
+#[test]
+fn the_keys_of_a_call_are_made_anew_as_a_new_era_of_the_device_is_accepted() {
+    // as the Focus answers the INVITE carrying it (RCC.16 section 8.3.2)
+    let (device, kds, bob, _, _) = alice_and_bob_in_time_with_kds();
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    let (_, next) = device_makes_a_new_era(&device, &kds, &bob);
+    device.first_commit_accepted(CONVERSATION).unwrap();
+    let mut bobs_keys = keys_of_bob_in(&bob, &next);
+    let encrypted = device
+        .encrypt_call_frame("call-1", b"meta", b"frame 1")
+        .unwrap();
+    assert_eq!(bob_decrypts(&mut bobs_keys, &encrypted).1, b"frame 1");
+
+    // or in the session (section 6.2.4)
+    let (device, kds, bob, _, _) = alice_and_bob_in_time_with_kds();
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    let (_, next) = device_makes_a_new_era(&device, &kds, &bob);
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    let mut bobs_keys = keys_of_bob_in(&bob, &next);
+    let encrypted = device
+        .encrypt_call_frame("call-1", b"meta", b"frame 2")
+        .unwrap();
+    assert_eq!(bob_decrypts(&mut bobs_keys, &encrypted).1, b"frame 2");
 }
