@@ -989,3 +989,47 @@ fn the_receipts_of_the_latest_commits_asked_for_are_known_alone() {
     assert!(!delivered_by_bob(&device, &first, "<delivered/>"));
     assert!(delivered_by_bob(&device, &last, "<delivered/>"));
 }
+
+#[test]
+fn the_receipts_of_a_commit_are_taken_in_its_own_group_alone() {
+    let (device, _, _, clock) = alice_and_bob_in_time();
+    let switched = switches(&device);
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    device.call_participants("call-1", vec![String::from(BOB_TEL)]);
+    let (_, message_id) = device_commits(&device, &clock);
+
+    // in another group, for the app
+    let xml = notification_xml(&message_id, "delivery-notification", "<delivered/>");
+    let receipt = notification_cpim(BOB_TEL, "imdn-40", "", &xml);
+    assert!(!device.commit_delivered(
+        "conversation-2",
+        &cpim_message(&receipt).get_info().unwrap(),
+        xml.as_bytes()
+    ));
+    assert!(switched.lock().unwrap().is_empty());
+    assert!(delivered_by_bob(&device, &message_id, "<delivered/>"));
+}
+
+#[test]
+fn a_group_moved_to_unencrypted_makes_no_keys_for_its_calls() {
+    // nothing being encrypted then (RCC.16 section 11.2)
+    use rust_rcs_core::mls::rcs::proto::EndMlsReason;
+
+    let (device, _, _) = alice_and_bob();
+    device
+        .end_encryption(
+            CONVERSATION,
+            IMPU,
+            GROUP_URI,
+            EndMlsReason::ClientFailureEncryptionNotAvailable,
+        )
+        .unwrap()
+        .expect("a control message");
+    let previous = epoch_identifier(&device, CONVERSATION);
+    device
+        .on_server_message(CONVERSATION, &accepted(previous))
+        .unwrap();
+    assert!(device.encryption_ended(CONVERSATION));
+    assert_eq!(device.start_call_keys("call-1", CONVERSATION), Ok(false));
+    assert!(!device.encrypts_call("call-1"));
+}
