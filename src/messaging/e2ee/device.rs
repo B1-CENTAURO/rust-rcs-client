@@ -42,6 +42,7 @@ use super::replace::Replacements;
 use super::store::{MlsStore, SaveState, StoreError};
 use super::unanswered::Unanswered;
 use super::upgrade::Upgrades;
+use super::video::VideoCalls;
 
 /// The Cipher Suite the device enrols in: Client Certificates are ECDSA
 /// P-256 or P-384 (RCC.16 Annex A.3.7)
@@ -95,6 +96,13 @@ impl ControlMessages<'_> {
     pub(super) fn groups(&self) -> Vec<String> {
         self.notes
             .read(|data| data.control_messages.keys().cloned().collect())
+    }
+
+    /// The Message-ID of the one of the group `conversation_id` waiting for
+    /// the Focus, if one does
+    pub(super) fn get(&self, conversation_id: &str) -> Option<String> {
+        self.notes
+            .read(|data| data.control_messages.get(conversation_id).cloned())
     }
 
     /// Whether one of the group `conversation_id` waits for the Focus
@@ -168,6 +176,8 @@ pub struct E2eeDevice {
     /// not open yet; and the keys of the files uploaded for the messages
     /// sending them
     notes: Notes,
+    /// The keys of the media of the Group RCS Video Chats taken part in
+    video_calls: VideoCalls,
 }
 
 impl E2eeDevice {
@@ -197,6 +207,7 @@ impl E2eeDevice {
             provisioned: Mutex::new(None),
             make_signer: Box::new(|| SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).ok()),
             notes,
+            video_calls: VideoCalls::default(),
         };
         device.settle_restarts();
         Ok(device)
@@ -255,6 +266,10 @@ impl E2eeDevice {
 
     pub fn store(&self) -> &MlsStore {
         &self.store
+    }
+
+    pub(super) fn video_calls(&self) -> &VideoCalls {
+        &self.video_calls
     }
 
     pub(super) fn control_messages(&self) -> ControlMessages<'_> {

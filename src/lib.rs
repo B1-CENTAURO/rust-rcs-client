@@ -94,6 +94,8 @@ use messaging::e2ee::group::DeviceGroups;
 #[cfg(feature = "e2ee")]
 use messaging::e2ee::verification::VerificationError;
 #[cfg(feature = "e2ee")]
+use messaging::e2ee::video::FrameError;
+#[cfg(feature = "e2ee")]
 use provisioning::characteristic::Characteristic;
 #[cfg(feature = "e2ee")]
 use provisioning::ims_application::ImsApplication;
@@ -101,6 +103,8 @@ use provisioning::ims_application::ImsApplication;
 use provisioning::rcs_application::RcsApplication;
 #[cfg(feature = "e2ee")]
 use rust_rcs_core::mls::rcs::certificate::RcsCredentialValidator;
+#[cfg(feature = "e2ee")]
+use video_chat::ffi::VideoChatKeysCallback;
 use video_chat::ffi::{
     group_video_chat_event_code, video_chat_event_code, VideoChatCallback,
     VideoChatIceCandidatesCallback, VideoChatMediaUpdateCallback, VideoChatMember,
@@ -1584,12 +1588,13 @@ pub unsafe extern "C" fn rcs_client_start_video_chat(
     )
 }
 
-/// Calls the participants of the group chat at `conference_uri`, not
-/// encrypted end to end, with the SDP offer `sdp_offer` of the app's WebRTC
-/// stack to the SFU of its Controlling Function (RCC.07 section 3.7.5.5.1),
-/// writing the call_id of the call to `call_id`, `call_id_size` bytes, at
-/// least 37; 0 if it was called, -1 otherwise, as for
-/// rcs_client_start_video_chat()
+/// Calls the participants of the group chat at `conference_uri` with the
+/// SDP offer `sdp_offer` of the app's WebRTC stack to the SFU of its
+/// Controlling Function (RCC.07 section 3.7.5.5.1), writing the call_id of
+/// the call to `call_id`, `call_id_size` bytes, at least 37; 0 if it was
+/// called, -1 otherwise, as for rcs_client_start_video_chat(). In a group
+/// encrypted end to end, its media is to be encrypted with SFrame (RCC.16
+/// section 9.8.2), as rcs_client_video_chat_encrypts_media() tells.
 #[no_mangle]
 pub unsafe extern "C" fn rcs_client_start_group_video_chat(
     client: *mut RcsClient,
@@ -1885,6 +1890,149 @@ pub unsafe extern "C" fn rcs_client_video_chat_media_disconnected(
     with_video_chat(client, call_id, |service, call_id| {
         service.media_disconnected(call_id)
     })
+}
+
+/// Whether the media of the group call `call_id` is to be encrypted with
+/// SFrame by the app, frame by frame, as in a group chat encrypted end to end
+/// (RCC.16 section 9.8.2): 1 if so, from the call started or answered until
+/// it ends; 0 if not
+#[cfg(feature = "e2ee")]
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_video_chat_encrypts_media(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+) -> i32 {
+    let device = client.as_ref().and_then(|client| client.e2ee.as_ref());
+    match (device, optional_string(call_id)) {
+        (Some(device), Some(call_id)) => i32::from(device.encrypts_call(&call_id)),
+        _ => 0,
+    }
+}
+
+/// The `len` bytes at `data`, none if it is null
+#[cfg(feature = "e2ee")]
+unsafe fn bytes_at<'a>(data: *const u8, len: usize) -> &'a [u8] {
+    match data.is_null() {
+        true => &[],
+        false => std::slice::from_raw_parts(data, len),
+    }
+}
+
+/// Writes what `made` made of the call `call_id` of `client` to `out`, of
+/// `out_capacity` bytes: its length, or -1 if the call has no keys, -2 if
+/// `out` has no room for it, -3 if the frame was rejected, -4 if replayed
+#[cfg(feature = "e2ee")]
+unsafe fn frame_out(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+    out: *mut u8,
+    out_capacity: usize,
+    made: impl FnOnce(&E2eeDevice, &str) -> Result<Vec<u8>, FrameError>,
+) -> i64 {
+    let device = client.as_ref().and_then(|client| client.e2ee.as_ref());
+    let (Some(device), Some(call_id)) = (device, optional_string(call_id)) else {
+        return -1;
+    };
+    match made(device, &call_id) {
+        Ok(frame) if frame.len() <= out_capacity && (!out.is_null() || frame.is_empty()) => {
+            if !frame.is_empty() {
+                ptr::copy_nonoverlapping(frame.as_ptr(), out, frame.len());
+            }
+            frame.len() as i64
+        }
+        Ok(_) => -2,
+        Err(FrameError::NoKeys) => -1,
+        Err(FrameError::Rejected) => -3,
+        Err(FrameError::Replayed) => -4,
+    }
+}
+
+/// Encrypts the `frame_len` bytes of the frame at `frame` of the group call
+/// `call_id` with its SFrame keys, `metadata_len` bytes of metadata at
+/// `metadata` authenticated with it (RFC 9605 section 4.4.3), into `out`,
+/// which has room for `out_capacity` bytes, as many as the frame and
+/// RCS_VIDEO_CHAT_FRAME_OVERHEAD more: the length written, or -1 if the call
+/// has no keys, -2 if `out` has no room for it, -3 if it was not encrypted
+///
+/// Until a Commit of this client is delivered to the others of the call,
+/// frames go in the keys of the epoch before (RCC.16 section 9.8.2).
+#[cfg(feature = "e2ee")]
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_encrypt_video_chat_frame(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+    metadata: *const u8,
+    metadata_len: usize,
+    frame: *const u8,
+    frame_len: usize,
+    out: *mut u8,
+    out_capacity: usize,
+) -> i64 {
+    let (metadata, frame) = (bytes_at(metadata, metadata_len), bytes_at(frame, frame_len));
+    frame_out(client, call_id, out, out_capacity, |device, call_id| {
+        device.encrypt_call_frame(call_id, metadata, frame)
+    })
+}
+
+/// Decrypts the `encrypted_len` bytes of the SFrame frame at `encrypted` of
+/// the group call `call_id`, `metadata_len` bytes of metadata at `metadata`
+/// authenticated with it (RFC 9605 section 4.4.4), into `out`, which has
+/// room for `out_capacity` bytes, as many as `encrypted_len` at most: the
+/// length written, or -1 if the call has no keys, -2 if `out` has no room for
+/// it, -3 if it is of no epoch the keys have, or does not open, -4 if it came
+/// already, or is too old to tell (section 9.3); a frame not written is not
+/// to be played
+#[cfg(feature = "e2ee")]
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_decrypt_video_chat_frame(
+    client: *mut RcsClient,
+    call_id: *const c_char,
+    metadata: *const u8,
+    metadata_len: usize,
+    encrypted: *const u8,
+    encrypted_len: usize,
+    out: *mut u8,
+    out_capacity: usize,
+) -> i64 {
+    let (metadata, encrypted) = (
+        bytes_at(metadata, metadata_len),
+        bytes_at(encrypted, encrypted_len),
+    );
+    frame_out(client, call_id, out, out_capacity, |device, call_id| {
+        device.decrypt_call_frame(call_id, metadata, encrypted)
+    })
+}
+
+/// Sets `cb`, told when the keys of a group call switch to the epoch a
+/// Commit of this client moved its group to, once the others in the call
+/// have it: the app is to send an empty frame then, encrypted with
+/// rcs_client_encrypt_video_chat_frame(), if it sends no media, for the
+/// others to switch too (RCC.16 section 9.8.2). The context of one set
+/// before is let go of.
+#[cfg(feature = "e2ee")]
+#[no_mangle]
+pub unsafe extern "C" fn rcs_client_set_video_chat_keys_listener(
+    client: *mut RcsClient,
+    cb: Option<VideoChatKeysCallback>,
+    cb_context: *mut MessageResultCallbackContext,
+) {
+    platform_log(LOG_TAG, "calling rcs_client_set_video_chat_keys_listener()");
+
+    let cb_context = NonNull::new(cb_context)
+        .map(|cb_context| Arc::new(Mutex::new(MessageResultCallbackContextWrapper(cb_context))));
+
+    let (Some(device), Some(cb)) = (client.as_ref().and_then(|client| client.e2ee.as_ref()), cb)
+    else {
+        return;
+    };
+    device.set_call_keys_listener(Arc::new(move |call_id, epoch| {
+        let cb_context = cb_context
+            .as_ref()
+            .map(|cb_context| cb_context.lock().unwrap());
+        let context = cb_context.map_or(ptr::null_mut(), |cb_context| cb_context.0.as_ptr());
+        let call_id = c_string(call_id);
+        cb(call_id.as_ptr(), epoch, context);
+    }));
 }
 
 /// Sets what is told of the invitations to group chats not known before. The

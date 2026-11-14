@@ -5,7 +5,7 @@ RCS Video Chat is the WebRTC video call RCC.07 v18.0 starts from a conversation:
 - **The client** carries the SDP offer and answer, the ICE candidates and the media updates between the two sides. They go as `rcs/video-chat+proto` messages of the chat's MSRP session, which the app never sees (section 3.7.5.2.3). It also runs the call's timers and reports joining and leaving to the Service Provider.
 - **The app** gathers the ICE candidates, makes the SDP, connects DTLS-SRTP and picks the codecs (sections 3.7.5.2.1, 3.7.5.3). It tells the client when the media connects or goes down.
 
-A call goes on at a time, 1-to-1 or of a group. Group calls are taken in groups not encrypted end to end for now.
+A call goes on at a time, 1-to-1 or of a group.
 
 ## Configuration
 
@@ -125,9 +125,43 @@ A group call is reported by the Conversation-ID of the group.
 
 ## E2EE
 
-With the `e2ee` feature, the messages of a call go in the chat with the contact as any message does. If the chat is encrypted, they go encrypted (RCC.16 section 9.8.1), and a contact that advertises E2EE gets a new encrypted chat. The media is protected by the DTLS-SRTP of WebRTC, end to end between the two devices.
+With the `e2ee` feature, the calls of encrypted chats are encrypted end to end too (RCC.16 section 9.8).
 
-In a group encrypted end to end, the signalling is to be signed and the media encrypted with SFrame (section 9.8.2), which the client does not do yet. A group call is not started there (event 7 with 488), and one offered there is not taken.
+**A 1-to-1 call:** its messages go in the chat with the contact as any message does. If the chat is encrypted, they go encrypted (section 9.8.1), and a contact that advertises E2EE gets a new encrypted chat. The media is protected by the DTLS-SRTP of WebRTC, end to end between the two devices.
+
+**A group call in an encrypted group** (section 9.8.2):
+
+- **The signalling is signed, not encrypted,** for the Controlling Function to read. Each ClientGroupVideoMessage goes with a signature, by the MLS group, of the VideoChatMessage it carries and its Message-ID (sections 7.6.1, 7.6.3.4). A signal of another participant is taken only if that participant signed it; one that isn't signed, or is signed by another, is dropped. The client does this alone.
+- **The media is encrypted with SFrame** (RFC 9605) by the app, frame by frame, with keys the client makes from the MLS group (RFC 9605 section 5.2). The keys are made as the call starts or is answered: if they cannot be, the call fails (event 7, 488).
+
+  1. Once the call is started or answered, `rcs_client_video_chat_encrypts_media` gives 1.
+  2. Encrypt each frame sent with `rcs_client_encrypt_video_chat_frame`, in a buffer of the frame's size and `RCS_VIDEO_CHAT_FRAME_OVERHEAD` more. Use WebRTC's encoded transform, which hands over each encoded frame, before packetization.
+  3. Decrypt each frame received with `rcs_client_decrypt_video_chat_frame`. Drop a frame it does not write (-3 or -4).
+  4. Set `rcs_client_set_video_chat_keys_listener`: when it is told of a call, send an empty frame encrypted with the call's keys if no media is being sent (see below).
+
+  The metadata given with a frame is authenticated with it, not encrypted. Give the same on both sides, or none.
+
+**New epochs.** As members join, leave or update their keys, the MLS group moves to a new epoch, and its keys change. The client takes the keys of each new epoch at once, so frames of it are decrypted from then on. Frames go on being sent in the epoch before:
+- the client that sent the Commit switches once all the other clients of the call delivered it, and the keys listener is told then;
+- the others switch once a frame of that client in the new epoch comes.
+
+That is why a client that committed but sends no media must send an empty frame: the others wait for its frames. The app does not have to do anything else.
+
+## Where RCC.16 is silent
+
+The client:
+
+- **signs a VideoChatMessage with its VerifiableVideoChatMessage alone.** RCC.16 gives no case of the AuthenticatedData for it, as it does for notifications (section 7.5.3.2), so no Era-ID goes with it.
+- **binds the signature to the Message-ID of the CPIM message the ClientGroupVideoMessage goes in.** It takes the Controlling Function to relay that Message-ID, and the MLS-Derived-Content-Signature header, with the VideoChatMessage. The signal of another participant is taken as of the participant of the CPIM From.
+- **takes unsigned what the Controlling Function adds of its own:** the SDP of the SFU, the participants, and its ICE candidates and media updates. It also takes what it relays of this client unsigned, such as the Hangup of the SFU finding the client disconnected. None of these can be signed by a member.
+- **does not take a group call's signalling as a sign that the group moved to unencrypted,** as it does for messages sent unencrypted in an encrypted group (section 11.2), since it is signed and not encrypted.
+- **uses the SFrame cipher suite AES_128_GCM_SHA256_128 (0x0004),** the one that goes with the MLS cipher suite of RCC.16. Its Key IDs carry 4 bits of the epoch, the 16 bits of the sender's leaf index above them, and a context chosen at random above those, as rust-rcs-core shares them out. Every client of the call must share Key IDs out the same way, which RCC.16 leaves open.
+- **asks for its Commit's delivery during a call** (`Disposition-Notification: positive-delivery, negative-delivery`). It also sends a signed delivery notification of a Commit that asks for it. RCC.16 has the committer wait for the delivery receipts of the others, but no message of its own asks for them, and a Commit reaches the others in a message of the Conversation Focus. Those receipts are not given to the app.
+- **waits for the receipts of the participants the Controlling Function lists as joined,** besides this client. One that leaves the call is no longer waited for.
+- **switches all the same once a wait runs out:**
+  - the committer, 20·T1 (10 s) after the Focus accepted its Commit, as long as Timer_Delta waits for the media;
+  - the others, 64·T1 (32 s) after they took it, for a committer that is not in the call, or sends nothing.
+- **makes the keys anew, sending in the new epoch at once, when it joins the group again** with an External Commit, as a self-heal does (section 10.1.1), at another leaf.
 
 ## Where RCC.07 is silent
 
@@ -147,5 +181,4 @@ The client:
 
 ## Not covered yet
 
-- **Group RCS Video Chats in groups encrypted end to end** (RCC.16 section 9.8.2): their signalling signed, and their media encrypted with SFrame, which rust-rcs-core keys from the MLS group.
 - **gRPC-configured clients** (RCC.30 section 3.1.4).

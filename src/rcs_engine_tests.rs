@@ -29,17 +29,17 @@ use tokio::sync::Notify;
 use crate::messaging::config::MessagingConfigs;
 use crate::messaging::cpm::encryption::GroupEncryption;
 use crate::messaging::cpm::session_tests::{
-    answer, body_data, cpim_text, header_value, new_group, request_uri, start, status_code,
-    ChatScript, Client, MsrpPeer, Peer, ScriptedEncryption, CHAT_BUNDLE, GROUP, IMPU, PEER, TOKEN,
-    TRANSPORT_ADDRESS,
+    answer, body_data, cpim_text, header_value, joined_encrypted_group, new_group, request_uri,
+    start, status_code, ChatScript, Client, MsrpPeer, Peer, ScriptedEncryption, CHAT_BUNDLE, GROUP,
+    IMPU, PEER, TOKEN, TRANSPORT_ADDRESS,
 };
 use crate::messaging::ffi::RecipientType;
 
 use super::{
     cpim_from, joined_feature_tags, report_video_chat_event, route_message, sealing_of,
     send_group_video_chat_message, send_to_contact, send_video_chat_message, taken_by_video_chat,
-    Content, MessageRoute, PendingMessage, PreparingChats, RcsEngineConnectionState,
-    RcsEngineRegistrationState, UploadFor,
+    Content, EngineVideoChatLink, MessageRoute, PendingMessage, PreparingChats,
+    RcsEngineConnectionState, RcsEngineRegistrationState, UploadFor,
 };
 use crate::video_chat::{
     VideoChatConfig, VideoChatEvent, VideoChatLink, VideoChatService, CONTENT_TYPE,
@@ -1026,23 +1026,37 @@ fn video_chat_messages_go_to_the_video_chats_not_to_the_app() {
         b"text/plain",
         b"hi"
     ));
-    // of an encrypted group: taken, though not yet by the video chats, as
-    // RCC.16 section 9.8.2 has it signed
-    let group = ServerGroupVideoMessage {
-        video_chat_message: prost::Message::encode_to_vec(&invitation("carol-call", "")),
-        sdp: String::from("sfu offer"),
-        ..ServerGroupVideoMessage::default()
+    // of an encrypted group, taken, but by the video chats only signed by
+    // the participant of its CPIM From (RCC.16 section 9.8.2)
+    let relayed = |call_id: &str| {
+        prost::Message::encode_to_vec(&ServerGroupVideoMessage {
+            video_chat_message: prost::Message::encode_to_vec(&invitation(call_id, "")),
+            sdp: String::from("sfu offer"),
+            ..ServerGroupVideoMessage::default()
+        })
     };
-    let group = prost::Message::encode_to_vec(&group);
+    let group = relayed("carol-call");
+    let forging = ScriptedEncryption::of_chats(ChatScript::default());
     assert!(taken_by_video_chat(
         &video_chat,
-        || Some(true),
+        || Some(Some((
+            Arc::clone(&forging) as Arc<dyn GroupEncryption>,
+            String::from("conversation-1")
+        ))),
         b"sip:group@conf.example.com",
         &cpim_info,
         CONTENT_TYPE.as_bytes(),
         &group
     ));
     assert!(told.lock().unwrap().is_empty());
+    assert_eq!(
+        forging.verified_messages(),
+        [(
+            String::from("conversation-1"),
+            String::from("<tel:+15550002>"),
+            prost::Message::encode_to_vec(&invitation("carol-call", ""))
+        )]
+    );
     // of a 1-to-1 chat, with parameters too
     assert!(taken_by_video_chat(
         &video_chat,
@@ -1064,17 +1078,24 @@ fn video_chat_messages_go_to_the_video_chats_not_to_the_app() {
         )]
     );
     service.hang_up("bob-call");
-    // of a group not encrypted, from the participant of its CPIM From
+    // signed so
+    let verifying = ScriptedEncryption::of_chats(ChatScript {
+        verifying: true,
+        ..ChatScript::default()
+    });
     assert!(taken_by_video_chat(
         &video_chat,
-        || Some(false),
+        || Some(Some((
+            Arc::clone(&verifying) as Arc<dyn GroupEncryption>,
+            String::from("conversation-1")
+        ))),
         b"sip:group@conf.example.com",
         &cpim_info,
         CONTENT_TYPE.as_bytes(),
         &group
     ));
     assert_eq!(
-        *told.lock().unwrap(),
+        std::mem::take(&mut *told.lock().unwrap()),
         [(
             String::from("carol-call"),
             String::from("sip:group@conf.example.com"),
@@ -1084,9 +1105,32 @@ fn video_chat_messages_go_to_the_video_chats_not_to_the_app() {
             }
         )]
     );
+    assert_eq!(verifying.verified_messages().len(), 1);
+    service.hang_up("carol-call");
+    // of a group not encrypted, from the participant of its CPIM From
+    assert!(taken_by_video_chat(
+        &video_chat,
+        || Some(None),
+        b"sip:group@conf.example.com",
+        &cpim_info,
+        CONTENT_TYPE.as_bytes(),
+        &relayed("dave-call")
+    ));
     assert_eq!(
-        *link.group_sent.lock().unwrap(),
-        ["sip:group@conf.example.com"]
+        *told.lock().unwrap(),
+        [(
+            String::from("dave-call"),
+            String::from("sip:group@conf.example.com"),
+            VideoChatEvent::Incoming {
+                sdp_offer: String::from("sfu offer"),
+                ongoing: false,
+            }
+        )]
+    );
+    assert_eq!(
+        link.group_sent.lock().unwrap().len(),
+        3,
+        "the AckInvitations and the rejection"
     );
     // the video chats gone, not the app's all the same
     drop(service);
@@ -1119,6 +1163,68 @@ fn the_cpim_from_of_a_group_message_gives_its_participant() {
         "tel:+15550002"
     );
     assert_eq!(cpim_from(&cpim_info(b" tel:+15550002 ")), "tel:+15550002");
+}
+
+#[test]
+fn a_group_video_chat_message_goes_unsigned_once_the_group_moved_to_unencrypted() {
+    // RCC.16 section 11.2
+    let (client, mut peer) = start(true);
+    let rt = Arc::clone(&client.rt);
+    let engine = Engine::over(&client, configured_for_groups());
+    let encryption = ScriptedEncryption::in_group_moved_to_unencrypted();
+    client
+        .sessions
+        .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+    let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-video-ended");
+
+    let sent = engine.group_video_chat(VIDEO_CHAT);
+    let send = connection.next_message(&rt);
+    assert_eq!(cpim_content(&send.body), VIDEO_CHAT);
+    connection.respond(&rt, &send, "200 OK");
+    assert_eq!(told(&sent), 200);
+    assert!(encryption.signed_messages().is_empty());
+    connection.quiet(&rt);
+    peer.silence();
+}
+
+#[test]
+fn the_media_keys_of_a_group_call_are_those_of_the_encryption_of_its_group() {
+    // RCC.16 section 9.8.2, by the Conversation-ID of the group
+    let (client, mut peer) = start(true);
+    let engine = Engine::over(&client, configured_for_groups());
+    let (mut connection, _, _, _) = new_group(&client, &mut peer);
+    let conversation_id = client.sessions.group_conversation_id(GROUP).unwrap();
+    let link = EngineVideoChatLink {
+        route: engine.route.clone(),
+        preparing: Arc::clone(&engine.preparing),
+        tm: client.core.get_transaction_manager(),
+        rt: Arc::clone(&client.rt),
+    };
+    // without E2EE, or of no group known, none
+    assert_eq!(link.start_media_keys("call-1", GROUP), Some(false));
+    for made in [Some(true), None] {
+        let encryption = ScriptedEncryption::keying_calls(vec![conversation_id.clone()], made);
+        client
+            .sessions
+            .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+        assert_eq!(link.start_media_keys("call-1", GROUP), made, "{:?}", made);
+        assert_eq!(
+            link.start_media_keys("call-2", "sip:unknown@conf.example.com"),
+            Some(false)
+        );
+        link.media_participants("call-1", vec![String::from(PEER)]);
+        link.end_media_keys("call-1");
+        assert_eq!(
+            encryption.call_keys(),
+            [
+                format!("start {} call-1", conversation_id),
+                format!("participants call-1 {}", PEER),
+                String::from("end call-1"),
+            ]
+        );
+    }
+    connection.quiet(&client.rt);
+    peer.silence();
 }
 
 #[test]
@@ -1198,32 +1304,42 @@ fn a_group_video_chat_message_goes_in_the_group_chat() {
     engine.configure(messaging);
     assert_eq!(told(&engine.group_video_chat(VIDEO_CHAT)), 403);
 
-    // nor yet in a group encrypted end to end, where it is to be signed
-    // (RCC.16 section 9.8.2)
-    engine.configure(configured_for_groups());
-    let conversation_id = client.sessions.group_conversation_id(GROUP).unwrap();
-    encrypting(
-        &client,
-        ChatScript {
-            encrypting: vec![conversation_id.clone()],
-            ..ChatScript::default()
-        },
-    );
-    assert_eq!(told(&engine.group_video_chat(VIDEO_CHAT)), 488);
-
-    // but as in one not encrypted once it moved to unencrypted (RCC.16
-    // section 11.2)
-    client
-        .sessions
-        .set_group_encryption(
-            ScriptedEncryption::moved_to_unencrypted(vec![conversation_id])
-                as Arc<dyn GroupEncryption>,
-        );
-    let sent = engine.group_video_chat(VIDEO_CHAT);
-    let send = connection.next_message(&rt);
-    assert_eq!(cpim_content(&send.body), VIDEO_CHAT);
-    connection.respond(&rt, &send, "200 OK");
-    assert_eq!(told(&sent), 200);
     connection.quiet(&rt);
     peer.silence();
+}
+
+#[test]
+fn a_group_video_chat_message_is_signed_in_an_encrypted_group() {
+    // RCC.16 section 9.8.2: signed, and not encrypted, for the Controlling
+    // Function to read; never sent unsigned there
+    for (signature, status) in [(Some("signed"), 200), (None, 500)] {
+        let (client, mut peer) = start(true);
+        let rt = Arc::clone(&client.rt);
+        let engine = Engine::over(&client, configured_for_groups());
+        let encryption = ScriptedEncryption::in_encrypted_group(signature);
+        client
+            .sessions
+            .set_group_encryption(Arc::clone(&encryption) as Arc<dyn GroupEncryption>);
+        let (mut connection, _, _) = joined_encrypted_group(&client, &mut peer, "group-video");
+
+        let sent = engine.group_video_chat(VIDEO_CHAT);
+        if status == 200 {
+            let send = connection.next_message(&rt);
+            assert_eq!(send.body, b"signed");
+            connection.respond(&rt, &send, "200 OK");
+        }
+        assert_eq!(told(&sent), status);
+        let signed = encryption.signed_messages();
+        assert_eq!(signed.len(), 1);
+        assert_eq!(signed[0].0, "conversation-1");
+        assert!(
+            String::from_utf8_lossy(&signed[0].1).contains("Content-Type: rcs/video-chat+proto"),
+            "{:?}",
+            signed[0].1
+        );
+        assert_eq!(cpim_content(&signed[0].1), VIDEO_CHAT);
+        assert!(encryption.encrypted_messages().is_empty());
+        connection.quiet(&rt);
+        peer.silence();
+    }
 }

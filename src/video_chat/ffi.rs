@@ -157,3 +157,9 @@ pub fn group_video_chat_event_code(event: &GroupVideoChatEvent) -> Option<(i32, 
         GroupVideoChatEvent::Members(_) => None,
     }
 }
+
+/// Told of the keys of the group call `call_id` switched to the epoch
+/// `epoch` of its MLS group, a Commit of this client moving it there: an
+/// empty frame is to be sent in them if no media is (RCC.16 section 9.8.2)
+pub type VideoChatKeysCallback =
+    extern "C" fn(call_id: *const c_char, epoch: u64, context: *mut MessageResultCallbackContext);
