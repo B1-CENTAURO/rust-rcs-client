@@ -349,8 +349,9 @@ fn the_media_of_a_group_call_is_encrypted_with_the_keys_of_its_mls_group() {
 }
 
 /// The Commit of a key update of the device, its control message and
-/// Message-ID, accepted by the Focus, the group in epoch 2
+/// Message-ID, accepted by the Focus, the group in the epoch after
 pub(super) fn device_commits(device: &E2eeDevice, clock: &Clock) -> (Vec<u8>, String) {
+    let (before, _) = epoch(device, CONVERSATION).unwrap();
     clock.advance(31 * DAY);
     let cpim = device
         .update_keys(CONVERSATION, IMPU, GROUP_URI)
@@ -363,7 +364,7 @@ pub(super) fn device_commits(device: &E2eeDevice, clock: &Clock) -> (Vec<u8>, St
     device
         .on_server_message(CONVERSATION, &accepted(previous))
         .unwrap();
-    assert_eq!(epoch(device, CONVERSATION), Ok((2, false)));
+    assert_eq!(epoch(device, CONVERSATION), Ok((before + 1, false)));
     (cpim, message_id)
 }
 
@@ -1032,4 +1033,20 @@ fn a_group_moved_to_unencrypted_makes_no_keys_for_its_calls() {
     assert!(device.encryption_ended(CONVERSATION));
     assert_eq!(device.start_call_keys("call-1", CONVERSATION), Ok(false));
     assert!(!device.encrypts_call("call-1"));
+}
+
+#[test]
+fn the_committer_switches_on_the_receipts_of_its_latest_commit_alone() {
+    let (device, _, _, clock) = alice_and_bob_in_time();
+    let switched = switches(&device);
+    device.start_call_keys("call-1", CONVERSATION).unwrap();
+    device.call_participants("call-1", vec![String::from(BOB_TEL)]);
+    let (_, first) = device_commits(&device, &clock);
+    let (_, second) = device_commits(&device, &clock);
+
+    // the first one's delivered, not for the app, but not waited for
+    assert!(delivered_by_bob(&device, &first, "<delivered/>"));
+    assert!(switched.lock().unwrap().is_empty());
+    assert!(delivered_by_bob(&device, &second, "<delivered/>"));
+    assert_eq!(*switched.lock().unwrap(), [(String::from("call-1"), 3)]);
 }

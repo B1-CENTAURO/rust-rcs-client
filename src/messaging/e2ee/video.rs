@@ -100,10 +100,8 @@ struct Switch {
 struct CallKeys {
     conversation_id: String,
     session: SframeSession,
-    /// The Era of the MLS group the session was made from, and the leaf of
-    /// this client in it, which the session sends as
+    /// The Era of the MLS group the session was made from
     era: Option<u32>,
-    leaf_index: u32,
     /// The participants of the call besides this client, as the
     /// Controlling Function tells them
     participants: Vec<String>,
@@ -280,19 +278,18 @@ impl E2eeDevice {
     /// New keys of a call of the group `conversation_id`, from the epoch it
     /// is in, of no participants yet
     fn call_keys_of(&self, conversation_id: &str) -> Result<CallKeys, StoreError> {
-        let (session, era, leaf_index) = self
+        let (session, era) = self
             .store()
             .peek_conversation(conversation_id.as_bytes(), |conversation, client| {
                 let session =
                     SframeSession::of(conversation, client, SUITE, DEFAULT_LAYOUT, context_id())?;
-                Ok::<_, ErrorKind>((session, conversation.era(), conversation.own_leaf_index()))
+                Ok::<_, ErrorKind>((session, conversation.era()))
             })?
             .map_err(StoreError::Mls)?;
         Ok(CallKeys {
             conversation_id: String::from(conversation_id),
             session,
             era,
-            leaf_index,
             participants: Vec::new(),
             switch: None,
         })
@@ -346,8 +343,10 @@ impl E2eeDevice {
     /// Commit of this client: the keys of its calls take those of the
     /// epoch, switched to as RCC.16 section 9.8.2 has it
     ///
-    /// The keys of a call whose group is in a new Era, or which this client
-    /// is at another leaf of, are made anew, from the epoch the group is in.
+    /// The keys of a call whose group is in a new Era are made anew, from the
+    /// epoch the group is in. Those of a call this client is at another leaf
+    /// of, as it joined the group again, are made anew as it does
+    /// (call_keys_remade()).
     pub(super) fn call_keys_advanced(
         &self,
         conversation_id: &str,
@@ -383,8 +382,8 @@ impl E2eeDevice {
                     }
                 };
                 // in a new Era of the group, as one of this client the Focus
-                // accepted, or at another leaf: made anew
-                if era != call.era || leaf_index != call.leaf_index {
+                // accepted: made anew
+                if era != call.era {
                     self.remake(call);
                     continue;
                 }
